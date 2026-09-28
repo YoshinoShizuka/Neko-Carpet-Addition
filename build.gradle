@@ -1,0 +1,99 @@
+plugins {
+    // 26.x 起用这个「不 remap」的 Loom 插件；1.21.x 及以前才是 fabric-loom-remap
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = "${project.archives_base_name}-mc${project.minecraft_version}"
+}
+
+repositories {
+    // Carpet 26.3 正式版走 Modrinth maven
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+    }
+    // Carpet 的 beta / 正式版历史版本（备选源）
+    maven {
+        name = 'masa'
+        url = 'https://masa.dy.fi/maven'
+        content { includeGroup 'carpet' }
+    }
+    mavenCentral()
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+
+    // 26.x 不混淆，所有依赖都用普通 implementation，不需要 modImplementation
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "maven.modrinth:carpet:${project.carpet_modrinth_version}"
+    // 备选：implementation "carpet:fabric-carpet:${project.carpet_masa_version}"
+}
+
+loom {
+    runConfigs.configureEach {
+        // 单模块工程，运行目录就放在项目内的 run/（原来的 ../../run 会跑到项目外）
+        runDir 'run'
+    }
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 25
+}
+
+processResources {
+    inputs.property 'version', project.version
+
+    filesMatching('fabric.mod.json') {
+        expand 'version': project.version
+    }
+}
+
+jar {
+    from('LICENSE') {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
+}
+
+// ===== 产物定位辅助 =====
+// 标准的 jar 产物在 build/libs/ 下；这里额外做两件事，
+// 免得在 IDEA 里翻了半天找不到：
+//   1. build 结束后把 jar 的绝对路径打到控制台
+//   2. 额外提供 dist 任务，把 jar 复制到项目根目录的 dist/
+
+tasks.named('build') {
+    doLast {
+        def f = tasks.named('jar').get().archiveFile.get().asFile
+        if (f.exists()) {
+            println ''
+            println '============================================================'
+            println "  JAR : ${f.absolutePath}"
+            println "  SIZE: ${f.length()} bytes"
+            println '============================================================'
+        } else {
+            println "  [WARN] jar not found: ${f.absolutePath}"
+        }
+    }
+}
+
+tasks.register('dist', Copy) {
+    group = 'build'
+    description = 'Copies the built mod jar into dist/ at the project root'
+    dependsOn tasks.named('jar')
+    from tasks.named('jar').flatMap { it.archiveFile }
+    into layout.projectDirectory.dir('dist')
+    doLast {
+        println "  dist -> ${layout.projectDirectory.dir('dist').asFile.absolutePath}"
+    }
+}

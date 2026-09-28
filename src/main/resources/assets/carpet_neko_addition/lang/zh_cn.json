@@ -1,0 +1,7 @@
+{
+  "carpet.category.neko": "neko",
+  "carpet.rule.autoMending.name": "自动经验修补",
+  "carpet.rule.autoMending.desc": "装备或手上有耐久不满物品且有经验修补附魔时，每秒自动消耗玩家已有的经验值进行修补",
+  "carpet.rule.voidWarehouse.name": "虚空仓库",
+  "carpet.rule.voidWarehouse.desc": "把铁砧改名的工作台变成全服共享仓库"
+}

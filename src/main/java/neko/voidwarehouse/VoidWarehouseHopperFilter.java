@@ -1,5 +1,7 @@
 package neko.voidwarehouse;
 
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+
 /**
  * 漏斗上的「分类物过滤模式」开关（由 {@code HopperBlockEntityMixin} 实现）。
  *
@@ -27,4 +29,16 @@ public interface VoidWarehouseHopperFilter {
 
     /** 打开 / 关掉分类物过滤模式 */
     void setClassifierFilter(boolean enabled);
+
+    /**
+     * 把原版搬运冷却（{@code cooldownTime}）清零。
+     *
+     * <p>入库漏斗做「上方容器 → 漏斗」无上限吸取时，复用了原版
+     * {@link HopperBlockEntity#addItem} 往漏斗里放东西，而它内部会顺手把目标漏斗设成
+     * 8 gt 冷却（{@code tryMoveInItem} 里的 {@code setCooldown(8)} 副作用）。
+     * 若不及时清零，下一个 tick 原版 {@code tryMoveItems} 会因 {@code isOnCooldown()}
+     * 直接跳过、再也不调 {@code suckInItems}，无上限就退化成「8 gt 吸 1 个」。
+     * 所以吸完必须清零，让每个 tick 都能继续吸。</p>
+     */
+    void resetCooldown();
 }

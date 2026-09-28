@@ -3,6 +3,8 @@ package neko.voidwarehouse;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
+import net.minecraft.world.WorldlyContainer;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.HopperBlock;
@@ -126,5 +128,99 @@ public final class VoidWarehouseHopper {
             hopper.setChanged();
         }
         return moved;
+    }
+
+    /**
+     * 「上方容器 → 漏斗」的无上限吸取：把漏斗正上方那个容器的物品<b>一次吸满</b>漏斗。
+     *
+     * <p>这是对原版 {@code HopperBlockEntity#tryTakeInItemFromSlot} 的「整格版」：
+     * 原版每 tick 只 {@code removeItem(slot, 1)}（拿 1 个），再靠 {@code tryMoveItems}
+     * 里 {@code setCooldown(8)} 的节流实现「8 gt 吸 1 个」。这里改成<b>整格搬</b>，
+     * 并且不设冷却（由调用方 {@code suckInItems} 的接管负责把冷却清零），
+     * 于是每个 tick 都能把上方容器能给的尽量吸进漏斗 —— <b>无速率上限</b>。</p>
+     *
+     * <h2>为什么仍是「原版规则」</h2>
+     * <ul>
+     *   <li>「能不能从上方容器取」仍然走原版判定（{@link #canTakeFrom}，等价于
+     *       原版 {@code canTakeItemFromContainer}）：熔炉之类 {@link WorldlyContainer}
+     *        的侧面过滤照旧生效，不会因为我们的模组就「能从炉顶吸原料」；</li>
+     *   <li>「能不能放进漏斗」仍走原版 {@link HopperBlockEntity#addItem} 的全部限制
+     *       （堆叠上限、格子合并），放不下的部分<b>原样放回</b>上方容器；</li>
+     *   <li>只对「上方是容器」的情况生效：上方是掉落物 / 完整方块时，调用方根本不走这里，
+     *       还是原版 {@code suckInItems} 的吸掉落物分支。</li>
+     * </ul>
+     *
+     * <p><b>绝不丢东西</b>：{@code addItem} 返回「没放进去的剩余」，这里把它并回上方容器的
+     * 原格；只有当 {@code leftover} 为空（全部放进去了）才真正把上方格清掉。</p>
+     *
+     * @param level 服务端世界（调用方已断言）
+     * @param hopper 入库漏斗（口朝向仓库终端、且上方是容器）
+     * @return 是否真的吸进来了东西（调用方据此决定要不要让原版进入 8 gt 冷却 —— 我们恒为 false，
+     *         因为无上限模式下不想要原版的节流）
+     */
+    public static boolean suckUnlimited(ServerLevel level, HopperBlockEntity hopper) {
+        Container source = HopperBlockEntity.getContainerAt(level, hopper.getBlockPos().above());
+        if (source == null) {
+            return false;
+        }
+        boolean moved = false;
+        int size = source.getContainerSize();
+        for (int slot = 0; slot < size; slot++) {
+            ItemStack stack = source.getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            // 原版判定：这个格子的东西能不能被「取」出来（WorldlyContainer 侧面过滤等）
+            if (!canTakeFrom(source, hopper, stack, slot)) {
+                continue;
+            }
+            int count = stack.getCount();
+            // 整格拿走（不绕过原版，因为上面已经用 canTakeFrom 判定过）
+            ItemStack taken = source.removeItem(slot, count);
+            if (taken.isEmpty()) {
+                continue;
+            }
+            // 放进漏斗：走原版 addItem 的全部合并 / 上限 / 放料判定，direction 传 null
+            // 与「吸料」这一路原版语义一致（跳过 WorldlyContainer 的放料侧面过滤）
+            ItemStack leftover = HopperBlockEntity.addItem(hopper, source, taken, null);
+            if (leftover.isEmpty()) {
+                moved = true;
+            } else {
+                // 漏斗放不下的部分：并回上方容器的原格（原格此时要么空、要么同种）
+                ItemStack rest = source.getItem(slot);
+                if (rest.isEmpty()) {
+                    source.setItem(slot, leftover);
+                } else if (ItemStack.isSameItemSameComponents(rest, leftover)) {
+                    rest.grow(leftover.getCount());
+                } else {
+                    // 理论到不了这里（removeItem 后原格只剩同种或空），防御性兜底
+                    source.setItem(slot, leftover);
+                }
+                moved = true;
+            }
+            source.setChanged();
+        }
+        if (moved) {
+            hopper.setChanged();
+        }
+        return moved;
+    }
+
+    /**
+     * 复刻原版 {@code HopperBlockEntity#canTakeItemFromContainer}：
+     * 这个格子的物品能不能被取走（用于「上方容器 → 漏斗」的吸料）。
+     *
+     * <p>原版实现就两句话：{@code source.canTakeItem(dest, slot, stack)} 且
+     * （若 source 是 {@link WorldlyContainer}）{@code canTakeItemThroughFace(slot, stack, face)}。
+     * 因为原版方法是 {@code private static} 调不到，这里照着写一份等价物。</p>
+     */
+    private static boolean canTakeFrom(Container source, Container dest, ItemStack stack, int slot) {
+        if (!source.canTakeItem(dest, slot, stack)) {
+            return false;
+        }
+        if (source instanceof WorldlyContainer worldly) {
+            return worldly.canTakeItemThroughFace(slot, stack, Direction.DOWN);
+        }
+        return true;
     }
 }

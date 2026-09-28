@@ -21,11 +21,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * <b>服务端「对方块右键」的最上游拦截</b>：{@code ServerPlayerGameMode#useItemOn}
  * 是服务端处理方块右键真正的最上游，比「方块自己的交互」和 {@code BlockItem#useOn} 都早。
  *
- * <h2>两个入口</h2>
+ * <h2>三个入口</h2>
  * <ol>
  *   <li><b>手里拿着「虚空仓库」</b>右键任意方块 → 开界面（保留原来的用法，不会误放下去）；</li>
  *   <li><b>右键一个已放置的仓库终端</b>（{@link VoidWarehouseTerminals}）→ 开界面，
- *       空手也行、手里拿着别的东西也行。</li>
+ *       空手也行、手里拿着别的东西也行；</li>
+ *   <li><b>右键一个接了漏斗的原版工作台</b>（{@link VoidWarehouseTerminals#isHopperConnected}）→
+ *       开界面 —— 搭好流水线的普通工作台也能当入口。</li>
  * </ol>
  *
  * <h2>潜行 = 放置</h2>
@@ -60,7 +62,9 @@ public abstract class ServerPlayerGameModeMixin {
         }
         boolean terminal = level instanceof ServerLevel serverLevel
                 && VoidWarehouseTerminals.isTerminal(serverLevel, hitResult.getBlockPos());
-        if (!terminal && !VoidWarehouseTrigger.isVoidWarehouse(stack)) {
+        boolean hopperLinked = level instanceof ServerLevel serverLevel2
+                && VoidWarehouseTerminals.isHopperConnected(serverLevel2, hitResult.getBlockPos());
+        if (!terminal && !hopperLinked && !VoidWarehouseTrigger.isVoidWarehouse(stack)) {
             return;
         }
         InteractionResult result = VoidWarehouseTrigger.interact(level, player, hand);

@@ -26,11 +26,11 @@ import net.minecraft.world.level.block.state.BlockState;
  * 因此这一条是天然成立的，代码里不需要额外排除。</p>
  *
  * <h2>筛选一致</h2>
- * <p>带任何非默认数据组件的物品（耐久 / 附魔 / 自定义名…）会被跳过，
- * 原样留在漏斗里，与界面上的筛选规则完全一致（都走
- * {@link VoidWarehouseData#isInsertable}）。<b>潜影盒是例外但不冲突</b>：
- * 漏斗里的潜影盒会被同样的逻辑<b>拆开</b>入库（盒内物品按真实数量存，
- * 盒子变成 2 潜影壳 + 1 箱子）；盒内混了带数据的物品时同样整盒拒收、原地不动。</p>
+ * <p>任何非空物品（含带数据组件的受损工具 / 附魔 / 改名物品）都会按「同物品 + 同数据组件」
+ * 入库（都走 {@link VoidWarehouseData#isInsertable}），仓库本身不再筛选 ——
+ * 要不要放行某个物品，由玩家自己在漏斗里用分类物白名单过滤。<b>潜影盒是例外</b>：
+ * 漏斗里的非空潜影盒会被同样的逻辑<b>拆开</b>入库（盒内物品按真实数量存，
+ * 盒子变成 2 潜影壳 + 1 箱子）；空盒子则整盒入库，不拆。</p>
  *
  * <h2>只搬漏斗自己</h2>
  * <p>这里只动「漏斗格子里的物品」。漏斗上方容器 → 漏斗那一段仍走原版逻辑（原版速率），
@@ -105,7 +105,7 @@ public final class VoidWarehouseHopper {
         for (int i = 0; i < slots; i++) {
             ItemStack stack = hopper.getItem(i);
             if (stack.isEmpty() || !VoidWarehouseData.isInsertable(stack)) {
-                // 空格 / 带数据的物品：原样留在漏斗里
+                // 空格：原样留在漏斗里（带 NBT 的物品现在也放行，由玩家过滤）
                 continue;
             }
             int count = stack.getCount();

@@ -3,11 +3,14 @@ package neko.voidwarehouse;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.GlobalPos;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.datafix.DataFixTypes;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraft.world.level.saveddata.SavedDataType;
 
@@ -88,6 +91,60 @@ public final class VoidWarehouseTerminals extends SavedData {
     /** 登记表里现在有多少个终端（诊断用） */
     public static int size(ServerLevel level) {
         return get(level).terminals.size();
+    }
+
+    // ------------------------------------------------------------------ 漏斗连接
+
+    /**
+     * 这个工作台周围是不是有「相连」的漏斗（指向它、或被它指向）。
+     *
+     * <p>用途：一个<b>未改名</b>的原版工作台，只要接了漏斗，右键它也能访问仓库 ——
+     * 这样玩家搭好自动化产线后，不需要再专门放一个改名工作台当入口，
+     * 直接右键那条流水线上的工作台就能看仓库。</p>
+     *
+     * <p>相连的三种摆法（与原版漏斗的朝向约束一致，漏斗口没有「朝上」）：</p>
+     * <ul>
+     *   <li><b>工作台正上方</b>有漏斗、且它口朝下（{@code DOWN}）→ 指向工作台（入库）；</li>
+     *   <li><b>工作台正下方</b>有漏斗 → 工作台在漏斗正上方（出料，见
+     *       {@link VoidWarehouseExtractor}）；</li>
+     *   <li><b>四个水平方向</b>有漏斗、且它口朝工作台 → 指向工作台（入库）。</li>
+     * </ul>
+     *
+     * <p>只认工作台方块、且规则开着，其余情况快速返回 {@code false}。</p>
+     */
+    public static boolean isHopperConnected(ServerLevel level, BlockPos pos) {
+        if (!VoidWarehouseSettings.voidWarehouse) {
+            return false;
+        }
+        if (!level.getBlockState(pos).is(Blocks.CRAFTING_TABLE)) {
+            return false;
+        }
+        // 正上方：漏斗口朝下才指向工作台
+        if (isHopperFacing(level, pos.above(), Direction.DOWN)) {
+            return true;
+        }
+        // 正下方：工作台在漏斗正上方（出料），任意朝向都算相连
+        if (isHopper(level, pos.below())) {
+            return true;
+        }
+        // 四个水平方向：漏斗口朝工作台
+        for (Direction side : Direction.Plane.HORIZONTAL) {
+            if (isHopperFacing(level, pos.relative(side), side.getOpposite())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 这个坐标上是漏斗、且它的口正好朝向 {@code facing} */
+    private static boolean isHopperFacing(ServerLevel level, BlockPos pos, Direction facing) {
+        BlockState state = level.getBlockState(pos);
+        return state.is(Blocks.HOPPER) && state.getValue(HopperBlock.FACING) == facing;
+    }
+
+    /** 这个坐标上是不是漏斗（不关心朝向） */
+    private static boolean isHopper(ServerLevel level, BlockPos pos) {
+        return level.getBlockState(pos).is(Blocks.HOPPER);
     }
 
     // ------------------------------------------------------------------ 写

@@ -86,19 +86,18 @@ import java.util.Optional;
  * 而且载入后的排列会被重排成创造栏顺序，与旧文件里的乱序无关。</p>
  *
  * <h2>入库筛选</h2>
- * <p>带任何非默认数据组件的物品<b>一律拒收</b>（{@link #isStorable}）：受损工具、改过名的物品、
- * 附魔物品、药水…… 这些物品每种形态都会各占一格，放进仓库只会把「一格一种」的模型撑爆。
- * 筛选对<b>所有</b>入库途径生效（界面 Shift 点击 / 光标存回 / 数字键 / 漏斗）。</p>
+ * <p>仓库<b>不设筛选</b>：任何非空物品（含带 NBT / 数据组件的受损工具、附魔物品、改名物品、
+ * 药水、写了字的书……）一律按「同物品 + 同数据组件」各占一格入库。要不要放行某个物品，
+ * 由<b>玩家自己在漏斗里过滤</b>（分类物白名单，见 {@link VoidWarehouseHopper}）。</p>
  *
- * <h2>潜影盒：入库时拆开，取出时现造</h2>
+ * <h2>潜影盒：入库时拆开（空盒除外），取出时现造</h2>
  * <p>潜影盒是原版里唯一能让玩家自己决定「一格装多少」的容器，所以它被当作仓库的
  * <b>打包单位</b>，而不是普通物品（{@link VoidWarehouseShulker}）：</p>
  * <ul>
- *   <li><b>入库</b>：盒子被<b>拆开</b> —— 盒里的每种物品各按真实数量入库，盒子本身变成
- *       {@code 2 个潜影壳 + 1 个箱子}（原版配方）。空盒子同样会被拆成潜影壳与箱子，
- *       所以仓库里永远不存「潜影盒」这种物品，两个方向完全对称。</li>
- *   <li><b>校验</b>：盒子里只要有一个物品带非默认数据组件（受损工具 / 附魔 / 改名…），
- *       <b>整单拒绝</b> —— 盒子原样留在玩家手里，仓库一点都没动。</li>
+ *   <li><b>入库</b>：非空盒子被<b>拆开</b> —— 盒里的每种物品各按真实数量入库，盒子本身变成
+ *       {@code 2 个潜影壳 + 1 个箱子}（原版配方）。<b>空盒子不拆</b>，直接整盒入库，
+ *       占一格记 1 个「潜影盒」；</li>
+ *   <li><b>校验</b>：盒内物品不再做数据组件校验（带 NBT 的物品现在也允许入库）。</li>
  * </ul>
  * <p>拆是一个「全成或全不成」的操作：校验全部通过之后才真正写入，中间不存在写一半的情况。</p>
  *
@@ -486,19 +485,19 @@ public final class VoidWarehouseData extends SavedData {
     // ------------------------------------------------------------------ 写
 
     /**
-     * 入库。<b>潜影盒会被拆开</b>，其余物品<b>带数据组件的一律拒收</b>（见 {@link #isStorable}）。
+     * 入库。<b>潜影盒会被拆开</b>（空盒除外，见 {@link #unpackShulkerBox}），
+     * 其余物品（含带数据组件的物品）一律按「同物品 + 同数据组件」入库。</p>
      *
      * <p>同一种物品只会占一格，数量直接累加到那一格上（无上限）；
-     * 仓库里还没有这种物品、而且它是「纯净」物品时，才新增一格 ——
-     * 新格子<b>追加在末尾</b>，位置由下一次读之前的 {@link #ensureSorted()} 统一纠正成
-     * 创造栏顺序，跟「第几个存进来」无关。</p>
+     * 仓库里还没有这种物品时才新增一格 —— 新格子<b>追加在末尾</b>，位置由下一次读之前的
+     * {@link #ensureSorted()} 统一纠正成创造栏顺序，跟「第几个存进来」无关。</p>
      *
      * <p>收下时<b>会就地清空 {@code incoming}</b>（数量置 0）；被拒收时
      * <b>原样不动 {@code incoming}</b>，调用方据此把物品留给玩家 / 留在漏斗里。
      * 内部用 {@code copyWithCount(1)} 造样板，绝不会把同一个 {@link ItemStack} 实例
      * 同时挂在两处，从根上杜绝复制。</p>
      *
-     * @return 是否收下（{@code false} = 空物品、潜影盒里带了带数据的物品、或物品本身带数据被拒收）
+     * @return 是否收下（{@code false} = 空物品）
      */
     public boolean insert(ItemStack incoming) {
         if (incoming == null || incoming.isEmpty()) {
@@ -507,12 +506,6 @@ public final class VoidWarehouseData extends SavedData {
         if (VoidWarehouseShulker.isShulkerBox(incoming)) {
             return this.unpackShulkerBox(incoming);
         }
-        if (this.find(incoming) == null && !isStorable(incoming)) {
-            // 新类型 + 带数据：拒收。
-            // 已经是仓库里某一格的那种物品（老存档遗留）可以原样放回，
-            // 否则「取出后背包放满 → 退回仓库」会把玩家的东西卡在筛选规则外。
-            return false;
-        }
         return this.put(incoming);
     }
 
@@ -520,21 +513,25 @@ public final class VoidWarehouseData extends SavedData {
      * 把潜影盒<b>拆开</b>入库：盒内物品按各自数量入库，盒子本身变成
      * {@code 2 个潜影壳 + 1 个箱子}（原版配方）。
      *
-     * <p><b>先全部校验、再全部写入</b>，所以这是一个「全成或全不成」的操作：
-     * 盒子里只要有一个物品带非默认数据组件，这里会直接 {@code return false}，
-     * {@code box} 原封不动，仓库一个字节都没改。校验通过之后的 {@link #put} 不会再失败
-     * （仓库数量无上限），所以不存在「拆一半」的中间状态。</p>
+     * <p><b>空盒子不拆</b>：一个东西都没装的潜影盒，直接当成普通物品整盒入库
+     * （占一格，记 1 个「潜影盒」）。这样玩家手里那个空盒子不会被偷偷换成壳和箱子，
+     * 语义也最直观 —— 空盒子就是空盒子。</p>
      *
-     * @return 是否收下（{@code false} = 盒内有带数据的物品）
+     * <p><b>盒内物品照单全收</b>：不再校验盒内物品是否带数据组件（带 NBT 的物品
+     * 现在也允许入库），拆出来的每件都按各自数量入库。</p>
+     *
+     * <p>拆是一个「全成或全不成」的操作：校验全部通过之后才真正写入，中间不存在写一半的情况。</p>
+     *
+     * @return 是否收下
      */
     private boolean unpackShulkerBox(ItemStack box) {
-        List<ItemStack> contents = VoidWarehouseShulker.contentsOf(box);
-        for (ItemStack inside : contents) {
-            if (!isStorable(inside)) {
-                // 盒子里混了带数据的物品（受损工具 / 附魔 / 改名…）：整单拒绝，原样退回
-                return false;
-            }
+        if (VoidWarehouseShulker.isEmptyBox(box)) {
+            // 空盒子：当普通物品整盒入库（不拆成壳 + 箱）
+            this.put(box);
+            this.markChanged();
+            return true;
         }
+        List<ItemStack> contents = VoidWarehouseShulker.contentsOf(box);
         for (ItemStack inside : contents) {
             // contentsOf 给的是拷贝，put 会把它清空，不会影响到盒子本身
             this.put(inside);
@@ -628,26 +625,24 @@ public final class VoidWarehouseData extends SavedData {
     /**
      * 这个堆叠允不允许存进虚空仓库。
      *
-     * <p>规则：<b>只要带任何非默认数据组件就拒收</b>。26.x 里没有 NBT 一说，
-     * 物品的额外信息全是数据组件，{@link ItemStack#getComponentsPatch()} 拿到的正是
-     * 「与原型默认值不一样的那些组件」，所以「补丁为空」= 没有任何额外数据 = 纯净物品。</p>
+     * <p>规则：<b>只要非空就收</b>。带 NBT（数据组件）的物品 —— 受损工具 / 附魔物品 /
+     * 改过名的物品 / 药水 / 写了字的书 —— 现在<b>一律放行</b>，不再在仓库这一层做筛选。
+     * 「一格一种形态」仍然成立：带不同数据组件的物品各占一格，数量照常无上限。</p>
      *
-     * <p>被挡在门外的是：耐久受损的工具 / 盔甲、改过名的物品、附魔物品与附魔书、
-     * 药水、写了字的书、带图案的旗帜……<br>
-     * 这样仓库里每种物品永远只有一种形态，一格一种的模型不会被「同一把剑的不同耐久」
-     * 撑出成千上万个格子。</p>
+     * <p>是否放行某个物品，改由<b>玩家自己在漏斗里过滤</b>（分类物白名单，见
+     * {@link VoidWarehouseHopper} / {@link VoidWarehouseClassifier}），仓库本身不替玩家做主。</p>
      *
      * <p><b>潜影盒是例外</b>：它虽然常常带 {@code CONTAINER} 组件，但不走这条路 ——
      * 它在 {@link #insert} 里就被拆成原料了，见 {@link #isInsertable}。</p>
      */
     public static boolean isStorable(ItemStack stack) {
-        return stack != null && !stack.isEmpty() && stack.getComponentsPatch().isEmpty();
+        return stack != null && !stack.isEmpty();
     }
 
     /**
      * 这个堆叠能不能「交给仓库处理」（可以被 {@link #insert} 收下或拆解）。
      *
-     * <p>= 纯净物品 <b>或</b> 潜影盒（潜影盒会被拆开，盒内物品另行校验）。
+     * <p>= 任意非空物品 <b>或</b> 潜影盒（非空潜影盒会被拆开，空盒整盒入库）。
      * 漏斗那类「先筛一遍再决定要不要搬」的调用方要用的是这一个，而不是 {@link #isStorable}。</p>
      */
     public static boolean isInsertable(ItemStack stack) {

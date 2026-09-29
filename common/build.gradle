@@ -1,0 +1,45 @@
+// ===== common：跨版本共享的纯逻辑 =====
+//
+// 这里只放「不引用任何 Minecraft 版本类型」的代码：
+//   - Carpet 规则声明（Settings 类，只依赖 carpet-api 的 @Rule / RuleCategory）
+//   - 翻译加载（Gson 读 lang json）
+//   - 纯常量
+//
+// 各版本子工程（modern/*、versions/*）通过 `implementation project(':common')` 引用它，
+// 在各自版本里编译同一份源码。因为不碰 MC 类型，天然跨版本通用。
+//
+// 注意：carpet 只用 compileOnly —— `carpet.api.settings.Rule` / `RuleCategory` 这套注解
+// 在 1.14 ~ 26.x 的 Carpet 里包路径与签名一致，common 只需要它的编译期符号；
+// 真正运行时由各版本子工程自己声明对应版本的 Carpet 依赖提供。
+
+plugins {
+    id 'java-library'
+}
+
+group = 'neko'
+version = '1.0.0'
+
+repositories {
+    // Modrinth maven：用 26.3 的 carpet 拿 @Rule 注解的编译期符号（跨版本 API 稳定）
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+    }
+    mavenCentral()
+}
+
+dependencies {
+    // compileOnly：只在编译 common 时需要 carpet 的注解，不打进产物、不参与传递。
+    compileOnly 'maven.modrinth:carpet:yt9oDFOj'
+    // Gson（TranslationLoader 用）。MC 运行时自带，但 common 独立编译需要它。
+    compileOnly 'com.google.code.gson:gson:2.10.1'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

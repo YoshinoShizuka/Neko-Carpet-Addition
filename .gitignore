@@ -1,12 +1,12 @@
 # ===== Gradle =====
 .gradle/
-build/
+**/build/
 !gradle/wrapper/gradle-wrapper.jar
 
-# ===== Fabric Loom 运行目录 =====
+# ===== Fabric Loom 运行目录（各版本子模块里都有）=====
 # `./gradlew runServer` / `runClient` 的临时世界、配置与日志
-run/
-logs/
+**/run/
+**/logs/
 
 # ===== IDE =====
 .idea/

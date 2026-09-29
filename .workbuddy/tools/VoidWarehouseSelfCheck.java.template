@@ -1,0 +1,353 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.Connection;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemLore;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+
+import java.math.BigInteger;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * 【临时自检】验证 1.21.11 移植是否真的能跑 —— 验证完就删掉。
+ *
+ * <p>挂在第一帧的 {@code onTick} 上，跑完打印一行 {@code SMOKE RESULT} 并停服。
+ * 断言失败会把名字打到日志里，方便定位。</p>
+ */
+public final class VoidWarehouseSelfCheck {
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private VoidWarehouseSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        VoidWarehouseSettings.voidWarehouse = true;
+        try {
+            dataChecks(server);
+            displayChecks(server);
+            shulkerChecks();
+            terminalChecks(server);
+            hopperChecks(server);
+            playerChecks(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT 1.21.11 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ---------------------------------------------------------------- 断言
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("FAIL: " + name);
+        }
+    }
+
+    private static List<Component> lore(ItemStack stack) {
+        ItemLore lore = stack.get(DataComponents.LORE);
+        return lore == null ? List.of() : lore.lines();
+    }
+
+    private static String text(Component c) {
+        return c.getString();
+    }
+
+    /** 取「盒 / 组 / 个」换算那一行；没有就返回 null */
+    private static String packLine(ItemStack stack) {
+        for (Component line : lore(stack)) {
+            String s = text(line);
+            if (!s.isEmpty() && Character.isDigit(s.charAt(0))) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    private static boolean anyLine(ItemStack stack, String needle) {
+        for (Component line : lore(stack)) {
+            if (text(line).contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean allColored(ItemStack stack) {
+        List<Component> lines = lore(stack);
+        if (lines.isEmpty()) {
+            return false;
+        }
+        for (Component line : lines) {
+            if (line.getStyle().getColor() == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // ---------------------------------------------------------------- 数据层
+
+    private static void dataChecks(MinecraftServer server) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        check("D1 初始为空", data.entryCount() == 0);
+
+        check("D2 插入圆石", data.insert(new ItemStack(Items.COBBLESTONE, 64)));
+        check("D3 占 1 格", data.entryCount() == 1);
+        check("D4 数量 64", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(64)));
+
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        check("D5 同类累加成 128", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(128)));
+        check("D6 累加不新增格", data.entryCount() == 1);
+
+        // BigInteger 无上限：直接给一个远超 long 范围的一半的量
+        VoidWarehouseData.Entry cobble = data.entryAt(0);
+        BigInteger huge = new BigInteger("1000000000000000000"); // 1e18
+        cobble.add(huge);
+        BigInteger expect = huge.add(BigInteger.valueOf(128));
+        check("D7 任意精度累加", data.amountOf(Items.COBBLESTONE).equals(expect));
+
+        int took = data.take(0, 64);
+        check("D8 取 64 返回 64", took == 64);
+        check("D9 余量正确", data.amountOf(Items.COBBLESTONE).equals(expect.subtract(BigInteger.valueOf(64))));
+
+        // 不同物品各占一格
+        data.insert(new ItemStack(Items.DIAMOND, 3));
+        check("D10 新物品新增一格", data.entryCount() == 2);
+
+        // 不可堆叠物品
+        data.clearContent();
+        data.insert(new ItemStack(Items.DIAMOND_SWORD, 1));
+        check("D11 不可堆叠物品入库", data.entryCount() == 1 && data.entryAt(0).maxStack() == 1);
+
+        data.clearContent();
+        check("D12 清空", data.entryCount() == 0 && data.isEmpty());
+    }
+
+    // ---------------------------------------------------------------- 展示文本
+
+    private static void displayChecks(MinecraftServer server) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+
+        // ---- 圆石 3456 = 2 盒（1728 × 2，余数 0）----
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        data.entryAt(0).add(BigInteger.valueOf(3456 - 64));
+        ItemStack disp = data.entryAt(0).display();
+        check("T1 3456 → 2 盒", "2 盒".equals(packLine(disp)));
+        check("T2 不带约等于号", !anyLine(disp, "≈"));
+        check("T3 普通模式每行有颜色", allColored(disp));
+        check("T4 普通模式 lore ≤ 4 行", lore(disp).size() <= 4);
+        check("T5 普通模式说取出 1 个", anyLine(disp, "左键：取出 1 个"));
+        check("T6 普通模式说取出 1 组", anyLine(disp, "右键：取出 1 组（64 个）"));
+
+        // ---- 圆石 5000 = 2 盒 24 组 8 个 ----
+        data.entryAt(0).add(BigInteger.valueOf(5000 - 3456));
+        disp = data.entryAt(0).display();
+        check("T7 5000 → 2 盒 24 组 8 个", "2 盒 24 组 8 个".equals(packLine(disp)));
+
+        // ---- 圆石 30：不足一组，不该有换算行 ----
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 30));
+        check("T8 不足一组不显示换算", packLine(data.entryAt(0).display()) == null);
+
+        // ---- 潜影盒模式：换一套说明，绝不出现普通模式的取出话术 ----
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        data.entryAt(0).add(BigInteger.valueOf(3456 - 64));
+        ItemStack boxDisp = data.entryAt(0).displayInBoxMode();
+        check("T9 盒模式说交出 1 盒", anyLine(boxDisp, "左键：交出 1 盒"));
+        check("T10 盒模式不说取出 1 个", !anyLine(boxDisp, "取出 1 个"));
+        check("T11 盒模式不说取出 1 组", !anyLine(boxDisp, "取出 1 组"));
+        check("T12 盒模式 lore ≤ 5 行", lore(boxDisp).size() <= 5);
+        check("T13 盒模式每行有颜色", allColored(boxDisp));
+        check("T14 盒模式写明消耗", anyLine(boxDisp, "消耗：潜影壳"));
+
+        // ---- 不可堆叠物品：只有「盒 + 个」，不出现「组」----
+        data.clearContent();
+        data.insert(new ItemStack(Items.DIAMOND_SWORD, 1));
+        check("T15 不可堆叠 1 个无换算", packLine(data.entryAt(0).display()) == null);
+        data.entryAt(0).add(BigInteger.valueOf(29)); // 共 30
+        String sword = packLine(data.entryAt(0).display());
+        check("T16 不可堆叠 30 → 1 盒 3 个", "1 盒 3 个".equals(sword));
+        check("T17 不可堆叠不出现「组」", sword != null && !sword.contains("组"));
+        check("T18 不可堆叠合并成一行操作", anyLine(data.entryAt(0).display(), "左键 / 右键：取出 1 个"));
+
+        data.clearContent();
+    }
+
+    // ---------------------------------------------------------------- 潜影盒
+
+    private static void shulkerChecks() {
+        check("S1 识别潜影盒", VoidWarehouseShulker.isShulkerBox(new ItemStack(Items.SHULKER_BOX)));
+        check("S2 圆石不是盒子", !VoidWarehouseShulker.isShulkerBox(new ItemStack(Items.COBBLESTONE)));
+        check("S3 空盒子判定", VoidWarehouseShulker.isEmptyBox(new ItemStack(Items.SHULKER_BOX)));
+        check("S4 圆石一盒 1728", VoidWarehouseShulker.capacity(new ItemStack(Items.COBBLESTONE)) == 1728);
+        check("S5 末影珍珠一盒 432", VoidWarehouseShulker.capacity(new ItemStack(Items.ENDER_PEARL)) == 432);
+
+        ItemStack packed = VoidWarehouseShulker.pack(new ItemStack(Items.COBBLESTONE), 100);
+        check("S6 打包出来是盒子", VoidWarehouseShulker.isShulkerBox(packed));
+        List<ItemStack> inside = VoidWarehouseShulker.contentsOf(packed);
+        int total = 0;
+        for (ItemStack s : inside) {
+            total += s.getCount();
+        }
+        check("S7 盒内总数守恒 100", total == 100);
+        check("S8 盒内按格铺满", inside.size() == 2 && inside.get(0).getCount() == 64);
+    }
+
+    // ---------------------------------------------------------------- 终端登记
+
+    private static void terminalChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        BlockPos a = new BlockPos(0, 4, 0);
+        BlockPos b = new BlockPos(0, 4, 2);
+
+        level.setBlock(a, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        level.setBlock(b, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        VoidWarehouseTerminals.remove(level, a);
+        VoidWarehouseTerminals.remove(level, b);
+        int before = VoidWarehouseTerminals.size(level);
+
+        VoidWarehouseTerminals.add(level, a);
+        check("R1 登记后是终端", VoidWarehouseTerminals.isTerminal(level, a));
+        check("R2 未登记的不是终端", !VoidWarehouseTerminals.isTerminal(level, b));
+        check("R3 数量 +1", VoidWarehouseTerminals.size(level) == before + 1);
+        VoidWarehouseTerminals.add(level, a);
+        check("R4 重复登记幂等", VoidWarehouseTerminals.size(level) == before + 1);
+
+        VoidWarehouseTerminals.remove(level, a);
+        check("R5 注销后不是终端", !VoidWarehouseTerminals.isTerminal(level, a));
+
+        level.setBlock(a, Blocks.AIR.defaultBlockState(), 3);
+        level.setBlock(b, Blocks.AIR.defaultBlockState(), 3);
+    }
+
+    // ---------------------------------------------------------------- 漏斗（mixins 真的生效吗）
+
+    private static void hopperChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+
+        BlockPos table = new BlockPos(0, 5, 0);
+        BlockPos hopperPos = new BlockPos(0, 6, 0);
+        level.setBlock(table, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        level.setBlock(hopperPos, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN).setValue(HopperBlock.ENABLED, true), 3);
+        VoidWarehouseTerminals.add(level, table);
+
+        BlockEntity raw = level.getBlockEntity(hopperPos);
+        if (!(raw instanceof HopperBlockEntity hopper)) {
+            check("H1 漏斗方块实体存在（注：null 说明没造出来）", false);
+            return;
+        }
+        check("H1 漏斗方块实体存在", true);
+
+        hopper.setItem(0, new ItemStack(Items.COBBLESTONE, 64));
+        hopper.setItem(1, new ItemStack(Items.DIAMOND, 10));
+
+        // 直接调原版每 tick 的入口：我们的 HEAD 注入就挂在这里
+        HopperBlockEntity.pushItemsTick(level, hopperPos, level.getBlockState(hopperPos), hopper);
+
+        check("H2 漏斗被搬空", hopper.isEmpty());
+        check("H3 圆石进库 64", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(64)));
+        check("H4 钻石进库 10", data.amountOf(Items.DIAMOND).equals(BigInteger.valueOf(10)));
+
+        // 不指向终端的漏斗：不该被搬空（原版行为）
+        BlockPos loose = new BlockPos(4, 5, 0);
+        level.setBlock(loose, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN).setValue(HopperBlock.ENABLED, true), 3);
+        BlockEntity rawLoose = level.getBlockEntity(loose);
+        if (rawLoose instanceof HopperBlockEntity looseHopper) {
+            looseHopper.setItem(0, new ItemStack(Items.IRON_INGOT, 5));
+            HopperBlockEntity.pushItemsTick(level, loose, level.getBlockState(loose), looseHopper);
+            check("H5 普通漏斗保持原版", looseHopper.getItem(0).getCount() == 5);
+            check("H6 普通漏斗的东西没进库", data.amountOf(Items.IRON_INGOT).signum() == 0);
+        } else {
+            check("H5 普通漏斗方块实体存在", false);
+        }
+
+        VoidWarehouseTerminals.remove(level, table);
+        level.setBlock(table, Blocks.AIR.defaultBlockState(), 3);
+        level.setBlock(hopperPos, Blocks.AIR.defaultBlockState(), 3);
+        level.setBlock(loose, Blocks.AIR.defaultBlockState(), 3);
+        data.clearContent();
+    }
+
+    // ---------------------------------------------------------------- 玩家 / 菜单
+
+    private static void playerChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+
+        ServerPlayer player;
+        try {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "NekoSelfCheck");
+            ClientInformation info = ClientInformation.createDefault();
+            player = new ServerPlayer(server, level, profile, info);
+            player.connection = new ServerGamePacketListenerImpl(
+                    server, new Connection(PacketFlow.SERVERBOUND), player,
+                    CommonListenerCookie.createInitial(profile, false));
+        } catch (Throwable t) {
+            check("P1 假玩家可构造", false);
+            System.out.println("   假玩家构造失败: " + t);
+            return;
+        }
+        check("P1 假玩家可构造", true);
+
+        VoidWarehouseMenu menu = new VoidWarehouseMenu(1, player.getInventory(), data, player);
+        check("P2 菜单可构造", menu != null);
+
+        // 左键点第 0 格：取 1 个到背包
+        menu.clicked(0, 0, ClickType.PICKUP, player);
+        int carried = 0;
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            ItemStack s = player.getInventory().getItem(i);
+            if (s.getItem() == Items.COBBLESTONE) {
+                carried += s.getCount();
+            }
+        }
+        check("P3 左键取出 1 个", carried == 1);
+        check("P4 仓库扣到 63", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(63)));
+
+        // 右键点第 0 格：取一组（64 → 只剩 63，全取走 → 该格消失）
+        menu.clicked(0, 1, ClickType.PICKUP, player);
+        check("P5 右键取走剩下的 63", data.amountOf(Items.COBBLESTONE).signum() == 0);
+        check("P6 取空后格子消失", data.entryCount() == 0);
+
+        data.clearContent();
+    }
+}

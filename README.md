@@ -912,15 +912,17 @@ public static final SavedDataType<VoidWarehouseData> TYPE =
 
 | MC 版本 | 子工程 | 产物（dist/） | 状态 |
 |---|---|---|---|
-| 26.3 | `modern/26.3` | `carpet-Neko-Addition-mc26.3-1.0.1.jar` | ✅ 编译 + 自检 |
-| 26.2 | `modern/26.2` | `carpet-Neko-Addition-mc26.2-1.0.1.jar` | ✅ 编译 + 自检 |
-| 26.1.1 | `modern/26.1.1` | `carpet-Neko-Addition-mc26.1.1-1.0.1.jar` | ✅ 编译 + 自检 |
-| 26.1.2 | `modern/26.1.2` | `carpet-Neko-Addition-mc26.1.2-1.0.1.jar` | ✅ 编译 + 自检 |
-| 1.21.11 | `versions/1.21.11` | — | ⏳ 待落地（混淆版本，需 Yarn 改写） |
+| 26.3 | `modern/26.3` | `carpet-Neko-Addition-mc26.3-1.0.3.jar` | ✅ 编译 + 自检（29 项全过） |
+| 26.2 | `modern/26.2` | `carpet-Neko-Addition-mc26.2-1.0.3.jar` | ✅ 编译 + 自检（29 项全过） |
+| 26.1.1 | `modern/26.1.1` | `carpet-Neko-Addition-mc26.1.1-1.0.3.jar` | ✅ 编译 + 自检（29 项全过） |
+| 26.1.2 | `modern/26.1.2` | `carpet-Neko-Addition-mc26.1.2-1.0.3.jar` | ✅ 编译 + 自检（29 项全过） |
+| 1.21.11 | `versions/1.21.11` | `carpet-Neko-Addition-mc1.21.11-1.0.3.jar` | ✅ 编译 + 自检（55 项全过） |
 
 - **26.x 四个版本**（26.1.1 / 26.1.2 / 26.2 / 26.3）同属「不混淆」体系，用
   `net.fabricmc.fabric-loom`（不 remap），源码差异极小（见 `docs/多版本架构说明.md`）。
-- **1.21.x** 仍是混淆版本，走 `net.fabricmc.fabric-loom-remap` + Yarn 映射，是独立的落地工程。
+- **1.21.11** 是混淆版本，走 `net.fabricmc.fabric-loom-remap`；映射用的是
+  **Mojang 官方映射**（不是 Yarn），这样 26.x 的类名可以直接沿用，真正需要改的
+  只有 8 处 API（详见 `docs/多版本架构说明.md`）。
 
 构建某个版本（例如 26.2）：
 

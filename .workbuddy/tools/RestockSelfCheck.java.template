@@ -1,0 +1,292 @@
+package neko.voidwarehouse.restock;
+
+import carpet.CarpetServer;
+import com.mojang.authlib.GameProfile;
+import io.netty.buffer.Unpooled;
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.network.Connection;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.util.List;
+import java.util.UUID;
+
+import neko.voidwarehouse.VoidWarehouse;
+import neko.voidwarehouse.VoidWarehouseData;
+import neko.voidwarehouse.VoidWarehouseSettings;
+
+/**
+ * 【临时自检】验证打印机补货这一套；验证完连同 hook 一起删掉。
+ */
+public final class RestockSelfCheck {
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private RestockSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        try {
+            all(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT restock/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("FAIL: " + name);
+        }
+    }
+
+    private static void all(MinecraftServer server) {
+        // ---- 1. 规则确实注册进了 Carpet ----
+        check("R1 规则已注册", CarpetServer.settingsManager.getRule("voidWarehouseRestock") != null);
+
+        ServerLevel level = server.overworld();
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+
+        ServerPlayer player = fakePlayer(server, level);
+        if (player == null) {
+            check("R2 假玩家可构造", false);
+            return;
+        }
+        check("R2 假玩家可构造", true);
+        clearInventory(player);
+
+        // ---- 2. 开关语义：主开关和补货开关任一关闭都必须是 RULE_OFF ----
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = false;
+        check("R3 补货规则关 → RULE_OFF",
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                        == PrinterTakeResultPayload.RULE_OFF);
+
+        VoidWarehouseRestockSettings.voidWarehouseRestock = true;
+        VoidWarehouseSettings.voidWarehouse = false;
+        check("R4 主规则关 → RULE_OFF",
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                        == PrinterTakeResultPayload.RULE_OFF);
+
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = true;
+
+        // ---- 3. 非法输入 ----
+        check("R5 空候选 → BAD_REQUEST",
+                PrinterTakeService.take(server, player, List.of()) == PrinterTakeResultPayload.BAD_REQUEST);
+        check("R6 畸形 id 不抛异常且视为无货",
+                PrinterTakeService.take(server, player, List.of("!!!! not an id !!!!"))
+                        == PrinterTakeResultPayload.EMPTY);
+        check("R7 空仓库 → EMPTY",
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                        == PrinterTakeResultPayload.EMPTY);
+
+        // ---- 4. 正常取一组 ----
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        data.insert(new ItemStack(Items.COBBLESTONE, 136));
+        int status = PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"));
+        check("R8 有货 → OK", status == PrinterTakeResultPayload.OK);
+        check("R9 背包恰好到手 64", countOf(player, Items.COBBLESTONE) == 64);
+        check("R10 仓库剩 136", data.amountOf(Items.COBBLESTONE).intValue() == 136);
+
+        // ---- 5. 凑 stock 只有 5 时给 5（不是整批失败） ----
+        clearInventory(player);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 5));
+        check("R11 库存不足一组 → 有多少给多少",
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                        == PrinterTakeResultPayload.OK);
+        check("R12 到手 5", countOf(player, Items.COBBLESTONE) == 5);
+        check("R13 仓库清零", data.amountOf(Items.COBBLESTONE).signum() == 0);
+
+        // ---- 6. 背包已满：必须原样退还，仓库不许凭空消耗 ----
+        clearInventory(player);
+        fillInventory(player, new ItemStack(Items.STONE, 64));
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        check("R14 背包满 → INVENTORY_FULL",
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                        == PrinterTakeResultPayload.INVENTORY_FULL);
+        check("R15 背包满时仓库零消耗", data.amountOf(Items.COBBLESTONE).intValue() == 64);
+
+        // ---- 7. 只塞得下 3 个：给 3，其余 61 归还 ----
+        clearInventory(player);
+        fillInventory(player, new ItemStack(Items.STONE, 64));
+        player.getInventory().setItem(35, ItemStack.EMPTY);
+        player.getInventory().setItem(35, new ItemStack(Items.COBBLESTONE, 61));
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        check("R16 部分可放也返回 OK",
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                        == PrinterTakeResultPayload.OK);
+        check("R17 原来 61 + 补到 64", countOf(player, Items.COBBLESTONE) == 64);
+        check("R18 放不下的 61 已归还仓库", data.amountOf(Items.COBBLESTONE).intValue() == 61);
+
+        // ---- 8. 潜影盒必须挡掉 ----
+        clearInventory(player);
+        data.clearContent();
+        data.insert(new ItemStack(Items.SHULKER_BOX, 16));
+        check("R19 潜影盒不会被取给客户端",
+                PrinterTakeService.take(server, player, List.of("minecraft:shulker_box"))
+                        == PrinterTakeResultPayload.EMPTY);
+        check("R20 拿了之后背包仍是空的", countOf(player, Items.SHULKER_BOX) == 0);
+
+        // ---- 9. 不可堆叠物品（剑）一次给 1 ----
+        clearInventory(player);
+        data.clearContent();
+        data.insert(new ItemStack(Items.DIAMOND_SWORD, 10));
+        check("R21 剑也能取",
+                PrinterTakeService.take(server, player, List.of("minecraft:diamond_sword"))
+                        == PrinterTakeResultPayload.OK);
+        check("R22 剑到手 1 把", countOf(player, Items.DIAMOND_SWORD) == 1);
+        check("R23 剑仓库剩 9", data.amountOf(Items.DIAMOND_SWORD).intValue() == 9);
+
+        // ---- 10. 候选清单按序命中 ----
+        clearInventory(player);
+        data.clearContent();
+        data.insert(new ItemStack(Items.ANDESITE, 64));
+        check("R24 第一个候选无货则退到第二个",
+                PrinterTakeService.take(server, player,
+                        List.of("minecraft:cobblestone", "minecraft:andesite"))
+                        == PrinterTakeResultPayload.OK);
+        check("R25 命中的是第二个", countOf(player, Items.ANDESITE) == 64);
+
+        // ---- 11. 网络层的两件事：通道注册 + 字节级往返 ----
+        // 没有真客户端可以联调，这两项就把「拼不到 C2S 那一侧」的风险压到最低。
+        check("R26 C2S 接收端已注册",
+                net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.getGlobalReceivers()
+                        .contains(PrinterTakePayload.TYPE.id()));
+
+        // ---- 12. 注册方向划分的回归断言（跨模组共用通道时最容易踩的坑）----
+        // 血泪史：服务端模组 `environment="*"`，也会在客户端进程里初始化。
+        // 曾把 litematica_printer:printer_take_result 的 S2C 也注册了，与同进程的
+        // printer 客户端抢注册 → 客户端 onInitializeClient 抛
+        // IllegalArgumentException: Packet type ... is already registered!，启动即崩。
+        // 用「再注册一次会不会成功」反推本模组占没占这条通道，是最省事也最可靠的查法。
+        check("R26b C2S 双通道接收端都挂着",
+                ServerPlayNetworking.getGlobalReceivers().contains(PrinterTakePayload.TYPE.id())
+                        && ServerPlayNetworking.getGlobalReceivers()
+                                .contains(PrinterTakePayload.PRINTER_TYPE.id()));
+        check("R26c 两条通道名确实不同",
+                !PrinterTakePayload.TYPE.id().equals(PrinterTakePayload.PRINTER_TYPE.id())
+                        && !PrinterTakeResultPayload.TYPE.id()
+                                .equals(PrinterTakeResultPayload.PRINTER_TYPE.id()));
+
+        // S2C：本模组<b>不该</b>占着 printer 那条 —— 能成功注册 = 客户端注册它时不会撞
+        boolean s2cFree = true;
+        try {
+            PayloadTypeRegistry.clientboundPlay()
+                    .register(PrinterTakeResultPayload.PRINTER_TYPE, PrinterTakeResultPayload.CODEC);
+        } catch (IllegalArgumentException already) {
+            s2cFree = false;
+        }
+        check("R26d S2C 的 printer 通道未被本模组占用（客户端可安全注册）", s2cFree);
+
+        // C2S：本模组<b>必须</b>占着它，否则收不到新版客户端的请求
+        boolean c2sTaken = false;
+        try {
+            PayloadTypeRegistry.serverboundPlay()
+                    .register(PrinterTakePayload.PRINTER_TYPE, PrinterTakePayload.CODEC);
+        } catch (IllegalArgumentException already) {
+            c2sTaken = true;
+        }
+        check("R26e C2S 的 printer 通道已被本模组注册（能收新版请求）", c2sTaken);
+
+        PrinterTakePayload request = new PrinterTakePayload(42,
+                List.of("minecraft:stone", "minecraft:cobblestone"));
+        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+        try {
+            PrinterTakePayload.CODEC.encode(buf, request);
+            PrinterTakePayload back = PrinterTakePayload.CODEC.decode(buf);
+            check("R27 C2S 往返一致", request.equals(back));
+            check("R28 C2S 字节刚好读完（没有残留/错位）", buf.readableBytes() == 0);
+
+            buf.clear();
+            PrinterTakeResultPayload result = new PrinterTakeResultPayload(42,
+                    PrinterTakeResultPayload.INVENTORY_FULL);
+            PrinterTakeResultPayload.CODEC.encode(buf, result);
+            PrinterTakeResultPayload backResult = PrinterTakeResultPayload.CODEC.decode(buf);
+            check("R29 S2C 往返一致", result.equals(backResult));
+            check("R30 S2C 字节刚好读完", buf.readableBytes() == 0);
+        } catch (Throwable t) {
+            check("R27..R30 编解码不抛异常", false);
+            System.out.println("   编解码失败: " + t);
+        } finally {
+            buf.release();
+        }
+
+        data.clearContent();
+    }
+
+    // ---------------------------------------------------------------- 辅助
+
+    /**
+     * 造一个「没真正连上线」的玩家。
+     *
+     * <p>与 1.21.11 那一版自检同一套写法：{@code Connection} 没有 channel，
+     * 所以包只会入队而不会真的发出去，改背包是安全的。</p>
+     */
+    private static ServerPlayer fakePlayer(MinecraftServer server, ServerLevel level) {
+        try {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "RestockSelfCheck");
+            ServerPlayer player = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
+            player.connection = new ServerGamePacketListenerImpl(
+                    server, new Connection(PacketFlow.SERVERBOUND), player,
+                    CommonListenerCookie.createInitial(profile, false));
+            return player;
+        } catch (Throwable t) {
+            System.out.println("   假玩家构造失败: " + t);
+            return null;
+        }
+    }
+
+    private static int countOf(ServerPlayer player, Item item) {
+        int total = 0;
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack stack = inv.getItem(i);
+            if (stack.getItem() == item) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    private static void clearInventory(ServerPlayer player) {
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            inv.setItem(i, ItemStack.EMPTY);
+        }
+    }
+
+    private static void fillInventory(ServerPlayer player, ItemStack template) {
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < 36; i++) {
+            inv.setItem(i, template.copyWithCount(template.getCount()));
+        }
+    }
+}

@@ -33,6 +33,10 @@ dependencies {
     implementation "maven.modrinth:carpet:${project.carpet_modrinth_version}"
     // 备选：implementation "carpet:fabric-carpet:${project.carpet_masa_version}"
 
+    // Fabric API：只需要 networking 那一部分，但 fabric-api 的方便之处就在于
+    // 一个坐标把整套拉下来、版本自动对齐（不必逐个模块指定版本号）。
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
     // 跨版本共享的纯逻辑（Settings / 翻译加载 / 常量）
     implementation project(':common')
 }

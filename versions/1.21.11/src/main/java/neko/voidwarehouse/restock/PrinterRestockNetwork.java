@@ -51,23 +51,49 @@ public final class PrinterRestockNetwork {
      *
      * <p>两个 {@code PayloadTypeRegistry} 的注册必须早：它们是客户端与服务端
      * 「自定义包能不能收发」的协商依据，晚于连接建立再注册就来不及了。</p>
+     *
+     * <h2>为什么<b>只</b>注册自家那两条通道</h2>
+     * <p>本模组的 {@code environment} 是 {@code "*"}，也就是说它<b>也会在客户端进程里跑</b>
+     * （单人存档、局域网主机、以及任何把 Carpet 模组丢进客户端 mods 的玩法都是这种情形）。
+     * 早先这里顺手把 {@code litematica_printer:*} 那套也注册了，理由是「名字不同就不会撞」——
+     * <b>这个理由是错的</b>：Fabric 的注册表在同一进程里只有一个，
+     * 装了 {@code litematica-printer} 客户端模组时，两边会抢着注册同一个
+     * {@code litematica_printer:printer_take_result}，后注册的一方拿到</p>
+     * <pre>{@code IllegalArgumentException: Packet type ... is already registered!}</pre>
+     * <p>而崩溃点会落在客户端的 {@code onInitializeClient}（启动即崩）。</p>
+     *
+     * <h2>两条命名空间的方向划分（这条是硬约束）</h2>
+     * <p>C2S 与 S2C 是两套<b>各自独立</b>的注册表，各自按通道名去重。
+     * 把「谁注册哪个方向」写错一格就会撞。</p>
+     * <table border="1">
+     *   <tr><th>通道</th><th>方向</th><th>注册方</th></tr>
+     *   <tr><td>{@code carpet_neko_addition:printer_take}</td><td>C2S</td><td>服务端（本模组）</td></tr>
+     *   <tr><td>{@code carpet_neko_addition:printer_take_result}</td><td>S2C</td><td>服务端（本模组）</td></tr>
+     *   <tr><td>{@code litematica_printer:printer_take}</td><td>C2S</td><td>服务端（本模组）</td></tr>
+     *   <tr><td>{@code litematica_printer:printer_take_result}</td><td>S2C</td><td><b>打印机客户端，本模组绝不注册</b></td></tr>
+     * </table>
+     * <p>服务端发这条回执并不需要先注册：{@code ServerPlayNetworking.send} 只做
+     * 「构造包 + 交给连接发出」，不查本地注册表；是否需要发由
+     * {@link ServerPlayNetworking#canSend} 依据客户端协商阶段上报的可接收集合决定。</p>
+     *
+     * <h2>版本差异</h2>
+     * <p>1.21.11 的 fabric-api 这里叫 {@code playC2S()} / {@code playS2C()}；
+     * 26.x 的 fabric-api（6.3.x）重命名为 {@code serverboundPlay()} / {@code clientboundPlay()}。
+     * 其余用法完全一致 —— 这是唯一一处跨版本的 networking API 差异。</p>
      */
     public static void init() {
-        // 【版本差异】1.21.11 的 fabric-api 这里叫 playC2S() / playS2C()；
-        // 26.x 的 fabric-api（6.3.x）重命名为 serverboundPlay() / clientboundPlay()。
-        // 其余用法完全一致 —— 这是本次同步里唯一一处跨版本的 networking API 差异。
-
-        // ---- 通道 A：服务端自家的 carpet_neko_addition:*（旧客户端仍在用）----
+        // ---- 通道 A：服务端自家的 carpet_neko_addition:* ----
         // C2S：打印机 → 服务端，取货请求
         PayloadTypeRegistry.playC2S().register(PrinterTakePayload.TYPE, PrinterTakePayload.CODEC);
-        // S2C：服务端 → 打印机，取货回执
+        // S2C：服务端 → 打印机，取货回执（旧客户端仍在收这条）
         PayloadTypeRegistry.playS2C().register(PrinterTakeResultPayload.TYPE, PrinterTakeResultPayload.CODEC);
 
-        // ---- 通道 B：打印机专属的 litematica_printer:* ----
+        // ---- 通道 B：打印机专属 litematica_printer:* ----
+        // 只登记 C2S 一侧（服务端要「收」新版客户端的请求，解包必须有 codec）。
+        // S2C 一侧（printer_take_result）刻意<b>不</b>登记 —— 所有权在客户端，理由见上。
         PayloadTypeRegistry.playC2S().register(PrinterTakePayload.PRINTER_TYPE, PrinterTakePayload.CODEC);
-        PayloadTypeRegistry.playS2C().register(PrinterTakeResultPayload.PRINTER_TYPE, PrinterTakeResultPayload.CODEC);
 
-        // 两套 C2S 通道都接到同一个处理器上 —— 请求本身的语义完全相同
+        // 两套 C2S 通道接到同一个处理器上 —— 请求语义完全相同，只是通道名不同
         ServerPlayNetworking.registerGlobalReceiver(PrinterTakePayload.TYPE, PrinterRestockNetwork::handle);
         ServerPlayNetworking.registerGlobalReceiver(PrinterTakePayload.PRINTER_TYPE, PrinterRestockNetwork::handle);
 
@@ -120,16 +146,19 @@ public final class PrinterRestockNetwork {
         return false;
     }
 
+    /**
+     * 把结果按「客户端能收哪条就发哪条」回执出去。
+     *
+     * <p>两条 S2C 通道的归属不同：{@code carpet_neko_addition:printer_take_result}
+     * 是本模组注册的（老客户端认这条）；{@code litematica_printer:printer_take_result}
+     * 由打印机客户端自己注册。所以先问 {@code canSend}——它查的是客户端在
+     * 通道协商阶段上报的可接收集合，等价于「对面到底登记了哪个类型」。</p>
+     */
     private static void reply(ServerPlayer player, int nonce, int status) {
         if (player == null) {
             return;
         }
-        if (player == null) {
-            return;
-        }
         PrinterTakeResultPayload payload = new PrinterTakeResultPayload(nonce, status);
-        // 沿「请求走哪条通道、回执就走哪条」的对应关系发回去。
-        // 客户端只登记了它自己那一条的处理方式，发错通道的包在它那边是未知类型，会被丢弃。
         ServerPlayNetworking.send(player, payload);
         if (ServerPlayNetworking.canSend(player, PrinterTakeResultPayload.PRINTER_TYPE)) {
             ServerPlayNetworking.send(player, payload);

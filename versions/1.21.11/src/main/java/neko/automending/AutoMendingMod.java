@@ -2,6 +2,7 @@ package neko.automending;
 
 import neko.NekoConstants;
 import neko.voidwarehouse.VoidWarehouseExtension;
+import neko.voidwarehouse.restock.PrinterRestockNetwork;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.loader.api.FabricLoader;
 
@@ -18,5 +19,8 @@ public class AutoMendingMod implements ModInitializer {
         AutoMendingExtension.init();
         // 虚空仓库是同一个模组里的第二条 Carpet 规则，单独注册一个扩展
         VoidWarehouseExtension.init();
+        // Fabric networking：给 litematica-printer 留的取货通道。
+        // 必须早于任何玩家连接，所以在 onInitialize 里注册。
+        PrinterRestockNetwork.init();
     }
 }

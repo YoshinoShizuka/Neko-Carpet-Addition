@@ -3,7 +3,7 @@
 // 这是 1.21.x 及更早版本的「接入点」骨架（当前落地目标 1.21.11）。1.21.x 仍是混淆版本，
 // 工具链与 26.x 完全不同：
 //   - 插件：net.fabricmc.fabric-loom-remap（不是 modern/26.x 用的 fabric-loom）
-//   - 映射：Yarn（1.21.11+build.6）
+//   - 映射：Mojang 官方映射（loom.officialMojangMappings()）
 //   - Java：21（不是 25）
 //   - 依赖：modImplementation（需要 remap），不是 implementation
 //
@@ -48,6 +48,11 @@ dependencies {
 
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "carpet:fabric-carpet:${project.carpet_version}"
+
+    // Fabric API：打印机联动的 C2S/S2C 数据包要用它的 networking 抽象。
+    // 混淆版本必须用 modImplementation —— 否则 fabric-api 内部的中间名不会被 remap，
+    // 我们代码里写的 net.fabricmc.fabric.api.networking.* 运行时会找不到类。
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
     // 跨版本共享的纯逻辑
     implementation project(':common')

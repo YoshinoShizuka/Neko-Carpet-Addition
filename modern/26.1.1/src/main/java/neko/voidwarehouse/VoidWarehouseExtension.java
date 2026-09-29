@@ -5,6 +5,8 @@ import carpet.CarpetServer;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 
+import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
+
 /**
  * 虚空仓库的 Carpet 扩展。
  *
@@ -24,6 +26,8 @@ public class VoidWarehouseExtension implements CarpetExtension {
     @Override
     public void onGameStarted() {
         CarpetServer.settingsManager.parseSettingsClass(VoidWarehouseSettings.class);
+        // 补货规则单独成类：它只存在于能用 Fabric networking 的那几个版本
+        CarpetServer.settingsManager.parseSettingsClass(VoidWarehouseRestockSettings.class);
     }
 
     /**

@@ -3,5 +3,7 @@
   "carpet.rule.autoMending.name": "Automatic Mending",
   "carpet.rule.autoMending.desc": "Automatically spends the player's existing XP to repair damaged items enchanted with Mending, once per second",
   "carpet.rule.voidWarehouse.name": "Void Warehouse",
-  "carpet.rule.voidWarehouse.desc": "A crafting table renamed via anvil becomes a server-wide shared warehouse"
+  "carpet.rule.voidWarehouse.desc": "A crafting table renamed via anvil becomes a server-wide shared warehouse",
+  "carpet.rule.voidWarehouseRestock.name": "Void Warehouse Restock",
+  "carpet.rule.voidWarehouseRestock.desc": "Lets a printer that ran out of blocks while building take a full stack straight from the Void Warehouse. Warning: while enabled, any player with a compatible printer can draw from the shared stock"
 }

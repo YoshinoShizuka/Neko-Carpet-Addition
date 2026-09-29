@@ -869,6 +869,44 @@ public final class VoidWarehouseData extends SavedData {
         return actual.intValue();
     }
 
+    /**
+     * 与 {@link #takeExact} 一样按样板扣减，但<b>把扣下来的东西作为真实堆叠返回</b>。
+     *
+     * <p>为什么需要它：打印机这类「替玩家把货放进背包」的场景，光知道
+     * 「扣成功了」不够 —— 还得拿到那个带完整数据组件的 {@link ItemStack} 才能塞进
+     * 背包槽位，否则玩家拿到的是凭空 {@code new ItemStack(item)}，附魔书、
+     * 药水一类的数据会在搬运过程中被抹掉。</p>
+     *
+     * <p>数量不够时返回「能给的最大数量」而不是整批失败 —— 仓库里只剩 3 个圆石时，
+     * 能拿 3 个总比一个都拿不到强。</p>
+     *
+     * @param wanted 想要多少个（会被该物品的原版堆叠上限夹住）
+     * @return 取出的堆叠；一件都没有（或参数非法）时返回<b>空堆叠</b>，绝不返回 null
+     */
+    public ItemStack takeStack(ItemStack sample, int wanted) {
+        if (sample == null || sample.isEmpty() || wanted <= 0) {
+            return ItemStack.EMPTY;
+        }
+        Entry entry = this.find(sample);
+        if (entry == null) {
+            return ItemStack.EMPTY;
+        }
+        ItemStack template = entry.template();
+        int limit = Math.min(wanted, Math.max(1, template.getMaxStackSize()));
+        BigInteger actual = entry.amount().min(BigInteger.valueOf(limit));
+        if (actual.signum() <= 0) {
+            return ItemStack.EMPTY;
+        }
+        entry.subtract(actual);
+        if (entry.amount().signum() <= 0) {
+            this.entries.remove(entry);
+            this.unindexEntry(entry);
+        }
+        this.markChanged();
+        // copyWithCount：切断与 template 的实例关联（template 恒为 1 个样用）
+        return template.copyWithCount(actual.intValue());
+    }
+
     /** 清空整个仓库（目前没有界面入口，保留给指令 / 调试使用） */
     public void clearContent() {
         if (this.entries.isEmpty()) {

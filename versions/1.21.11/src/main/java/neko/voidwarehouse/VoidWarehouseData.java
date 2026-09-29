@@ -2,6 +2,9 @@ package neko.voidwarehouse;
 
 import com.mojang.datafixers.util.Either;
 import com.mojang.serialization.Codec;
+import com.mojang.serialization.DataResult;
+import com.mojang.serialization.DynamicOps;
+import com.mojang.serialization.MapCodec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
@@ -12,6 +15,8 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemLore;
 import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraft.world.level.saveddata.SavedDataType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -357,10 +362,97 @@ public final class VoidWarehouseData extends SavedData {
         }
     }
 
+    /**
+     * 一条记录的解码结果：要么是一条可用记录，要么是一条「读不出来的原文」。
+     *
+     * <p>为什么要区分这两种 —— 见 {@link #ITEMS_CODEC} 的说明。这是「不让一条坏数据
+     * 带走整个仓库」的关键：坏的那条被原样留下来（{@link Broken}），好的一条照常进仓库，
+     * 解码<b>永远不会整体失败</b>，于是 {@code computeIfAbsent} 也永远不会把仓库
+     * 替换成一个空实例。</p>
+     */
+    private sealed interface Decoded {
+        record Ok(RawEntry entry) implements Decoded {
+        }
+
+        /** 解析失败的原始 NBT 片段，只为「原样写回」而留，不会进仓库 */
+        record Broken(net.minecraft.nbt.Tag raw) implements Decoded {
+        }
+    }
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("carpet_neko_addition/void_warehouse");
+
+    /**
+     * {@code items} 列表的解码器：<b>逐条独立解码，单条失败不牵连整表</b>。
+     *
+     * <h2>为什么不能直接用 {@code RawEntry.CODEC.listOf()}</h2>
+     * <p>{@code Codec.list} 的语义是「全成或全不成」：只要列表里有<b>任意一条</b>解码
+     * 出错，整个 {@code DataResult} 就是 error 状态，{@code readSavedData} 拿到 null，
+     * 而 26.3 的 {@code SavedDataStorage.computeIfAbsent} 会把 null 当成「文件不存在」，
+     * <b>静默造一个空仓库</b>并标脏，退出时一路覆盖写盘 —— 仓库所有物品就此消失。
+     * 那条坏数据可能只是某个模组被卸载后残留的一件物品。</p>
+     *
+     * <p>所以这里自己做列表解码：逐条 {@code RawEntry.CODEC.parse}，
+     * 成功的进 {@link Decoded.Ok}，失败的<b>连同原文一起</b>进 {@link Decoded.Broken}
+     * （原文留着是为了写盘时原样写回，不至于因为一个读不懂的条目就把它删掉）。
+     * 无论多少条失败，这个方法<b>永远返回 success</b>。</p>
+     */
+    private static final Codec<List<Decoded>> ITEMS_CODEC = new Codec<>() {
+        @Override
+        public <T> DataResult<com.mojang.datafixers.util.Pair<List<Decoded>, T>> decode(
+                DynamicOps<T> ops, T input) {
+            return ops.getList(input).map(stream -> {
+                List<Decoded> out = new ArrayList<>();
+                final int[] failures = {0};
+                final int[] index = {0};
+                stream.accept(element -> {
+                    int at = index[0]++;
+                    DataResult<RawEntry> one = RawEntry.CODEC.parse(ops, element);
+                    Optional<RawEntry> ok = one.result();
+                    if (ok.isPresent()) {
+                        out.add(new Decoded.Ok(ok.get()));
+                    } else {
+                        failures[0]++;
+                        // 把失败原因写进日志：以前这条信息只在「整个仓库读不出来」时
+                        // 才以一句 Failed to parse 出现，现在精确到「第几条、为什么」。
+                        LOGGER.error("虚空仓库第 {} 条记录解码失败，已跳过（其余 {} 条不受影响）：{}",
+                                at, out.size(), one.error().map(Object::toString).orElse("未知原因"));
+                        // ops 是 NbtOps 时 element 就是 CompoundTag；转成 Tag 存原文。
+                        out.add(new Decoded.Broken(element instanceof net.minecraft.nbt.Tag tag
+                                ? tag : net.minecraft.nbt.EndTag.INSTANCE));
+                    }
+                });
+                if (failures[0] > 0) {
+                    LOGGER.error("虚空仓库共有 {} 条记录解码失败（总 {} 条），已保留可读部分继续运行。",
+                            failures[0], out.size());
+                }
+                return com.mojang.datafixers.util.Pair.of(out, ops.empty());
+            });
+        }
+
+        @Override
+        public <T> DataResult<T> encode(List<Decoded> input, DynamicOps<T> ops, T prefix) {
+            com.mojang.serialization.ListBuilder<T> builder = ops.listBuilder();
+            for (Decoded decoded : input) {
+                if (decoded instanceof Decoded.Ok ok) {
+                    builder.add(RawEntry.CODEC.encodeStart(ops, ok.entry()));
+                } else if (decoded instanceof Decoded.Broken broken) {
+                    // 原文写回：读不懂 ≠ 可以丢。下次说不定就有人能读懂它
+                    // （比如那个模组又装回来了），在那之前原样留着。
+                    // NbtOps 的元素类型就是 Tag，此时可以直接原样放回去；
+                    // 换成别的 ops（理论上不会）时退回「转过去」的通用路径。
+                    @SuppressWarnings("unchecked")
+                    T raw = (T) broken.raw();
+                    builder.add(DataResult.success(raw));
+                }
+            }
+            return builder.build(prefix);
+        }
+    };
+
     public static final Codec<VoidWarehouseData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
-            RawEntry.CODEC.listOf()
+            ITEMS_CODEC
                     .optionalFieldOf(ITEMS_KEY, List.of())
-                    .forGetter(VoidWarehouseData::rawEntries)
+                    .forGetter(VoidWarehouseData::decodedEntries)
     ).apply(instance, VoidWarehouseData::new));
 
     public static final SavedDataType<VoidWarehouseData> TYPE = new SavedDataType<>(
@@ -373,6 +465,26 @@ public final class VoidWarehouseData extends SavedData {
 
     /** 唯一数据源：界面、序列化、数量统计全都读这一份清单（<b>永远</b>按 {@link VoidWarehouseSort} 的顺序排好） */
     private final List<Entry> entries = new ArrayList<>();
+
+    /**
+     * 从存档里读不出来的那些条目的<b>原始 NBT</b>。
+     *
+     * <p>它们不参与仓库的任何逻辑，只是一直跟着走：读出来 → 原样写回去。
+     * 这样「某个模组被临时卸载、它的物品现在没人认识」不会导致那些条目被永久抹掉 ——
+     * 模组装回来之后它们还能用。见 {@link #ITEMS_CODEC}。</p>
+     */
+    private final List<net.minecraft.nbt.Tag> brokenEntries = new ArrayList<>();
+
+    /**
+     * 从存档载入时，{@code items} 列表里<b>一共读到了多少条</b>（不管读没读懂）。
+     *
+     * <p>用于 {@link #loadedCount()}：上层拿它和「可读条目数」对比，就能判断
+     * 「这份数据到底是本来就是空的，还是文件在那儿、内容却整片读丢了」。</p>
+     */
+    private int loadedEntryCount;
+
+    /** 载入时读不出来的条数（诊断用） */
+    private int loadedBrokenCount;
 
     /**
      * 物品 → 装它的那些格（增量维护的查找索引，见类注释「性能」一节）。
@@ -395,10 +507,24 @@ public final class VoidWarehouseData extends SavedData {
     public VoidWarehouseData() {
     }
 
-    VoidWarehouseData(List<RawEntry> loaded) {
-        for (RawEntry raw : loaded) {
-            raw.toEntry().ifPresent(this::absorb);
+    /**
+     * 从解码结果建仓库。
+     *
+     * <p>好条目进仓库（同物品合并）；坏条目原文留在 {@link #brokenEntries} 里，
+     * 下次写盘时原样写回。<b>注意这里绝不能因为「一条都读不出来」就抛异常</b> ——
+     * 抛异常会让上层把整个仓库当成读取失败，那才是真正会丢数据的路径。
+     * 「读到空」这种情况由 {@link VoidWarehouse#data} 那一层的指纹校验负责拦截。</p>
+     */
+    VoidWarehouseData(List<Decoded> loaded) {
+        for (Decoded decoded : loaded) {
+            if (decoded instanceof Decoded.Ok ok) {
+                ok.entry().toEntry().ifPresent(this::absorb);
+            } else if (decoded instanceof Decoded.Broken broken) {
+                this.brokenEntries.add(broken.raw());
+            }
         }
+        this.loadedEntryCount = this.entries.size();
+        this.loadedBrokenCount = this.brokenEntries.size();
         // 这里不排序：载入进来的顺序可能是旧文件的乱序，但第一次读之前
         // ensureSorted() 一定会把它整成创造栏顺序（见 sortedGeneration 的初值 -1）。
     }
@@ -917,6 +1043,38 @@ public final class VoidWarehouseData extends SavedData {
         this.markChanged();
     }
 
+    // ------------------------------------------------------------------ 载入指纹
+
+    /**
+     * 这份数据<b>是不是从一份「本该有内容、却一条都没读出来」的存档加载出来的</b>。
+     *
+     * <p>用途只有一个：{@link VoidWarehouse#data} 在把实例交出去之前用它做最后一道
+     * 闸门 —— 一旦为 true，说明数据层出了严重问题（文件里有记录，却没能变成任何一格），
+     * 此时<b>绝不能</b>让这个空壳继续工作并写盘，必须直接拒绝服务。</p>
+     *
+     * <p>判据很严：必须「文件里确实有条目」且「一条都没变成可用的格子」。
+     * 真的空仓库（玩家自己清空的、或从来没存过东西的）{@code loadedEntryCount} 是 0，
+     * 不会误报。</p>
+     */
+    public boolean isSuspiciouslyEmpty() {
+        return this.loadedEntryCount > 0 && this.entries.isEmpty();
+    }
+
+    /** 从存档里一共读到了多少条（含读不懂的）。0 表示文件本来就是空的 / 新建的。 */
+    public int loadedCount() {
+        return this.loadedEntryCount;
+    }
+
+    /** 载入时读不懂的条数 */
+    public int loadedBrokenCount() {
+        return this.loadedBrokenCount;
+    }
+
+    /** 读不懂、但仍会原样写回的那些条目条数 */
+    public int brokenCount() {
+        return this.brokenEntries.size();
+    }
+
     /**
      * 任何改动都要走这里：让统计缓存与「数量排序」视图缓存失效，并标记存档为脏。
      *
@@ -933,10 +1091,19 @@ public final class VoidWarehouseData extends SavedData {
 
     // ------------------------------------------------------------------ 序列化输出
 
-    private List<RawEntry> rawEntries() {
-        List<RawEntry> list = new ArrayList<>(this.entries.size());
+    /**
+     * 写盘用的条目列表：仓库里的每一格 + 读不出来的原文（原样带回去）。
+     *
+     * <p>坏原文排在最后，顺序稳定；它们不参与仓库的任何逻辑，只是「借道」存续。</p>
+     */
+    private List<Decoded> decodedEntries() {
+        List<Decoded> list = new ArrayList<>(this.entries.size() + this.brokenEntries.size());
         for (Entry entry : this.entries) {
-            list.add(new RawEntry(Optional.of(entry.template()), Optional.empty(), Optional.of(entry.amount())));
+            list.add(new Decoded.Ok(
+                    new RawEntry(Optional.of(entry.template()), Optional.empty(), Optional.of(entry.amount()))));
+        }
+        for (net.minecraft.nbt.Tag raw : this.brokenEntries) {
+            list.add(new Decoded.Broken(raw));
         }
         return list;
     }

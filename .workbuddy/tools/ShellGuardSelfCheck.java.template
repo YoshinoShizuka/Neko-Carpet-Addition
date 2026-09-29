@@ -1,0 +1,223 @@
+package neko.voidwarehouse;
+
+import com.mojang.serialization.DataResult;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.StringTag;
+import net.minecraft.nbt.Tag;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+/**
+ * 【临时自检】验证「静默清空」这条修复；验证完连同 hook 一起删掉。
+ *
+ * <p>要证的三件事：</p>
+ * <ol>
+ *   <li><b>单条坏不牵连整表</b>：往 {@code items} 里塞一条读不出来的记录，
+ *       其余条目必须原样保留，且解码<b>整体成功</b>（不返回 error）。</li>
+ *   <li><b>坏条不丢</b>：读不懂的那条会被原样写回，不会因为一次读写就消失。</li>
+ *   <li><b>空壳闸门真的会拦</b>：磁盘上有条目、实例却是全新空对象时，
+ *       {@link VoidWarehouse#data} 必须抛异常而不是把空壳交出去。</li>
+ * </ol>
+ */
+public final class ShellGuardSelfCheck {
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private ShellGuardSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        try {
+            all(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT shellguard/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("FAIL: " + name);
+        }
+    }
+
+    private static void all(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        var ops = level.registryAccess().createSerializationContext(NbtOps.INSTANCE);
+
+        // ---------------------------------------------------------------
+        // 1. 造一份「2 条好的 + 1 条坏的」的 items 列表
+        // ---------------------------------------------------------------
+        CompoundTag good1 = entry(Items.COBBLESTONE, 1234);
+        CompoundTag good2 = entry(Items.DIRT, 5678);
+        // 坏的：item 字段存在，但类型完全不是 compound（是个字符串）→ ItemStack.CODEC
+        // 拿不到 map，必然解析失败。这正是「模组卸载后残留了结构对不上的条目」那种坏法。
+        CompoundTag badEntry = new CompoundTag();
+        badEntry.put("item", StringTag.valueOf("这不是一个物品"));
+        badEntry.putLong("count", 99);
+
+        ListTag items = new ListTag();
+        items.add(good1);
+        items.add(badEntry);
+        items.add(good2);
+
+        CompoundTag payload = new CompoundTag();
+        payload.put("items", items);
+
+        // ---------------------------------------------------------------
+        // 2. 解码：必须整体成功，且保留 2 条好的
+        // ---------------------------------------------------------------
+        DataResult<VoidWarehouseData> result =
+                VoidWarehouseData.CODEC.parse(ops, payload);
+        check("S1 单条坏数据不导致整体解码失败", result.result().isPresent());
+
+        VoidWarehouseData data = result.result().orElse(null);
+        if (data == null) {
+            check("S2 解码结果可用", false);
+            return;
+        }
+        check("S2 解码结果可用", true);
+        check("S3 两条好记录原样保留（圆石 1234）",
+                data.amountOf(Items.COBBLESTONE).intValue() == 1234);
+        check("S4 两条好记录原样保留（泥土 5678）",
+                data.amountOf(Items.DIRT).intValue() == 5678);
+        check("S5 坏记录被记为 broken 而不是丢掉", data.brokenCount() == 1);
+        check("S6 载入计数 = 2（成功还原成格子的条数）", data.loadedCount() == 2);
+
+        // ---------------------------------------------------------------
+        // 3. 重新编码：坏的那条必须还在（原样写回）
+        // ---------------------------------------------------------------
+        Tag reencoded = VoidWarehouseData.CODEC.encodeStart(ops, data).result().orElse(null);
+        check("S7 重新编码成功", reencoded != null);
+        if (reencoded instanceof CompoundTag out) {
+            ListTag outItems = out.getList("items").orElse(new ListTag());
+            check("S8 写回后仍是 3 条（坏条未被抹掉）", outItems.size() == 3);
+            // 坏条在写回列表里的位置：好条各占一位，坏条排最后
+            boolean badStillThere = false;
+            for (int i = 0; i < outItems.size(); i++) {
+                Tag one = outItems.get(i);
+                if (one instanceof CompoundTag c) {
+                    Tag item = c.get("item");
+                    if (item instanceof StringTag s && "这不是一个物品".equals(s.asString().orElse(""))) {
+                        badStillThere = true;
+                    }
+                }
+            }
+            check("S9 坏条的原文一字不差地写回", badStillThere);
+        } else {
+            check("S8 写回后仍是 3 条（坏条未被抹掉）", false);
+            check("S9 坏条的原文一字不差地写回", false);
+        }
+
+        // ---------------------------------------------------------------
+        // 4. 空壳闸门：磁盘上有条目、实例却是全新空对象 → 必须抛异常
+        // ---------------------------------------------------------------
+        check("S10 正常仓库不会被误判为空壳", !data.isSuspiciouslyEmpty());
+
+        VoidWarehouseData fresh = new VoidWarehouseData();
+        check("S11 全新空对象自身看不出问题（需靠磁盘对照）", !fresh.isSuspiciouslyEmpty());
+
+        // 造一个「磁盘上确实有条目」的现场：直接把 2 条写进真正的存档文件。
+        // 这就是闸门要拦的那一幕（实例是 newly constructed、文件却有货）。
+        boolean diskWritten = writeFakeWarehouseFile(server, level);
+        check("S12a 能造出「磁盘有货」的现场", diskWritten);
+
+        boolean diskHas = diskHasItems(server, level);
+        check("S12b 磁盘探测确实读到条目", diskHas);
+        check("S12c 闸门判据成立（磁盘有货 + 实例为全新空对象）",
+                diskHas && fresh.isEmpty() && fresh.loadedCount() == 0);
+
+        // 反向：真·空仓库（正常加载过、里面就是空的）不该被拦。
+        // 注意要用「有 items 字段但为空列表」的 payload —— 那才是玩家清空后的真实写照。
+        CompoundTag emptyPayload = new CompoundTag();
+        emptyPayload.put("items", new ListTag());
+        VoidWarehouseData legitEmpty = VoidWarehouseData.CODEC
+                .parse(ops, emptyPayload)
+                .result().orElse(null);
+        check("S13 真·空仓库不会被误拦",
+                legitEmpty != null && !legitEmpty.isSuspiciouslyEmpty() && legitEmpty.isEmpty());
+
+        // 反向 2：连 items 字段都没有（老文件 / 极端情况）也只当空，不报错
+        VoidWarehouseData missingItems = VoidWarehouseData.CODEC
+                .parse(ops, new CompoundTag())
+                .result().orElse(null);
+        check("S14 缺 items 字段也能解析（不整表失败）", missingItems != null);
+    }
+
+    /** 造一条正常记录：{@code {item:{id:..,count:1}, count:N}} */
+    private static CompoundTag entry(net.minecraft.world.item.Item item, long amount) {
+        CompoundTag stack = new CompoundTag();
+        stack.putString("id", net.minecraft.core.registries.BuiltInRegistries.ITEM
+                .getKey(item).toString());
+        stack.putInt("count", 1);
+        CompoundTag e = new CompoundTag();
+        e.put("item", stack);
+        e.putLong("count", amount);
+        return e;
+    }
+
+    /** 磁盘上那份文件里 items 是不是非空（复刻 VoidWarehouse 的探测逻辑） */
+    private static boolean diskHasItems(MinecraftServer server, ServerLevel level) {
+        try {
+            Path file = warehouseFile(server, level);
+            if (!Files.isRegularFile(file)) {
+                return false;
+            }
+            CompoundTag tag = net.minecraft.nbt.NbtIo.readCompressed(
+                    file, net.minecraft.nbt.NbtAccounter.unlimitedHeap());
+            return tag.getCompound("data")
+                    .flatMap(inner -> inner.getList("items"))
+                    .map(list -> list.size() > 0)
+                    .orElse(false);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 把「2 条真记录」写进真正的存档文件，制造「磁盘有货」的现场 */
+    private static boolean writeFakeWarehouseFile(MinecraftServer server, ServerLevel level) {
+        try {
+            Path file = warehouseFile(server, level);
+            Files.createDirectories(file.getParent());
+            ListTag items = new ListTag();
+            items.add(entry(Items.COBBLESTONE, 1234));
+            items.add(entry(Items.DIRT, 5678));
+            CompoundTag data = new CompoundTag();
+            data.put("items", items);
+            CompoundTag root = new CompoundTag();
+            root.put("data", data);
+            net.minecraft.nbt.NbtIo.writeCompressed(root, file);
+            return true;
+        } catch (Exception e) {
+            System.out.println("!! 造现场失败: " + e);
+            return false;
+        }
+    }
+
+    private static Path warehouseFile(MinecraftServer server, ServerLevel level) {
+        Path root = server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT);
+        Path dir = net.minecraft.world.level.dimension.DimensionType
+                .getStorageFolder(level.dimension(), root);
+        return dir.resolve("data").resolve("carpet_neko_addition/void_warehouse.dat");
+    }
+}

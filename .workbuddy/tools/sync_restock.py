@@ -22,9 +22,13 @@ TARGETS = {
     "1.21.11": {
         "root": "versions/1.21.11",
         "fabric_version": "0.141.6+1.21.11",
-        # 1.21.11 的数据层是 SavedData + CompoundTag（不是 26.x 的 SavedDataType + Codec），
-        # 整文件复制会把存档格式改坏。takeStack 要单独手写进去，见下方 WHOLE_FILES 注释。
+        # 1.21.11 的数据层其实和 26.x 同构（都是 SavedDataType + Codec），
+        # 全文件只差两处：少一个 Identifier import、SavedDataType 的 id 是 String 而非 Identifier。
+        # 但这两处差异让「整文件盲拷」会编译失败，所以 VoidWarehouseData 仍走手工移植（见文档）。
         "whole_files": [
+            # VoidWarehouse 只用通用 API（MinecraftServer/ServerLevel/NBT/DimensionType），
+            # 1.21.11 走 officialMojangMappings，这些名字一致，可以整文件复制。
+            "src/main/java/neko/voidwarehouse/VoidWarehouse.java",
             "src/main/java/neko/automending/AutoMendingMod.java",
             "src/main/java/neko/voidwarehouse/VoidWarehouseExtension.java",
             "src/main/resources/assets/carpet_neko_addition/lang/zh_cn.json",
@@ -37,6 +41,11 @@ SRC = ROOT / "modern/26.3"
 
 # 整文件复制（内容在 26.x 之间一致，只是多了打印机的那几段）
 WHOLE_FILES = [
+    # VoidWarehouse：本轮加了「空壳闸门」+ 写盘前 .bak 快照。
+    # 它只用 MinecraftServer / ServerLevel / ServerPlayer / NBT / DimensionType +
+    # LevelResource，五个版本（含 1.21.11 的 Mojang 官方映射）这些名字完全一样，
+    # 所以可以整文件复制。这是防「静默清空」的关键文件，必须五个版本一起到位。
+    "src/main/java/neko/voidwarehouse/VoidWarehouse.java",
     "src/main/java/neko/voidwarehouse/VoidWarehouseData.java",
     # VoidWarehouseText：聊天栏提示（[信息] 前缀 + 千分位）也要在别的包里用，
     # 所以 info()/count() 由 package-private 提成了 public。五个版本内容完全一致。
@@ -54,6 +63,16 @@ RESTOCK_FILES = [
     "PrinterRestockNetwork.java",
     "VoidWarehouseRestockSettings.java",
 ]
+
+# 逐版本排除：这些文件在 26.x 之间一致，但 1.21.11 有版本特定的写法，
+# 整包复制会把已经调好的东西改坏。
+#
+# PrinterRestockNetwork：Fabric API 的注册入口在 1.21.x 叫 playC2S()/playS2C()，
+#   26.x（fabric-api 6.3.x）改名成了 serverboundPlay()/clientboundPlay()。
+#   无脑覆盖 → 1.21.11 直接编译失败。
+SKIP_PER_TARGET = {
+    "1.21.11": {"PrinterRestockNetwork.java"},
+}
 
 FABRIC_DEP_IMPL = (
     '    // Fabric API：只需要 networking 那一部分，但 fabric-api 的方便之处就在于\n'
@@ -98,11 +117,15 @@ def sync(target_name: str, cfg: dict) -> None:
     # 1. restock 包
     dst_dir = base / "src/main/java/neko/voidwarehouse/restock"
     dst_dir.mkdir(parents=True, exist_ok=True)
+    skip = SKIP_PER_TARGET.get(target_name, set())
     for name in RESTOCK_FILES:
         src = SRC / "src/main/java/neko/voidwarehouse/restock" / name
         # 自检是临时的，不同步
         if not src.exists():
             print(f"    [skip] {name}（源不存在）")
+            continue
+        if name in skip:
+            print(f"    [skip] {name}（{target_name} 有版本特定写法，不覆盖）")
             continue
         shutil.copyfile(src, dst_dir / name)
         print(f"    copy  restock/{name}")

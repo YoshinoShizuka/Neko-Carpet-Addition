@@ -33,5 +33,4 @@ include ':modern:26.1.1'
 include ':modern:26.1.2'
 
 // ---- versions（1.21.x 及更早，混淆）----
-// 逐个版本放开：先保留 1.21.11 的接入点，骨架就绪后再 include
-// include ':versions:1.21.11'
+include ':versions:1.21.11'

@@ -29,8 +29,8 @@ import java.util.List;
  * （客户端）里各有一份<b>源码副本</b>，包名、类名、字段、{@code CODEC} 的结构必须
  * <b>逐字节等价</b>：</p>
  * <ul>
- *   <li>客户端那份在 {@code me.aleksilassila.litematica.printer.integration.voidwarehouse}
- *       里有一份镜像，只是注释不同；</li>
+ *   <li>客户端那份是 {@code litematica-printer/src/main/java/neko/voidwarehouse/restock/}
+ *       下的<b>同包名同类名</b>副本，只是注释不同；</li>
  *   <li>为什么必须共用：单人 / 局域网里客户端与服务端<b>同进程</b>，共用
  *       {@code PayloadTypeRegistryImpl.SERVERBOUND_PLAY} 这一个静态 map。编码时
  *       {@code CustomPacketPayload.writeCap} 先 {@code buf.writeIdentifier(type.id())}，

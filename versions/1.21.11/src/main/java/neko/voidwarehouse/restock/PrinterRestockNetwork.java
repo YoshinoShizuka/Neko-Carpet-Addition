@@ -9,6 +9,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+import neko.voidwarehouse.VoidWarehouseText;
+
 /**
  * 把 {@link PrinterTakeService} 挂到网络上：注册两个 payload + 一个 C2S 接收端。
  *
@@ -66,7 +68,9 @@ public final class PrinterRestockNetwork {
      * </table>
      *
      * <p>客户端可以不注册 C2S：发送本身不查注册表，但<b>编码</b>会按通道名查
-     * C2S 表找 codec，同进程时那张表就是服务端填好的，里面已经有 {@code printer_take}。</p>
+     * C2S 表找 codec，同进程时那张表就是服务端填好的，里面已经有 {@code printer_take}。
+     * <b>前提是两端用的是同一个 {@code PrinterTakePayload} 类</b>，
+     * 否则查到的 codec 会在内部 checkcast 时炸掉。</p>
      *
      * <h2>版本差异</h2>
      * <p>1.21.11 的 fabric-api 这里叫 {@code playC2S()} / {@code playS2C()}；
@@ -94,7 +98,7 @@ public final class PrinterRestockNetwork {
     /**
      * 收到取货请求。
      *
-     * <p>只做三件事：过限流 → 转交 {@link PrinterTakeService} → 把结果码原样发回去。
+     * <p>只做三件事：过限流 → 转交 {@link PrinterTakeService} → 回包 + 发提示。
      * 具体判断都写在 service 里，这里保持薄，便于单独验证。</p>
      */
     private static void handle(PrinterTakePayload payload, ServerPlayNetworking.Context context) {
@@ -106,8 +110,35 @@ public final class PrinterRestockNetwork {
             return;
         }
 
-        int status = PrinterTakeService.take(context.server(), player, payload.candidates());
-        reply(player, nonce, status);
+        PrinterTakeService.TakeOutcome outcome =
+                PrinterTakeService.take(context.server(), player, payload.candidates());
+        reply(player, nonce, outcome.status());
+        notifyTaken(player, outcome);
+    }
+
+    /**
+     * 取货成功后，在聊天栏告诉玩家「拿走了多少、仓库还剩多少」。
+     *
+     * <h2>为什么只在成功且真的放了东西时才发</h2>
+     * <p>打印机的取货请求是<b>自动、高频</b>的：一次大面积建造会连发几十次。
+     * 如果每种结果都发一条，聊天栏会被刷屏，玩家自己的聊天记录全被顶掉。
+     * 所以这里只覆盖「你确实拿到了东西」这一种情形 —— 剩下的失败态
+     * （没货 / 背包满 / 限流 / 规则关）本来就该由打印机自己在 HUD 上体现，
+     * 聊天栏塞这些等于噪音。</p>
+     *
+     * <h2>为什么放在网络层而不是 service 里</h2>
+     * <p>{@code PrinterTakeService} 的定位是纯逻辑、可单独跑自检，
+     * 一旦它自己去 {@code sendSystemMessage}，就绑死了「必须有真玩家」这个前提。
+     * 发消息是「怎么用这个结果」，属于网络层的事。</p>
+     */
+    private static void notifyTaken(ServerPlayer player, PrinterTakeService.TakeOutcome outcome) {
+        if (player == null || !outcome.delivered()) {
+            return;
+        }
+        String name = outcome.sample().getHoverName().getString();
+        String body = "取走 " + VoidWarehouseText.count(outcome.takenCount()) + " 个 " + name
+                + "，仓库剩余 " + VoidWarehouseText.count(outcome.remaining()) + " 个";
+        player.sendSystemMessage(VoidWarehouseText.info(body));
     }
 
     /**

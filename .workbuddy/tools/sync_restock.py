@@ -38,6 +38,9 @@ SRC = ROOT / "modern/26.3"
 # 整文件复制（内容在 26.x 之间一致，只是多了打印机的那几段）
 WHOLE_FILES = [
     "src/main/java/neko/voidwarehouse/VoidWarehouseData.java",
+    # VoidWarehouseText：聊天栏提示（[信息] 前缀 + 千分位）也要在别的包里用，
+    # 所以 info()/count() 由 package-private 提成了 public。五个版本内容完全一致。
+    "src/main/java/neko/voidwarehouse/VoidWarehouseText.java",
     "src/main/java/neko/automending/AutoMendingMod.java",
     "src/main/java/neko/voidwarehouse/VoidWarehouseExtension.java",
     "src/main/resources/assets/carpet_neko_addition/lang/zh_cn.json",

@@ -9,7 +9,6 @@ import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
-import net.minecraft.world.level.ItemLike;
 import net.minecraft.world.level.block.ShulkerBoxBlock;
 
 import java.math.BigInteger;
@@ -33,6 +32,13 @@ import neko.voidwarehouse.VoidWarehouseSettings;
  * <p>背包塞满时如果只是「扣了仓库但不给货」，玩家的仓库就被凭空吃掉了，
  * 而且是很难查的那种。所以这里判定 placed ≤ 0 时把扣掉的整份塞回仓库，
  * 一次都不吭声也不行，要回 {@code INVENTORY_FULL} 让客户端知道。</p>
+ *
+ * <h2>为什么返回一个 {@link TakeOutcome} 而不是 {@code int}</h2>
+ * <p>原先只回一个状态码，够用是因为取货方（打印机）只关心「成没成」。
+ * 但要在聊天栏告诉玩家「取走多少 / 还剩多少」就得多带两个数出来 ——
+ * 这两个数在 {@link #giveOrRollback} 里本来就算过一遍（{@code placed}），
+ * 丢掉再让调用方重算一遍纯属浪费，而且调用方还拿不到「实际放进了几个」这个
+ * 只在下发过程中才确定的值。</p>
  */
 public final class PrinterTakeService {
 
@@ -48,24 +54,48 @@ public final class PrinterTakeService {
     }
 
     /**
+     * 一次取货的完整结果。
+     *
+     * <p>是个纯数据载体，不含任何 Minecraft 行为 —— service 只负责算，怎么用（回包 / 发消息）
+     * 由网络层决定。</p>
+     *
+     * @param status       结果码，语义见 {@link PrinterTakeResultPayload}
+     * @param takenCount   这次<b>真正放进背包</b>的数量（失败 / 回滚时为 0）
+     * @param remaining    本次操作<b>之后</b>该物品在仓库里的剩余数量
+     * @param sample       这轮命中的物品样板（数量恒 1）；一次都没命中时为 {@link ItemStack#EMPTY}
+     */
+    public record TakeOutcome(int status, int takenCount, BigInteger remaining, ItemStack sample) {
+
+        /** 只有状态、没有数量的简写（失败路径用；剩余数量按「没动过仓库」置 0） */
+        static TakeOutcome of(int status) {
+            return new TakeOutcome(status, 0, BigInteger.ZERO, ItemStack.EMPTY);
+        }
+
+        /** 成功取货时才有意义：确实往背包里放了东西 */
+        public boolean delivered() {
+            return status == PrinterTakeResultPayload.OK && takenCount > 0;
+        }
+    }
+
+    /**
      * 执行一次取货。
      *
      * @param server  服务端实例（取仓库用）
      * @param player  收货的玩家
      * @param candidates 候选物品的注册表 id 字符串，按顺序尝试
-     * @return 结果码（见 {@link PrinterTakeResultPayload}）
+     * @return 结果（状态码 + 实际取走数量 + 取后剩余量）
      */
-    public static int take(MinecraftServer server, ServerPlayer player, List<String> candidates) {
+    public static TakeOutcome take(MinecraftServer server, ServerPlayer player, List<String> candidates) {
         if (server == null || player == null) {
-            return PrinterTakeResultPayload.BAD_REQUEST;
+            return TakeOutcome.of(PrinterTakeResultPayload.BAD_REQUEST);
         }
         // 主开关也一并检查：voidWarehouse 关掉时仓库 UI 会被强制关闭，
         // 此时「补货规则看起来是开的但取不出东西」会很难排查，索性明确回报 RULE_OFF。
         if (!VoidWarehouseSettings.voidWarehouse || !VoidWarehouseRestockSettings.voidWarehouseRestock) {
-            return PrinterTakeResultPayload.RULE_OFF;
+            return TakeOutcome.of(PrinterTakeResultPayload.RULE_OFF);
         }
         if (candidates == null || candidates.isEmpty()) {
-            return PrinterTakeResultPayload.BAD_REQUEST;
+            return TakeOutcome.of(PrinterTakeResultPayload.BAD_REQUEST);
         }
 
         VoidWarehouseData data = VoidWarehouse.data(server);
@@ -86,7 +116,7 @@ public final class PrinterTakeService {
             }
             return giveOrRollback(data, player, sample, stock);
         }
-        return PrinterTakeResultPayload.EMPTY;
+        return TakeOutcome.of(PrinterTakeResultPayload.EMPTY);
     }
 
     /**
@@ -136,12 +166,12 @@ public final class PrinterTakeService {
      *
      * @param sample 样板（数量无所谓，内部只看 Item + 数据组件）
      */
-    private static int giveOrRollback(VoidWarehouseData data, ServerPlayer player,
-                                      ItemStack sample, BigInteger stock) {
+    private static TakeOutcome giveOrRollback(VoidWarehouseData data, ServerPlayer player,
+                                              ItemStack sample, BigInteger stock) {
         int wanted = stock.min(BigInteger.valueOf(Integer.MAX_VALUE)).intValue();
         ItemStack taken = data.takeStack(sample, wanted);
         if (taken.isEmpty()) {
-            return PrinterTakeResultPayload.EMPTY;
+            return TakeOutcome.of(PrinterTakeResultPayload.EMPTY);
         }
         Inventory inventory = player.getInventory();
         int remaining = tryGive(inventory, taken);
@@ -150,7 +180,8 @@ public final class PrinterTakeService {
         if (placed <= 0) {
             // 一件都没放进去 → 原样退还，仓库零消耗
             data.insert(taken);
-            return PrinterTakeResultPayload.INVENTORY_FULL;
+            return new TakeOutcome(PrinterTakeResultPayload.INVENTORY_FULL, 0,
+                    data.amountExact(sample), sample);
         }
         if (remaining > 0) {
             // 放了一部分 → 只退还没放下的那部分
@@ -161,7 +192,10 @@ public final class PrinterTakeService {
         if (player.inventoryMenu != player.containerMenu) {
             player.inventoryMenu.broadcastChanges();
         }
-        return PrinterTakeResultPayload.OK;
+        // 注意：remaining 是「退还未放下部分之后」的真实剩余量，不是取货前的 stock - placed。
+        // 两者在「背包只塞得下一部分」时不同（没放下的会退回去），所以必须重新查一次。
+        return new TakeOutcome(PrinterTakeResultPayload.OK, placed,
+                data.amountExact(sample), sample);
     }
 
     /**

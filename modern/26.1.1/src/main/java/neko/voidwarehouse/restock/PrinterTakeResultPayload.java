@@ -18,8 +18,9 @@ import net.minecraft.resources.Identifier;
  * （{@code take-OK} 只代表服务端发货了），两边取交集最稳。</p>
  *
  * <h2>⚠ 与 {@link PrinterTakePayload} 同理，这个类也是<b>两端共用</b>的</h2>
- * <p>客户端那份镜像在 {@code me.aleksilassila.litematica.printer.integration.voidwarehouse}，
- * 包名、类名、状态码常量、{@code CODEC} 结构必须与这里逐字节等价。</p>
+ * <p>客户端那份镜像在 {@code litematica-printer/src/main/java/neko/voidwarehouse/restock/}，
+ * <b>同包名、同类名</b>，状态码常量与 {@code CODEC} 结构必须与这里逐字节等价
+ * （验收方式：两端 {@code javap -p -c} 输出 {@code diff} 为空）。</p>
  *
  * <p>与取货请求的区别在于<b>注册方向不同</b>：这条是 S2C，走
  * {@code CLIENTBOUND_PLAY} 表。客户端为了能<b>解</b>包，必须自己

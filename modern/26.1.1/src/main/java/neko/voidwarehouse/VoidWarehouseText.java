@@ -38,7 +38,7 @@ import java.util.Locale;
  * <p>「X 盒 X 组 X 个」是<b>精确换算</b>而不是估算（口径与 {@link VoidWarehouseShulker}
  * 的装盒逻辑完全一致），加约等于号反而让人以为数字不准。</p>
  */
-final class VoidWarehouseText {
+public final class VoidWarehouseText {
     /** 核心数值：数量、盒 / 组 / 个换算 */
     static final ChatFormatting VALUE = ChatFormatting.GOLD;
     /** 可执行操作：左键 / 右键 */
@@ -74,8 +74,12 @@ final class VoidWarehouseText {
      *
      * <p>统一带前缀是为了让玩家一眼分清「这是虚空仓库在跟我说话」，
      * 而不是自己或别人的聊天消息。</p>
+     *
+     * <p>{@code public} 是因为 {@code neko.voidwarehouse.restock}（打印机补货）也在
+     * 别的包外，它发的「取走多少 / 还剩多少」提示必须和仓库 UI 里那套前缀一致，
+     * 各写各的迟早会分叉。</p>
      */
-    static Component info(String body) {
+    public static Component info(String body) {
         return Component.literal("[信息] ")
                 .withStyle(ChatFormatting.GOLD)
                 .withStyle(ChatFormatting.BOLD)
@@ -83,12 +87,12 @@ final class VoidWarehouseText {
     }
 
     /** 千分位：一盒上千个、库存上亿，不分隔符没法一眼读出位数 */
-    static String count(BigInteger amount) {
+    public static String count(BigInteger amount) {
         return String.format(Locale.ROOT, "%,d", amount);
     }
 
     /** {@link #count(BigInteger)} 的 int 版（容量、堆叠上限这类小数字） */
-    static String count(long amount) {
+    public static String count(long amount) {
         return String.format(Locale.ROOT, "%,d", amount);
     }
 }

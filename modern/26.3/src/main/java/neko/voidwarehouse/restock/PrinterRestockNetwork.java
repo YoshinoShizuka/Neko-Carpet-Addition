@@ -9,6 +9,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+import neko.voidwarehouse.VoidWarehouseText;
+
 /**
  * 把 {@link PrinterTakeService} 挂到网络上：注册两个 payload + 一个 C2S 接收端。
  *
@@ -52,55 +54,56 @@ public final class PrinterRestockNetwork {
      * <p>两个 {@code PayloadTypeRegistry} 的注册必须早：它们是客户端与服务端
      * 「自定义包能不能收发」的协商依据，晚于连接建立再注册就来不及了。</p>
      *
- * <h2>注册的总原则：一条通道只有一个主人</h2>
- * <p>本模组的 {@code environment} 是 {@code "*"}，也就是说它<b>也会在客户端进程里跑</b>
- * （单人存档、局域网主机、以及任何把 Carpet 模组丢进客户端 mods 的玩法都是这种情形）。
- * 而 {@code PayloadTypeRegistryImpl} 是<b>全局静态单例</b>，
- * {@code register} 的实现是 {@code if (packetTypes.containsKey(id)) throw ...}
- * （<b>严格去重，不是 putIfAbsent</b>）。所以「谁注册哪个 key」必须提前分死，
- * 两边都注册同一个 key 一定炸。</p>
- *
- * <table border="1">
- *   <tr><th>通道</th><th>方向</th><th>注册方</th></tr>
- *   <tr><td>{@code carpet_neko_addition:printer_take}</td><td>C2S</td><td>服务端（本模组）</td></tr>
- *   <tr><td>{@code carpet_neko_addition:printer_take_result}</td><td>S2C</td><td>服务端（本模组）+ 客户端 putIfAbsent</td></tr>
- * </table>
- *
- * <h2>客户端为什么可以不注册 C2S</h2>
- * <p>{@code ClientPlayNetworking.send} 只做「构造包 + 交给连接发出」，<b>发送本身不查本地注册表</b>；
- * 但<b>编码阶段会查</b> —— {@code writeCap} 按 {@code type.id()} 去
- * {@code PayloadTypeRegistryImpl.SERVERBOUND_PLAY} 找 codec。同进程时这张表
- * 就是服务端刚填好的那张，里面已经有 {@code printer_take} → 客户端直接受益，
- * 无需自己再注册（自己注册反而会撞名字）。</p>
- *
- * <h2>回执为什么两边都注册</h2>
- * <p>回执是 S2C：服务端 {@code send} 时需要 {type, codec} 去构造包，客户端需要
- * 同一个 {type, codec} 去解包。同进程下这是同一张 {@code CLIENTBOUND_PLAY} 表，
- * 谁先注册谁占坑。本模组主体在服务端、初始化更早，所以由这里注册；
- * 客户端侧的注册写成「表里已有就跳过」的幂等形式，双保险。</p>
- */
-public static void init() {
-    // C2S：打印机 → 服务端，取货请求。整张表里这有且只有这一个 key，
-    // 客户端复用这一条（它自己不注册），因此两端解析到的永远是同一个类。
-    PayloadTypeRegistry.serverboundPlay().register(PrinterTakePayload.TYPE, PrinterTakePayload.CODEC);
-    // S2C：服务端 → 打印机，取货回执
-    PayloadTypeRegistry.clientboundPlay().register(PrinterTakeResultPayload.TYPE, PrinterTakeResultPayload.CODEC);
+     * <h2>注册的总原则：一条通道只有一个主人</h2>
+     * <p>本模组的 {@code environment} 是 {@code "*"}，也就是说它<b>也会在客户端进程里跑</b>
+     * （单人存档、局域网主机、以及任何把 Carpet 模组丢进客户端 mods 的玩法都是这种情形）。
+     * 而 {@code PayloadTypeRegistryImpl} 是<b>全局静态单例</b>，
+     * {@code register} 的实现是 {@code if (packetTypes.containsKey(id)) throw ...}
+     * （<b>严格去重，不是 putIfAbsent</b>）。所以「谁注册哪个 key」必须提前分死，
+     * 两边都注册同一个 key 一定炸。</p>
+     *
+     * <table border="1">
+     *   <tr><th>通道</th><th>方向</th><th>注册方</th></tr>
+     *   <tr><td>{@code carpet_neko_addition:printer_take}</td><td>C2S</td><td>服务端（本模组）</td></tr>
+     *   <tr><td>{@code carpet_neko_addition:printer_take_result}</td><td>S2C</td><td>服务端（本模组），客户端幂等补位</td></tr>
+     * </table>
+     *
+     * <h2>客户端为什么可以不注册 C2S</h2>
+     * <p>{@code ClientPlayNetworking.send} 只做「构造包 + 交给连接发出」，<b>发送本身不查本地注册表</b>；
+     * 但<b>编码阶段会查</b> —— {@code writeCap} 按 {@code type.id()} 去
+     * {@code PayloadTypeRegistryImpl.SERVERBOUND_PLAY} 找 codec。同进程时这张表
+     * 就是服务端刚填好的那张，里面已经有 {@code printer_take} → 客户端直接受益，
+     * 无需自己再注册（自己注册反而会撞名字）。<b>前提是两端用的是同一个
+     * {@code PrinterTakePayload} 类</b>，否则查到的 codec 会在内部 checkcast 时炸掉。</p>
+     *
+     * <h2>回执为什么两边都注册</h2>
+     * <p>回执是 S2C：服务端 {@code send} 时需要 {type, codec} 去构造包，客户端需要
+     * 同一个 {type, codec} 去解包。同进程下这是同一张 {@code CLIENTBOUND_PLAY} 表，
+     * 谁先注册谁占坑。本模组主体在服务端、初始化更早，所以由这里注册；
+     * 客户端侧的注册写成「表里已有就跳过」的幂等形式，双保险。</p>
+     */
+    public static void init() {
+        // C2S：打印机 → 服务端，取货请求。整张表里这有且只有这一个 key，
+        // 客户端复用这一条（它自己不注册），因此两端解析到的永远是同一个类。
+        PayloadTypeRegistry.serverboundPlay().register(PrinterTakePayload.TYPE, PrinterTakePayload.CODEC);
+        // S2C：服务端 → 打印机，取货回执
+        PayloadTypeRegistry.clientboundPlay().register(PrinterTakeResultPayload.TYPE, PrinterTakeResultPayload.CODEC);
 
-    ServerPlayNetworking.registerGlobalReceiver(PrinterTakePayload.TYPE, PrinterRestockNetwork::handle);
+        ServerPlayNetworking.registerGlobalReceiver(PrinterTakePayload.TYPE, PrinterRestockNetwork::handle);
 
-    // 玩家下线就把限流记录抹掉，否则长期运行的服务器会一直攒着离线玩家的 UUID
-    ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
-        ServerPlayer player = handler.player;
-        if (player != null) {
-            LAST_REQUEST_AT.remove(player.getUUID());
-        }
-    });
-}
+        // 玩家下线就把限流记录抹掉，否则长期运行的服务器会一直攒着离线玩家的 UUID
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+            ServerPlayer player = handler.player;
+            if (player != null) {
+                LAST_REQUEST_AT.remove(player.getUUID());
+            }
+        });
+    }
 
     /**
      * 收到取货请求。
      *
-     * <p>只做三件事：过限流 → 转交 {@link PrinterTakeService} → 把结果码原样发回去。
+     * <p>只做三件事：过限流 → 转交 {@link PrinterTakeService} → 回包 + 发提示。
      * 具体判断都写在 service 里，这里保持薄，便于单独验证。</p>
      */
     private static void handle(PrinterTakePayload payload, ServerPlayNetworking.Context context) {
@@ -112,8 +115,35 @@ public static void init() {
             return;
         }
 
-        int status = PrinterTakeService.take(context.server(), player, payload.candidates());
-        reply(player, nonce, status);
+        PrinterTakeService.TakeOutcome outcome =
+                PrinterTakeService.take(context.server(), player, payload.candidates());
+        reply(player, nonce, outcome.status());
+        notifyTaken(player, outcome);
+    }
+
+    /**
+     * 取货成功后，在聊天栏告诉玩家「拿走了多少、仓库还剩多少」。
+     *
+     * <h2>为什么只在成功且真的放了东西时才发</h2>
+     * <p>打印机的取货请求是<b>自动、高频</b>的：一次大面积建造会连发几十次。
+     * 如果每种结果都发一条，聊天栏会被刷屏，玩家自己的聊天记录全被顶掉。
+     * 所以这里只覆盖「你确实拿到了东西」这一种情形 —— 剩下的失败态
+     * （没货 / 背包满 / 限流 / 规则关）本来就该由打印机自己在 HUD 上体现，
+     * 聊天栏塞这些等于噪音。</p>
+     *
+     * <h2>为什么放在网络层而不是 service 里</h2>
+     * <p>{@code PrinterTakeService} 的定位是纯逻辑、可单独跑自检，
+     * 一旦它自己去 {@code sendSystemMessage}，就绑死了「必须有真玩家」这个前提。
+     * 发消息是「怎么用这个结果」，属于网络层的事。</p>
+     */
+    private static void notifyTaken(ServerPlayer player, PrinterTakeService.TakeOutcome outcome) {
+        if (player == null || !outcome.delivered()) {
+            return;
+        }
+        String name = outcome.sample().getHoverName().getString();
+        String body = "取走 " + VoidWarehouseText.count(outcome.takenCount()) + " 个 " + name
+                + "，仓库剩余 " + VoidWarehouseText.count(outcome.remaining()) + " 个";
+        player.sendSystemMessage(VoidWarehouseText.info(body));
     }
 
     /**

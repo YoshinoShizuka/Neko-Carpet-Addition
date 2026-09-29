@@ -83,13 +83,13 @@ public final class RestockSelfCheck {
         VoidWarehouseSettings.voidWarehouse = true;
         VoidWarehouseRestockSettings.voidWarehouseRestock = false;
         check("R3 补货规则关 → RULE_OFF",
-                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone")).status()
                         == PrinterTakeResultPayload.RULE_OFF);
 
         VoidWarehouseRestockSettings.voidWarehouseRestock = true;
         VoidWarehouseSettings.voidWarehouse = false;
         check("R4 主规则关 → RULE_OFF",
-                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone")).status()
                         == PrinterTakeResultPayload.RULE_OFF);
 
         VoidWarehouseSettings.voidWarehouse = true;
@@ -97,19 +97,20 @@ public final class RestockSelfCheck {
 
         // ---- 3. 非法输入 ----
         check("R5 空候选 → BAD_REQUEST",
-                PrinterTakeService.take(server, player, List.of()) == PrinterTakeResultPayload.BAD_REQUEST);
+                PrinterTakeService.take(server, player, List.of()).status()
+                        == PrinterTakeResultPayload.BAD_REQUEST);
         check("R6 畸形 id 不抛异常且视为无货",
-                PrinterTakeService.take(server, player, List.of("!!!! not an id !!!!"))
+                PrinterTakeService.take(server, player, List.of("!!!! not an id !!!!")).status()
                         == PrinterTakeResultPayload.EMPTY);
         check("R7 空仓库 → EMPTY",
-                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone")).status()
                         == PrinterTakeResultPayload.EMPTY);
 
         // ---- 4. 正常取一组 ----
         data.clearContent();
         data.insert(new ItemStack(Items.COBBLESTONE, 64));
         data.insert(new ItemStack(Items.COBBLESTONE, 136));
-        int status = PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"));
+        int status = PrinterTakeService.take(server, player, List.of("minecraft:cobblestone")).status();
         check("R8 有货 → OK", status == PrinterTakeResultPayload.OK);
         check("R9 背包恰好到手 64", countOf(player, Items.COBBLESTONE) == 64);
         check("R10 仓库剩 136", data.amountOf(Items.COBBLESTONE).intValue() == 136);
@@ -119,7 +120,7 @@ public final class RestockSelfCheck {
         data.clearContent();
         data.insert(new ItemStack(Items.COBBLESTONE, 5));
         check("R11 库存不足一组 → 有多少给多少",
-                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone")).status()
                         == PrinterTakeResultPayload.OK);
         check("R12 到手 5", countOf(player, Items.COBBLESTONE) == 5);
         check("R13 仓库清零", data.amountOf(Items.COBBLESTONE).signum() == 0);
@@ -130,7 +131,7 @@ public final class RestockSelfCheck {
         data.clearContent();
         data.insert(new ItemStack(Items.COBBLESTONE, 64));
         check("R14 背包满 → INVENTORY_FULL",
-                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone")).status()
                         == PrinterTakeResultPayload.INVENTORY_FULL);
         check("R15 背包满时仓库零消耗", data.amountOf(Items.COBBLESTONE).intValue() == 64);
 
@@ -142,7 +143,7 @@ public final class RestockSelfCheck {
         data.clearContent();
         data.insert(new ItemStack(Items.COBBLESTONE, 64));
         check("R16 部分可放也返回 OK",
-                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"))
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone")).status()
                         == PrinterTakeResultPayload.OK);
         check("R17 原来 61 + 补到 64", countOf(player, Items.COBBLESTONE) == 64);
         check("R18 放不下的 61 已归还仓库", data.amountOf(Items.COBBLESTONE).intValue() == 61);
@@ -152,7 +153,7 @@ public final class RestockSelfCheck {
         data.clearContent();
         data.insert(new ItemStack(Items.SHULKER_BOX, 16));
         check("R19 潜影盒不会被取给客户端",
-                PrinterTakeService.take(server, player, List.of("minecraft:shulker_box"))
+                PrinterTakeService.take(server, player, List.of("minecraft:shulker_box")).status()
                         == PrinterTakeResultPayload.EMPTY);
         check("R20 拿了之后背包仍是空的", countOf(player, Items.SHULKER_BOX) == 0);
 
@@ -161,7 +162,7 @@ public final class RestockSelfCheck {
         data.clearContent();
         data.insert(new ItemStack(Items.DIAMOND_SWORD, 10));
         check("R21 剑也能取",
-                PrinterTakeService.take(server, player, List.of("minecraft:diamond_sword"))
+                PrinterTakeService.take(server, player, List.of("minecraft:diamond_sword")).status()
                         == PrinterTakeResultPayload.OK);
         check("R22 剑到手 1 把", countOf(player, Items.DIAMOND_SWORD) == 1);
         check("R23 剑仓库剩 9", data.amountOf(Items.DIAMOND_SWORD).intValue() == 9);
@@ -172,9 +173,45 @@ public final class RestockSelfCheck {
         data.insert(new ItemStack(Items.ANDESITE, 64));
         check("R24 第一个候选无货则退到第二个",
                 PrinterTakeService.take(server, player,
-                        List.of("minecraft:cobblestone", "minecraft:andesite"))
+                        List.of("minecraft:cobblestone", "minecraft:andesite")).status()
                         == PrinterTakeResultPayload.OK);
         check("R25 命中的是第二个", countOf(player, Items.ANDESITE) == 64);
+
+        // ---- 10b. TakeOutcome 带出来的三个数（聊天栏提示的取数依据）----
+        // 聊天提示要显示「取走 N 个 / 剩余 M 个」，这两个值全部取自 TakeOutcome。
+        // 一旦它们与真实背包/仓库状态不一致，玩家看到的提示就是假的 —— 所以单独钉一遍。
+        clearInventory(player);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 200));
+        PrinterTakeService.TakeOutcome okOutcome =
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"));
+        check("R25b 成功时 delivered() 为真", okOutcome.delivered());
+        check("R25c takenCount 与背包实得一致",
+                okOutcome.takenCount() == 64 && countOf(player, Items.COBBLESTONE) == 64);
+        check("R25d remaining 与仓库实况一致",
+                okOutcome.remaining().intValue() == 136
+                        && data.amountOf(Items.COBBLESTONE).intValue() == 136);
+        check("R25e sample 是命中的那种物品（数量恒 1）",
+                okOutcome.sample().getItem() == Items.COBBLESTONE
+                        && okOutcome.sample().getCount() == 1);
+
+        // 失败路径：takenCount 必须为 0，不然聊天栏会报出「取走了 N 个」但实际没给
+        PrinterTakeService.TakeOutcome emptyOutcome =
+                PrinterTakeService.take(server, player, List.of("minecraft:diamond_block"));
+        check("R25f 失败时 delivered() 为假且 takenCount=0",
+                !emptyOutcome.delivered() && emptyOutcome.takenCount() == 0);
+
+        // 部分放下：takenCount 是「真的进了背包」的数量（3），remaining 是「退还之后」的
+        // 真实剩余（61）—— 不是「取货前的 64 - 3 = 61」这种巧合，得分别验。
+        clearInventory(player);
+        fillInventory(player, new ItemStack(Items.STONE, 64));
+        player.getInventory().setItem(35, new ItemStack(Items.COBBLESTONE, 61));
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        PrinterTakeService.TakeOutcome partial =
+                PrinterTakeService.take(server, player, List.of("minecraft:cobblestone"));
+        check("R25g 部分放下时 takenCount=3、remaining=61",
+                partial.takenCount() == 3 && partial.remaining().intValue() == 61);
 
         // ---- 11. 网络层的两件事：通道注册 + 字节级往返 ----
         // 没有真客户端可以联调，这两项就把「拼不到 C2S 那一侧」的风险压到最低。

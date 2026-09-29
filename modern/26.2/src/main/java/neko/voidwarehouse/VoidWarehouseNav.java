@@ -1,6 +1,5 @@
 package neko.voidwarehouse;
 
-import net.minecraft.ChatFormatting;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.Item;
@@ -9,8 +8,8 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemLore;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 
 /**
  * 第 6 行（容器下标 45..53）的固定导航图标。
@@ -108,28 +107,26 @@ final class VoidWarehouseNav {
     /** 占位格：红色染色玻璃片，带一行说明，点了什么都不会发生 */
     private static ItemStack filler() {
         ItemStack stack = new ItemStack(Items.STAINED_GLASS_PANE.red());
-        stack.set(DataComponents.CUSTOM_NAME, Component.literal("占位符").withStyle(ChatFormatting.GRAY));
+        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.line("占位符", VoidWarehouseText.OFF));
         stack.set(DataComponents.LORE, new ItemLore(List.of(
-                Component.literal("仅为界面左右对称而留的空格").withStyle(ChatFormatting.DARK_GRAY),
-                Component.literal("点击无任何作用").withStyle(ChatFormatting.DARK_GRAY))));
+                VoidWarehouseText.line("点击无任何作用", VoidWarehouseText.NOTE))));
         return stack;
     }
 
     /**
      * 翻页按钮的图标 + 提示。
      *
-     * <p>配色约定（与下方各开关一致）：名字用 {@link ChatFormatting#YELLOW}（可用）/
-     * {@link ChatFormatting#DARK_GRAY}（不可用）；第一行 lore 是<b>关键动作说明</b>，用
-     * {@link ChatFormatting#YELLOW}；底部「怎么用」是 {@link ChatFormatting#DARK_GRAY} 的弱提示。</p>
+     * <p>颜色按 {@link VoidWarehouseText} 的语义走：可用时名字是金（{@code VALUE} 一类的亮色），
+     * 不可用时整个灰掉；底部「怎么用」统一深灰。</p>
      */
     private static ItemStack button(Item icon, String label, String hint, boolean enabled, String disabledHint) {
         ItemStack stack = new ItemStack(icon);
-        stack.set(DataComponents.CUSTOM_NAME, Component.literal(label)
-                .withStyle(enabled ? ChatFormatting.YELLOW : ChatFormatting.DARK_GRAY));
+        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.line(label,
+                enabled ? VoidWarehouseText.VALUE : VoidWarehouseText.OFF));
         stack.set(DataComponents.LORE, new ItemLore(List.of(
-                Component.literal(enabled ? hint : disabledHint)
-                        .withStyle(enabled ? ChatFormatting.YELLOW : ChatFormatting.GRAY),
-                Component.literal("左键单击翻页，不可取出").withStyle(ChatFormatting.DARK_GRAY))));
+                VoidWarehouseText.line(enabled ? hint : disabledHint,
+                        enabled ? VoidWarehouseText.VALUE : VoidWarehouseText.NOTE),
+                VoidWarehouseText.line("左键翻页，不可取出", VoidWarehouseText.NOTE))));
         return stack;
     }
 
@@ -137,30 +134,28 @@ final class VoidWarehouseNav {
      * 潜影盒模式开关。
      *
      * <p>图标固定是潜影盒，开 / 关只体现在名字颜色和说明文字里，所以位置和图形完全不跳。
-     * 说明里把「一盒装多少」和「一盒要消耗几个潜影壳 / 箱子」写清楚，
-     * 玩家不用去翻文档就知道点下去会发生什么。</p>
+     * 说明只留「现在是什么模式 / 一盒多大 / 要点什么代价 / 什么情况会被拒」这四件事，
+     * 每件事一行，不再把边界说明和「怎么切换」重复写两遍。</p>
      */
     private static ItemStack shulkerToggle(boolean on) {
         ItemStack stack = new ItemStack(Items.SHULKER_BOX);
-        stack.set(DataComponents.CUSTOM_NAME,
-                Component.literal("潜影盒模式：" + (on ? "开" : "关"))
-                        .withStyle(on ? ChatFormatting.GREEN : ChatFormatting.GRAY));
-        stack.set(DataComponents.LORE, new ItemLore(List.of(
-                // 第一行：当前模式的关键说明 —— 黄色
-                Component.literal(on ? "取出时改为交出「装满的潜影盒」" : "当前是普通取出模式")
-                        .withStyle(ChatFormatting.YELLOW),
-                // 容量 / 消耗等「数字事实」—— 青色（AQUA）
-                Component.literal("1 盒 = 27 格 × 该物品堆叠上限（最多 1,728 个）")
-                        .withStyle(ChatFormatting.AQUA),
-                Component.literal("每盒消耗：潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
-                                + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST)
-                        .withStyle(ChatFormatting.AQUA),
-                // 重要边界提示 —— 金色（GOLD），一眼就能看到
-                Component.literal(on ? "库存不足一盒 → 交出装不满的盒子；潜影壳 / 箱子不够 → 整次拒绝"
-                                : "左键单击切换")
-                        .withStyle(ChatFormatting.GOLD),
-                // 底部「怎么用」弱提示 —— 深灰
-                Component.literal("左键单击切换，不可取出").withStyle(ChatFormatting.DARK_GRAY))));
+        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.name("潜影盒模式：" + (on ? "开" : "关"), on));
+        List<Component> lore = new ArrayList<>(5);
+        // 当前模式
+        lore.add(VoidWarehouseText.line(
+                on ? "取出改为交出「装满的潜影盒」" : "当前：按普通方式取出", VoidWarehouseText.FACT));
+        // 一盒多大（圆石 1728 是玩家最熟悉的参照，写出来比只给公式好读）
+        lore.add(VoidWarehouseText.line("1 盒 = 27 格 × 堆叠上限（圆石 1,728 个）", VoidWarehouseText.FACT));
+        // 代价
+        lore.add(VoidWarehouseText.line("消耗：潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
+                + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST + "（优先用空盒）", VoidWarehouseText.COST));
+        // 开了才需要知道的边界（什么时候拿不到满盒、什么时候整个被拒）；关着时不写，省一行
+        if (on) {
+            lore.add(VoidWarehouseText.line("不足一盒 → 给装不满的盒；材料不够 → 整次拒绝",
+                    VoidWarehouseText.COST));
+        }
+        lore.add(VoidWarehouseText.line("左键切换，不可取出", VoidWarehouseText.NOTE));
+        stack.set(DataComponents.LORE, new ItemLore(lore));
         return stack;
     }
 
@@ -172,45 +167,30 @@ final class VoidWarehouseNav {
      */
     private static ItemStack amountSortToggle(boolean on) {
         ItemStack stack = new ItemStack(Items.COMPASS);
-        stack.set(DataComponents.CUSTOM_NAME,
-                Component.literal("数量排序：" + (on ? "开" : "关"))
-                        .withStyle(on ? ChatFormatting.GREEN : ChatFormatting.GRAY));
+        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.name("数量排序：" + (on ? "开" : "关"), on));
         stack.set(DataComponents.LORE, new ItemLore(List.of(
-                // 第一行：当前排列的关键说明 —— 黄色
-                Component.literal(on ? "当前：数量从大到小排列" : "当前：按创造模式物品栏顺序排列")
-                        .withStyle(ChatFormatting.YELLOW),
-                // 与排序规则相关的「数字事实」—— 青色（AQUA）
-                Component.literal("数量相同的物品仍按创造模式物品栏顺序排列")
-                        .withStyle(ChatFormatting.AQUA),
-                Component.literal("只改显示顺序，不改仓库里的存放")
-                        .withStyle(ChatFormatting.AQUA),
-                // 重要提醒 —— 金色（GOLD）
-                Component.literal("取出物品会让数量变化，排列会跟着实时调整")
-                        .withStyle(ChatFormatting.GOLD),
-                // 底部「怎么用」弱提示 —— 深灰
-                Component.literal("左键单击切换，不可取出").withStyle(ChatFormatting.DARK_GRAY))));
+                // 当前排列
+                VoidWarehouseText.line(on ? "当前：数量从大到小" : "当前：创造模式物品栏顺序",
+                        VoidWarehouseText.FACT),
+                // 只改显示不改存放（玩家最容易误会的一点，单独一行说清）
+                VoidWarehouseText.line("只改显示顺序，不改仓库里的存放", VoidWarehouseText.NOTE),
+                VoidWarehouseText.line("左键切换，不可取出", VoidWarehouseText.NOTE))));
         return stack;
     }
 
     private static ItemStack indicator(int page, int pageCount, int entryCount, BigInteger totalAmount,
                                        boolean amountSort) {
         ItemStack stack = new ItemStack(Items.PAPER);
-        stack.set(DataComponents.CUSTOM_NAME, Component.literal("第 " + (page + 1) + " / " + pageCount + " 页")
-                .withStyle(ChatFormatting.AQUA));
+        stack.set(DataComponents.CUSTOM_NAME,
+                VoidWarehouseText.name("第 " + (page + 1) + " / " + pageCount + " 页", null));
         stack.set(DataComponents.LORE, new ItemLore(List.of(
-                // 已存种类数 —— 黄色，最关心的概览
-                Component.literal("已存 " + entryCount + " 种物品 · 每页 " + VoidWarehouseData.PAGE_SIZE + " 格")
-                        .withStyle(ChatFormatting.YELLOW),
-                // 合计数量 —— 灰色，次要数字
-                Component.literal("合计 " + format(totalAmount) + " 个物品 · 每种物品一格，数量无上限")
-                        .withStyle(ChatFormatting.GRAY),
-                // 当前排列 —— 青色，与排序开关呼应的事实
-                Component.literal("排列：" + (amountSort ? "数量从大到小" : "创造模式物品栏顺序"))
-                        .withStyle(ChatFormatting.AQUA))));
+                // 最关心的两个数字合并成一行：多少种 + 多少个
+                VoidWarehouseText.line("已存 " + entryCount + " 种 · 合计 "
+                        + VoidWarehouseText.count(totalAmount) + " 个", VoidWarehouseText.VALUE),
+                VoidWarehouseText.line("每种物品一格，数量无上限", VoidWarehouseText.NOTE),
+                // 当前排列，与排序开关呼应
+                VoidWarehouseText.line("排列：" + (amountSort ? "数量从大到小" : "创造模式物品栏顺序"),
+                        VoidWarehouseText.FACT))));
         return stack;
-    }
-
-    private static String format(BigInteger amount) {
-        return String.format(Locale.ROOT, "%,d", amount);
     }
 }

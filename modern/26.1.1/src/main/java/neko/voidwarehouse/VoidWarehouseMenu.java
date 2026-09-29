@@ -340,10 +340,16 @@ public class VoidWarehouseMenu extends ChestMenu {
                     if (boxMode) {
                         // 潜影盒模式下右键：发起「按数量取货」请求 —— 玩家在聊天栏输入数量，
                         // 一次性取出 N 个（拆成满盒 + 散货）。见 VoidWarehouseWithdraw。
+                        //
+                        // request 会<b>主动把这个界面关掉</b>（聊天栏被界面盖着就没法输入），
+                        // 所以这里必须直接 return：菜单此刻已经不存在了，再往下走
+                        // syncAllViewers 就是对着一个已关闭的菜单发包。
+                        // 取完货由 VoidWarehouseWithdraw 自己把界面开回来（页码/开关都还在）。
                         VoidWarehouseData.Entry entry = this.entryAt(slotId);
                         if (entry != null && player instanceof ServerPlayer serverPlayer) {
                             VoidWarehouseWithdraw.request(serverPlayer, entry.template());
                         }
+                        return;
                     } else {
                         this.withdrawOrStore(slotId, player);
                     }

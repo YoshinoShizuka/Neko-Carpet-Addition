@@ -1,8 +1,6 @@
 package neko.voidwarehouse;
 
-import net.minecraft.ChatFormatting;
 import net.minecraft.core.component.DataComponents;
-import net.minecraft.network.chat.Component;
 import net.minecraft.world.Container;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
@@ -10,7 +8,6 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemLore;
 
 import java.util.List;
-import java.util.Locale;
 
 /**
  * 「某一页」的容器视图。
@@ -74,10 +71,9 @@ final class VoidWarehousePageContainer implements Container {
     static {
         ItemStack placeholder = new ItemStack(Items.BARRIER);
         placeholder.set(DataComponents.CUSTOM_NAME,
-                Component.literal("空位（占位符）").withStyle(ChatFormatting.GRAY));
+                VoidWarehouseText.line("空位", VoidWarehouseText.OFF));
         placeholder.set(DataComponents.LORE, new ItemLore(List.of(
-                Component.literal("此处还没有存放物品").withStyle(ChatFormatting.GRAY),
-                Component.literal("物品入库后这里会显示真实物品").withStyle(ChatFormatting.DARK_GRAY))));
+                VoidWarehouseText.line("物品入库后这里会显示真实物品", VoidWarehouseText.NOTE))));
         PLACEHOLDER = placeholder;
     }
 
@@ -180,41 +176,20 @@ final class VoidWarehousePageContainer implements Container {
         return shown.isEmpty() ? PLACEHOLDER : shown;
     }
 
-    /** 潜影盒模式下，在展示堆叠后面追加几行「这么点下去会怎样」的说明 */
+    /**
+     * 潜影盒模式下物品格的展示内容。
+     *
+     * <p>这里<b>不是</b>在普通说明后面追加几行，而是直接取
+     * {@link VoidWarehouseData.Entry#displayInBoxMode()} 那一套：盒模式下
+     * 「左键取出 1 个 / 右键取出一组」是不成立的说明，追加只会既长又误导。</p>
+     */
     private ItemStack shulkerDisplay(int index) {
-        ItemStack shown = this.data.displayAt(index);
-        if (shown.isEmpty()) {
-            // 空位同样用屏障占位（潜影盒模式只是给「有物品」的格子加说明，空位仍是占位符）
+        VoidWarehouseData.Entry entry = this.data.entryAt(index);
+        if (entry == null) {
+            // 空位同样用屏障占位（潜影盒模式只是给「有物品」的格子换说明，空位仍是占位符）
             return PLACEHOLDER;
         }
-        // displayAt 返回的是 data 里缓存的那一份，动它会把缓存写坏 —— 先复制再改
-        // （copyWithCount/copy 的组件是 copy-on-write，改副本不会污染真品）
-        ItemStack copy = shown.copy();
-        ItemLore lore = copy.get(DataComponents.LORE);
-        ItemLore base = lore == null ? ItemLore.EMPTY : lore;
-        copy.set(DataComponents.LORE, base
-                .withLineAdded(Component.literal(
-                                "左键 / Shift / 双击 = 交出 1 盒（" + count(this.capacityOf(index)) + " 个）")
-                        .withStyle(ChatFormatting.AQUA))
-                .withLineAdded(Component.literal(
-                                "右键 = 按数量取货（在聊天栏输入数量，拆成满盒 + 散货）")
-                        .withStyle(ChatFormatting.AQUA))
-                .withLineAdded(Component.literal(
-                                "将消耗：潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
-                                        + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST + "（优先用空盒）")
-                        .withStyle(ChatFormatting.AQUA)));
-        return copy;
-    }
-
-    /** 本页第 {@code slot} 格那种物品「一盒能装多少个」 */
-    int capacityOf(int index) {
-        VoidWarehouseData.Entry entry = this.data.entryAt(index);
-        return entry == null ? 0 : VoidWarehouseShulker.capacity(entry.template());
-    }
-
-    /** 千分位展示（一盒几百上千个，不写分隔符不容易一眼读出来） */
-    private static String count(int value) {
-        return String.format(Locale.ROOT, "%,d", value);
+        return entry.displayInBoxMode();
     }
 
     /** 取出若干（真正扣减仓库数量）；返回的是一份崭新的堆叠，与仓库里的样板无关 */

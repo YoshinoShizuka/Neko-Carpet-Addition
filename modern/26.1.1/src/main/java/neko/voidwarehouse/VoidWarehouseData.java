@@ -3,7 +3,6 @@ package neko.voidwarehouse;
 import com.mojang.datafixers.util.Either;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
-import net.minecraft.ChatFormatting;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
@@ -132,12 +131,15 @@ public final class VoidWarehouseData extends SavedData {
      * 仓库里的一格 = 一种物品 + 一个无上限的数量。
      *
      * <p>{@code template} 的数量恒为 1，只当「长什么样」的样板；真品数量在 {@code amount}。
-     * {@code display} 是懒生成的展示堆叠缓存（带 lore），数量一变就失效重建。</p>
+     * {@code display} / {@code boxDisplay} 是两种模式下各自的展示堆叠缓存（带 lore），
+     * 数量一变就一起失效重建。</p>
      */
     public static final class Entry {
         private final ItemStack template;
         private BigInteger amount;
         private ItemStack display;
+        /** 潜影盒模式下的展示堆叠（操作说明是「交出盒子」那套，与普通模式不是一回事） */
+        private ItemStack boxDisplay;
 
         Entry(ItemStack template, BigInteger amount) {
             // 只留一份数量为 1 的样板，彻底切断与原堆叠的实例关联（防复制）
@@ -167,6 +169,7 @@ public final class VoidWarehouseData extends SavedData {
             }
             this.amount = this.amount.add(delta);
             this.display = null;
+            this.boxDisplay = null;
         }
 
         void subtract(BigInteger delta) {
@@ -178,31 +181,122 @@ public final class VoidWarehouseData extends SavedData {
                 this.amount = BigInteger.ZERO;
             }
             this.display = null;
+            this.boxDisplay = null;
         }
 
-        /** 给界面看的展示堆叠（带数量与操作提示），缓存复用 */
+        /** 普通模式的展示堆叠（带数量与操作提示），缓存复用 */
         public ItemStack display() {
             if (this.display == null) {
-                this.display = buildDisplay(this.template, this.amount);
+                this.display = buildDisplay(this.template, this.amount, false);
             }
             return this.display;
         }
 
-        private static ItemStack buildDisplay(ItemStack template, BigInteger amount) {
+        /**
+         * 潜影盒模式的展示堆叠，缓存复用。
+         *
+         * <p>这里<b>不是</b>在普通说明后面追加几行 —— 而是换一套说明：盒模式下
+         * 「左键取出 1 个 / 右键取出一组」<b>根本不成立</b>（左键交出的是一整盒），
+         * 留着它们既占地方又误导人。两套说明各自精简，行数都控制在 5 行以内。</p>
+         */
+        public ItemStack displayInBoxMode() {
+            if (this.boxDisplay == null) {
+                this.boxDisplay = buildDisplay(this.template, this.amount, true);
+            }
+            return this.boxDisplay;
+        }
+
+        /**
+         * 造展示堆叠：两种模式共用「数据行」，各自接自己的「操作行」。
+         *
+         * @param boxMode 潜影盒模式？决定操作行说的是「取出」还是「交出盒子」
+         */
+        private static ItemStack buildDisplay(ItemStack template, BigInteger amount, boolean boxMode) {
             int max = Math.max(1, template.getMaxStackSize());
             // 格子里永远只画一个：count = 1 时原版不会渲染右下角的数字。
             // 真实数量往往远超一组、甚至到亿级，画在格子里既不合理也会糊到隔壁格，
             // 所以格子只当图标用，真实数量写在下面的 lore 里。
             ItemStack stack = template.copyWithCount(1);
-            List<Component> lore = List.of(
-                    Component.literal("数量：" + format(amount)).withStyle(ChatFormatting.WHITE),
-                    Component.literal("左键：取出 1 个").withStyle(ChatFormatting.GREEN),
-                    Component.literal(max > 1
-                                    ? "右键：取出一组（最多 " + max + " 个）"
-                                    : "右键：取出 1 个")
-                            .withStyle(ChatFormatting.YELLOW));
+            List<Component> lore = new ArrayList<>(5);
+
+            // ---- 数据行：数量 +（够多时的）盒 / 组 / 个换算 ----
+            lore.add(VoidWarehouseText.line("数量：" + format(amount), VoidWarehouseText.VALUE));
+            String packing = describePacking(amount, max);
+            if (packing != null) {
+                lore.add(VoidWarehouseText.line(packing, VoidWarehouseText.VALUE));
+            }
+
+            // ---- 操作行：两种模式各说各的，绝不混着显示 ----
+            if (boxMode) {
+                int capacity = VoidWarehouseShulker.capacity(template);
+                lore.add(VoidWarehouseText.line(
+                        "左键：交出 1 盒（" + VoidWarehouseText.count(capacity) + " 个）",
+                        VoidWarehouseText.ACTION));
+                lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION));
+                lore.add(VoidWarehouseText.line("消耗：潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
+                        + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST, VoidWarehouseText.COST));
+            } else if (max > 1) {
+                lore.add(VoidWarehouseText.line("左键：取出 1 个", VoidWarehouseText.ACTION));
+                lore.add(VoidWarehouseText.line(
+                        "右键：取出 1 组（" + max + " 个）", VoidWarehouseText.ACTION));
+            } else {
+                // 不可堆叠物品（剑、工具…）左右键都是取 1 个，合成一行说，不重复两遍
+                lore.add(VoidWarehouseText.line("左键 / 右键：取出 1 个", VoidWarehouseText.ACTION));
+            }
+
             stack.set(DataComponents.LORE, new ItemLore(lore));
             return stack;
+        }
+
+        /**
+         * 把总数换算成「X 盒 X 组 X 个」，方便玩家一眼估出要带几个潜影盒出门。
+         *
+         * <p>换算口径与 {@link VoidWarehouseShulker} 完全一致：
+         * <b>1 盒 = 27 格 × 该物品的堆叠上限</b>（圆石 1728、末影珍珠 432），
+         * <b>1 组 = 该物品的堆叠上限</b>。所以 5000 个圆石 = 2 盒 24 组 8 个。</p>
+         *
+         * <p><b>这是精确换算而不是估算，所以不带「≈」</b> —— 加约等于号会让人以为数字不准。</p>
+         *
+         * <p><b>不足一组时返回 {@code null}</b>（那行就不显示）：库存只有 30 个圆石时
+         * 写「0 盒 0 组 30 个」纯属噪音。末尾余数为 0 时也省略那一段，
+         * 于是「整盒」显示成「3 盒」而不是「3 盒 0 组 0 个」。</p>
+         *
+         * <p><b>不可堆叠物品（剑、工具…）特殊处理</b>：它们一组就等于 1 个，写「N 组」
+         * 纯属废话，所以只在够一盒（27 个）时才显示，而且只说「几盒 + 几个」，
+         * 不出现「组」这一级。</p>
+         *
+         * <p>全程用 {@link BigInteger} 做除法（{@code divideAndRemainder}），
+         * 亿级数量也不会溢出 —— 数量本身是任意精度的，换算不能先把它降级成 long。</p>
+         */
+        private static String describePacking(BigInteger amount, int max) {
+            // 门槛：够「一组」才值得换算。不可堆叠物品一组 = 1 个，此时只有「盒」有意义，
+            // 所以门槛抬到「一盒」（27 个）。
+            BigInteger threshold = BigInteger.valueOf(
+                    max > 1 ? max : VoidWarehouseShulker.BOX_SLOTS);
+            if (amount.compareTo(threshold) < 0) {
+                return null;
+            }
+            BigInteger boxCapacity = BigInteger.valueOf((long) VoidWarehouseShulker.BOX_SLOTS * max);
+            BigInteger[] byBox = amount.divideAndRemainder(boxCapacity);
+            BigInteger boxes = byBox[0];
+            BigInteger stacks = BigInteger.ZERO;
+            BigInteger loose = byBox[1];
+            if (max > 1) {
+                BigInteger[] byStack = loose.divideAndRemainder(BigInteger.valueOf(max));
+                stacks = byStack[0];
+                loose = byStack[1];
+            }
+            StringBuilder text = new StringBuilder();
+            if (boxes.signum() > 0) {
+                text.append(format(boxes)).append(" 盒 ");
+            }
+            if (max > 1 && stacks.signum() > 0) {
+                text.append(format(stacks)).append(" 组 ");
+            }
+            if (loose.signum() > 0) {
+                text.append(format(loose)).append(" 个");
+            }
+            return text.toString().trim();
         }
 
         /** 千分位展示，{@code %,d} 原生支持 BigInteger */

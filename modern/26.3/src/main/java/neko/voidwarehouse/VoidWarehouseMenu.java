@@ -1,6 +1,5 @@
 package neko.voidwarehouse;
 
-import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
@@ -117,24 +116,25 @@ public class VoidWarehouseMenu extends ChestMenu {
     private static final BigInteger SHELL_NEED = BigInteger.valueOf(VoidWarehouseShulker.SHELL_COST);
     private static final BigInteger CHEST_NEED = BigInteger.valueOf(VoidWarehouseShulker.CHEST_COST);
 
-    private static final Component MSG_FULL = Component.literal("虚空仓库已满，无法放入");
+    // 聊天提示统一走 VoidWarehouseText.info()：带金色 [信息] 前缀，一眼能和普通聊天分开
+    private static final Component MSG_FULL = VoidWarehouseText.info("虚空仓库已满，放不进去了");
     private static final Component MSG_RESCUED =
-            Component.literal("背包已满，手上拿着的物品已存入虚空仓库");
+            VoidWarehouseText.info("背包已满，手上的物品已存入虚空仓库");
     private static final Component MSG_INV_FULL =
-            Component.literal("背包已满，放不下的物品留在了虚空仓库");
+            VoidWarehouseText.info("背包已满，放不下的留在虚空仓库");
     private static final Component MSG_REJECTED =
-            Component.literal("该物品带有额外数据（耐久 / 附魔 / 自定义名等），虚空仓库拒收");
+            VoidWarehouseText.info("带额外数据的物品（耐久 / 附魔 / 改名）拒收");
     private static final Component MSG_BOX_REJECTED =
-            Component.literal("潜影盒里含有带额外数据的物品（耐久 / 附魔 / 自定义名等），整盒拒收");
-    private static final Component MSG_SHULKER_ON = infoMessage("潜影盒模式开");
-    private static final Component MSG_SHULKER_OFF = infoMessage("潜影盒模式关");
-    private static final Component MSG_NO_BOX_PARTS =
-            Component.literal("仓库里的潜影壳或箱子不足，无法装盒（每盒需要 潜影壳 ×"
-                    + VoidWarehouseShulker.SHELL_COST + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST + "）");
+            VoidWarehouseText.info("盒内有带额外数据的物品，整盒拒收");
+    private static final Component MSG_SHULKER_ON = VoidWarehouseText.info("潜影盒模式开");
+    private static final Component MSG_SHULKER_OFF = VoidWarehouseText.info("潜影盒模式关");
+    private static final Component MSG_NO_BOX_PARTS = VoidWarehouseText.info(
+            "潜影壳或箱子不足，无法装盒（每盒需 潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
+                    + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST + "）");
     private static final Component MSG_BOX_INV_FULL =
-            Component.literal("背包放不下潜影盒，本次取出已取消（仓库未扣减任何物品）");
-    private static final Component MSG_SORT_ON = infoMessage("数量排序开");
-    private static final Component MSG_SORT_OFF = infoMessage("数量排序关");
+            VoidWarehouseText.info("背包放不下盒子，本次取消（仓库未扣减）");
+    private static final Component MSG_SORT_ON = VoidWarehouseText.info("数量排序开");
+    private static final Component MSG_SORT_OFF = VoidWarehouseText.info("数量排序关");
 
     private final VoidWarehouseData data;
     private final VoidWarehousePageContainer pageContainer;
@@ -341,10 +341,16 @@ public class VoidWarehouseMenu extends ChestMenu {
                     if (boxMode) {
                         // 潜影盒模式下右键：发起「按数量取货」请求 —— 玩家在聊天栏输入数量，
                         // 一次性取出 N 个（拆成满盒 + 散货）。见 VoidWarehouseWithdraw。
+                        //
+                        // request 会<b>主动把这个界面关掉</b>（聊天栏被界面盖着就没法输入），
+                        // 所以这里必须直接 return：菜单此刻已经不存在了，再往下走
+                        // syncAllViewers 就是对着一个已关闭的菜单发包。
+                        // 取完货由 VoidWarehouseWithdraw 自己把界面开回来（页码/开关都还在）。
                         VoidWarehouseData.Entry entry = this.entryAt(slotId);
                         if (entry != null && player instanceof ServerPlayer serverPlayer) {
                             VoidWarehouseWithdraw.request(serverPlayer, entry.template());
                         }
+                        return;
                     } else {
                         this.withdrawOrStore(slotId, player);
                     }
@@ -664,19 +670,6 @@ public class VoidWarehouseMenu extends ChestMenu {
         if (player instanceof ServerPlayer serverPlayer) {
             serverPlayer.sendSystemMessage(text);
         }
-    }
-
-    /**
-     * 把提示包装成「金色 + [信息] 前缀」的聊天栏消息。
-     *
-     * <p>只用于两个模式开关（数量排序 / 潜影盒模式）的切换提示，让玩家一眼看出这是一条
-     * 「信息类」提醒而非错误。前缀 {@code [信息]} 用加粗金色、正文用金色。</p>
-     */
-    private static Component infoMessage(String body) {
-        return Component.literal("[信息] ")
-                .withStyle(ChatFormatting.GOLD)
-                .withStyle(ChatFormatting.BOLD)
-                .append(Component.literal(body).withStyle(ChatFormatting.GOLD));
     }
 
     /**

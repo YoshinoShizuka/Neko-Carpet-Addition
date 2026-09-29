@@ -1,6 +1,5 @@
 package neko.voidwarehouse;
 
-import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Inventory;
@@ -21,10 +20,18 @@ import java.util.concurrent.ConcurrentHashMap;
  * <h2>整体流程</h2>
  * <ol>
  *   <li>玩家在<b>潜影盒模式</b>下右键某个仓库格 → {@link #request(ServerPlayer, ItemStack)}
- *       记一条待处理请求，并提示玩家「在聊天栏输入要取走的数量」；</li>
+ *       记一条待处理请求、<b>主动关掉仓库界面</b>，并提示玩家「在聊天栏输入要取走的数量」；</li>
  *   <li>玩家在聊天栏输入一个数字 → 聊天 Mixin 调 {@link #onChat(ServerPlayer, String)}，
- *       解析数量并执行取货；输入非数字 → 取消请求、提示已取消。</li>
+ *       解析数量并执行取货；</li>
+ *   <li><b>无论取货成功、失败、取消还是超时，最后都把仓库界面开回来</b>
+ *       （见 {@link #reopenWarehouse(ServerPlayer)}）。</li>
  * </ol>
+ *
+ * <h2>为什么要先关界面再开回来</h2>
+ * <p>数量只能在聊天栏里输入，而仓库界面会盖住聊天栏、输入时看不见自己打了什么。
+ * 所以发起请求时先 {@code closeContainer()} 让聊天栏露出来，取完货再自动开回来 ——
+ * 页码 / 潜影盒模式 / 数量排序都在玩家自己的 {@link VoidWarehouseViews.View} 里，
+ * <b>重新打开时和离开时一模一样</b>，玩家感觉不到被打断过。</p>
  *
  * <h2>取货换算（满盒 + 散货）</h2>
  * <p>一盒容量 {@code capacity = 27 × 该物品堆叠上限}。请求数量 {@code N} 拆成：</p>
@@ -35,14 +42,22 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>例如圆石（堆叠 64，capacity 1728）：输入 1729 → 1 满盒 + 1 散货；
  * 输入 3457 → 2 满盒 + 1 散货（3456 + 1）。</p>
  *
+ * <h2>散货够多就顺手装盒（省背包格子）</h2>
+ * <p>散件是按「一组一份」铺进背包的，散货一多就会占掉一大片格子。所以当散货超过
+ * {@link #LOOSE_PACK_STACKS} 组时，<b>把它也装进一个盒子</b>（原本那些满盒之外再多一个盒子）：</p>
+ * <pre>
+ *   输入 2728（圆石） = 1 满盒(1728) + 散货 1000
+ *   1000 &gt; 9 组(576)  → 散货装盒 → 产物 = 1 满盒 + 1 个装 1000 的盒（只占 2 格）
+ * </pre>
+ * <p>散货不足这个数就原样给散件 —— 一个 30 个的散货只占 1 格，为它花一个盒子不划算。</p>
+ *
  * <h2>合成材料的扣除（优先用空盒）</h2>
- * <p>每个满盒都需要一个「盒子」：</p>
+ * <p>每个盒子（含「散货装出来的那个」）都需要一个「盒子」：</p>
  * <ul>
  *   <li><b>仓库里有空潜影盒库存</b> → 优先用空盒装（每盒扣 1 个空盒，不耗壳 / 箱）；</li>
  *   <li><b>空盒不够</b> → 剩下的盒子每个扣 {@link VoidWarehouseShulker#SHELL_COST} 个潜影壳 +
  *       {@link VoidWarehouseShulker#CHEST_COST} 个箱子（原版配方）。</li>
  * </ul>
- * <p>散货不需要盒子，直接给散件。</p>
  *
  * <h2>All-or-nothing</h2>
  * <p>整次操作要么全成、要么全不成：先校验「物品库存 / 空盒 / 壳 / 箱 / 背包空间」全部够，
@@ -54,19 +69,27 @@ public final class VoidWarehouseWithdraw {
 
     private static final long REQUEST_TTL_MS = 30_000L;
 
+    /**
+     * 散货超过这么多「组」就顺手打包成一个盒子。
+     *
+     * <p>9 组 = 9 个背包格子。散货到这个量级再用散件给，背包会被铺掉一大片；
+     * 装成盒只占 1 格。不足这么多就原样给散件 —— 为 30 个散货花一个盒子不划算。</p>
+     */
+    private static final int LOOSE_PACK_STACKS = 9;
+
     private static final Component MSG_PROMPT =
-            info("请在聊天栏输入要取走的数量（输入其他内容取消）");
-    private static final Component MSG_CANCELLED = info("已取消本次取货");
+            VoidWarehouseText.info("请输入要取走的数量（其他内容 = 取消）");
+    private static final Component MSG_CANCELLED = VoidWarehouseText.info("已取消本次取货");
     private static final Component MSG_INVALID =
-            info("输入的不是有效数量，已取消本次取货");
+            VoidWarehouseText.info("不是有效数量，已取消本次取货");
     private static final Component MSG_TOO_LARGE =
-            info("数量过大（最多 " + MAX_REQUEST + "），已取消本次取货");
+            VoidWarehouseText.info("数量过大（最多 " + MAX_REQUEST + "），已取消本次取货");
     private static final Component MSG_NO_STOCK =
-            info("仓库里这种物品的数量不足，本次取货已取消");
+            VoidWarehouseText.info("仓库里这种物品不够，本次取消");
     private static final Component MSG_NO_PARTS =
-            info("空潜影盒 / 潜影壳 / 箱子不足，无法装盒，本次取货已取消");
+            VoidWarehouseText.info("空盒 / 潜影壳 / 箱子不足，无法装盒，本次取消");
     private static final Component MSG_INV_FULL =
-            info("背包放不下这么多物品，本次取货已取消");
+            VoidWarehouseText.info("背包放不下这么多，本次取消");
 
     /** 一条待处理请求：记录要取的是哪种物品（样板，数量恒 1）+ 发起时间 */
     private record Pending(ItemStack sample, long createdMs) {
@@ -91,7 +114,21 @@ public final class VoidWarehouseWithdraw {
             return;
         }
         PENDING.put(player.getUUID(), new Pending(sample.copyWithCount(1), System.currentTimeMillis()));
+        // 先关掉仓库界面：聊天栏被界面盖着，输入时看不见自己打了什么。
+        // 取完货（或取消）会由 onChat 统一开回来，见 reopenWarehouse。
+        player.closeContainer();
         player.sendSystemMessage(MSG_PROMPT);
+    }
+
+    /**
+     * 把仓库界面开回来（无论本次取货是成功、失败、取消还是超时）。
+     *
+     * <p>页码 / 潜影盒模式 / 数量排序都存在<b>按玩家持久化</b>的
+     * {@link VoidWarehouseViews.View} 里，所以重新打开的界面和关掉之前<b>完全一样</b>，
+     * 玩家不会丢失自己翻到的那一页。</p>
+     */
+    private static void reopenWarehouse(ServerPlayer player) {
+        VoidWarehouse.open(player);
     }
 
     /** 玩家有没有一条待处理请求 */
@@ -112,24 +149,32 @@ public final class VoidWarehouseWithdraw {
         if (pending == null) {
             return false;
         }
-        // 过期（玩家磨蹭太久）：直接作废，消息交还原版聊天
+        boolean consumed;
         if (System.currentTimeMillis() - pending.createdMs() > REQUEST_TTL_MS) {
-            return false;
+            // 过期（玩家磨蹭太久）：直接作废，消息交还原版聊天
+            consumed = false;
+        } else {
+            long requested;
+            try {
+                requested = Long.parseLong(message.trim());
+            } catch (NumberFormatException e) {
+                // 非数字：取消请求，但让这条消息照常发出去（玩家可能只是想说话）
+                player.sendSystemMessage(MSG_INVALID);
+                requested = -1;
+            }
+            if (requested < 0) {
+                consumed = false;
+            } else if (requested == 0 || requested > MAX_REQUEST) {
+                player.sendSystemMessage(MSG_TOO_LARGE);
+                consumed = true;
+            } else {
+                execute(player, pending.sample(), requested);
+                consumed = true;
+            }
         }
-        long requested;
-        try {
-            requested = Long.parseLong(message.trim());
-        } catch (NumberFormatException e) {
-            player.sendSystemMessage(MSG_INVALID);
-            // 非数字：取消请求，但让这条消息照常发出去（玩家可能只是想说话）
-            return false;
-        }
-        if (requested <= 0 || requested > MAX_REQUEST) {
-            player.sendSystemMessage(MSG_TOO_LARGE);
-            return true;
-        }
-        execute(player, pending.sample(), requested);
-        return true;
+        // 界面是发起请求时被我们关掉的，所以无论成不成都要开回来
+        reopenWarehouse(player);
+        return consumed;
     }
 
     // ------------------------------------------------------------------ 执行
@@ -144,9 +189,14 @@ public final class VoidWarehouseWithdraw {
         if (data == null) {
             return;
         }
+        int max = Math.max(1, sample.getMaxStackSize());
         long capacity = VoidWarehouseShulker.capacity(sample);
-        long boxes = requested / capacity;
-        long remainder = requested % capacity;
+        long fullBoxes = requested / capacity;
+        long loose = requested % capacity;
+        // 散货超过 LOOSE_PACK_STACKS 组：它单独要占掉一大片背包格子，顺手装进一个盒子
+        // （这个盒子同样要算材料，所以盒子总数是 fullBoxes + 1）
+        boolean packLoose = loose > (long) LOOSE_PACK_STACKS * max;
+        long totalBoxes = packLoose ? fullBoxes + 1 : fullBoxes;
 
         // ① 校验物品库存（精确口径：同物品 + 同数据组件，与 takeExact 一致）
         BigInteger stock = data.amountExact(sample);
@@ -155,9 +205,9 @@ public final class VoidWarehouseWithdraw {
             return;
         }
 
-        // ② 校验盒子材料：优先空盒，不够的用壳 + 箱
-        long emptyBoxes = data.emptyBoxCount().min(BigInteger.valueOf(boxes)).longValue();
-        long needCraft = boxes - emptyBoxes;
+        // ② 校验盒子材料：优先空盒，不够的用壳 + 箱（按 totalBoxes 算，含散货装出来的那个）
+        long emptyBoxes = data.emptyBoxCount().min(BigInteger.valueOf(totalBoxes)).longValue();
+        long needCraft = totalBoxes - emptyBoxes;
         BigInteger needShells = BigInteger.valueOf(needCraft * VoidWarehouseShulker.SHELL_COST);
         BigInteger needChests = BigInteger.valueOf(needCraft * VoidWarehouseShulker.CHEST_COST);
         if (data.amountOf(Items.SHULKER_SHELL).compareTo(needShells) < 0
@@ -166,12 +216,17 @@ public final class VoidWarehouseWithdraw {
             return;
         }
 
-        // ③ 生成产物：boxes 个满盒 + 散货（散货按 maxStackSize 拆成若干满堆叠 + 1 个余数堆叠）
+        // ③ 生成产物：若干满盒 + （散货要么装盒、要么按组拆成散件）
         List<ItemStack> outputs = new ArrayList<>();
-        for (long i = 0; i < boxes; i++) {
+        for (long i = 0; i < fullBoxes; i++) {
             outputs.add(VoidWarehouseShulker.pack(sample, capacity));
         }
-        appendLoose(outputs, sample, remainder);
+        if (packLoose) {
+            // 散货装盒：这一盒没装满（loose < capacity），但只占 1 个背包格
+            outputs.add(VoidWarehouseShulker.pack(sample, loose));
+        } else {
+            appendLoose(outputs, sample, loose);
+        }
         if (outputs.isEmpty()) {
             return;
         }
@@ -196,10 +251,19 @@ public final class VoidWarehouseWithdraw {
         if (needChests.signum() > 0) {
             data.takeItem(Items.CHEST, needChests.intValue());
         }
-        player.sendSystemMessage(info("已取出 " + requested + " 个（"
-                + (boxes > 0 ? boxes + " 满盒" : "")
-                + (remainder > 0 ? (boxes > 0 ? " + " : "") + remainder + " 散货" : "")
-                + "）"));
+        // 提示里如实反映「散货是散着给的还是装盒给的」，玩家一眼知道自己拿到了什么
+        StringBuilder summary = new StringBuilder("已取出 ").append(requested).append(" 个（");
+        boolean hasPrefix = false;
+        if (fullBoxes > 0) {
+            summary.append(fullBoxes).append(" 满盒");
+            hasPrefix = true;
+        }
+        if (packLoose) {
+            summary.append(hasPrefix ? " + " : "").append("散货 ").append(loose).append(" 已装盒");
+        } else if (loose > 0) {
+            summary.append(hasPrefix ? " + " : "").append(loose).append(" 散货");
+        }
+        player.sendSystemMessage(VoidWarehouseText.info(summary.append("）").toString()));
     }
 
     // ------------------------------------------------------------------ 背包
@@ -298,13 +362,4 @@ public final class VoidWarehouseWithdraw {
         inv.setChanged();
     }
 
-    // ------------------------------------------------------------------ 提示
-
-    /** 金色 + [信息] 前缀的聊天栏提示 */
-    private static Component info(String body) {
-        return Component.literal("[信息] ")
-                .withStyle(ChatFormatting.GOLD)
-                .withStyle(ChatFormatting.BOLD)
-                .append(Component.literal(body).withStyle(ChatFormatting.GOLD));
-    }
 }

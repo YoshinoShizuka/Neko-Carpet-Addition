@@ -23,34 +23,45 @@ import java.util.List;
  * <h2>{@code nonce} 的用处</h2>
  * <p>回执靠它和请求配对。打印机同一时刻只允许一个请求在飞，所以其实只要一个整数就够；
  * 保留它主要是为了「迟到的回执不会误导当前这一次请求」。</p>
+ *
+ * <h2>⚠ 这个类被<b>两端共用</b>，改动前先读完这一段</h2>
+ * <p>同一个类在 {@code carpet-Neko-Addition}（服务端）与 {@code litematica-printer}
+ * （客户端）里各有一份<b>源码副本</b>，包名、类名、字段、{@code CODEC} 的结构必须
+ * <b>逐字节等价</b>：</p>
+ * <ul>
+ *   <li>客户端那份在 {@code me.aleksilassila.litematica.printer.integration.voidwarehouse}
+ *       里有一份镜像，只是注释不同；</li>
+ *   <li>为什么必须共用：单人 / 局域网里客户端与服务端<b>同进程</b>，共用
+ *       {@code PayloadTypeRegistryImpl.SERVERBOUND_PLAY} 这一个静态 map。编码时
+ *       {@code CustomPacketPayload.writeCap} 先 {@code buf.writeIdentifier(type.id())}，
+ *       再 {@code findCodec(id)} 按<b>通道名</b>查表，最后拿查到的 codec 去 encode
+ *       客户端那个 payload 对象。</li>
+ *   <li>如果两端各用各的类（历史上就是这样），查到的 codec 内部会
+ *       {@code checkcast} 服务端的类 → 客户端 payload 直接
+ *       {@code ClassCastException: VoidWarehouseTakePayload cannot be cast to
+ *       neko.voidwarehouse.restock.PrinterTakePayload}，连接当场断开。</li>
+ *   <li>共用之后「谁赢」不再重要：Fabric 的类加载按 classpath 顺序取第一个命中的 jar，
+ *       但两份字节码等价，用哪份行为都一样。</li>
+ * </ul>
+ *
+ * <h2>为什么只有一条通道名</h2>
+ * <p>早先版本给打印机单独开过 {@code litematica_printer:printer_take}，想法是
+ * 「名字不同就不会撞」。<b>这个方向是错的</b>：撞不撞看的是类，不是名字；
+ * 名字分开只会让两端各注册一个 key，而客户端发自家 key 时服务端的 handler
+ * 仍然只会 cast 成自己的类。现在收敛回服务端命名空间这一条，
+ * 语义上也更对 —— 这是<b>服务端的能力</b>，通道自然归服务端命名空间。</p>
  */
 public record PrinterTakePayload(int nonce, List<String> candidates) implements CustomPacketPayload {
 
     /**
-     * 服务端自家那条通道：{@code carpet_neko_addition:printer_take}。
+     * 唯一的取货通道：{@code carpet_neko_addition:printer_take}（C2S）。
      *
-     * <p>保留它是为了向后兼容 —— 还没升级的打印机客户端仍然往这条通道发。</p>
+     * <p>客户端与服务端<b>指向同一个常量语义</b>，两边各自的 {@code TYPE} 实例
+     * （但 {@code Identifier} 相等）都能查中注册表里那条记录。</p>
      */
     public static final CustomPacketPayload.Type<PrinterTakePayload> TYPE =
             new CustomPacketPayload.Type<>(
                     Identifier.fromNamespaceAndPath("carpet_neko_addition", "printer_take"));
-
-    /**
-     * 打印机客户端用的专属通道：{@code litematica_printer:printer_take}。
-     *
-     * <h2>为什么非要分成两条</h2>
-     * <p>Fabric 的 {@code PayloadTypeRegistryImpl.register} 实现是
-     * {@code if (packetTypes.containsKey(type.id())) throw new IllegalArgumentException(...)} ——
-     * <b>只按通道名 Identifier 去重</b>，既不比类也不比 CODEC；而每条通道在 dispatch 表里
-     * <b>只绑一个 codec</b>。两边共用同一个名字时：客户端模组与服务端模组抢着注册，
-     * 谁先谁赢；输的一方发出去的包会被赢家的 codec 解释，直接
-     * {@code ClassCastException: VoidWarehouseTakePayload cannot be cast to PrinterTakePayload}。</p>
-     *
-     * <p>分成两条通道名之后，两边的注册互不冲突，各走各的 codec。</p>
-     */
-    public static final CustomPacketPayload.Type<PrinterTakePayload> PRINTER_TYPE =
-            new CustomPacketPayload.Type<>(
-                    Identifier.fromNamespaceAndPath("litematica_printer", "printer_take"));
 
     /**
      * 一次最多带几个候选物品。

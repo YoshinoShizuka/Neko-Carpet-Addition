@@ -52,58 +52,50 @@ public final class PrinterRestockNetwork {
      * <p>两个 {@code PayloadTypeRegistry} 的注册必须早：它们是客户端与服务端
      * 「自定义包能不能收发」的协商依据，晚于连接建立再注册就来不及了。</p>
      *
-     * <h2>为什么<b>只</b>注册自家那两条通道</h2>
-     * <p>本模组的 {@code environment} 是 {@code "*"}，也就是说它<b>也会在客户端进程里跑</b>
-     * （单人存档、局域网主机、以及任何把 Carpet 模组丢进客户端 mods 的玩法都是这种情形）。
-     * 早先这里顺手把 {@code litematica_printer:*} 那套也注册了，理由是「名字不同就不会撞」——
-     * <b>这个理由是错的</b>：Fabric 的注册表是<b>全局单例</b>，同一进程里
-     * 装了 {@code litematica-printer} 客户端模组时，两边会抢着注册同一个
-     * {@code litematica_printer:printer_take_result}，后注册的一方拿到</p>
-     * <pre>{@code IllegalArgumentException: Packet type ... is already registered!}</pre>
-     * <p>而崩溃点会落在客户端的 {@code onInitializeClient}（启动即崩）。</p>
-     *
-     * <h2>两条命名空间的方向划分（这条是硬约束）</h2>
-     * <p>{@code PayloadTypeRegistryImpl} 里 {@code SERVERBOUND_PLAY} 与 {@code CLIENTBOUND_PLAY}
-     * 是<b>两个独立的静态 map</b>，各自按通道名去重。把「谁注册哪个方向」写错一格就会撞。</p>
-     * <table border="1">
-     *   <tr><th>通道</th><th>方向</th><th>注册方</th></tr>
-     *   <tr><td>{@code carpet_neko_addition:printer_take}</td><td>C2S</td><td>服务端（本模组）</td></tr>
-     *   <tr><td>{@code carpet_neko_addition:printer_take_result}</td><td>S2C</td><td>服务端（本模组）</td></tr>
-     *   <tr><td>{@code litematica_printer:printer_take}</td><td>C2S</td><td>服务端（本模组）</td></tr>
-     *   <tr><td>{@code litematica_printer:printer_take_result}</td><td>S2C</td><td><b>打印机客户端，本模组绝不注册</b></td></tr>
-     * </table>
-     * <p>最后一行的「绝不注册」是这次崩溃的修复要点：该 S2C 类型由客户端在自己的
-     * {@code onInitializeClient} 里注册，而本模组 {@code environment="*"} 时也在同一进程里初始化，
-     * 一旦这里也去注册，后到的一方拿 {@code already registered}，客户端<b>启动即崩</b>。</p>
-     *
-     * <p>服务端发这条回执并不需要先注册：{@code ServerPlayNetworking.send} 只做
-     * 「构造包 + 交给连接发出」，不查本地注册表；是否需要发由
-     * {@link ServerPlayNetworking#canSend} 依据客户端协商阶段上报的可接收集合决定。</p>
-     */
-    public static void init() {
-        // ---- 通道 A：服务端自家的 carpet_neko_addition:* ----
-        // C2S：打印机 → 服务端，取货请求
-        PayloadTypeRegistry.serverboundPlay().register(PrinterTakePayload.TYPE, PrinterTakePayload.CODEC);
-        // S2C：服务端 → 打印机，取货回执（旧客户端仍在收这条）
-        PayloadTypeRegistry.clientboundPlay().register(PrinterTakeResultPayload.TYPE, PrinterTakeResultPayload.CODEC);
+ * <h2>注册的总原则：一条通道只有一个主人</h2>
+ * <p>本模组的 {@code environment} 是 {@code "*"}，也就是说它<b>也会在客户端进程里跑</b>
+ * （单人存档、局域网主机、以及任何把 Carpet 模组丢进客户端 mods 的玩法都是这种情形）。
+ * 而 {@code PayloadTypeRegistryImpl} 是<b>全局静态单例</b>，
+ * {@code register} 的实现是 {@code if (packetTypes.containsKey(id)) throw ...}
+ * （<b>严格去重，不是 putIfAbsent</b>）。所以「谁注册哪个 key」必须提前分死，
+ * 两边都注册同一个 key 一定炸。</p>
+ *
+ * <table border="1">
+ *   <tr><th>通道</th><th>方向</th><th>注册方</th></tr>
+ *   <tr><td>{@code carpet_neko_addition:printer_take}</td><td>C2S</td><td>服务端（本模组）</td></tr>
+ *   <tr><td>{@code carpet_neko_addition:printer_take_result}</td><td>S2C</td><td>服务端（本模组）+ 客户端 putIfAbsent</td></tr>
+ * </table>
+ *
+ * <h2>客户端为什么可以不注册 C2S</h2>
+ * <p>{@code ClientPlayNetworking.send} 只做「构造包 + 交给连接发出」，<b>发送本身不查本地注册表</b>；
+ * 但<b>编码阶段会查</b> —— {@code writeCap} 按 {@code type.id()} 去
+ * {@code PayloadTypeRegistryImpl.SERVERBOUND_PLAY} 找 codec。同进程时这张表
+ * 就是服务端刚填好的那张，里面已经有 {@code printer_take} → 客户端直接受益，
+ * 无需自己再注册（自己注册反而会撞名字）。</p>
+ *
+ * <h2>回执为什么两边都注册</h2>
+ * <p>回执是 S2C：服务端 {@code send} 时需要 {type, codec} 去构造包，客户端需要
+ * 同一个 {type, codec} 去解包。同进程下这是同一张 {@code CLIENTBOUND_PLAY} 表，
+ * 谁先注册谁占坑。本模组主体在服务端、初始化更早，所以由这里注册；
+ * 客户端侧的注册写成「表里已有就跳过」的幂等形式，双保险。</p>
+ */
+public static void init() {
+    // C2S：打印机 → 服务端，取货请求。整张表里这有且只有这一个 key，
+    // 客户端复用这一条（它自己不注册），因此两端解析到的永远是同一个类。
+    PayloadTypeRegistry.serverboundPlay().register(PrinterTakePayload.TYPE, PrinterTakePayload.CODEC);
+    // S2C：服务端 → 打印机，取货回执
+    PayloadTypeRegistry.clientboundPlay().register(PrinterTakeResultPayload.TYPE, PrinterTakeResultPayload.CODEC);
 
-        // ---- 通道 B：打印机专属 litematica_printer:* ----
-        // 只登记 C2S 一侧（服务端要「收」新版客户端的请求，解包必须有 codec）。
-        // S2C 一侧（printer_take_result）刻意<b>不</b>登记 —— 所有权在客户端，理由见上。
-        PayloadTypeRegistry.serverboundPlay().register(PrinterTakePayload.PRINTER_TYPE, PrinterTakePayload.CODEC);
+    ServerPlayNetworking.registerGlobalReceiver(PrinterTakePayload.TYPE, PrinterRestockNetwork::handle);
 
-        // 两套 C2S 通道接到同一个处理器上 —— 请求语义完全相同，只是通道名不同
-        ServerPlayNetworking.registerGlobalReceiver(PrinterTakePayload.TYPE, PrinterRestockNetwork::handle);
-        ServerPlayNetworking.registerGlobalReceiver(PrinterTakePayload.PRINTER_TYPE, PrinterRestockNetwork::handle);
-
-        // 玩家下线就把限流记录抹掉，否则长期运行的服务器会一直攒着离线玩家的 UUID
-        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
-            ServerPlayer player = handler.player;
-            if (player != null) {
-                LAST_REQUEST_AT.remove(player.getUUID());
-            }
-        });
-    }
+    // 玩家下线就把限流记录抹掉，否则长期运行的服务器会一直攒着离线玩家的 UUID
+    ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+        ServerPlayer player = handler.player;
+        if (player != null) {
+            LAST_REQUEST_AT.remove(player.getUUID());
+        }
+    });
+}
 
     /**
      * 收到取货请求。
@@ -146,25 +138,20 @@ public final class PrinterRestockNetwork {
     }
 
     /**
-     * 把结果按「客户端能收哪条就发哪条」回执出去。
+     * 把结果回执出去。
      *
-     * <p>两条 S2C 通道的归属不同：{@code carpet_neko_addition:printer_take_result}
-     * 是本模组注册的（老客户端认这条）；{@code litematica_printer:printer_take_result}
-     * 由打印机客户端自己注册。所以先问 {@code canSend}——它查的是客户端在
-     * 通道协商阶段上报的可接收集合，等价于「对面到底登记了哪个类型」。</p>
-     *
-     * <p>新版客户端<b>只</b>登记了 {@code litematica_printer:*} 那条，
-     * 对它发自家通道是白费（会被当未知通道丢掉）；老客户端则相反。两边发的话，
-     * 对面总会收到一条、另一条静默丢弃，代价极小，换来「新旧客户端都不用改」。</p>
+     * <p>{@code ServerPlayNetworking.send} 只做「构造包 + 交给连接发出」，
+     * 不需要对端先注册；真正决定「发不发得出去」的是 {@code canSend} ——
+     * 它查客户端在通道协商阶段上报的可接收集合（也就是对面到底登记了哪个类型）。
+     * 通道现在只有一条，发之前问一句，对端没装模组就干脆别发。</p>
      */
     private static void reply(ServerPlayer player, int nonce, int status) {
         if (player == null) {
             return;
         }
-        PrinterTakeResultPayload payload = new PrinterTakeResultPayload(nonce, status);
-        ServerPlayNetworking.send(player, payload);
-        if (ServerPlayNetworking.canSend(player, PrinterTakeResultPayload.PRINTER_TYPE)) {
-            ServerPlayNetworking.send(player, payload);
+        if (!ServerPlayNetworking.canSend(player, PrinterTakeResultPayload.TYPE)) {
+            return;
         }
+        ServerPlayNetworking.send(player, new PrinterTakeResultPayload(nonce, status));
     }
 }

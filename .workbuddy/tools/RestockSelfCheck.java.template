@@ -8,6 +8,7 @@ import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.network.Connection;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
 import net.minecraft.server.level.ServerLevel;
@@ -181,40 +182,66 @@ public final class RestockSelfCheck {
                 net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.getGlobalReceivers()
                         .contains(PrinterTakePayload.TYPE.id()));
 
-        // ---- 12. 注册方向划分的回归断言（跨模组共用通道时最容易踩的坑）----
-        // 血泪史：服务端模组 `environment="*"`，也会在客户端进程里初始化。
-        // 曾把 litematica_printer:printer_take_result 的 S2C 也注册了，与同进程的
-        // printer 客户端抢注册 → 客户端 onInitializeClient 抛
-        // IllegalArgumentException: Packet type ... is already registered!，启动即崩。
-        // 用「再注册一次会不会成功」反推本模组占没占这条通道，是最省事也最可靠的查法。
-        check("R26b C2S 双通道接收端都挂着",
-                ServerPlayNetworking.getGlobalReceivers().contains(PrinterTakePayload.TYPE.id())
-                        && ServerPlayNetworking.getGlobalReceivers()
-                                .contains(PrinterTakePayload.PRINTER_TYPE.id()));
-        check("R26c 两条通道名确实不同",
-                !PrinterTakePayload.TYPE.id().equals(PrinterTakePayload.PRINTER_TYPE.id())
-                        && !PrinterTakeResultPayload.TYPE.id()
-                                .equals(PrinterTakeResultPayload.PRINTER_TYPE.id()));
+        // ---- 12. 单通道架构的回归断言（跨模组共用 payload 类时最容易踩的坑）----
+        // 血泪史（两个阶段）：
+        //  ① 最早两端各用自己的 payload 类、共用同一个通道名 → 编码时
+        //     ClassCastException: VoidWarehouseTakePayload cannot be cast to PrinterTakePayload。
+        //  ② 改成「两条通道名各走各的」→ 客户端发自家通道时，服务端 handler 仍然
+        //     要 cast 成自己的类，还是炸；且服务端顺手注册 S2C 还会与客户端抢注册。
+        // 最终解法：两端<b>共用同一个 payload 类</b>（同包同名），通道也收敛成一条。
+        // 下面的断言就是钉住这个不变量 —— 谁再加第二条通道 / 再改一处名字，这里立刻红。
+        check("R26b C2S 接收端挂着（单通道）",
+                ServerPlayNetworking.getGlobalReceivers().contains(PrinterTakePayload.TYPE.id()));
+        check("R26c 通道收敛为服务端命名空间",
+                PrinterTakePayload.TYPE.id().getNamespace().equals("carpet_neko_addition")
+                        && PrinterTakeResultPayload.TYPE.id().getNamespace()
+                                .equals("carpet_neko_addition"));
 
-        // S2C：本模组<b>不该</b>占着 printer 那条 —— 能成功注册 = 客户端注册它时不会撞
-        boolean s2cFree = true;
-        try {
-            PayloadTypeRegistry.clientboundPlay()
-                    .register(PrinterTakeResultPayload.PRINTER_TYPE, PrinterTakeResultPayload.CODEC);
-        } catch (IllegalArgumentException already) {
-            s2cFree = false;
-        }
-        check("R26d S2C 的 printer 通道未被本模组占用（客户端可安全注册）", s2cFree);
-
-        // C2S：本模组<b>必须</b>占着它，否则收不到新版客户端的请求
-        boolean c2sTaken = false;
+        // 关键不变量：注册表里那条 C2S 记录绑的 codec，必须就是 PrinterTakePayload 自己的
+        // codec。名字一样、但 codec 互换了（比如被另一个 mod 抢先注册）就说明架构又歪了。
+        boolean c2sIsOurs = false;
         try {
             PayloadTypeRegistry.serverboundPlay()
-                    .register(PrinterTakePayload.PRINTER_TYPE, PrinterTakePayload.CODEC);
+                    .register(PrinterTakePayload.TYPE, PrinterTakePayload.CODEC);
         } catch (IllegalArgumentException already) {
-            c2sTaken = true;
+            // 抛异常 = 这个 key 已被占用。占用者是不是我们？
+            // 用「注册 PrinterTakeResultPayload 的 codec 到同一个 key 会不会也被拒」
+            // 没法区分，改为直接断言：本条能注册成功（说明刚才没注册过）就不算 ours。
+            c2sIsOurs = true;
         }
-        check("R26e C2S 的 printer 通道已被本模组注册（能收新版请求）", c2sTaken);
+        check("R26d C2S 的 printer_take 通道已被本模组注册（顺序无关）", c2sIsOurs);
+
+        // 两条 S2C/C2S 的名字必须不同，否则表里会互相覆盖
+        check("R26e 取货与回执是两条不同通道",
+                !PrinterTakePayload.TYPE.id().equals(PrinterTakeResultPayload.TYPE.id()));
+
+        // 关键不变量：C2S 表里 printer_take 那条记录的 codec 必须能直接编解码
+        // PrinterTakePayload 自己 —— 这正是「两端共用一个类」落地的直接证据。
+        // 编码时 writeCap 走的就是这条 codec，能过就说明不会再 ClassCastException。
+        //
+        // 注意 PayloadTypeRegistry 接口上没有 get(id)（只有 register / registerLarge），
+        // 唯一的只读入口在实现类 PayloadTypeRegistryImpl 上；这里两个都试：
+        // 优先用接口 register 的返回值（最稳），拿不到再退到 Impl.get。
+        boolean roundTripThroughRegistry = false;
+        try {
+            PrinterTakePayload probePayload = new PrinterTakePayload(7, List.of("minecraft:stone"));
+            net.minecraft.network.protocol.common.custom.CustomPacketPayload.TypeAndCodec<?, ?>
+                    entry = resolveRegisteredEntry();
+            if (entry != null) {
+                @SuppressWarnings("unchecked")
+                net.minecraft.network.codec.StreamCodec<FriendlyByteBuf,
+                        net.minecraft.network.protocol.common.custom.CustomPacketPayload> codec =
+                        (net.minecraft.network.codec.StreamCodec<FriendlyByteBuf,
+                                net.minecraft.network.protocol.common.custom.CustomPacketPayload>) entry.codec();
+                FriendlyByteBuf probe = new FriendlyByteBuf(Unpooled.buffer());
+                codec.encode(probe, probePayload);
+                roundTripThroughRegistry = probePayload.equals(codec.decode(probe));
+                probe.release();
+            }
+        } catch (Throwable t) {
+            System.out.println("   注册表 codec 往返失败: " + t);
+        }
+        check("R26f 注册表里的 codec 能编解码本类（共用类落地的直接证据）", roundTripThroughRegistry);
 
         PrinterTakePayload request = new PrinterTakePayload(42,
                 List.of("minecraft:stone", "minecraft:cobblestone"));
@@ -288,5 +315,24 @@ public final class RestockSelfCheck {
         for (int i = 0; i < 36; i++) {
             inv.setItem(i, template.copyWithCount(template.getCount()));
         }
+    }
+
+    /**
+     * 取 C2S 表里 {@code printer_take} 那条记录（type + codec）。
+     *
+     * <p>{@code PayloadTypeRegistry} 这个<b>接口</b>只暴露 register / registerLarge，
+     * 没有只读查询入口；真正的查表方法 {@code get(Identifier)} 在实现类
+     * {@code PayloadTypeRegistryImpl} 上（也是 public）。这里直接强转过去用。</p>
+     *
+     * <p>本模组在编译期只有 Fabric 的 api 模块（implementation fabric-api），
+     * 实现类在同一个 jar 里，所以强转不需要额外依赖。</p>
+     */
+    private static net.minecraft.network.protocol.common.custom.CustomPacketPayload.TypeAndCodec<?, ?>
+            resolveRegisteredEntry() {
+        Object registry = PayloadTypeRegistry.serverboundPlay();
+        if (registry instanceof net.fabricmc.fabric.impl.networking.PayloadTypeRegistryImpl<?> impl) {
+            return impl.get(PrinterTakePayload.TYPE.id());
+        }
+        return null;
     }
 }

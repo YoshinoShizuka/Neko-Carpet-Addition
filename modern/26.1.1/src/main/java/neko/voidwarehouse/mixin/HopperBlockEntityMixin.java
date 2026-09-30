@@ -81,6 +81,12 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * {@link VoidWarehouseHopperFilter}），由 {@code SlotMixin} 在玩家手动放东西时打开、
  * 在漏斗被掏空时关掉。标记只在「口朝向终端」的入库漏斗上生效，
  * <b>普通漏斗即使带着标记也完全按原版跑</b>。</p>
+ * <p><b>旧存档兼容性</b>：种子清单上线前的旧存档只存了这个布尔标记、没有逐格种子，
+ * 当年的分类物是「反推漏斗当前内容」得来的（会把残留货物一并认成分类物，
+ * 事故现场 {@code 橡木 石头 空 空 空}）。这类存档加载时<b>不再信任</b>：
+ * {@link VoidWarehouseClassifier#healLegacy} 直接清掉种子、关掉过滤，让玩家重新手动指定
+ * （分类物只能由玩家的手声明）。带新格式 schema 标记（{@code CLASSIFIER_SCHEMA_TAG}）的
+ * 存档才信任其逐格种子。</p>
  * <p>这一处注入写的是 {@code require = 0}：{@code canPlaceItemInContainer} 是
  * {@code private static} 的私有实现，原版以后把它内联进 {@code tryMoveInItem} 是完全可能的。
  * 真到那一天，我们宁可「这一个功能悄悄失效」，也不要「整个模组加载失败、把所有人的服务器带崩」 ——
@@ -98,6 +104,9 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
 
     /** 存档里「玩家指定的分类物清单」的键名（定长 5 条，空格写 {@code ItemStack.EMPTY}） */
     private static final String CLASSIFIER_SEED_TAG = "CarpetNekoAdditionClassifierSeeds";
+
+    /** 存档格式标记：带这个键的才信任其逐格种子；不带的一律按旧存档治愈（清掉污染） */
+    private static final String CLASSIFIER_SCHEMA_TAG = "CarpetNekoAdditionClassifierSchema";
 
     /** 漏斗的格子数（原版固定 5，这里写成常量省得每次问容器） */
     private static final int HOPPER_SLOTS = 5;
@@ -172,6 +181,9 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
     private void carpetAutomending$saveClassifierFilter(ValueOutput output, CallbackInfo ci) {
         if (this.carpetAutomending$classifierFilter) {
             output.putBoolean(CLASSIFIER_FILTER_TAG, true);
+            // 新格式标记：带它才说明逐格种子是「玩家亲手指定的」，加载时值得信任。
+            // 旧存档（种子清单上线前写的）没有这个标记，加载时一律按污染治愈、清掉重来。
+            output.putBoolean(CLASSIFIER_SCHEMA_TAG, true);
             // 按格子独立写 key，<b>空槽一律跳过</b>：ItemStack.CODEC 拒绝 air（count=0），
             // 当初图省事用定长 list 把 5 格全写进去，空槽的 EMPTY 会触发
             // 「Failed to append ... minecraft:air」警告并静默丢弃 —— 虽然不影响对齐，
@@ -189,12 +201,24 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
      * 从存档读回标记与分类物清单：<b>服务器重启、区块卸载重载之后，白名单照样在</b>。
      *
      * <p>标签不存在时读成 {@code false} / 全空（老存档 / 普通漏斗）。
-     * 老存档只有开关、没有清单 —— 那种情况由 {@link VoidWarehouseClassifier#adoptLegacy}
-     * 就地把当时的漏斗内容认作分类物，玩家摆过的东西不会丢。</p>
+     * 老存档（种子清单上线前写的）只有开关、没有逐格种子，当年的分类物是「反推漏斗
+     * 当前内容」得来的 —— 会把残留货物一并认成分类物。这类存档<b>不再信任</b>：
+     * 由 {@link VoidWarehouseClassifier#healLegacy} 直接清掉种子、关掉过滤，
+     * 让玩家重新手动指定（分类物只能由玩家的手声明）。</p>
      */
     @Inject(method = "loadAdditional", at = @At("HEAD"))
     private void carpetAutomending$loadClassifierFilter(ValueInput input, CallbackInfo ci) {
         this.carpetAutomending$classifierFilter = input.getBooleanOr(CLASSIFIER_FILTER_TAG, false);
+        boolean schemaOk = input.getBooleanOr(CLASSIFIER_SCHEMA_TAG, false);
+        if (!schemaOk) {
+            // 旧存档（种子清单上线前写的）：filter 开关可能是开的，但分类物是当年靠
+            // 「反推漏斗当前内容」得来的 —— 漏斗里若混着杂物（事故现场 橡木 石头 空 空 空），
+            // 那份杂物会被一并认成分类物、写成永久的逐格种子，以后每次加载都复现。
+            // 不信任：直接清掉所有种子、关掉过滤，让玩家重新手动指定。
+            // （分类物只能由玩家的手声明，这是硬规则，不能靠反推漏斗内容猜。）
+            VoidWarehouseClassifier.healLegacy(this, false);
+            return;
+        }
         for (int i = 0; i < HOPPER_SLOTS; i++) {
             // 按格子独立读：写着的那几格读回来，没写的那几格保持空（没被指定过）
             final int slot = i;
@@ -220,14 +244,10 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
         if (VoidWarehouseHopper.isIntake(serverLevel, pos, state)) {
             VoidWarehouseHopperFilter self = (VoidWarehouseHopperFilter) hopper;
             if (self.hasClassifierFilter() && !VoidWarehouseClassifier.hasAnySeed(self)) {
-                // 一份分类物都没指定（老存档可能只有开关、没有清单）→ 就地认下当前内容，
-                // 免得升级之后玩家摆过的白名单凭空消失（详见 adoptLegacy）。
-                VoidWarehouseClassifier.adoptLegacy(hopper, self);
-                hopper.setChanged();
-            }
-            if (self.hasClassifierFilter() && !VoidWarehouseClassifier.hasAnySeed(self)) {
-                // 连当前内容也是空的 → 真的没有分类物 → 自动退出过滤模式，
-                // 回到「漏斗里有什么就搬什么」的原规则
+                // 一份分类物都没指定（正常路径上开关早被关掉了，这里只是兜底）→
+                // 回到「漏斗里有什么就搬什么」的原规则，不让一个空开关卡住搬运。
+                // 注意：不再像旧版那样「就地认下当前内容」当分类物 —— 那会把残留的
+                // 货物（比如上方容器流下来的石头）一并认成分类物，正是 橡木 石头 空 空 空 的元凶。
                 self.setClassifierFilter(false);
                 hopper.setChanged();
             }

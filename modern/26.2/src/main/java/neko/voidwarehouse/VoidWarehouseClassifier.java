@@ -1,7 +1,6 @@
 package neko.voidwarehouse;
 
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.level.block.entity.HopperBlockEntity;
 
 /**
  * 「分类物」—— 漏斗里玩家摆出来的那几件物品。
@@ -29,6 +28,9 @@ import net.minecraft.world.level.block.entity.HopperBlockEntity;
  * </ol>
  */
 public final class VoidWarehouseClassifier {
+    /** 漏斗固定 5 格（与 {@code HopperBlockEntityMixin#HOPPER_SLOTS} 一致）。 */
+    private static final int SLOTS = 5;
+
     /**
      * 每格至少要留住的个数 —— 这就是「余量」。
      *
@@ -52,7 +54,7 @@ public final class VoidWarehouseClassifier {
      * 恰好躺在里面的货物一并认成分类物。</p>
      */
     public static boolean hasAnySeed(VoidWarehouseHopperFilter filter) {
-        for (int i = 0; i < hopperSlots(filter); i++) {
+        for (int i = 0; i < SLOTS; i++) {
             if (!filter.getClassifierSeed(i).isEmpty()) {
                 return true;
             }
@@ -72,7 +74,7 @@ public final class VoidWarehouseClassifier {
         if (stack.isEmpty()) {
             return false;
         }
-        for (int i = 0; i < hopperSlots(filter); i++) {
+        for (int i = 0; i < SLOTS; i++) {
             ItemStack seed = filter.getClassifierSeed(i);
             if (!seed.isEmpty() && ItemStack.isSameItemSameComponents(seed, stack)) {
                 return true;
@@ -105,7 +107,7 @@ public final class VoidWarehouseClassifier {
      * @param slot 机器正打算往哪一格塞（原版 {@code tryMoveInItem} 给的槽位号）
      */
     public static boolean isOwnSlot(VoidWarehouseHopperFilter filter, ItemStack stack, int slot) {
-        if (stack.isEmpty() || slot < 0 || slot >= hopperSlots(filter)) {
+        if (stack.isEmpty() || slot < 0 || slot >= SLOTS) {
             return false;
         }
         ItemStack seed = filter.getClassifierSeed(slot);
@@ -113,26 +115,26 @@ public final class VoidWarehouseClassifier {
     }
 
     /**
-     * <b>老存档兼容</b>：开关是开的，但清单是空的（本轮之前没有清单这个概念）。
+     * <b>旧存档治愈（根因修复）</b>：种子清单上线之前写的旧存档，只存了一个 filter 开关、
+     * 没有逐格种子，分类物是靠「反推漏斗当前内容」得到的。那种存档的漏斗里可能混着杂物
+     * （事故现场 {@code 橡木 石头 空 空 空}），如果原样认领，石头会被永久当成分类物 ——
+     * 玩家只摆了橡木，看到的却是 {@code 橡木 石头 空 空 空}，而且<b>以后每次加载都复现</b>
+     * （污染被写进了永久的逐格种子）。
      *
-     * <p>那种存档里「分类物」本来就等价于「漏斗里当时装着什么」，所以这里照旧
-     * 把当前 5 格认作分类物，玩家摆过的白名单就不会在升级之后凭空消失。
-     * 认领完当场写进清单，之后一律以清单为准。</p>
+     * <p>所以旧存档<b>一律不信任</b>：清掉所有种子、关掉过滤，让玩家重新手动指定。
+     * 分类物只能由玩家的手来声明，这是硬规则，不能靠反推漏斗内容猜。</p>
      *
-     * <p>副作用要说明白：如果玩家的漏斗里当时混进了杂物（正是事故现场那种
-     * {@code 橡木 石头 空 空 空}），那份杂物也会被认领进去。
-     * 处理办法很简单 —— 把那一格的物品手动拿走，清单上这一格随即清空。</p>
+     * @param schemaOk 存档是否带新格式 schema 标记。带标记的（本轮之后写的）才信任其种子；
+     *                 不带标记的一律按旧存档处理（清掉、关掉）。
      */
-    public static void adoptLegacy(HopperBlockEntity hopper, VoidWarehouseHopperFilter filter) {
-        int slots = hopper.getContainerSize();
-        for (int i = 0; i < slots; i++) {
-            filter.setClassifierSeed(i, hopper.getItem(i));
+    public static void healLegacy(VoidWarehouseHopperFilter filter, boolean schemaOk) {
+        if (schemaOk) {
+            return;
         }
-    }
-
-    private static int hopperSlots(VoidWarehouseHopperFilter filter) {
-        // 清单长度由实现方保证（原版漏斗固定 5 格）；这里不假设，问一句更稳
-        return filter instanceof HopperBlockEntity hopper ? hopper.getContainerSize() : 5;
+        for (int i = 0; i < 5; i++) {
+            filter.setClassifierSeed(i, ItemStack.EMPTY);
+        }
+        filter.setClassifierFilter(false);
     }
 
 }

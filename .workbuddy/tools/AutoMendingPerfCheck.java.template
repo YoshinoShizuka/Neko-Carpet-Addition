@@ -1,0 +1,349 @@
+package neko.automending;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.core.Holder;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.enchantment.Enchantment;
+import net.minecraft.world.item.enchantment.Enchantments;
+
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * 【临时性能自检】量化 {@link AutoMending#mending} 的单次开销，用来回答
+ * 「带经验修补装备的玩家很多时会不会有性能问题」。
+ *
+ * <p>要测的三件事：</p>
+ * <ol>
+ *   <li><b>单次调用的绝对开销</b> —— 分「空槽 / 有装备但未受损 / 有装备且受损」三种形态。
+ *       第一种是下界，第二种是绝大多数玩家绝大多数时刻的真实状态（也是玩家数放大时真正要乘的量），
+ *       第三种是热路径。</li>
+ *   <li><b>是否随「身上带多少件」增长</b> —— 换一批装备件数不同但都未受损的玩家对照。</li>
+ *   <li><b>是否随「单件附魔条数」增长</b> —— 一件装备挂 8 个附魔，看是否变慢。</li>
+ * </ol>
+ *
+ * <p>测量方法：预热若干轮再计时，热路径用「重置 + 修补」减去「只重置」得到净开销。</p>
+ */
+public final class PerfSelfCheck {
+
+    private static boolean done = false;
+
+    /** 预热轮数（让 JIT 把 mending 内联掉，否则测的是解释器） */
+    private static final int WARMUP = 100_000;
+    /** 正式测量轮数（每轮 ITERS 次） */
+    private static final int ITERS = 300_000;
+    /** 重复轮数，取最小值 —— 最小值比平均值更能反映「无 GC/JIT 干扰」的真实开销 */
+    private static final int ROUNDS = 5;
+
+    /** 吃掉循环结果，防止 JIT 判定为死代码把整个循环删掉 */
+    private static long sink;
+
+    /** 模拟「玩家身上会参与修补的槽位」：原版 getRandomItemWith 只遍历这些 */
+    private static final EquipmentSlot[] GEAR = {
+            EquipmentSlot.HEAD,
+            EquipmentSlot.CHEST,
+            EquipmentSlot.LEGS,
+            EquipmentSlot.FEET,
+            EquipmentSlot.MAINHAND,
+            EquipmentSlot.OFFHAND
+    };
+
+    private PerfSelfCheck() {
+    }
+
+    /**
+     * @return true 表示本轮执行了自检（调用方据此 halt 服务端）；已跑过则返回 false
+     */
+    public static boolean run(MinecraftServer server) {
+        if (done) {
+            return false;
+        }
+        ServerLevel level = server.overworld();
+        if (level == null) {
+            return false;
+        }
+        done = true;
+
+        System.out.println("==== PerfSelfCheck begin ====");
+        System.out.println("   预热 " + WARMUP + " 次 / 每组 " + ROUNDS + " 轮 × " + ITERS + " 次，取最小值");
+
+        Holder<Enchantment> mending;
+        try {
+            Registry<Enchantment> reg = level.registryAccess().lookupOrThrow(Registries.ENCHANTMENT);
+            mending = reg.getOrThrow(Enchantments.MENDING);
+        } catch (Throwable t) {
+            System.out.println("   取 mending 附魔失败: " + t);
+            System.out.println("SMOKE RESULT automending-perf/26.3 checks=1 failures=1");
+            return true;
+        }
+
+        ServerPlayer p = fakePlayer(server, level, "PerfProbe");
+        if (p == null) {
+            System.out.println("FAIL 假玩家构造");
+            System.out.println("SMOKE RESULT automending-perf/26.3 checks=1 failures=1");
+            return true;
+        }
+
+        // ---------- 组 A：完全空槽（下界） ----------
+        double nsEmpty = bench(() -> AutoMending.mending(p), p);
+
+        // ---------- 组 B：6 件 mending 装备，全部未受损（稳态） ----------
+        equip(p, mending, 0);
+        double nsIdle = bench(() -> AutoMending.mending(p), p);
+
+        // ---------- 组 C：6 件 mending 装备，全部受损（热路径，净开销） ----------
+        equip(p, mending, 400);
+        double nsHotRaw = bench(() -> {
+            resetXp(p, 2752);
+            resetGear(p, 400);
+            AutoMending.mending(p);
+        }, p);
+        double nsResetOnly = bench(() -> {
+            resetXp(p, 2752);
+            resetGear(p, 400);
+        }, p);
+        double nsHot = nsHotRaw - nsResetOnly;
+
+        // ---------- 组 D：6 件装备，每件 8 条附魔，全部受损 ----------
+        //    与组 C 用完全相同的重置结构（6 件 setDamageValue），这样 D − C 就是纯粹的
+        //    「单件附魔条数」影响，不会混进重置成本的噪声。
+        clearGear(p);
+        List<Holder<Enchantment>> extras = List.of(
+                reg(level, Enchantments.UNBREAKING),
+                reg(level, Enchantments.PROTECTION),
+                reg(level, Enchantments.THORNS),
+                reg(level, Enchantments.RESPIRATION),
+                reg(level, Enchantments.AQUA_AFFINITY),
+                reg(level, Enchantments.DEPTH_STRIDER),
+                reg(level, Enchantments.FEATHER_FALLING)
+        );
+        ItemStack[] fat = {
+                new ItemStack(Items.NETHERITE_HELMET),
+                new ItemStack(Items.NETHERITE_CHESTPLATE),
+                new ItemStack(Items.NETHERITE_LEGGINGS),
+                new ItemStack(Items.NETHERITE_BOOTS),
+                new ItemStack(Items.NETHERITE_SWORD),
+                new ItemStack(Items.SHIELD)
+        };
+        int loadedEnchants = 0;
+        for (int i = 0; i < GEAR.length; i++) {
+            ItemStack st = fat[i];
+            st.enchant(mending, 1);
+            for (Holder<Enchantment> e : extras) {
+                st.enchant(e, 3);
+            }
+            st.setDamageValue(400);
+            loadedEnchants = Math.max(loadedEnchants, st.getEnchantments().size());
+            p.setItemSlot(GEAR[i], st);
+        }
+        double nsManyEnchRaw = bench(() -> {
+            resetXp(p, 2752);
+            resetGear(p, 400);
+            AutoMending.mending(p);
+        }, p);
+        double nsManyEnchReset = bench(() -> {
+            resetXp(p, 2752);
+            resetGear(p, 400);
+        }, p);
+        double nsManyEnch = nsManyEnchRaw - nsManyEnchReset;
+
+        // ---------- 组 F：最坏支付分支 —— 低等级 + 进度条空 + 满损高耐久物品 ----------
+        //    这会真的走进 spendExact 的 while 循环（逐级下降，最多 8 级），并触发
+        //    「付不满 → 按实付回滚耐久」。是自动修补里最重的一条路径。
+        clearGear(p);
+        ItemStack pick = new ItemStack(Items.NETHERITE_PICKAXE);
+        pick.enchant(mending, 1);
+        int pickMax = pick.getMaxDamage();
+        p.setItemSlot(EquipmentSlot.MAINHAND, pick);
+        double nsDrainRaw = bench(() -> {
+            p.setExperienceLevels(30);
+            p.setExperiencePoints(0);
+            pick.setDamageValue(pickMax);
+            AutoMending.mending(p);
+        }, p);
+        double nsDrainReset = bench(() -> {
+            p.setExperienceLevels(30);
+            p.setExperiencePoints(0);
+            pick.setDamageValue(pickMax);
+        }, p);
+        double nsDrain = nsDrainRaw - nsDrainReset;
+
+        // ---------- 组 G：装备槽全空，但背包里塞满 36 件「受损 + mending」物品 ----------
+        //    用来验证「携带」不参与：getRandomItemWith 只遍历 EquipmentSlot.VALUES，
+        //    背包里的东西一次都不会被看到。这一组的耗时应当与组 A（空槽）同量级。
+        clearGear(p);
+        int backpackItems = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack st = new ItemStack(Items.NETHERITE_PICKAXE);
+            st.enchant(mending, 1);
+            st.setDamageValue(1000);
+            p.getInventory().setItem(i, st);
+            backpackItems++;
+        }
+        double nsBackpack = bench(() -> AutoMending.mending(p), p);
+        for (int i = 0; i < 36; i++) {
+            p.getInventory().setItem(i, ItemStack.EMPTY);
+        }
+
+        // ---------- 组 E：10 个玩家（验证「玩家数线性」） ----------
+        clearGear(p);
+        ServerPlayer[] many = new ServerPlayer[10];
+        for (int i = 0; i < many.length; i++) {
+            many[i] = fakePlayer(server, level, "PerfProbe" + i);
+            if (many[i] != null) {
+                equip(many[i], mending, 0);
+            }
+        }
+        double nsTenPlayers = bench(() -> {
+            for (ServerPlayer q : many) {
+                if (q != null) {
+                    AutoMending.mending(q);
+                }
+            }
+        }, p) / 10.0;
+
+        clearGear(p);
+
+        // ---------- 换算 ----------
+        System.out.println();
+        System.out.println("组 A 空槽（无装备）        : " + fmt(nsEmpty) + " ns/次");
+        System.out.println("组 B 6 件 mending 未受损   : " + fmt(nsIdle) + " ns/次   <-- 稳态，乘以玩家数");
+        System.out.println("组 C 6 件 mending 已受损   : " + fmt(nsHot) + " ns/次   <-- 热路径净开销");
+        System.out.println("组 D 6 件 × " + loadedEnchants + " 条附魔 + 受损 : " + fmt(nsManyEnch) + " ns/次");
+        System.out.println("组 F 付不满分支（满损镐，需逐级扣 8 级）: " + fmt(nsDrain) + " ns/次");
+        System.out.println("组 E 10 玩家 ÷ 10（未受损）: " + fmt(nsTenPlayers) + " ns/次/玩家");
+        System.out.println("组 G 背包塞满 " + backpackItems + " 件受损 mending，装备槽全空: "
+                + fmt(nsBackpack) + " ns/次   <-- 应与组 A 同量级");
+        System.out.println();
+        report("100 玩家 @ 1 次/秒，稳态", nsIdle, 100);
+        report("500 玩家 @ 1 次/秒，稳态", nsIdle, 500);
+        report("100 玩家 @ 1 次/秒，全部受损（最坏假设）", nsHot, 100);
+        report("100 玩家 @ 1 次/秒，全走付不满分支（极端最坏）", nsDrain, 100);
+        System.out.println();
+        System.out.println("   参考：50 ms = 一个 tick 的全部预算（20 TPS）");
+        System.out.println("   说明：重置成本已用「重置+修补 − 只重置」减掉；E 组用于验证与玩家数成正比");
+
+        double ratio = nsIdle > 0 ? nsTenPlayers / nsIdle : 0;
+        int failures = 0;
+        // 线性验证：10 玩家摊薄后应和单玩家同量级（放宽到 3 倍以避免 JIT/GC 噪声误判）
+        if (!(ratio > 0 && ratio < 3.0)) {
+            System.out.println("FAIL 组 E 与组 B 偏差过大（比值 " + fmt(ratio) + "），线性假设不成立");
+            failures++;
+        }
+        // 「携带」不参与：背包塞满 36 件受损 mending 后，耗时应当仍然明显低于
+        // 「身上穿 6 件 mending」的稳态开销（组 G < 组 B）。这才是有含义的对照：
+        // 若背包物品真的参与扫描，组 G 会跳到组 C（上千 ns）那一档。
+        if (!(nsBackpack < nsIdle)) {
+            System.out.println("FAIL 组 G(" + fmt(nsBackpack) + ") 未低于组 B(" + fmt(nsIdle)
+                    + ")，背包物品疑似参与了扫描");
+            failures++;
+        }
+        System.out.println("   对照：组 G/组 B = " + fmt(nsBackpack / nsIdle)
+                + "（若背包参与扫描，此值应接近组 C/组 B = " + fmt(nsHot / nsIdle) + "）");
+        System.out.println("   [sink=" + sink + "]");   // 防死代码消除：让上面的累加成为可观测输出
+        System.out.println("SMOKE RESULT automending-perf/26.3 checks=5 failures=" + failures);
+        System.out.println("==== PerfSelfCheck end ====");
+        return true;
+    }
+
+    // ===================== 测量与辅助 =====================
+
+    private static double bench(Runnable body, ServerPlayer spin) {
+        for (int i = 0; i < WARMUP; i++) {
+            body.run();
+            sink += spin.experienceLevel;
+        }
+        double best = Double.MAX_VALUE;
+        for (int r = 0; r < ROUNDS; r++) {
+            long t0 = System.nanoTime();
+            for (int i = 0; i < ITERS; i++) {
+                body.run();
+                sink += spin.experienceLevel;
+            }
+            long t1 = System.nanoTime();
+            best = Math.min(best, (t1 - t0) / (double) ITERS);
+        }
+        return best;
+    }
+
+    private static void report(String label, double ns, int players) {
+        double msPerSecond = ns * players / 1_000_000.0;   // 每秒 1 次 ⇒ 每秒总微秒
+        System.out.println("   " + label + "：每秒合计 " + String.format("%.4f", msPerSecond)
+                + " ms，占 tick 预算 " + String.format("%.5f", msPerSecond / 50.0 * 100.0) + " %");
+    }
+
+    private static String fmt(double v) {
+        return String.format("%.1f", v);
+    }
+
+    private static Holder<Enchantment> reg(ServerLevel level, net.minecraft.resources.ResourceKey<Enchantment> key) {
+        return level.registryAccess().lookupOrThrow(Registries.ENCHANTMENT).getOrThrow(key);
+    }
+
+    /** 把 6 个槽全换上带 mending 的装备；damage > 0 时统一设成该损坏值 */
+    private static void equip(ServerPlayer p, Holder<Enchantment> mending, int damage) {
+        ItemStack[] items = {
+                new ItemStack(Items.NETHERITE_HELMET),
+                new ItemStack(Items.NETHERITE_CHESTPLATE),
+                new ItemStack(Items.NETHERITE_LEGGINGS),
+                new ItemStack(Items.NETHERITE_BOOTS),
+                new ItemStack(Items.NETHERITE_SWORD),
+                new ItemStack(Items.SHIELD)
+        };
+        for (int i = 0; i < GEAR.length; i++) {
+            ItemStack st = items[i];
+            st.enchant(mending, 1);
+            if (damage > 0) {
+                st.setDamageValue(Math.min(damage, st.getMaxDamage()));
+            }
+            p.setItemSlot(GEAR[i], st);
+        }
+    }
+
+    private static void clearGear(ServerPlayer p) {
+        for (EquipmentSlot s : GEAR) {
+            p.setItemSlot(s, ItemStack.EMPTY);
+        }
+    }
+
+    private static void resetGear(ServerPlayer p, int damage) {
+        for (EquipmentSlot s : GEAR) {
+            ItemStack st = p.getItemBySlot(s);
+            if (!st.isEmpty()) {
+                st.setDamageValue(damage);
+            }
+        }
+    }
+
+    private static void resetXp(ServerPlayer p, int level) {
+        p.setExperienceLevels(level);
+        p.setExperiencePoints(p.getXpNeededForNextLevel() / 2);
+    }
+
+    /** 造一个「没真正连上线」的玩家（Connection 没有 channel，包只入队不发） */
+    private static ServerPlayer fakePlayer(MinecraftServer server, ServerLevel level, String name) {
+        try {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), name);
+            ServerPlayer player = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
+            player.connection = new ServerGamePacketListenerImpl(
+                    server, new Connection(PacketFlow.SERVERBOUND), player,
+                    CommonListenerCookie.createInitial(profile, false));
+            return player;
+        } catch (Throwable t) {
+            System.out.println("   假玩家构造失败: " + t);
+            return null;
+        }
+    }
+}

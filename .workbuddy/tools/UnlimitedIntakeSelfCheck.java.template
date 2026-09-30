@@ -1,0 +1,570 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+import net.minecraft.world.phys.Vec3;
+
+import java.lang.reflect.Field;
+import java.math.BigInteger;
+import java.util.List;
+
+/**
+ * 【临时自检】验证「物品从入库漏斗上方经过却没被吸走」的修复；验证完连同 hook 一起删掉。
+ *
+ * <p>要证的事：</p>
+ * <ol>
+ *   <li><b>一个服务端 tick 收走全部掉落物</b>（原版一次只收 1 个，这正是丢东西的原因）；</li>
+ *   <li><b>绝不丢东西</b>：地上放下多少、仓库就进多少，一分不差（ERP 对账）；</li>
+ *   <li><b>该守的规矩一个没破</b>：分类物白名单照样过滤、不是入库漏斗的一个不碰、
+ *       红石锁存时照样停摆；</li>
+ *   <li><b>8 gt 冷却真的被清掉了</b>（{@code pushItemsTick} 收尾的 TAIL 注入有效）；</li>
+ *   <li><b>玩家把仓库清空之后闸门不许误报</b>（上一轮埋的最严重的那个坑）。</li>
+ * </ol>
+ *
+ * <h2>为什么按 tick 分步推进</h2>
+ * <p>刚 {@code addFreshEntity} 撒下去的实体<b>当帧查不到</b>（离线自检没有玩家，
+ * 附近的实体段未必就绪），实测会让「吸力范围内查得到几个」这类断言间歇性假失败。
+ * 所以每个场景分两拍：<b>这一 tick 布场景 → 下一 tick 断言</b>。
+ * 中间正好隔了<b>一个完整的服务端 tick</b>，漏斗自己也真 tick 了一次 ——
+ * 比手工调 {@code pushItemsTick} 更贴近线上。</p>
+ */
+public final class UnlimitedIntakeSelfCheck {
+
+    private static final BlockPos T = new BlockPos(0, 5, 0);       // 仓库终端（工作台）
+    private static final BlockPos H = new BlockPos(0, 6, 0);       // 入库漏斗
+    private static final BlockPos LOOSE = new BlockPos(8, 6, 0);   // 不对着终端的普通漏斗
+
+    /** 最后一个场景的编号（跑完它下一步就是收尾） */
+    private static final int LAST = 26;
+
+    private static int checks = 0;
+    private static int failures = 0;
+    private static int stage = 0;
+    private static int waited = 0;
+    private static boolean halted = false;
+
+    private UnlimitedIntakeSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (halted) {
+            return;
+        }
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    /**
+     * 每拍推进一步。关键的三条稳定性措施：
+     *
+     * <ol>
+     *   <li><b>先强制加载区块、并真的等它就绪</b>（{@code setChunkForced} 是排队的，
+     *       不是立刻生效；区块没就绪时撒下去的实体查不到、漏斗也不会被 tick）；</li>
+     *   <li><b>每个场景前大范围清场两次</b> —— 上一轮残留的实体会污染这一轮的总量对账
+     *       （实测过：多出来的 1 个 / 3 个就是这么来的）；</li>
+     *   <li><b>布场景与断言之间空转一 tick</b> —— 刚 {@code addFreshEntity} 的实体当帧查不到。</li>
+     * </ol>
+     */
+    private static void step(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        switch (stage) {
+            case 0:     // 强制加载（不立刻生效，下面要等）
+                level.setChunkForced(0, 0, true);
+                break;
+            case 1:     // 等区块真的就绪
+                if (!level.isLoaded(H) || !level.isLoaded(LOOSE)) {
+                    if (++waited > 200) {
+                        check("W0 区块在 200 tick 内没加载出来", false);
+                        stage = LAST;
+                        return;
+                    }
+                    return;
+                }
+                gateProbe(data);
+                break;
+            case 2:
+            case 3:
+                wideCleanup(level);
+                break;
+            case 4:
+                setupArticles(level, data);
+                break;
+            case 5:
+                break;
+            case 6:
+                assertAllSwept(level, data);
+                break;
+            case 7:
+                wideCleanup(level);
+                break;
+            case 8:
+                setupBigStack(level, data);
+                break;
+            case 9:
+                break;
+            case 10:
+                assertBigStack(level, data);
+                break;
+            case 11:
+                wideCleanup(level);
+                break;
+            case 12:
+                setupWhitelist(level, data);
+                break;
+            case 13:
+                break;
+            case 14:
+                assertWhitelist(level, data);
+                break;
+            case 15:
+                wideCleanup(level);
+                break;
+            case 16:
+                setupPlainHopper(level, data);
+                break;
+            case 17:
+                break;
+            case 18:
+                assertPlainHopper(level, data);
+                break;
+            case 19:
+                wideCleanup(level);
+                break;
+            case 20:
+                setupRedstoneLock(level, data);
+                break;
+            case 21:
+                break;
+            case 22:
+                assertRedstoneLock(level, data);
+                break;
+            case 23:
+                wideCleanup(level);
+                break;
+            case 24:
+                setupCooldown(level, data);
+                break;
+            case 25:
+                wideCleanup(level);
+                break;
+            case 26:
+                emptyingAfterLoadMustNotTripTheGuard(level, data);
+                break;
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    private static void finish(MinecraftServer server) {
+        if (halted) {
+            return;
+        }
+        halted = true;
+        ServerLevel level = server.overworld();
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        level.setBlock(T, Blocks.AIR.defaultBlockState(), 3);
+        level.setBlock(H, Blocks.AIR.defaultBlockState(), 3);
+        level.setBlock(LOOSE, Blocks.AIR.defaultBlockState(), 3);
+        // 故意留下 2 条合法数据：下一轮加载它，验证「空壳闸门」不会误伤一份正常存档
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        data.insert(new ItemStack(Items.DIRT, 5678));
+        System.out.println("SEED 留下 cobble=1234 / dirt=5678，供下一轮验证闸门不误报");
+        System.out.println("SMOKE RESULT unlimited_intake/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("FAIL: " + name);
+        }
+    }
+
+    // ------------------------------------------------------------------ 0. 载入指纹
+
+    /**
+     * 上一轮故意留了 2 条合法数据：这一轮必须原样读出来，且「空壳闸门」不许报警
+     * （那会把玩家的仓库直接掐死）。
+     */
+    private static void gateProbe(VoidWarehouseData data) {
+        System.out.println("GATE loadedCount=" + data.loadedCount()
+                + " loadedBroken=" + data.loadedBrokenCount()
+                + " entryCount=" + data.entryCount()
+                + " cobble=" + amount(data, Items.COBBLESTONE)
+                + " dirt=" + amount(data, Items.DIRT)
+                + " suspicious=" + data.isSuspiciouslyEmpty());
+    }
+
+    // ------------------------------------------------------------------ A. 一个 tick 全收
+
+    /**
+     * 9 个实体同时压在入库漏斗上。
+     *
+     * <p>中间只隔了<b>一个服务端 tick</b>。原版 {@code suckInItems} 收到第一个就
+     * {@code return true}（一次只收 1 个），所以「还剩 8 个」= 走的原版，
+     * 「一个不剩」才是我们想要的。</p>
+     */
+    private static void setupArticles(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("A0 入库漏斗造出来了", false);
+            return;
+        }
+        check("A0 入库漏斗造出来了", true);
+        clearEntitiesAbove(level, hopper);
+        data.clearContent();
+
+        drop(level, hopper, Items.COBBLESTONE, 10, 4);
+        drop(level, hopper, Items.DIAMOND, 5, 3);
+        drop(level, hopper, Items.IRON_INGOT, 7, 1);
+        drop(level, hopper, Items.EMERALD, 3, 1);
+    }
+
+    private static void assertAllSwept(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        if (hopper == null) {
+            check("A1 入库漏斗还在", false);
+            return;
+        }
+        int left = HopperBlockEntity.getItemsAtAndAbove(level, hopper).size();
+        check("A2 一个 tick 收得一个不剩（剩 " + left + " 个实体）", left == 0);
+        check("A3 漏斗已搬空（没留在漏斗里过夜）", hopper.isEmpty());
+
+        long stored = amount(data, Items.COBBLESTONE) + amount(data, Items.DIAMOND)
+                + amount(data, Items.IRON_INGOT) + amount(data, Items.EMERALD);
+        // ERP 对账：地上放下多少，仓库就必须进多少，一分钱都不能差
+        check("A4 总量守恒：丢 65 / 入库 " + stored, stored == 65);
+        check("A5 圆石 40", amount(data, Items.COBBLESTONE) == 40);
+        check("A6 钻石 15", amount(data, Items.DIAMOND) == 15);
+        check("A7 铁锭 7", amount(data, Items.IRON_INGOT) == 7);
+        check("A8 绿宝石 3", amount(data, Items.EMERALD) == 3);
+
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ B. 超过一堆的实体
+
+    /**
+     * 单个实体带着 200 个圆石（超过 1 堆）。
+     *
+     * <p>原版 {@code tryMoveInItem} 往空格子里放东西是「整摞塞进去」，而
+     * {@code HopperBlockEntity#setItem} 会 {@code limitSize} 把它截到 64 ——
+     * 多出来的会被静默吞掉，实体却照常 {@code discard()}。
+     * 实测过：修复前这里只进库 64，136 个凭空消失。</p>
+     */
+    private static void setupBigStack(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("B0 入库漏斗造出来了", false);
+            return;
+        }
+        clearEntitiesAbove(level, hopper);
+        data.clearContent();
+        dropOne(level, hopper, Items.COBBLESTONE, 200);
+    }
+
+    private static void assertBigStack(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        if (hopper == null) {
+            check("B1 入库漏斗还在", false);
+            return;
+        }
+        check("B1 一个实体也被收走", HopperBlockEntity.getItemsAtAndAbove(level, hopper).size() == 0);
+        check("B2 200 个一个不少全进库（入库 " + amount(data, Items.COBBLESTONE) + "）",
+                amount(data, Items.COBBLESTONE) == 200);
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ C. 白名单照样过滤
+
+    /**
+     * 开了分类物（圆石）的入库漏斗：<b>圆石照收，泥土一个都别想混进来</b>。
+     *
+     * <p>无上限不等于「什么都收」—— 分类器是玩家手动设的规矩，绕过它就是丢信任。</p>
+     */
+    private static void setupWhitelist(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("C0 入库漏斗造出来了", false);
+            return;
+        }
+        clearEntitiesAbove(level, hopper);
+        data.clearContent();
+        // 玩家手动往漏斗里放了一个圆石当分类物
+        hopper.setItem(0, new ItemStack(Items.COBBLESTONE, 1));
+        ((VoidWarehouseHopperFilter) hopper).setClassifierFilter(true);
+        dropOne(level, hopper, Items.COBBLESTONE, 10);
+        dropOne(level, hopper, Items.DIRT, 5);
+    }
+
+    private static void assertWhitelist(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        if (hopper == null) {
+            check("C1 入库漏斗还在", false);
+            return;
+        }
+        List<ItemEntity> left = HopperBlockEntity.getItemsAtAndAbove(level, hopper);
+        boolean dirtLeft = false;
+        for (ItemEntity entity : left) {
+            if (entity.getItem().getItem() == Items.DIRT && entity.getItem().getCount() == 5) {
+                dirtLeft = true;
+            }
+        }
+        check("C1 圆石被收走", amount(data, Items.COBBLESTONE) >= 9);
+        check("C2 泥土原地不动（白名单没被绕过）", dirtLeft);
+        check("C3 泥土一个都没进库", amount(data, Items.DIRT) == 0);
+        check("C4 分类物还留在漏斗里", !hopper.isEmpty());
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ D. 普通漏斗不受影响
+
+    /**
+     * 一个<b>没有</b>对着终端的漏斗：我们的清扫必须完全不插手。
+     *
+     * <p>过了一个 tick，原版最多收走 1 个 —— 所以「至少还剩 5 个」才说明我们没越权
+     * （收得一个不剩 = 接管漏出去了）。</p>
+     */
+    private static void setupPlainHopper(ServerLevel level, VoidWarehouseData data) {
+        level.setBlock(LOOSE, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+        HopperBlockEntity hopper = hopperAt(level, LOOSE);
+        if (hopper == null) {
+            check("D0 普通漏斗造出来了", false);
+            return;
+        }
+        clearEntitiesAbove(level, hopper);
+        data.clearContent();
+        drop(level, hopper, Items.OAK_LOG, 1, 6);
+    }
+
+    private static void assertPlainHopper(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, LOOSE);
+        if (hopper == null) {
+            check("D1 普通漏斗还在", false);
+            return;
+        }
+        int left = HopperBlockEntity.getItemsAtAndAbove(level, hopper).size();
+        check("D1 普通漏斗没被无上限接管（剩 " + left + " / 6）", left >= 5);
+        check("D2 普通漏斗的东西一个都没进库", amount(data, Items.OAK_LOG) == 0);
+        level.setBlock(LOOSE, Blocks.AIR.defaultBlockState(), 3);
+        clearEntitiesAbove(level, hopper);
+        data.clearContent();
+    }
+
+    // ------------------------------------------------------------------ E. 红石锁存
+
+    /** {@code ENABLED=false} 的入库漏斗：一个都不许收（不能无视红石往仓库里灌）。 */
+    private static void setupRedstoneLock(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("E0 入库漏斗造出来了", false);
+            return;
+        }
+        clearEntitiesAbove(level, hopper);
+        data.clearContent();
+        // 模拟被红石锁存
+        level.setBlock(H, level.getBlockState(H).setValue(HopperBlock.ENABLED, false), 3);
+        drop(level, hopper, Items.DIAMOND, 1, 6);
+    }
+
+    private static void assertRedstoneLock(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        int left = hopper == null ? -1 : HopperBlockEntity.getItemsAtAndAbove(level, hopper).size();
+        check("E1 红石锁存时一个都不收（剩 " + left + " / 6）", left == 6);
+        check("E2 红石锁存时仓库没进货", amount(data, Items.DIAMOND) == 0);
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ F. 冷却真的被清掉
+
+    /**
+     * 把 {@code cooldownTime} 强行设成 8 再跑一次 tick：入库漏斗应该被 TAIL 注入清成 0，
+     * 普通漏斗必须按原版留着（8-1=7）。
+     *
+     * <p>这一条专门盯着「{@code resetCooldown} 放在哪」—— 早先放在 {@code suckInItems}
+     * 中途会被 {@code tryMoveItems} 收尾的 {@code setCooldown(8)} 盖掉，等于白做。</p>
+     */
+    private static void setupCooldown(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("F0 入库漏斗造出来了", false);
+            return;
+        }
+        clearEntitiesAbove(level, hopper);
+        data.clearContent();
+
+        setCooldown(hopper, 8);
+        HopperBlockEntity.pushItemsTick(level, H, level.getBlockState(H), hopper);
+        check("F1 入库漏斗冷却被清零（实际 " + cooldownOf(hopper) + "）", cooldownOf(hopper) == 0);
+
+        level.setBlock(LOOSE, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+        HopperBlockEntity plain = hopperAt(level, LOOSE);
+        if (plain != null) {
+            setCooldown(plain, 8);
+            HopperBlockEntity.pushItemsTick(level, LOOSE, level.getBlockState(LOOSE), plain);
+            check("F2 普通漏斗冷却按原版递减（实际 " + cooldownOf(plain) + "）", cooldownOf(plain) == 7);
+        } else {
+            check("F2 普通漏斗造出来了", false);
+        }
+        level.setBlock(LOOSE, Blocks.AIR.defaultBlockState(), 3);
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ G. 玩家清空不许误报
+
+    /**
+     * <b>上一轮埋的最严重那个坑的回归测试</b>：载入完再把仓库取空，空壳闸门<b>不许报警</b>。
+     *
+     * <p>闸门原本有一条判据是「此刻 {@code entries} 是不是空的」。玩家可以随时把仓库搬空，
+     * 那时这条判据自然成立 —— 于是「磁盘上有 2 条、仓库却空」被当成了空壳，
+     * 每次 {@link VoidWarehouse#data} 都抛异常，仓库永久不可用。
+     * 现在「这一刺史读没读出来」在载入那一刻就定死了，之后再清空也不会重判。</p>
+     */
+    private static void emptyingAfterLoadMustNotTripTheGuard(ServerLevel level, VoidWarehouseData data) {
+        data.insert(new ItemStack(Items.OAK_LOG, 5));
+        data.clearContent();
+        check("G1 清空之后仓库确实是空的", data.isEmpty());
+        try {
+            VoidWarehouseData again = VoidWarehouse.data(level.getServer());
+            check("G2 已经清空的仓库照样能访问（闸门没误报）", again != null);
+            again.insert(new ItemStack(Items.OAK_LOG, 7));
+            check("G3 清空之后还能继续存货", amount(again, Items.OAK_LOG) == 7);
+        } catch (IllegalStateException e) {
+            check("G2 已经清空的仓库照样能访问（闸门没误报）→ " + e.getMessage(), false);
+        }
+        data.clearContent();
+    }
+
+    // ------------------------------------------------------------------ 工具
+
+    /** 摆一个「口朝下指工作台」的入库漏斗（工作台登记为仓库终端），返回它的方块实体。 */
+    private static HopperBlockEntity setup(ServerLevel level, BlockPos table, BlockPos pos) {
+        level.setBlock(table, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        level.setBlock(pos, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+        VoidWarehouseTerminals.add(level, table);
+        return hopperAt(level, pos);
+    }
+
+    private static HopperBlockEntity hopperAt(ServerLevel level, BlockPos pos) {
+        BlockEntity raw = level.getBlockEntity(pos);
+        return raw instanceof HopperBlockEntity hopper ? hopper : null;
+    }
+
+    private static void teardown(ServerLevel level, VoidWarehouseData data, BlockPos table, BlockPos pos) {
+        HopperBlockEntity hopper = hopperAt(level, pos);
+        if (hopper != null) {
+            clearEntitiesAbove(level, hopper);
+        }
+        level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+        level.setBlock(table, Blocks.AIR.defaultBlockState(), 3);
+        VoidWarehouseTerminals.remove(level, table);
+        data.clearContent();
+    }
+
+    /**
+     * 在漏斗正上方撒 {@code times} 个实体（每个 {@code count} 个物品）。
+     *
+     * <p>Y 取 {@code +1.1}：物品实体自身有 0.25 的碰撞盒，这个高度稳稳落在
+     * 原版吸力盒（实测 {@code y+0.1875 .. y+1.1875}）的中间。</p>
+     *
+     * @return 撒下去的物品<b>总个数</b>（不是实体个数）
+     */
+    private static long drop(ServerLevel level, HopperBlockEntity hopper, Item item, int count, int times) {
+        for (int i = 0; i < times; i++) {
+            dropOne(level, hopper, item, count);
+        }
+        return (long) count * times;
+    }
+
+    private static ItemEntity dropOne(ServerLevel level, HopperBlockEntity hopper, Item item, int count) {
+        BlockPos pos = hopper.getBlockPos();
+        ItemEntity entity = new ItemEntity(level, pos.getX() + 0.5D, pos.getY() + 1.1D, pos.getZ() + 0.5D,
+                new ItemStack(item, count));
+        entity.setDeltaMovement(Vec3.ZERO);
+        level.addFreshEntity(entity);
+        return entity;
+    }
+
+    /**
+     * 大范围清场：把测试区里所有的掉落物都删掉。
+     *
+     * <p>比 {@link #clearEntitiesAbove} 可靠 —— 它用的「吸力盒」在刚撒下实体的那一帧
+     * 查不到东西，残留的实体会一路污染到下一个场景的总量对账里。</p>
+     */
+    private static void wideCleanup(ServerLevel level) {
+        net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(-8D, 0D, -8D, 16D, 24D, 16D);
+        for (ItemEntity entity : level.getEntitiesOfClass(ItemEntity.class, box,
+                net.minecraft.world.entity.EntitySelector.ENTITY_STILL_ALIVE)) {
+            entity.discard();
+        }
+    }
+
+    /** 清掉吸力范围内的掉落物。幂等硬要求：上一轮的残渣不能污染这一轮的断言。 */
+    private static void clearEntitiesAbove(ServerLevel level, HopperBlockEntity hopper) {
+        for (ItemEntity entity : HopperBlockEntity.getItemsAtAndAbove(level, hopper)) {
+            entity.discard();
+        }
+    }
+
+    private static long amount(VoidWarehouseData data, Item item) {
+        BigInteger value = data.amountOf(item);
+        return value == null ? 0L : value.longValue();
+    }
+
+    private static final Field COOLDOWN_FIELD = findCooldownField();
+
+    private static Field findCooldownField() {
+        try {
+            Field field = HopperBlockEntity.class.getDeclaredField("cooldownTime");
+            field.setAccessible(true);
+            return field;
+        } catch (ReflectiveOperationException e) {
+            System.out.println("!! 反射拿不到 cooldownTime: " + e);
+            return null;
+        }
+    }
+
+    private static void setCooldown(HopperBlockEntity hopper, int value) {
+        try {
+            COOLDOWN_FIELD.setInt(hopper, value);
+        } catch (IllegalAccessException e) {
+            System.out.println("!! set cooldownTime 失败: " + e);
+        }
+    }
+
+    private static int cooldownOf(HopperBlockEntity hopper) {
+        try {
+            return COOLDOWN_FIELD.getInt(hopper);
+        } catch (IllegalAccessException e) {
+            System.out.println("!! read cooldownTime 失败: " + e);
+            return -1;
+        }
+    }
+}

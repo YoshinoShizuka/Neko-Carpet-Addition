@@ -17,7 +17,8 @@
 
 ### 自动经验修补 (autoMending)
 
-装备或手上有耐久不满、且带经验修补附魔的物品时，每秒自动消耗玩家已有的经验值进行修补。
+装备或手上有耐久不满、且带经验修补附魔的物品时，每秒自动消耗玩家已有的经验值，**一次把一件修满**。
+先花经验条里已攒下的经验，不够时自动向下动用等级经验补足；经验彻底用完才会停手。
 
 - 类型：`boolean`
 - 默认值：`false`
@@ -867,29 +868,41 @@ public static final SavedDataType<VoidWarehouseData> TYPE =
 
 ## 它是怎么实现的
 
-核心逻辑在 `AutoMending.java`，可以拆成四步：
+核心逻辑在 `AutoMending.java`，可以拆成五步：
 
-1. **算出手上能花多少经验**
-   取「当前等级内已积累的经验」= `experienceProgress × getXpNeededForNextLevel()`。
-   如果经验条正好是空的但还有等级，兜底给 1 点，好让扣减能从等级存量里拿。
-2. **找到要修的物品**
+1. **找到要修的物品**
    `EnchantmentHelper.getRandomItemWith(EnchantmentEffectComponents.REPAIR_WITH_XP, player, ItemStack::isDamaged)`
-   —— 在玩家主手/副手/盔甲/背包里随机挑一件「带经验修补且耐久不满」的物品。
-3. **换算并修复**
-   `EnchantmentHelper.modifyDurabilityToRepairFromXp(level, stack, amount)` 得到应该修多少耐久
+   —— 随机挑一件「带经验修补且耐久不满」的物品。
+   ⚠️ 它**只遍历装备槽**（`EquipmentSlot.VALUES`：主手/副手/头盔/胸甲/护腿/靴子），
+   **不扫背包** —— 所以背包里的物品不参与自动修补。
+2. **算出手上能花多少经验**
+   取「当前等级内已积累的经验」= `experienceProgress × getXpNeededForNextLevel()`（**用 double 算**，
+   否则 float32 会把「差一点点到整数」的乘积舍入上去、预算多出 1 点）。
+3. **把预算抬到「刚好够修满这一件」**
+   `budget = max(进度条存量, ceil(损坏值 / 2))`。取 `max` 是为了**一次就把这件修满**——
+   这正是旧版（以及 GUGU 原版）的手感；上限只到「刚好修满」为止，不会平白多花。
+   进度条不够的部分，第 5 步会向下动用等级来付。
+4. **换算并修复**
+   `EnchantmentHelper.modifyDurabilityToRepairFromXp(level, stack, budget)` 得到能修多少耐久
    （经验修补 I 是 1 经验 = 2 耐久），再取 `min(该值, 当前损坏值)` 真正扣耐久。
-4. **扣经验**
-   `player.giveExperiencePoints(-actual)`。传负数时原版会先进经验条、不够再降等级，
-   所以不需要自己处理升级/降级。
+   实际消耗按这个线性变换的**反函数**算（`actual × budget / repair`）——与原版
+   `ExperienceOrb#repairPlayerItems` 完全一致。只掉 1 点耐久时向下取整会得到 0，这里保底扣 1 点，
+   否则那一轮会白白空转。
+5. **扣经验：先进度条，不够再逐级下降（`spendExact`）**
+   进度条存量够就直接 `setExperiencePoints(bar - spent)`；不够则把进度条清零、逐级
+   `giveExperienceLevels(-1)`，每一级都用 `setExperiencePoints` 写成**精确的整数刻度**
+   （单次最多降 8 级，给「低等级 + 满损物品」兜底）。
 
-这套流程和原版 `ExperienceOrb#repairPlayerItems` 完全同构，唯一区别是经验来源：
-原版来自经验球实体，这里是玩家自己已有的经验。
+**为什么不用 `player.giveExperiencePoints(-spent)`**：它内部有一段 float32 的「负值回弹」循环，
+只要一次扣掉的经验超过进度条存量，等级就会 -1、而进度条被弹到 `1 + 负值` ≈ 98%。
+那既是视觉上的「经验条突然满了」，也是累积浮点漂移的来源。`spendExact` 用带 clamp 的原版 setter
+逐级写整数刻度，既没有回弹也没有漂移。
 
-> **经验消耗量提示**：第 4 步扣的是「实际修好的耐久数」而不是「消耗的经验数」。
-> 经验修补 I 下 1 点经验能修 2 点耐久，所以这个写法相当于 **1 点耐久 = 1 点经验**，
-> 比原版经验修补贵一倍（原版是 1 经验 = 2 耐久）。这与 GUGU 原版实现完全一致，
-> 如果想改成原版倍率，把 `giveExperiencePoints(-actual)` 换成 `giveExperiencePoints(-(actual / 2))`
-> 之类（注意除不尽时的取整策略）即可。
+这套流程和原版 `ExperienceOrb#repairPlayerItems` 同构，区别有两处：经验来源是玩家自己已有的经验；
+以及允许向下动用等级（原版经验球不存在这个选项）。
+
+> **经验消耗量**：修好 N 点耐久消耗 N/2 点经验，与原版经验修补一致（1 经验 = 2 耐久）。
+> 旧版（1.0.2 / GUGU）扣的是 `N`（**贵一倍**），这是早期的一个记账缺陷，已修正。
 
 ---
 
@@ -898,9 +911,15 @@ public static final SavedDataType<VoidWarehouseData> TYPE =
 | | Carpet GUGU Addition | 本项目 |
 |---|---|---|
 | 触发方式 | Mixin 注入 `ServerPlayer#tick` | Carpet 扩展事件 `CarpetExtension#onTick` |
+| 触发频率 | 每 20 tick（`getGameTime() % 20 == 0`） | 每 20 tick（与前者一致） |
 | 依赖 | Mixin 配置 + conditional-mixin | 无 Mixin，无额外依赖 |
 | 规则注册 | `CarpetServer.settingsManager.parseSettingsClass` | 相同（规则同样走 `/carpet`） |
-| 核心算法 | 见上文 | 完全一致 |
+| 核心算法 | 预算只取进度条存量；用 `giveExperiencePoints(-actual)` 扣减 | 预算抬到「刚好修满」；用 `spendExact` 精确逐级记账 |
+| 经验倍率 | 1 点耐久 = 1 点经验（贵一倍） | 1 经验 = 2 耐久（与原版一致） |
+
+**行为上两者等价的地方**：都是每秒把一件修满、进度条不够时都会向下消耗等级
+（GUGU 靠 `giveExperiencePoints` 扣穿后回弹，本项目靠 `spendExact` 显式逐级下降）。
+**差别在于**：本项目的落点永远是整数经验刻度，不会出现「进度条突然跳回 98%」，且扣减不翻倍。
 
 改用 `onTick` 后整个模组没有 Mixin，构建和运行时的失败面都小很多。
 

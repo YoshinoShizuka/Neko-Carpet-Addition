@@ -16,6 +16,7 @@ import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.enchantment.Enchantment;
+import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.item.enchantment.Enchantments;
 
 import java.util.UUID;
@@ -23,27 +24,32 @@ import java.util.UUID;
 /**
  * 【临时自检】验证自动经验修补的经验记账；验证完连同 {@code AutoMendingExtension} 里的 hook 一起删掉。
  *
- * <p>要守住的不变量只有两条，但正是玩家报的那个 bug：</p>
+ * <p>本轮要守的不变量比上一轮多了一条，因为口径变了：</p>
  * <ol>
- *   <li><b>等级恒定不变</b> —— {@code mending()} 只能花「进度条里已有的经验」，绝不能扣穿。</li>
- *   <li><b>{@code experienceProgress} 始终落在 {@code [0,1)}</b> —— 一旦变负，原版的降级回弹
- *       循环就会把进度条弹到 ~100%，玩家看到的就是「只看得见等级在变、看不出真实进度」。</li>
+ *   <li><b>一次触发就修满一件</b> —— 进度条存量不够时允许向下动用等级，但必须修满。
+ *       这是「修补速度」的本体：旧版（1.0.2 / GUGU）靠 {@code giveExperiencePoints} 扣穿后
+ *       进度条被弹回 ~98% 来维持满速；现在改成显式借等级，同样修满、但进度条不乱跳。</li>
+ *   <li><b>{@code experienceProgress} 始终落在 {@code [0,1)}</b> —— 一旦变负，原版那段
+ *       降级回弹循环就会把进度条弹到 ~100%。</li>
+ *   <li><b>记账守恒</b> —— 扣掉的经验必须等于修好的耐久数的一半（经验修补 I 是 1 经验 = 2 耐久），
+ *       等级见底付不满时宁可少修，也不能出现「修了却不扣经验」。</li>
+ *   <li><b>进度条用光后不停机</b> —— 只要还有等级，就还能继续修（旧 1.0.3 会直接停机）。</li>
  * </ol>
  *
- * <h2>T 组为什么必须扫 ulp 邻域</h2>
- * <p>第一版 T 组只扫了 {@code (float)k/(float)n} 这些"干净"的进度点，结果<b>旧算法越界 0 个</b>
- * —— 反证失败。这一下把机制说清楚了：</p>
+ * <h2>A 组为什么是「有牙」的关键</h2>
+ * <p>「一次修满」这条断言很容易变成没牙的断言 —— 只要进度条够用，老代码也能修满。
+ * 所以 A 组专门构造<b>进度条极低</b>的形态（{@code progress = 1/needed}）：</p>
  * <ul>
- *   <li>{@code f32(k/needed)} 是<b>安全点</b>：p*needed 即便被 float32 舍入到整数，也是向"更大"
- *       的方向，{@code floor} 得到的预算仍 ≤ 真实值。</li>
- *   <li>真正危险的是它的 <b>nextDown 邻域</b>：p 比 f32(k/needed) 小一个 ulp，可 p*needed 的
- *       float32 舍入仍然落到整数 k 上 —— 预算就比真实值大了 1，扣完 progress 变 -3e-8。</li>
- *   <li>而上一版修复用的 {@code giveExperiencePoints(-spent)} 是 <b>float32 减法</b>：每修一次
- *       就把 progress 推离 k/needed 网格一点点。漂移几轮后就落进危险邻域，下一次修补立刻扣穿。
- *       <b>这就是"修好了又复现"的完整闭环。</b></li>
+ *   <li>A1 用旧算法（预算只取进度条）跑一遍 → 只能修掉 2 点耐久，<b>修不满</b>；</li>
+ *   <li>A2 用新算法跑同一形态 → 修满。</li>
  * </ul>
- * <p>所以 T 组对每个 k/needed 扫 ±2 ulp，并且额外用 T4 模拟「持续获得经验 + 持续滑行修补」的
- * 真实链路，专门抓这种漂移。</p>
+ * <p>A1 失败、A2 通过，才说明「修满」这个断言真的能分辨两种实现。这正是玩家报的
+ * 「修补速度没以前快」的最小复现。</p>
+ *
+ * <h2>T 组为什么必须扫 ulp 邻域</h2>
+ * <p>{@code f32(k/needed)} 是<b>安全点</b>；危险的是它的 nextDown 邻域 —— p 比它小一个 ulp，
+ * 但 {@code p*needed} 的 float32 舍入仍落到整数 k 上，预算就比真实值大 1。所以 T 组对每个
+ * {@code k/needed} 扫 ±2 ulp，并用 T4 跑长链路抓累积漂移。</p>
  */
 public final class AutoMendingSelfCheck {
 
@@ -54,13 +60,14 @@ public final class AutoMendingSelfCheck {
     private AutoMendingSelfCheck() {
     }
 
-    public static void run(MinecraftServer server) {
+    /** @return true 表示本轮执行了自检（调用方据此 halt 服务端）；已跑过则返回 false */
+    public static boolean run(MinecraftServer server) {
         if (done) {
-            return;
+            return false;
         }
         ServerLevel level = server.overworld();
         if (level == null) {
-            return;
+            return false;
         }
         done = true;
 
@@ -70,7 +77,7 @@ public final class AutoMendingSelfCheck {
         if (player == null) {
             check("S0 假玩家构造成功", false);
             report();
-            return;
+            return true;
         }
         check("S0 假玩家构造成功", true);
 
@@ -83,28 +90,158 @@ public final class AutoMendingSelfCheck {
             System.out.println("   取 mending 附魔失败: " + t);
             check("S0b 取到 mending 附魔", false);
             report();
-            return;
+            return true;
         }
         check("S0b 取到 mending 附魔", true);
 
-        // ---- 装备：一件「受损的、带经验修补」的鞘翅 ----
         ItemStack elytra = new ItemStack(Items.ELYTRA);
         elytra.enchant(mending, 1);
-        elytra.setDamageValue(400);
         int maxDamage = elytra.getMaxDamage();
         player.setItemSlot(EquipmentSlot.CHEST, elytra);
         check("S0c 鞘翅带上了经验修补", player.getItemBySlot(EquipmentSlot.CHEST).isEnchanted());
+        System.out.println("  鞘翅最大耐久 = " + maxDamage);
 
-        // ================= T 组：穷举 float32 边界（本轮真凶） =================
+        // ================= A 组：进度条极低时「能不能一次修满」（核心回归）=================
+        // 形态：level 30 (needed=112)、progress = 1/112（进度条里只有 1 点经验）、鞘翅损坏 400
+        int lowLevel = 30;
+        player.setExperienceLevels(lowLevel);
+        int needed30 = player.getXpNeededForNextLevel();
+        player.setExperiencePoints(1);
+        float lowProgress = player.experienceProgress;
+        ItemStack chestA = player.getItemBySlot(EquipmentSlot.CHEST);
+
+        // ---- A1 旧算法（1.0.3）：预算只取进度条 ----
+        chestA.setDamageValue(400);
+        int legacyFixed = legacyRepair(player, chestA);
+        System.out.println("A1 旧算法（预算=进度条）：修好 " + legacyFixed + " 点，剩余损坏 "
+                + chestA.getDamageValue() + "，progress=" + player.experienceProgress);
+        check("A1 反证：旧算法在进度条极低时确实修不满（只修了 " + legacyFixed + " 点）",
+                legacyFixed > 0 && chestA.getDamageValue() > 0);
+
+        // ---- A2 新算法：同形态应当一次修满 ----
+        player.setExperienceLevels(lowLevel);
+        player.setExperiencePoints(1);
+        chestA.setDamageValue(400);
+        int lvBeforeA2 = player.experienceLevel;
+        AutoMending.mending(player);
+        int a2Fixed = 400 - chestA.getDamageValue();
+        System.out.println("A2 新算法：修好 " + a2Fixed + " 点，剩余损坏 " + chestA.getDamageValue()
+                + "，等级 " + lvBeforeA2 + " → " + player.experienceLevel
+                + "，progress=" + player.experienceProgress);
+        check("A2 新算法在进度条极低时一次修满（" + a2Fixed + "/400）", a2Fixed == 400);
+        check("A3 新算法没把 progress 弄成负数", player.experienceProgress >= 0.0F
+                && player.experienceProgress < 1.0F);
+
+        // ================= S 组正例：真实场景 =================
+        // ---- S1：30 级、进度条半满、鞘翅损坏 400 ----
+        player.setExperienceLevels(30);
+        player.setExperiencePoints(needed30 / 2);
+        int s1Level = player.experienceLevel;
+        int s1Bar = barXp(player);
+        ItemStack chest = player.getItemBySlot(EquipmentSlot.CHEST);
+        chest.setDamageValue(400);
+        AutoMending.mending(player);
+        int s1Fixed = 400 - chest.getDamageValue();
+        int s1Paid = s1Bar - barXp(player) + (s1Level - player.experienceLevel) * needed30; // 粗算，仅用于打印
+        System.out.println("S1 30 级半条进度：" + s1Bar + " 点经验，修好 " + s1Fixed + "/400 点，等级 "
+                + s1Level + " → " + player.experienceLevel + "，progress=" + player.experienceProgress);
+        check("S2 S1 一次修满鞘翅（" + s1Fixed + "/400）", s1Fixed == 400);
+        check("S3 S1 progress 落在 [0,1)", player.experienceProgress >= 0.0F && player.experienceProgress < 1.0F);
+
+        // ---- S4：高等级 2752（玩家实机等级），进度条半满 → 修满且不该掉级 ----
+        player.setExperienceLevels(2752);
+        int needed2752 = player.getXpNeededForNextLevel();
+        player.setExperiencePoints(needed2752 / 2);
+        player.totalExperience = 1_000_000;   // 给个够用的整数账本（假玩家初始 total 是 0）
+        int s4Level = player.experienceLevel;
+        float s4ProgressBefore = player.experienceProgress;
+        int s4TotalBefore = player.totalExperience;
+        chest.setDamageValue(maxDamage); // 鞘翅满损
+        AutoMending.mending(player);
+        int s4Fixed = maxDamage - chest.getDamageValue();
+        int s4Paid = s4TotalBefore - player.totalExperience; // 整数账本，没有 float32 反推误差
+        System.out.println("S4 2752 级（needed=" + needed2752 + "）半条进度 " + s4ProgressBefore
+                + "：修好 " + s4Fixed + "/" + maxDamage + " 点，等级 " + s4Level + " → "
+                + player.experienceLevel + "，progress=" + player.experienceProgress
+                + "，总经验 -" + s4Paid);
+        check("S5 S4 一次修满满损鞘翅（" + s4Fixed + "/" + maxDamage + "）", s4Fixed == maxDamage);
+        check("S6 S4 进度条够用时不该掉级", player.experienceLevel == s4Level);
+        // 记账守恒：修满 432 点耐久 = 花 216 点经验（经验修补 I 是 1 经验换 2 耐久）
+        check("S7 S4 消耗恰好是修好耐久的一半（" + s4Paid + " == " + (maxDamage / 2) + "）",
+                s4Paid == maxDamage / 2);
+
+        // ---- S8：进度条彻底用光、只剩等级 → 必须还能修（旧 1.0.3 会停机）----
+        player.setExperienceLevels(100);
+        player.setExperiencePoints(0);
+        int s8Level = player.experienceLevel;
+        chest.setDamageValue(maxDamage);
+        AutoMending.mending(player);
+        int s8Fixed = maxDamage - chest.getDamageValue();
+        System.out.println("S8 进度条清零、仅剩等级：" + s8Level + " → " + player.experienceLevel
+                + "，修好 " + s8Fixed + "/" + maxDamage + " 点，progress=" + player.experienceProgress);
+        check("S9 进度条空了仍能继续修（不停机，修了 " + s8Fixed + " 点）", s8Fixed > 0);
+        check("S10 进度条空了仍能一次修满（" + s8Fixed + "/" + maxDamage + "）", s8Fixed == maxDamage);
+        check("S11 S8 progress 落在 [0,1)", player.experienceProgress >= 0.0F
+                && player.experienceProgress < 1.0F);
+
+        // ---- S12：等级见底、进度条也空 → 不修也不扣（不能白嫖）----
+        player.setExperienceLevels(0);
+        player.setExperiencePoints(0);
+        chest.setDamageValue(maxDamage);
+        AutoMending.mending(player);
+        System.out.println("S12 等级 0 + 进度条 0：剩余损坏 " + chest.getDamageValue());
+        check("S13 一点经验都没有时既不修也不扣", chest.getDamageValue() == maxDamage);
+
+        // ---- S14：经验不足付清时宁可少修（账目守恒，不留白嫖）----
+        player.setExperienceLevels(0);
+        player.setExperiencePoints(3);          // 只有 3 点经验 → 最多修 6 点耐久
+        chest.setDamageValue(maxDamage);
+        AutoMending.mending(player);
+        int s14Fixed = maxDamage - chest.getDamageValue();
+        System.out.println("S14 只有 3 点经验：修好 " + s14Fixed + " 点（应 ≤ 6），剩余 "
+                + chest.getDamageValue() + "，progress=" + player.experienceProgress);
+        check("S15 经验不足时按实付折算，不白嫖（修 " + s14Fixed + " ≤ 6）", s14Fixed <= 6 && s14Fixed > 0);
+        check("S16 S14 扣完不该留下负进度", player.experienceProgress >= 0.0F);
+
+        // ================= R 组反证：证明「扣穿 ⇒ 掉级 + 进度条弹回」真实存在 =================
+        player.setExperienceLevels(30);
+        player.setExperiencePoints(56);
+        int bar = barXp(player);
+        int levelBefore = player.experienceLevel;
+        player.giveExperiencePoints(-(bar + 1)); // 只多扣 1 点，就足以扣穿
+        System.out.println("R1 反证：giveExperiencePoints 多扣 1 点 → 等级 " + levelBefore + " → "
+                + player.experienceLevel + "，进度 " + player.experienceProgress);
+        check("R2 反证成立：扣穿会掉 1 级（旧实现依赖这个副作用维持满条）",
+                player.experienceLevel == levelBefore - 1);
+        check("R3 反证成立：掉级同时进度条被弹回高位（>0.9）",
+                player.experienceProgress > 0.9F);
+
+        // ---- R4：新的精确支付在同一条件下绝不弹条 ----
+        player.setExperienceLevels(30);
+        player.setExperiencePoints(56);
+        int bar4 = barXp(player);
+        // 直接驱动 mending 的支付路径：进度条只够一小部分，剩下靠等级，逐级精确写刻度
+        ItemStack chestR = player.getItemBySlot(EquipmentSlot.CHEST);
+        chestR.setDamageValue(400);
+        AutoMending.mending(player);
+        boolean precise = isIntegralTick(player);
+        System.out.println("R4 新支付：等级 → " + player.experienceLevel + "，进度 "
+                + player.experienceProgress + "（needed=" + player.getXpNeededForNextLevel()
+                + "），是否精确整数刻度 = " + precise);
+        check("R5 新支付不产生「弹回 98%」的脏状态（<=0.9）", player.experienceProgress <= 0.9F);
+        check("R6 新支付落点始终是整数经验刻度", precise);
+
+        // ================= T 组：穷举 float32 边界 =================
+        player.setItemSlot(EquipmentSlot.CHEST, elytra);
+        ItemStack chestT = player.getItemBySlot(EquipmentSlot.CHEST);
         int tested = 0;
         int newBroke = 0;
-        int oldBroke = 0;
-        float worstNew = 0.0F;
+        int restart = 0;
         for (int lv = 0; lv <= 40; lv++) {
             player.setExperienceLevels(lv);
             int n = player.getXpNeededForNextLevel();
             for (int k = 1; k < n; k++) {
-                float clean = (float) k / (float) n;   // 实机 progress 的干净形态
+                float clean = (float) k / (float) n;
                 for (int d = -2; d <= 2; d++) {
                     float p = clean;
                     for (int s = 0; s < Math.abs(d); s++) {
@@ -114,31 +251,17 @@ public final class AutoMendingSelfCheck {
                         continue;
                     }
                     tested++;
-
-                    // ---- (a) 反证：旧算法 = float32 预算 + giveExperiencePoints（负值回弹）----
                     player.setExperienceLevels(lv);
+                    chestT.setDamageValue(Math.min(maxDamage, 4 * n + 8)); // 让 actual < repair，专打预算边界
                     player.experienceProgress = p;
-                    int lv0 = player.experienceLevel;
-                    int oldBudget = (int) Math.floor(p * (float) n);
-                    if (oldBudget > 0) {
-                        player.giveExperiencePoints(-oldBudget);
-                        if (player.experienceLevel != lv0) {
-                            oldBroke++;
-                        } else if (player.experienceProgress < 0.0F) {
-                            oldBroke++;
+                    for (int round = 0; round < 3; round++) {   // 连打 3 轮，抓漂移
+                        int dmg = chestT.getDamageValue();
+                        if (dmg <= 0) {
+                            chestT.setDamageValue(Math.min(maxDamage, 4 * n + 8));
                         }
-                    }
-
-                    // ---- (b) 修复后：真实走一遍 mending()，再叠加「多轮修补」看会不会漂移 ----
-                    player.setExperienceLevels(lv);
-                    ItemStack chest = player.getItemBySlot(EquipmentSlot.CHEST);
-                    chest.setDamageValue(Math.min(maxDamage - 1, 4 * n + 8)); // 保证 actual == repair
-                    player.experienceProgress = p;
-                    int lv1 = player.experienceLevel;
-                    for (int round = 0; round < 3; round++) {   // 连续修 3 轮，模拟漂移累积
-                        chest.setDamageValue(Math.min(maxDamage - 1, 4 * n + 8));
                         AutoMending.mending(player);
-                        if (player.experienceLevel != lv1 || player.experienceProgress < 0.0F) {
+                        if (!(player.experienceProgress >= 0.0F && player.experienceProgress < 1.0F)
+                                || player.experienceLevel < 0) {
                             newBroke++;
                             if (newBroke <= 6) {
                                 System.out.println("   [T] 越界 level=" + lv + " clean(k=" + k + "/" + n
@@ -148,124 +271,99 @@ public final class AutoMendingSelfCheck {
                             break;
                         }
                     }
-                    if (player.experienceProgress > worstNew) {
-                        worstNew = player.experienceProgress;
+                    // 每 500 个形态重新摆一次附魔鞘翅（可能被修满/替换）
+                    if ((++restart % 500) == 0) {
+                        player.setItemSlot(EquipmentSlot.CHEST, elytra.copy());
+                        chestT = player.getItemBySlot(EquipmentSlot.CHEST);
                     }
                 }
             }
         }
         System.out.println("T1 穷举完成：level 0~40，每点扫 ±2ulp，共 " + tested + " 个进度形态");
-        System.out.println("    修复后越界 " + newBroke + " 个；旧算法越界 " + oldBroke + " 个");
-        check("T1 穷举所有进度形态（含 ulp 邻域）：修复后 0 越界（" + newBroke + "）", newBroke == 0);
-        check("T2 反证：旧算法在这批点位上确实会越界（" + oldBroke + " 个）", oldBroke > 0);
+        check("T2 穷举所有进度形态（含 ulp 邻域）：0 越界（" + newBroke + "）", newBroke == 0);
 
         // ================= T4：真实链路（持续获得经验 + 持续滑行修补）=================
-        // 专门抓「float32 减法漂移」——上一版就是死在这里。
         player.setExperienceLevels(30);
         player.setExperiencePoints(0);
-        ItemStack chestT = player.getItemBySlot(EquipmentSlot.CHEST);
-        chestT.setDamageValue(0);
-        int t4LevelMin = player.experienceLevel;
-        boolean t4ProgressOk = true;
-        boolean t4LevelOk = true;
+        player.setItemSlot(EquipmentSlot.CHEST, elytra.copy());
+        ItemStack chest4 = player.getItemBySlot(EquipmentSlot.CHEST);
+        chest4.setDamageValue(0);
+        int t4ProgressOk = 0;
         int t4Repairs = 0;
+        int t4MaxDrop = 0;
         int lastLevel = player.experienceLevel;
         for (int i = 0; i < 20000; i++) {
             player.giveExperiencePoints(1 + (i % 3));            // 玩家持续获得经验
-            chestT.setDamageValue(Math.min(maxDamage - 1, chestT.getDamageValue() + 5)); // 滑行受损
-            int dmgBefore = chestT.getDamageValue();
+            chest4.setDamageValue(Math.min(maxDamage, chest4.getDamageValue() + 5)); // 滑行受损
+            int dmgBefore = chest4.getDamageValue();
             AutoMending.mending(player);                          // 自动修补
-            if (dmgBefore - chestT.getDamageValue() > 0) {
+            if (dmgBefore - chest4.getDamageValue() > 0) {
                 t4Repairs++;
             }
-            if (player.experienceLevel < lastLevel) {
-                t4LevelOk = false;
-                System.out.println("   [T4] 第 " + i + " 轮掉级：" + lastLevel + " -> " + player.experienceLevel);
+            int drop = lastLevel - player.experienceLevel;
+            if (drop > 0) {
+                t4MaxDrop = Math.max(t4MaxDrop, drop);
             }
             lastLevel = player.experienceLevel;
             if (!(player.experienceProgress >= 0.0F && player.experienceProgress < 1.0F)) {
-                t4ProgressOk = false;
-                System.out.println("   [T4] 第 " + i + " 轮进度越界：" + player.experienceProgress);
+                t4ProgressOk++;
+                if (t4ProgressOk <= 3) {
+                    System.out.println("   [T4] 第 " + i + " 轮进度越界：" + player.experienceProgress);
+                }
             }
-            t4LevelMin = Math.min(t4LevelMin, player.experienceLevel);
         }
-        System.out.println("T4 真实链路 20000 轮：等级 " + t4LevelMin + " → " + player.experienceLevel
-                + "，修理 " + t4Repairs + " 次，末进度 " + player.experienceProgress);
-        check("T4 真实链路：进度条永不越界", t4ProgressOk);
-        check("T4 真实链路：等级只增不减（无扣穿降级）", t4LevelOk);
-        check("T4 真实链路：确实反复修补过（" + t4Repairs + " 次）", t4Repairs > 0);
-
-        // ================= S 组正例：模拟鞘翅滑行 40 秒 =================
-        player.setExperienceLevels(30);
-        player.setExperiencePoints(56); // needed(30)=112 → progress = 0.5
-        int startLevel = player.experienceLevel;
-        ItemStack chest0 = player.getItemBySlot(EquipmentSlot.CHEST);
-        chest0.setDamageValue(400);
-        System.out.println("S1 起始：等级 " + startLevel + "（needed=" + player.getXpNeededForNextLevel()
-                + "） 进度 " + player.experienceProgress + " 进度条经验=" + barXp(player));
-
-        boolean levelStable = true;
-        boolean progressInRange = true;
-        boolean costMatches = true;
-        int totalRepaired = 0;
-        int totalSpent = 0;
-
-        for (int sec = 0; sec < 40; sec++) {
-            // 滑行：每 tick 掉 1 点耐久 → 20 tick（1 秒）掉 20 点
-            ItemStack chest = player.getItemBySlot(EquipmentSlot.CHEST);
-            chest.setDamageValue(Math.min(maxDamage - 1, chest.getDamageValue() + 20));
-
-            int xpBefore = barXp(player);
-            int dmgBefore = player.getItemBySlot(EquipmentSlot.CHEST).getDamageValue();
-
-            AutoMending.mending(player);
-
-            int dmgAfter = player.getItemBySlot(EquipmentSlot.CHEST).getDamageValue();
-            int xpAfter = barXp(player);
-            int repaired = dmgBefore - dmgAfter;
-            int spent = Math.max(0, xpBefore - xpAfter);
-
-            if (player.experienceLevel != startLevel) {
-                levelStable = false;
-            }
-            if (!(player.experienceProgress >= 0.0F && player.experienceProgress < 1.0F)) {
-                progressInRange = false;
-            }
-            // 消耗的经验必须 = 修好的耐久 / 2（repair_with_xp = multiply 2.0 的线性反算）
-            if (repaired > 0 && spent != repaired / 2) {
-                costMatches = false;
-                System.out.println("   第 " + (sec + 1) + " 秒记账不符：修 " + repaired + " 耐久却扣了 " + spent + " 经验");
-            }
-            totalRepaired += repaired;
-            totalSpent += spent;
-        }
-
-        System.out.println("S1 滑行 40 秒后：等级 " + player.experienceLevel
-                + " 进度 " + player.experienceProgress
-                + " 累计修耐久 " + totalRepaired + " 累计耗经验 " + totalSpent);
-        check("S2 修补全程等级恒定不变（旧代码会掉级）", levelStable);
-        check("S3 experienceProgress 全程落在 [0,1)", progressInRange);
-        check("S4 等级没被消耗（仍为 " + startLevel + "）", player.experienceLevel == startLevel);
-        check("S5 耗经验 == 修耐久 / 2（无 2 倍过度扣减）", costMatches);
-        check("S6 确实修了东西（不是全程空转）", totalRepaired > 0);
-
-        // ================= S 组反证：证明「扣穿 ⇒ 掉级 + 进度条弹回」 =================
-        player.setExperienceLevels(30);
-        player.setExperiencePoints(56);
-        int bar = barXp(player);
-        int levelBefore = player.experienceLevel;
-        player.giveExperiencePoints(-(bar + 1)); // 只多扣 1 点，就足以扣穿
-        System.out.println("S7 反证：多扣 1 点后 等级 " + levelBefore + " → " + player.experienceLevel
-                + "，进度 " + player.experienceProgress);
-        check("S7 反证成立：扣穿会掉 1 级", player.experienceLevel == levelBefore - 1);
-        check("S8 反证成立：掉级同时进度条被弹回高位（>0.9）", player.experienceProgress > 0.9F);
+        System.out.println("T4 真实链路 20000 轮：末等级 " + player.experienceLevel
+                + "，修理 " + t4Repairs + " 次，单轮最大掉级 " + t4MaxDrop
+                + "，末进度 " + player.experienceProgress);
+        check("T5 真实链路：进度条永不越界（" + t4ProgressOk + "）", t4ProgressOk == 0);
+        check("T6 真实链路：确实反复修补过（" + t4Repairs + " 次）", t4Repairs > 0);
+        check("T7 真实链路：单轮掉级不超过 8（实测 " + t4MaxDrop + "）", t4MaxDrop <= 8);
 
         report();
+        return true;
     }
 
-    /** 进度条里当前攒着的经验 = 进度 × 升到下一级所需经验（与修复后的 AutoMending 同口径） */
+    /** 进度条里当前攒着的经验 = 进度 × 升到下一级所需经验（与 AutoMending 同口径） */
     private static int barXp(ServerPlayer player) {
         return (int) Math.floor((double) player.experienceProgress * player.getXpNeededForNextLevel());
+    }
+
+    /** 进度是否是「整数经验刻度」（我们全部走 setExperiencePoints，理应恒成立） */
+    private static boolean isIntegralTick(ServerPlayer player) {
+        int n = player.getXpNeededForNextLevel();
+        double v = (double) player.experienceProgress * (double) n;
+        return Math.abs(v - Math.round(v)) < 0.01D;
+    }
+
+    /**
+     * 旧实现（1.0.3）的自动修补：预算只取进度条，扣减用 setExperiencePoints。
+     * 用来做 A 组反证 —— 证明「一次修满」这条断言确实能分辨新旧两种实现。
+     *
+     * @return 实际修好的耐久点数
+     */
+    private static int legacyRepair(ServerPlayer player, ItemStack stack) {
+        int needed = player.getXpNeededForNextLevel();
+        int budget = (int) Math.floor((double) player.experienceProgress * (double) needed);
+        if (budget <= 0) {
+            return 0;
+        }
+        int damage = stack.getDamageValue();
+        int repair = EnchantmentHelper.modifyDurabilityToRepairFromXp(player.level(), stack, budget);
+        if (repair <= 0) {
+            return 0;
+        }
+        int actual = Math.min(repair, damage);
+        if (actual <= 0) {
+            return 0;
+        }
+        int spent = actual * budget / repair;
+        if (spent <= 0) {
+            return 0;
+        }
+        stack.setDamageValue(damage - actual);
+        player.setExperiencePoints(budget - spent);
+        player.totalExperience = Math.max(0, player.totalExperience - spent);
+        return actual;
     }
 
     /**

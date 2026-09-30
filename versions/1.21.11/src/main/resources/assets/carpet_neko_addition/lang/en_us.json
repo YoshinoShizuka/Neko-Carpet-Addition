@@ -1,7 +1,7 @@
 {
   "carpet.category.neko": "neko",
   "carpet.rule.autoMending.name": "Automatic Mending",
-  "carpet.rule.autoMending.desc": "Automatically spends XP already banked in the player's experience bar to repair damaged items enchanted with Mending, once per second (never eats into levels)",
+  "carpet.rule.autoMending.desc": "Automatically repairs one damaged Mending item per second (fully). Spends XP banked in the experience bar first, and draws from experience levels when the bar runs short; only stops once the player is out of XP entirely",
   "carpet.rule.voidWarehouse.name": "Void Warehouse",
   "carpet.rule.voidWarehouse.desc": "A crafting table renamed via anvil becomes a server-wide shared warehouse",
   "carpet.rule.voidWarehouseRestock.name": "Void Warehouse Restock",

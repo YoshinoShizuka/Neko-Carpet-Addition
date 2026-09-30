@@ -1,7 +1,7 @@
 {
   "carpet.category.neko": "neko",
   "carpet.rule.autoMending.name": "自动经验修补",
-  "carpet.rule.autoMending.desc": "装备或手上有耐久不满且有经验修补附魔的物品时，每秒自动用经验条里已攒下的经验去修补（只花进度条里现有的部分，不会扣穿、不会掉等级）",
+  "carpet.rule.autoMending.desc": "装备或手上有耐久不满且有经验修补附魔的物品时，每秒自动消耗玩家已有的经验修补一件（一次修满）。先花经验条里已攒下的经验，不够时自动向下动用等级经验补足；经验彻底用完才会停手",
   "carpet.rule.voidWarehouse.name": "虚空仓库",
   "carpet.rule.voidWarehouse.desc": "把铁砧改名的工作台变成全服共享仓库",
   "carpet.rule.voidWarehouseRestock.name": "虚空仓库补货",

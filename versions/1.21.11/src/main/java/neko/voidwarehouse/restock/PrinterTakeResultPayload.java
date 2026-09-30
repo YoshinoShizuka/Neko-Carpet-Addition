@@ -19,7 +19,7 @@ import net.minecraft.resources.Identifier;
  *
  * <h2>⚠ 与 {@link PrinterTakePayload} 同理，这个类也是<b>两端共用</b>的</h2>
  * <p>客户端那份镜像在 {@code litematica-printer/src/main/java/neko/voidwarehouse/restock/}，
- * 包名、类名、状态码常量、{@code CODEC} 结构必须与这里逐字节等价
+ * <b>同包名、同类名</b>，状态码常量与 {@code CODEC} 结构必须与这里逐字节等价
  * （验收方式：两端 {@code javap -p -c} 输出 {@code diff} 为空）。</p>
  *
  * <p>与取货请求的区别在于<b>注册方向不同</b>：这条是 S2C，走

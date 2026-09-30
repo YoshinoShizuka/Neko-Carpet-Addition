@@ -25,6 +25,7 @@ TARGETS = ["modern/26.1.1", "modern/26.1.2", "modern/26.2", "versions/1.21.11"]
 FILES = [
     "VoidWarehouseHopper.java",
     "mixin/HopperBlockEntityMixin.java",
+    "mixin/SlotMixin.java",
     "VoidWarehouseHopperFilter.java",
     "VoidWarehouseClassifier.java",
     "VoidWarehouse.java",

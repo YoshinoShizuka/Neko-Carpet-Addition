@@ -35,7 +35,11 @@ import java.util.List;
  *   <li><b>分类物不许摊开</b>：上方灌进来的同种货物只进它自己那一格，
  *       5 格不会被开垦成 {@code 1 1 1 1 1}（J 组，本轮修的那个）；</li>
  *   <li><b>多个分类物各守各的格子</b>（K 组）；</li>
- *   <li><b>吞吐不被漏斗 5 格容量卡住</b>：一整桶 1728 个一 tick 搬空（L 组）。</li>
+ *   <li><b>吞吐不被漏斗 5 格容量卡住</b>：一整桶 1728 个一 tick 搬空（L 组）；</li>
+ *   <li><b>混合货物只认玩家指定的那一件</b>：上方桶一半圆石一半橡木、玩家只指定橡木时，
+ *       圆石一个都进不来（M 组）；</li>
+ *   <li><b>残留的杂物不许占位</b>：玩家动手之前就躺在漏斗里的圆石（从没被指定过）
+ *       必须被搬空，不许像修复前那样被当成分类物永久留 1 个（N 组，本轮修的那个）。</li>
  * </ol>
  *
  * <h2>为什么按 tick 分步推进</h2>
@@ -237,6 +241,22 @@ public final class UnlimitedIntakeSelfCheck {
             case 46:
                 assertThroughput(level, data);
                 break;
+            case 47:
+                setupMixedCargo(level, data);
+                break;
+            case 48:
+                break;
+            case 49:
+                assertMixedCargo(level, data);
+                break;
+            case 50:
+                setupStrayResidue(level, data);
+                break;
+            case 51:
+                break;
+            case 52:
+                assertStrayResidue(level, data);
+                break;
             default:
                 finish(server);
                 return;
@@ -385,7 +405,9 @@ public final class UnlimitedIntakeSelfCheck {
         data.clearContent();
         // 玩家手动往漏斗里放了一个圆石当分类物
         hopper.setItem(0, new ItemStack(Items.COBBLESTONE, 1));
-        ((VoidWarehouseHopperFilter) hopper).setClassifierFilter(true);
+        VoidWarehouseHopperFilter seed0 = (VoidWarehouseHopperFilter) hopper;
+        seed0.setClassifierSeed(0, new ItemStack(Items.COBBLESTONE, 1));
+        seed0.setClassifierFilter(true);
         dropOne(level, hopper, Items.COBBLESTONE, 10);
         dropOne(level, hopper, Items.DIRT, 5);
     }
@@ -596,7 +618,9 @@ public final class UnlimitedIntakeSelfCheck {
         }
         // 玩家手动往漏斗里放了 1 个橡木原木当分类物
         hopper.setItem(0, new ItemStack(Items.OAK_LOG, 1));
-        ((VoidWarehouseHopperFilter) hopper).setClassifierFilter(true);
+        VoidWarehouseHopperFilter seed1 = (VoidWarehouseHopperFilter) hopper;
+        seed1.setClassifierSeed(0, new ItemStack(Items.OAK_LOG, 1));
+        seed1.setClassifierFilter(true);
         barrel.setItem(0, new ItemStack(Items.COBBLESTONE, 10));
         barrel.setItem(1, new ItemStack(Items.OAK_LOG, 10));
     }
@@ -648,7 +672,9 @@ public final class UnlimitedIntakeSelfCheck {
             return;
         }
         hopper.setItem(0, new ItemStack(Items.OAK_LOG, 1));
-        ((VoidWarehouseHopperFilter) hopper).setClassifierFilter(true);
+        VoidWarehouseHopperFilter seed2 = (VoidWarehouseHopperFilter) hopper;
+        seed2.setClassifierSeed(0, new ItemStack(Items.OAK_LOG, 1));
+        seed2.setClassifierFilter(true);
         fillBarrel(barrel, Items.OAK_LOG, BARREL_SLOTS, 64);
     }
 
@@ -700,7 +726,10 @@ public final class UnlimitedIntakeSelfCheck {
         }
         hopper.setItem(0, new ItemStack(Items.OAK_LOG, 1));
         hopper.setItem(1, new ItemStack(Items.COBBLESTONE, 1));
-        ((VoidWarehouseHopperFilter) hopper).setClassifierFilter(true);
+        VoidWarehouseHopperFilter seed3 = (VoidWarehouseHopperFilter) hopper;
+        seed3.setClassifierSeed(0, new ItemStack(Items.OAK_LOG, 1));
+        seed3.setClassifierSeed(1, new ItemStack(Items.COBBLESTONE, 1));
+        seed3.setClassifierFilter(true);
         barrel.setItem(0, new ItemStack(Items.OAK_LOG, 10));
         barrel.setItem(1, new ItemStack(Items.COBBLESTONE, 10));
         barrel.setItem(2, new ItemStack(Items.DIRT, 10));
@@ -771,6 +800,134 @@ public final class UnlimitedIntakeSelfCheck {
         check("L3 总量守恒 1728 = " + (stored + leftAbove + countIn(hopper, Items.COBBLESTONE)),
                 stored + leftAbove + countIn(hopper, Items.COBBLESTONE) == 1728L);
         teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ M. 混合货物：只认玩家指定的那一件
+
+    /**
+     * 上方桶里<b>一半圆石一半橡木</b>，玩家只指定了橡木。
+     *
+     * <p>圆石应当一个都进不来：清单上没有它，关卡把住，它原样留在上方桶里 ——
+     * 「漏斗里的填充物只能由玩家来指定，不能以上方容器的物品来分类」。</p>
+     */
+    private static void setupMixedCargo(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("M0 入库漏斗造出来了", false);
+            return;
+        }
+        data.clearContent();
+        Container barrel = placeBarrel(level, H.above());
+        if (barrel == null) {
+            check("M0 上方桶造出来了", false);
+            return;
+        }
+        hopper.setItem(0, new ItemStack(Items.OAK_LOG, 1));
+        VoidWarehouseHopperFilter filter = (VoidWarehouseHopperFilter) hopper;
+        filter.setClassifierSeed(0, new ItemStack(Items.OAK_LOG, 1));   // 玩家的手：只指定了橡木
+        filter.setClassifierFilter(true);
+        for (int i = 0; i < 13; i++) {
+            barrel.setItem(i, new ItemStack(Items.COBBLESTONE, 64));
+        }
+        for (int i = 13; i < BARREL_SLOTS; i++) {
+            barrel.setItem(i, new ItemStack(Items.OAK_LOG, 64));
+        }
+        barrel.setChanged();
+    }
+
+    private static void assertMixedCargo(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        Container barrel = barrelAt(level, H.above());
+        if (hopper == null || barrel == null) {
+            check("M1 漏斗 / 上方桶都还在", false);
+            return;
+        }
+        long storedOak = amount(data, Items.OAK_LOG);
+        long storedCobble = amount(data, Items.COBBLESTONE);
+        long leftCobble = countIn(barrel, Items.COBBLESTONE);
+        System.out.println("M 实测：仓库 oak=" + storedOak + " cobble=" + storedCobble
+                + "；上方剩 oak=" + countIn(barrel, Items.OAK_LOG) + " cobble=" + leftCobble
+                + "；漏斗格 " + snapshot(hopper));
+        check("M1 没被指定的圆石一个都没进库（" + storedCobble + "）", storedCobble == 0);
+        check("M2 圆石原样留在上方桶里（" + leftCobble + " / 832）", leftCobble == 832);
+        check("M3 橡木全进库（" + storedOak + " / 896）", storedOak == 896);
+        check("M4 漏斗里只剩玩家指定的那一格（格 " + snapshot(hopper) + "）", !spreadBeyond(hopper, 0));
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ N. 残留的杂物不许占位（本轮修的那个）
+
+    /**
+     * <b>本轮修的那个。</b>玩家动手之前，上方容器流下来的圆石正躺在 slot1，
+     * 而玩家<b>从未指定过它</b>。
+     *
+     * <p>修复前：白名单靠「反推漏斗当前内容」得来 → 那颗圆石被当成分类物，
+     * {@code drain} 每格留 {@code KEEP} 个 ⇒ 它被永久留下，玩家看到
+     * {@code 橡木 石头 空 空 空}。</p>
+     * <p>修复后：清单上没有 slot1，那颗圆石<b>被搬空</b>（进库那 1 个），
+     * 位置还给玩家；上方桶里的圆石依旧一个都进不来。</p>
+     */
+    private static void setupStrayResidue(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("N0 入库漏斗造出来了", false);
+            return;
+        }
+        data.clearContent();
+        Container barrel = placeBarrel(level, H.above());
+        if (barrel == null) {
+            check("N0 上方桶造出来了", false);
+            return;
+        }
+        hopper.setItem(0, new ItemStack(Items.OAK_LOG, 1));
+        // 事故现场：玩家动手之前就躺在漏斗里的残留，玩家从没指定过它
+        hopper.setItem(1, new ItemStack(Items.COBBLESTONE, 1));
+        VoidWarehouseHopperFilter filter = (VoidWarehouseHopperFilter) hopper;
+        filter.setClassifierSeed(0, new ItemStack(Items.OAK_LOG, 1));
+        filter.setClassifierFilter(true);
+        for (int i = 0; i < 13; i++) {
+            barrel.setItem(i, new ItemStack(Items.COBBLESTONE, 64));
+        }
+        for (int i = 13; i < BARREL_SLOTS; i++) {
+            barrel.setItem(i, new ItemStack(Items.OAK_LOG, 64));
+        }
+        barrel.setChanged();
+    }
+
+    private static void assertStrayResidue(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        Container barrel = barrelAt(level, H.above());
+        if (hopper == null || barrel == null) {
+            check("N1 漏斗 / 上方桶都还在", false);
+            return;
+        }
+        long storedOak = amount(data, Items.OAK_LOG);
+        long storedCobble = amount(data, Items.COBBLESTONE);
+        long leftCobble = countIn(barrel, Items.COBBLESTONE);
+        System.out.println("N 实测：仓库 oak=" + storedOak + " cobble=" + storedCobble
+                + "；上方剩 cobble=" + leftCobble
+                + "；漏斗格 " + snapshot(hopper) + "（应只剩 slot0 的橡木余量）");
+        check("N1 没被指定的残留圆石被清掉了，没占着格子（格 " + snapshot(hopper) + "）",
+                countIn(hopper, Items.COBBLESTONE) == 0);
+        // 仓库里那 1 个圆石 = 被清掉的残留；上方桶里的 832 个一个都没进来
+        check("N2 残留被搬进库、上方桶的圆石仍被拦住（仓库 cobble=" + storedCobble + "，应为 1）",
+                storedCobble == 1);
+        check("N3 上方桶的圆石原样留着（" + leftCobble + " / 832）", leftCobble == 832);
+        check("N4 漏斗只剩玩家指定的那一格（格 " + snapshot(hopper) + "）", !spreadBeyond(hopper, 0));
+        check("N5 那一格只剩分类物余量 " + VoidWarehouseClassifier.KEEP + " 个（实际 "
+                + hopper.getItem(0).getCount() + "）", hopper.getItem(0).getCount() == VoidWarehouseClassifier.KEEP);
+        check("N6 橡木照常全进库（" + storedOak + " / 896）", storedOak == 896);
+        teardown(level, data, T, H);
+    }
+
+    /** {@code allowed} 以外的格子里还有没有东西（有 = 分类物被摊开 / 杂物占位）。 */
+    private static boolean spreadBeyond(HopperBlockEntity hopper, int allowed) {
+        for (int i = 0; i < hopper.getContainerSize(); i++) {
+            if (i != allowed && !hopper.getItem(i).isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------ 工具

@@ -236,8 +236,11 @@ public final class VanillaParitySelfCheck {
             // ---------------- E：带着分类物标记的普通漏斗 ----------------
             case 15:
                 buildChain(level, E_CHEST, E_HOPPER, Direction.DOWN, true);
-                // 手工把标记打开（等价于玩家往这个漏斗里放过东西），验证它不影响原版速率
-                ((VoidWarehouseHopperFilter) hopperAt(level, E_HOPPER)).setClassifierFilter(true);
+                // 手工把标记打开 + 记一份分类物清单（等价于玩家往这个漏斗里放过东西），
+                // 验证它不影响原版速率
+                VoidWarehouseHopperFilter eFilter = (VoidWarehouseHopperFilter) hopperAt(level, E_HOPPER);
+                eFilter.setClassifierSeed(0, new ItemStack(Items.COBBLESTONE, 1));
+                eFilter.setClassifierFilter(true);
                 fillHopper(hopperAt(level, E_HOPPER), Items.COBBLESTONE);
                 break;
             case 16:

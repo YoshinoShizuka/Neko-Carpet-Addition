@@ -34,6 +34,14 @@ public final class VoidWarehouse {
      */
     private static boolean shellReported;
 
+    /**
+     * 空壳闸门是否已经判过一次。
+     *
+     * <p><b>只判一次</b>是硬要求：判据里含「此刻仓库是否为空」，而仓库随时会被玩家取空，
+     * 那时重判必然误报。「读没读出来」是载入那一刻的事实，记下来就完事了。</p>
+     */
+    private static boolean guardChecked;
+
     /** 写盘前快照是否已经做过（每进程一次） */
     private static boolean backupDone;
 
@@ -72,13 +80,24 @@ public final class VoidWarehouse {
 
         // 空壳判定分两路，两条都必须拦：
         //   ① 读到了记录、却一条都没还原成物品 → 解码整片失败（见 VoidWarehouseData）。
-        //   ② 磁盘上明明有条目，实例却是个全新空对象（loadingCount 还是 0）→
+        //   ② 磁盘上明明有条目，实例却是个全新空对象（loadedCount 还是 0）→
         //      computeIfAbsent 走了「新建」分支，也就是 readSavedData 返回了 null。
         // ② 是关键：这条路上的实例由无参构造造出来，光看它自己什么都看不出来，
         // 必须回磁盘点一遍条目数才知道「本该有多少」。
         int onDisk = countItemsOnDisk(server, overworld);
-        if (data.isSuspiciouslyEmpty() || (onDisk > 0 && data.loadedCount() == 0 && data.isEmpty())) {
-            if (!shellReported) {
+
+        // ---- 空壳闸门：只在「刚拿到这一次数据」的当下判一次 ----
+        //
+        // 为什么必须一次性判定（实测踩出来的坑）：
+        //   两条判据里都有一半是「此刻仓库是不是空的」，而<b>仓库随时会被玩家取空</b>。
+        //   载入 2 条合法数据 → 玩家把东西全搬走 → 下次访问时「磁盘有 2 条、仓库却空」成立
+        //   → 闸门误报 → 每次访问都抛异常，仓库永久不可用。
+        //   所以「这一刺史读没读出来」这个事实必须在第一时间记下来，之后不再重算。
+        //   真正的坠落路径（readSavedData 返回 null → 全新空实例）在第一次访问时
+        //   loadedCount() 就是 0，照样拦得住 —— 保护力度一点没减。
+        if (!guardChecked) {
+            guardChecked = true;
+            if (data.isSuspiciouslyEmpty() || (onDisk > 0 && data.loadedCount() == 0 && data.isEmpty())) {
                 shellReported = true;
                 LOGGER.error("虚空仓库读到了空壳：文件 {} 里实际有 {} 条记录，"
                                 + "载入后却是 0 格（读取计数 {}，其中 {} 条读不懂）。"
@@ -86,6 +105,8 @@ public final class VoidWarehouse {
                                 + "请立即停止游戏并检查该文件（同目录下有 .bak 快照）。",
                         dataFile(server, overworld), onDisk, data.loadedCount(), data.loadedBrokenCount());
             }
+        }
+        if (shellReported) {
             throw new IllegalStateException(
                     "虚空仓库数据异常（磁盘上有 " + onDisk + " 条，载入后却为 0 格），已拒绝访问以保护存档；"
                             + "详情见日志与 " + DATA_FILE + ".bak");

@@ -13,7 +13,6 @@ import net.minecraft.world.Container;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.HopperBlock;
-import net.minecraft.world.level.block.entity.Hopper;
 import net.minecraft.world.level.block.entity.HopperBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.storage.ValueInput;
@@ -30,16 +29,25 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * 漏斗与虚空仓库之间的两个方向 + 分类物白名单。
  *
  * <h2>① 入库（无速率上限）—— 漏斗口<b>朝向</b>终端</h2>
- * <p>挂在 {@code HopperBlockEntity#pushItemsTick} 的 HEAD：这是原版漏斗每 tick 的入口
- * （Ticker），它在最开头递减冷却、然后在 {@code !isOnCooldown() && ENABLED} 时才去搬运，
- * 搬成功一次就把冷却设成 8 —— 这就是「8 gt 搬 1 个」的来源。我们在最前面先把漏斗里能存的
- * 物品<b>一次搬空</b>（{@link VoidWarehouseHopper#drain}），搬得再多也不设冷却。</p>
+ * <p>挂在 {@code HopperBlockEntity#pushItemsTick} 的 HEAD 与 TAIL 两处，配合起来把
+ * 「8 gt 搬 1 个」这条节流彻底拆掉：</p>
+ * <ul>
+ *   <li><b>HEAD</b>（ {@link #carpetAutomending$voidWarehouseUnlimited}）：每 tick 一次
+ *       <b>全量清扫</b> —— 先搬空漏斗、再把上方容器 / 上方路过的掉落物能收的全收进来、
+ *       收完当场再搬空一次（{@link VoidWarehouseHopper#intake}）。HEAD 是原版 ticker 的必经之处，
+ *       <b>不看冷却脸色</b>，所以真正的搬运不再受 8 gt 限制；</li>
+ *   <li><b>TAIL</b>（ {@link #carpetAutomending$unlimitedCooldown}）：整条 tick 走完之后把
+ *       {@code cooldownTime} 清零，让原版 {@code tryMoveItems} 那两条路径
+ *       （{@code suckInItems} 本体、{@code entityInside} 触发的那次）也不被 8 gt 卡着。
+ *       必须放在这里 —— 早先放在 {@code suckInItems} 中途是<b>无效的</b>，
+ *       {@code tryMoveItems} 收尾会立刻把 {@code setCooldown(8)} 盖回去。</li>
+ * </ul>
  * <p><b>不取消原版逻辑</b>，原因有两个：</p>
  * <ol>
  *   <li>原版只往「容器」里推东西，而工作台不是容器，所以原版这一段对本仓库是空操作，
  *       不会把物品推到别处去；</li>
- *   <li>保留原版逻辑，冷却才会照常递减（否则一旦我们 cancel，冷却会冻在原值上，
- *       把漏斗永久卡死），「上方容器 → 漏斗」那一段也能维持原版速率。</li>
+ *   <li>保留原版逻辑，红石 /  comparator 等一套语义都还成立，我们只是把「能搬多少」
+ *       这一件事改成不受限。</li>
  * </ol>
  *
  * <h2>② 出料 —— 终端压在漏斗<b>正上方</b></h2>
@@ -91,8 +99,9 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
     private boolean carpetAutomending$classifierFilter;
 
     /**
-     * 原版的搬运冷却字段（{@code cooldownTime}，private）。无上限吸取复用了原版
-     * {@code addItem}，它会顺手设 8 gt 冷却，这里要把它读回来清零（见 {@link #resetCooldown}）。
+     * 原版的搬运冷却字段（{@code cooldownTime}，private）。
+     * 入库漏斗在整条 tick 收尾处把它清零（见 {@link #carpetAutomending$unlimitedCooldown}），
+     * 让原版 {@code tryMoveItems} 不再被「每 8 gt 才动一次」卡住。
      */
     @Shadow
     private int cooldownTime;
@@ -152,7 +161,8 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
                 self.setClassifierFilter(false);
                 hopper.setChanged();
             }
-            VoidWarehouseHopper.drain(serverLevel, hopper, self.hasClassifierFilter());
+            // 每 tick 一次全量清扫：搬空 + 进货 + 再搬空（见 VoidWarehouseHopper#intake）
+            VoidWarehouseHopper.intake(serverLevel, hopper, self.hasClassifierFilter());
             return;
         }
         // 正上方是不是仓库终端？（终端压在漏斗上 → 反过来，从仓库往漏斗里出料）
@@ -162,42 +172,44 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
     }
 
     /**
-     * <b>入库漏斗的「上方容器 → 漏斗」无上限吸取</b>：接管原版 {@code suckInItems}。
+     * <b>把 8 gt 节流真正拆掉</b>：整条 tick 走完之后，把入库漏斗的搬运冷却清零。
      *
-     * <p>原版 {@code suckInItems} 有两个分支：上方是容器 → 从容器吸 1 个
-     * （每 8 gt 才 1 个，节流来自 {@code tryMoveItems} 的 {@code setCooldown(8)}）；
-     * 上方不是容器 → 吸掉落到漏斗口的物品。这里<b>只接管前者</b>：
-     * 当「这是入库漏斗」<b>且</b>「上方是容器」时，换成 {@link VoidWarehouseHopper#suckUnlimited}
-     * 一次吸满，返回 {@code false} 让 {@code tryMoveItems} 不设 8 gt 冷却，并顺手把
-     * {@code addItem} 内部设的冷却清零 —— 于是每个 tick 都能继续吸，实现无上限。</p>
-     * <p>其余情况（不是入库漏斗、或上方不是容器）第一行就 return，原版方法体一个字不碰。</p>
+     * <p>为什么必须放在 {@code pushItemsTick} 的<b>收尾</b>而不是中途（逐个核对字节码后的结论）：</p>
+     * <pre>{@code
+     * tryMoveItems(...) {
+     *     if (hopper.isOnCooldown()) return false;     // ← 冷却未清，这里直接出队
+     *     ...
+     *     flag = ejectItems(...);                      // 出料
+     *     flag |= supplier.getAsBoolean();             // ← 26.3 里它 == suckInItems
+     *     if (flag) { hopper.setCooldown(8); ... }     // ← 无条件写回 8
+     *     return flag;
+     * }
+     * }</pre>
+     * <p>早先的版本在 {@code suckInItems} 的 HEAD 里调 {@code resetCooldown()}，
+     * 那一步<b>紧接着就被上面的 {@code setCooldown(8)} 盖掉</b>，等于白做 ——
+     * 「无上限吸取」实际一直是 8 gt 一次。所以清零必须发生在 {@code tryMoveItems} <b>之后</b>。</p>
+     *
+     * <p>这一手与 Carpet-TIS 的 {@code hopperCountersUnlimitedSpeed} 收尾的
+     * {@code setCooldown(0)} 是同一个意思：让漏斗永远处于「冷却已过」的状态。</p>
+     *
+     * <p>注意：<b>搬运本身已经不依赖这个cool down了</b>（{@code intake} 挂在 HEAD，每 tick 必跑），
+     * 这里清零只是顺手把原版那两条路径（{@code suckInItems} 本体、
+     * 以及 {@code entityInside} 触发的 {@code tryMoveItems}）也放开，
+     * 让它们不再被 8 gt 卡着。只对入库漏斗生效，普通漏斗一个字节都不碰。</p>
      */
-    @Inject(method = "suckInItems", at = @At("HEAD"), cancellable = true)
-    private static void carpetAutomending$unlimitedIntake(Level level, Hopper hopper, CallbackInfoReturnable<Boolean> cir) {
+    @Inject(method = "pushItemsTick", at = @At("TAIL"))
+    private static void carpetAutomending$unlimitedCooldown(Level level, BlockPos pos, BlockState state,
+                                                            HopperBlockEntity hopper, CallbackInfo ci) {
         if (!VoidWarehouseSettings.voidWarehouse) {
             return;
         }
         if (!(level instanceof ServerLevel serverLevel)) {
             return;
         }
-        if (!(hopper instanceof HopperBlockEntity blockEntity)) {
-            return;
-        }
-        BlockPos pos = blockEntity.getBlockPos();
-        BlockState state = level.getBlockState(pos);
         if (!VoidWarehouseHopper.isIntake(serverLevel, pos, state)) {
-            // 不是入库漏斗 → 原版（含吸掉落物分支）
             return;
         }
-        // 上方是不是容器？不是（掉落物 / 完整方块）就交给原版吸掉落物
-        if (HopperBlockEntity.getContainerAt(level, pos.above()) == null) {
-            return;
-        }
-        boolean moved = VoidWarehouseHopper.suckUnlimited(serverLevel, blockEntity);
-        // 抵消 addItem 内部设的 8 gt 冷却，让下一个 tick 原版 tryMoveItems 继续调 suckInItems
-        ((VoidWarehouseHopperFilter) blockEntity).resetCooldown();
-        // 恒返回 false：不想要原版 tryMoveItems 的 setCooldown(8) 节流
-        cir.setReturnValue(moved);
+        ((VoidWarehouseHopperFilter) hopper).resetCooldown();
     }
 
     /**

@@ -18,6 +18,8 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.storage.ValueInput;
 import net.minecraft.world.level.storage.ValueOutput;
 import org.spongepowered.asm.mixin.Mixin;
+
+import java.util.List;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
@@ -94,6 +96,12 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
     /** 存档里那个布尔标记的键名（与 {@code TransferCooldown} 平级，只在本模组用到时才写） */
     private static final String CLASSIFIER_FILTER_TAG = "CarpetNekoAdditionClassifierFilter";
 
+    /** 存档里「玩家指定的分类物清单」的键名（定长 5 条，空格写 {@code ItemStack.EMPTY}） */
+    private static final String CLASSIFIER_SEED_TAG = "CarpetNekoAdditionClassifierSeeds";
+
+    /** 漏斗的格子数（原版固定 5，这里写成常量省得每次问容器） */
+    private static final int HOPPER_SLOTS = 5;
+
     /**
      * 这个漏斗有没有被玩家声明过分类物。
      *
@@ -102,6 +110,17 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
      */
     @Unique
     private boolean carpetAutomending$classifierFilter;
+
+    /**
+     * <b>玩家亲手指定的分类物清单</b>（按格子下标对齐，{@code null} / 空 = 这一格没指定）。
+     *
+     * <p>与 {@link #carpetAutomending$classifierFilter} 的区别：开关只说「这个漏斗有分类物吗」，
+     * 这份清单才真正回答「是哪几件、分别在哪一格」。
+     * <b>绝不能靠反推漏斗当前内容来回答后一个问题</b> —— 那会把任何残留在漏斗里的
+     * 货物一并认成分类物（实测：玩家只摆了橡木，漏斗却变成 {@code 橡木 石头 空 空 空}）。</p>
+     */
+    @Unique
+    private ItemStack[] carpetAutomending$classifierSeeds = new ItemStack[HOPPER_SLOTS];
 
     /**
      * 原版的搬运冷却字段（{@code cooldownTime}，private）。
@@ -122,6 +141,26 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
     }
 
     @Override
+    public ItemStack getClassifierSeed(int slot) {
+        if (slot < 0 || slot >= this.carpetAutomending$classifierSeeds.length) {
+            return ItemStack.EMPTY;
+        }
+        ItemStack seed = this.carpetAutomending$classifierSeeds[slot];
+        return seed == null ? ItemStack.EMPTY : seed;
+    }
+
+    @Override
+    public void setClassifierSeed(int slot, ItemStack stack) {
+        if (slot < 0 || slot >= this.carpetAutomending$classifierSeeds.length) {
+            return;
+        }
+        // 只存「种类」：数量归一是刻意的 —— 分类物回答的是「这是什么」，
+        // 与这一格此刻有几个无关（货物灌进来时数量会在 1 和 64 之间反复横跳）
+        this.carpetAutomending$classifierSeeds[slot] =
+                stack == null || stack.isEmpty() ? null : stack.copyWithCount(1);
+    }
+
+    @Override
     public void resetCooldown() {
         this.cooldownTime = 0;
     }
@@ -133,16 +172,35 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
     private void carpetAutomending$saveClassifierFilter(ValueOutput output, CallbackInfo ci) {
         if (this.carpetAutomending$classifierFilter) {
             output.putBoolean(CLASSIFIER_FILTER_TAG, true);
+            // 按格子独立写 key，<b>空槽一律跳过</b>：ItemStack.CODEC 拒绝 air（count=0），
+            // 当初图省事用定长 list 把 5 格全写进去，空槽的 EMPTY 会触发
+            // 「Failed to append ... minecraft:air」警告并静默丢弃 —— 虽然不影响对齐，
+            // 但会把日志刷爆，也埋下「读回来数量对不上」的隐患。
+            for (int i = 0; i < HOPPER_SLOTS; i++) {
+                ItemStack seed = this.getClassifierSeed(i);
+                if (!seed.isEmpty()) {
+                    output.store(CLASSIFIER_SEED_TAG + i, ItemStack.CODEC, seed);
+                }
+            }
         }
     }
 
     /**
-     * 从存档读回标记：<b>服务器重启、区块卸载重载之后，白名单照样在</b>。
-     * 标签不存在时读成 {@code false}（老存档 / 普通漏斗）。
+     * 从存档读回标记与分类物清单：<b>服务器重启、区块卸载重载之后，白名单照样在</b>。
+     *
+     * <p>标签不存在时读成 {@code false} / 全空（老存档 / 普通漏斗）。
+     * 老存档只有开关、没有清单 —— 那种情况由 {@link VoidWarehouseClassifier#adoptLegacy}
+     * 就地把当时的漏斗内容认作分类物，玩家摆过的东西不会丢。</p>
      */
     @Inject(method = "loadAdditional", at = @At("HEAD"))
     private void carpetAutomending$loadClassifierFilter(ValueInput input, CallbackInfo ci) {
         this.carpetAutomending$classifierFilter = input.getBooleanOr(CLASSIFIER_FILTER_TAG, false);
+        for (int i = 0; i < HOPPER_SLOTS; i++) {
+            // 按格子独立读：写着的那几格读回来，没写的那几格保持空（没被指定过）
+            final int slot = i;
+            input.read(CLASSIFIER_SEED_TAG + i, ItemStack.CODEC)
+                    .ifPresent(seed -> this.setClassifierSeed(slot, seed));
+        }
     }
 
     @Inject(method = "pushItemsTick", at = @At("HEAD"))
@@ -161,8 +219,15 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
         // 漏斗口指向的方块是不是仓库终端？（下面的面：原版没有朝上的漏斗，天然排除）
         if (VoidWarehouseHopper.isIntake(serverLevel, pos, state)) {
             VoidWarehouseHopperFilter self = (VoidWarehouseHopperFilter) hopper;
-            if (self.hasClassifierFilter() && !VoidWarehouseClassifier.hasAny(hopper)) {
-                // 分类物都被拿走了 → 自动退出过滤模式，回到「漏斗里有什么就搬什么」的原规则
+            if (self.hasClassifierFilter() && !VoidWarehouseClassifier.hasAnySeed(self)) {
+                // 一份分类物都没指定（老存档可能只有开关、没有清单）→ 就地认下当前内容，
+                // 免得升级之后玩家摆过的白名单凭空消失（详见 adoptLegacy）。
+                VoidWarehouseClassifier.adoptLegacy(hopper, self);
+                hopper.setChanged();
+            }
+            if (self.hasClassifierFilter() && !VoidWarehouseClassifier.hasAnySeed(self)) {
+                // 连当前内容也是空的 → 真的没有分类物 → 自动退出过滤模式，
+                // 回到「漏斗里有什么就搬什么」的原规则
                 self.setClassifierFilter(false);
                 hopper.setChanged();
             }
@@ -244,16 +309,17 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
             // 标记归标记：这个漏斗不是在往仓库里入库 → 完全按原版跑
             return;
         }
-        if (!VoidWarehouseClassifier.hasAny(hopper)) {
+        VoidWarehouseHopperFilter filter = (VoidWarehouseHopperFilter) hopper;
+        if (!VoidWarehouseClassifier.hasAnySeed(filter)) {
             // 防御：一件分类物都没有就没有白名单可言，放行（正常路径上开关已经被关掉了）
             return;
         }
-        if (!VoidWarehouseClassifier.matchesAny(hopper, stack)) {
+        if (!VoidWarehouseClassifier.matchesAny(filter, stack)) {
             // 不是分类物 → 原样留在上游容器 / 上游漏斗里，不进这个漏斗
             cir.setReturnValue(false);
             return;
         }
-        if (!VoidWarehouseClassifier.isOwnSlot(hopper, stack, slot)) {
+        if (!VoidWarehouseClassifier.isOwnSlot(filter, stack, slot)) {
             // 是分类物，但这一格不是它的格子 → 拒绝。
             //
             // 少了这一句就是「分类物摊开」事故：原版 addItem 按 slot 0→N 逐个试，

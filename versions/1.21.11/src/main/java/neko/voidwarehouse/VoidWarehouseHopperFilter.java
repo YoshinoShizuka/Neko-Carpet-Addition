@@ -1,9 +1,11 @@
 package neko.voidwarehouse;
 
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.entity.HopperBlockEntity;
 
 /**
- * 漏斗上的「分类物过滤模式」开关（由 {@code HopperBlockEntityMixin} 实现）。
+ * 漏斗上的「分类物过滤模式」开关 + <b>玩家亲手指定的分类物清单</b>
+ * （实现在 {@code HopperBlockEntityMixin}）。
  *
  * <p>这是一个<b>普通接口</b>，不是 Mixin：Mixin 只能把实现写在目标类自己身上，
  * 而外部代码想读一个「加在 {@code HopperBlockEntity} 上的字段」时，
@@ -22,6 +24,16 @@ import net.minecraft.world.level.block.entity.HopperBlockEntity;
  * <p><b>开关只对「口朝向仓库终端」的入库漏斗生效</b>（见
  * {@link VoidWarehouseHopper#isIntake}）。普通漏斗即使被标记了这个开关，
  * 行为也一个字都不会变 —— 这是「不影响原版漏斗属性」的硬要求。</p>
+ *
+ * <h2>为什么光有开关不够（实测事故）</h2>
+ * <p>早先只有那个布尔，而「哪些物品算分类物」是靠<b>反推漏斗当前格子里有什么</b>
+ * 得出来的。于是只要玩家动手之前漏斗里还残留着别的东西（比如上方容器流下来的石头），
+ * 那件东西就被<b>一并认成分类物</b>：{@code drain} 给它留 {@code KEEP} 个，
+ * 它从此永久占着一个格子，还摇身一变成了合法的分类物 ——
+ * 玩家看到的就是「我只摆了橡木，漏斗却变成 {@code 橡木 石头 空 空 空}」。</p>
+ * <p>所以分类物必须<b>有一份独立于漏斗内容的清单</b>：写清单的唯一途径是
+ * {@code Slot#setByPlayer}（玩家的手），机器搬运永远写不进来。
+ * 这正是需求里那句「漏斗里的填充物只能由玩家来指定」。</p>
  */
 public interface VoidWarehouseHopperFilter {
     /** 这个漏斗有没有被玩家声明过分类物（只对入库漏斗有意义） */
@@ -29,6 +41,22 @@ public interface VoidWarehouseHopperFilter {
 
     /** 打开 / 关掉分类物过滤模式 */
     void setClassifierFilter(boolean enabled);
+
+    /**
+     * 玩家亲手在第 {@code slot} 格指定的分类物；这一格没指定过就返回 {@code EMPTY}。
+     *
+     * <p><b>只认玩家的手</b>：写这份清单的唯一入口是 {@code Slot#setByPlayer}，
+     * 机器搬运（上方容器吸料、邻居漏斗推料、掉落物被吸入）一个字都写不进来。</p>
+     */
+    ItemStack getClassifierSeed(int slot);
+
+    /**
+     * 记下 / 抹掉玩家在第 {@code slot} 格指定的分类物（传空 = 抹掉）。
+     *
+     * <p>只存「种类」（数量归一），因为分类物回答的是「这是什么」，
+     * 与格子里此刻有几个无关。</p>
+     */
+    void setClassifierSeed(int slot, ItemStack stack);
 
     /**
      * 把原版搬运冷却（{@code cooldownTime}）清零。

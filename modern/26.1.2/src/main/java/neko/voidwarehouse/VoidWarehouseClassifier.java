@@ -42,15 +42,18 @@ public final class VoidWarehouseClassifier {
     }
 
     /**
-     * 这个漏斗里现在有没有分类物（任意一个非空格子）。
+     * 玩家有没有为这个漏斗指定过<b>任何</b>分类物（清单里任意一格非空）。
      *
-     * <p>入库端的用法：一件都没有 = 「漏斗里不存在分类物」= 回到原规则（见
+     * <p>入库端的用法：一件都没有 = 「不存在分类物」= 回到原规则（见
      * {@link VoidWarehouseHopper#drain}）。</p>
+     *
+     * <p><b>看的是玩家那份清单，不是漏斗当前的内容</b> —— 这条区别是
+     * {@code 橡木 石头 空 空 空} 那次事故的全部教训：反推漏斗内容会把任何
+     * 恰好躺在里面的货物一并认成分类物。</p>
      */
-    public static boolean hasAny(HopperBlockEntity hopper) {
-        int slots = hopper.getContainerSize();
-        for (int i = 0; i < slots; i++) {
-            if (!hopper.getItem(i).isEmpty()) {
+    public static boolean hasAnySeed(VoidWarehouseHopperFilter filter) {
+        for (int i = 0; i < hopperSlots(filter); i++) {
+            if (!filter.getClassifierSeed(i).isEmpty()) {
                 return true;
             }
         }
@@ -58,21 +61,20 @@ public final class VoidWarehouseClassifier {
     }
 
     /**
-     * 漏斗里有没有与 {@code stack} <b>相同</b>的分类物（物品 + 数据组件都要一致）。
+     * {@code stack} 是不是玩家指定的分类物之一（物品 + 数据组件都要一致）。
      *
      * <p>入库端在「机器往漏斗里塞东西」的唯一关卡
      * （{@code HopperBlockEntity#canPlaceItemInContainer}）问这一句：
      * 问不过去的物品<b>根本进不来</b> —— 于是漏斗里永远不会攒下不认识的东西，
      * 白名单也就不会自己长大。</p>
      */
-    public static boolean matchesAny(HopperBlockEntity hopper, ItemStack stack) {
+    public static boolean matchesAny(VoidWarehouseHopperFilter filter, ItemStack stack) {
         if (stack.isEmpty()) {
             return false;
         }
-        int slots = hopper.getContainerSize();
-        for (int i = 0; i < slots; i++) {
-            ItemStack resident = hopper.getItem(i);
-            if (!resident.isEmpty() && ItemStack.isSameItemSameComponents(resident, stack)) {
+        for (int i = 0; i < hopperSlots(filter); i++) {
+            ItemStack seed = filter.getClassifierSeed(i);
+            if (!seed.isEmpty() && ItemStack.isSameItemSameComponents(seed, stack)) {
                 return true;
             }
         }
@@ -93,21 +95,44 @@ public final class VoidWarehouseClassifier {
      * {@code 1 1 1 1 1}。手动填充看不出来，是因为玩家只写一次、只碰一格。</p>
      *
      * <h2>规则</h2>
-     * <p>分类物<b>只许合并进已经放着同种分类物的格子，不许开垦新格子</b>。
+     * <p>分类物<b>只许合并进玩家为它指定的那一格，不许开垦新格子</b>。
      * 于是「哪格是哪种」永远等于玩家摆出来的样子，白名单不会自己长大，
      * 玩家想加第二种分类物时那个格子也还空着。</p>
      *
-     * <p>注意这一条在语义上<b>已经蕴含</b>了 {@link #matchesAny}：格子里的东西与
-     * {@code stack} 同种，那漏斗里当然存在这个分类物。两道检查都保留，
-     * 是为了让「是不是白名单物品」与「该进哪一格」这两件事在代码里各自说清楚。</p>
+     * <p>判据是<b>玩家那份清单在这一格写的是什么</b>，与漏斗当前装着什么无关 ——
+     * 后者会把残留在漏斗里的货物也认成「这格的分类物」。</p>
      *
      * @param slot 机器正打算往哪一格塞（原版 {@code tryMoveInItem} 给的槽位号）
      */
-    public static boolean isOwnSlot(HopperBlockEntity hopper, ItemStack stack, int slot) {
-        if (stack.isEmpty() || slot < 0 || slot >= hopper.getContainerSize()) {
+    public static boolean isOwnSlot(VoidWarehouseHopperFilter filter, ItemStack stack, int slot) {
+        if (stack.isEmpty() || slot < 0 || slot >= hopperSlots(filter)) {
             return false;
         }
-        ItemStack resident = hopper.getItem(slot);
-        return !resident.isEmpty() && ItemStack.isSameItemSameComponents(resident, stack);
+        ItemStack seed = filter.getClassifierSeed(slot);
+        return !seed.isEmpty() && ItemStack.isSameItemSameComponents(seed, stack);
     }
+
+    /**
+     * <b>老存档兼容</b>：开关是开的，但清单是空的（本轮之前没有清单这个概念）。
+     *
+     * <p>那种存档里「分类物」本来就等价于「漏斗里当时装着什么」，所以这里照旧
+     * 把当前 5 格认作分类物，玩家摆过的白名单就不会在升级之后凭空消失。
+     * 认领完当场写进清单，之后一律以清单为准。</p>
+     *
+     * <p>副作用要说明白：如果玩家的漏斗里当时混进了杂物（正是事故现场那种
+     * {@code 橡木 石头 空 空 空}），那份杂物也会被认领进去。
+     * 处理办法很简单 —— 把那一格的物品手动拿走，清单上这一格随即清空。</p>
+     */
+    public static void adoptLegacy(HopperBlockEntity hopper, VoidWarehouseHopperFilter filter) {
+        int slots = hopper.getContainerSize();
+        for (int i = 0; i < slots; i++) {
+            filter.setClassifierSeed(i, hopper.getItem(i));
+        }
+    }
+
+    private static int hopperSlots(VoidWarehouseHopperFilter filter) {
+        // 清单长度由实现方保证（原版漏斗固定 5 格）；这里不假设，问一句更稳
+        return filter instanceof HopperBlockEntity hopper ? hopper.getContainerSize() : 5;
+    }
+
 }

@@ -133,7 +133,7 @@ public final class VoidWarehouseHopper {
         VoidWarehouseData data = VoidWarehouse.data(level.getServer());
         int moved = 0;
         boolean changed = false;
-        int keep = keepClassifiers ? VoidWarehouseClassifier.KEEP : 0;
+        VoidWarehouseHopperFilter filter = (VoidWarehouseHopperFilter) hopper;
         int slots = hopper.getContainerSize();
         for (int i = 0; i < slots; i++) {
             ItemStack stack = hopper.getItem(i);
@@ -141,6 +141,17 @@ public final class VoidWarehouseHopper {
                 // 空格：原样留在漏斗里（带 NBT 的物品现在也放行，由玩家过滤）
                 continue;
             }
+            // 余量只留给「玩家在这一格指定过的分类物」。
+            //
+            // 早先这里是无差别地「每个非空格子留 KEEP 个」，于是任何混进漏斗的东西
+            // 都会被永久留 1 个 —— 而且它一旦留下就成了漏斗里的常驻物品，
+            // 下一轮反推白名单时又会被认成新的分类物，自己给自己续命。
+            // 玩家看到的「橡木 石头 空 空 空」就是这么来的：石头从未被指定过，
+            // 只是恰好在玩家动手那一刻躺在漏斗里，就被留了下来、还被认作了分类物。
+            // 现在没被指定的格子一律搬空 —— 混进来的杂物会被自动清掉，不会占位。
+            int keep = keepClassifiers && VoidWarehouseClassifier.isOwnSlot(filter, stack, i)
+                    ? VoidWarehouseClassifier.KEEP
+                    : 0;
             int count = stack.getCount();
             if (count <= keep) {
                 // 只剩分类物的余量：留下那一份，它同时也继续当着分类物

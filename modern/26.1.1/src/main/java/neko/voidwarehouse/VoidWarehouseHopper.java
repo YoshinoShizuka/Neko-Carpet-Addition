@@ -167,19 +167,29 @@ public final class VoidWarehouseHopper {
      * 旁边地面上同一高度的掉落物也吸走（吸力盒横向比漏斗宽一格），那是<b>玩家没预期的行为</b>。
      * 原版怎么选演员表，我们就怎么选。</p>
      *
+     * <h2>白做的两步不做</h2>
+     * <p>实测（见 {@code docs/入库漏斗性能基准.md}）空转时一个漏斗每 tick 约 170ns，
+     * 其中「上方是不是容器」那次查询占了近一半 —— 而原写法会查<b>两遍</b>
+     * （{@link #intake} 判断走哪条分支一遍、{@link #suckUnlimited} 进门又查一遍）。
+     * 这里改成查一次、结果直接传下去。同理，<b>一条都没收上来时第二次
+     * {@link #drain} 无事可做</b>，直接跳过 —— 绝大多数入库漏斗绝大多数时间都是空的，
+     * 省掉的正是这部分。</p>
+     *
      * @param keepClassifiers 见 {@link #drain}
      */
     public static void intake(ServerLevel level, HopperBlockEntity hopper, boolean keepClassifiers) {
         // ① 先把上一 tick 残留的（含 vanilla 亲手吸进来的）搬空，让下面能吃到 5 格全空
         drain(level, hopper, keepClassifiers);
-        // ② 进货
-        if (HopperBlockEntity.getContainerAt(level, hopper.getBlockPos().above()) != null) {
-            suckUnlimited(level, hopper);
-        } else {
-            suckEntitiesUnlimited(level, hopper);
+        // ② 进货：上方是容器 → 整格搬；否则 → 收掉落物（与原版同样的二选一）
+        Container above = HopperBlockEntity.getContainerAt(level, hopper.getBlockPos().above());
+        boolean got = above != null
+                ? suckUnlimited(above, hopper)
+                : suckEntitiesUnlimited(level, hopper) > 0;
+        // ③ 本 tick 刚收进来的当场入库，不让它在漏斗里多待一刻。
+        //    一条都没收到时这一步无事可做 —— 跳过它，空转的漏斗就不用白跑第二趟。
+        if (got) {
+            drain(level, hopper, keepClassifiers);
         }
-        // ③ 本 tick 刚收进来的当场入库，不让它在漏斗里多待一刻
-        drain(level, hopper, keepClassifiers);
     }
 
     /**
@@ -305,13 +315,14 @@ public final class VoidWarehouseHopper {
      * <p><b>绝不丢东西</b>：{@code addItem} 返回「没放进去的剩余」，这里把它并回上方容器的
      * 原格；只有当 {@code leftover} 为空（全部放进去了）才真正把上方格清掉。</p>
      *
-     * @param level 服务端世界（调用方已断言）
-     * @param hopper 入库漏斗（口朝向仓库终端、且上方是容器）
-     * @return 是否真的吸进来了东西（调用方据此决定要不要让原版进入 8 gt 冷却 —— 我们恒为 false，
-     *         因为无上限模式下不想要原版的节流）
+     * <p>容器由调用方查好传进来（{@link #intake} 要用它判断走哪条进货分支，
+     * 同一次 tick 里不该查第二遍）。</p>
+     *
+     * @param source 漏斗正上方那个容器；{@code null} 表示上方没有容器，直接返回 false
+     * @param hopper 入库漏斗（口朝向仓库终端）
+     * @return 是否真的吸进来了东西
      */
-    public static boolean suckUnlimited(ServerLevel level, HopperBlockEntity hopper) {
-        Container source = HopperBlockEntity.getContainerAt(level, hopper.getBlockPos().above());
+    public static boolean suckUnlimited(Container source, HopperBlockEntity hopper) {
         if (source == null) {
             return false;
         }

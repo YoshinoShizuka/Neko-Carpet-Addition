@@ -348,3 +348,200 @@ SMOKE RESULT automending/26.3 checks=15 failures=0
   所以 `progress` 恒为 `k/needed` 形态（视觉上与原先无差异，误差 < 1/needed）。
 - **仍然不会去动等级里的经验**：进度条空了就停手。这是彻底消除「扣穿」的代价，
   也是第一轮就说明过的口径。
+
+---
+
+# 第三轮（终章）：真正根因不是本模组 —— 是 26.3 的「定位条」抢了经验条的 HUD 槽位
+
+> 日期：2026-09-30 ｜ 用户复现条件：存档 `20260906`，角色 `Akirono`，**2752 级**，
+> 经验条大约一半时触发自动修补，随后「进度条直接扣到零、等级不变」，
+> 但**重新吸取经验后经验条恢复正常**。
+
+前两轮修的是真实缺陷（过度扣减、float32 边界），但**症状没有消失**，
+因为它其实一直不是「经验数值被扣穿」造成的视觉表现。这一轮先用证据把服务端彻底排除，
+再把 HUD 的真正来源钉死。
+
+## 14. 服务端被三重证据排除
+
+### 14.1 数学上不可能归零
+
+归零的唯一路径是 `setExperiencePoints(budget - spent)` 收到 `<= 0`，即 `spent >= budget`：
+
+```
+spent = actual * budget / repair            actual = min(repair, damage)
+⇒ spent >= budget  ⇔  actual >= repair  ⇔  damage >= repair = 2 * budget
+```
+
+2752 级半满 ⇒ `needed = 24610` ⇒ `budget = 12305` ⇒ 需要**单件物品损坏值 ≥ 24610**。
+而原版耐久上限最高的是下界合金镐（2031）、鞘翅（432）——**差了 12 倍以上，物理上不可能**。
+
+### 14.2 存档 NBT 取证（游戏运行中两次采样）
+
+`saves/20260906/players/data/1a9e05c1-…dat`：
+
+| 时刻 | XpLevel | XpP | XpTotal |
+|---|---|---|---|
+| 第一次 | 2752 | 0.8139780759811401 | 35188967 |
+| 第二次 | 2752 | 0.8015034794807434 | 35188709 |
+
+- `XpP × 24610 = 20032.0004` ⇒ 精度内为整数 ⇒ **升级曲线是原版**（`floor` 取整性质成立），
+  顺带排除 FGA `experienceLevelCost`（它只会返回 7 或 107，两种都算不出整数）。
+- 两次采样间 `XpTotal` 只掉了 **258** 点 ⇒ 服务端进度条稳定在 **80%**，**根本没有被归零**。
+- 装备实测：护甲 damage 2/4/5/8；即使磨到鞘翅满损 432，`spent` 也只有 216 点（≈0.88% 进度）。
+
+> 附注：`XpTotal(35188709)` 比 `level 2752` 对应的累积经验高出约 155 万，看似异常，
+> 实为**原版行为**——`Player#onEnchantmentPerformed` 只做 `experienceLevel -= cost`，
+> **不动 `totalExperience`**。所以 `totalExperience` 从来不是进度条的权威来源，
+> 本模组用 `experienceProgress` 是对的。
+
+### 14.3 客户端链路是纯原版的
+
+- 发包条件（`ServerPlayer#doTick`）：`totalExperience != lastSentExp` → 发
+  `ClientboundSetExperiencePacket(progress, total, level)`；本模组每次修补都会改 `totalExperience`，必发。
+- 收包（`ClientPacketListener#handleSetExperience`）→ `LocalPlayer#setExperienceValues(progress, total, level)`
+  → **纯赋值，无 clamp、无重算**。
+- 渲染（`ExperienceBar#extractBackground`）：`needed > 0` 时
+  `w = (int)(experienceProgress * 183.0F)`，`w > 0` 才画绿色填充 —— **没有任何插值动画**。
+
+⇒ 若服务端发 0.80，客户端不可能自己显示成空条。**所以问题必然出在「这一帧画了哪根条」。**
+
+## 15. 根因：26.3 的定位条（LocatorBar）与经验条共用同一个 HUD 槽位
+
+### 15.1 `Hud` 把「条」和「等级数字」拆成两次调用（javap -c 实证）
+
+```java
+ContextualInfo info = nextContextualInfoState();
+if (info != contextualInfoBar.getFirst()) {
+    contextualInfoBar = Pair.of(info, contextualInfoBars.get(info).get());
+}
+contextualInfoBar.getSecond().extractBackground(g, dt);                     // (A) 条本体
+if (gameMode.hasExperience() && player.experienceLevel > 0) {
+    ContextualBar.extractExperienceLevel(g, font, player.experienceLevel);   // (B) 等级数字
+}
+contextualInfoBar.getSecond().extractRenderState(g, dt);                     // (C)
+```
+
+- **(B) 等级数字是独立调用**：只要 `hasExperience() && experienceLevel > 0` 就画，
+  **与当前是哪种条无关**。→ **这就是「等级还在、进度条没了」的直接解释。**
+- **(A) 条本体**由 `contextualInfoBar` 决定，而它由：
+
+### 15.2 槽位仲裁——「有其他人的话，默认显示定位条」
+
+```java
+private ContextualInfo nextContextualInfoState() {
+    boolean hasWaypoints  = player.connection.getWaypointManager().hasWaypoints();
+    boolean jumpable      = player.jumpableVehicle() != null;
+    boolean hasExperience = gameMode.hasExperience();
+
+    if (hasWaypoints) {
+        if (jumpable && willPrioritizeJumpInfo())          return JUMPABLE_VEHICLE;
+        if (hasExperience && willPrioritizeExperienceInfo()) return EXPERIENCE;  // ← 5 秒窗口
+        return LOCATOR;                                                          // ← 否则定位条
+    }
+    if (jumpable)      return JUMPABLE_VEHICLE;
+    if (hasExperience) return EXPERIENCE;
+    return EMPTY;
+}
+
+private boolean willPrioritizeExperienceInfo() {
+    return player.experienceDisplayStartTick + 100 > player.tickCount;   // 100 tick = 5 秒
+}
+```
+
+`experienceDisplayStartTick` **只在** `LocalPlayer#setExperienceValues` 里被刷新，
+且**仅当 `progress` 真的变了**：
+
+```java
+public void setExperienceValues(float progress, int total, int level) {
+    if (progress != this.experienceProgress) this.setExperienceDisplayStartTickToTickCount();
+    this.experienceProgress = progress; this.totalExperience = total; this.experienceLevel = level;
+}
+```
+
+### 15.3 定位条空着的时候长什么样
+
+```java
+// LocatorBar#extractBackground
+g.blitSprite(GUI_TEXTURED, LOCATOR_BAR_BACKGROUND, left, top, 182, 5);   // 只有背景，无填充
+// LocatorBar#extractRenderState → 只为「追踪到的 waypoint」画点/箭头
+```
+
+**182×5 的背景尺寸与经验条背景完全一致，但没有任何填充** —— 屏幕上就是一条**空条**。
+
+### 15.4 用户的实机现场（日志取证）
+
+```
+[18:53:44] Akirono[local:E:b921b6c9] logged in …        ← 用户
+[19:34:20] OWHP[local] logged in …                      ← 另一个玩家加入
+[19:35:19] OWHP[local] logged in …
+```
+
+`ClientWaypointManager#hasWaypoints()` = `!waypoints.isEmpty()`，由服务端下发的
+`ClientboundTrackedWaypointPacket` 填充。**世界里有 `OWHP` ⇒ `hasWaypoints() == true`。**
+
+而存档 `level.dat` 里**没有 `GameRules` 键**（全部默认），`GameRules` 注册处为：
+
+```
+302: ldc_w  "locator_bar"
+308: iconst_1                     ← 默认值 true
+309: registerBoolean(String, GameRuleCategory.PLAYER, boolean)
+```
+
+⇒ **定位条默认开启。** 引用 `LOCATOR_BAR` 的只有 4 个类，其中
+**`net/minecraft/server/waypoints/ServerWaypointManager`** 就是服务端的下发开关。
+
+### 15.5 把用户的三句话逐条对回去
+
+| 用户描述 | 机制 |
+|---|---|
+| 等级还在 | 等级数字走 (B)，独立于哪种条 |
+| 进度条「归零」 | `hasWaypoints() && !5秒窗口` ⇒ 槽位被 **LocatorBar** 占据，空背景无填充 |
+| 「一半时触发自动修补，随即扣到零」 | 修补**扣经验** ⇒ 发 `ClientboundSetExperiencePacket` ⇒ 客户端 `progress` 变化 ⇒ 刷新 5 秒窗口 ⇒ **经验条先亮起（此时看到它在一半）**；窗口过后定位条收回槽位 ⇒ 看上去「直接扣到零」 |
+| 重新吸取经验后恢复正常 | 吸经验同样刷新 5 秒窗口 ⇒ 经验条回到槽位 |
+
+**结论：不是自动经验修补的 bug。** 本模组的经验数值在服务端始终正确（14.1–14.2 双重证明），
+症状是 **26.3 新增的定位条会顶掉经验条槽位**这一原版行为，被「修补扣经验 ⇒ 经验条闪一下再被收回」
+的节奏放大后，看起来像模组把条扣空了。
+
+## 16. 处置
+
+**根因不在本模组代码内，不动 `AutoMending.java`。** 用户侧二选一：
+
+### 方案 A（推荐）：关掉定位条，经验条永久占位
+
+```
+/gamerule locator_bar false
+```
+
+服务端不再下发 waypoint ⇒ 客户端 `hasWaypoints()` 为假 ⇒ `nextContextualInfoState()`
+回到 `EXPERIENCE` 分支。**代价：失去「其他玩家方向指示」功能。**
+
+### 方案 B：保留定位条，换一种显示方式
+
+- `LPCTools → tweaks/barTweaks → locatorBarUsesExpBackground = true`
+  （定位条改用经验条背景）；
+- 或 `expBarDisplaysLocatorPoints = true`。
+
+（用户当前 `config/lpctools-LPCConfig.json` 里 barTweaks 五项**全为 `false`**，
+即该模组目前完全没干预这两根条。）
+
+### 排除清单（本轮逐一证伪，留档以免下次重复排查）
+
+| 嫌疑 | 证伪依据 |
+|---|---|
+| 部署包陈旧 | 线上 MD5 与上轮交付一致，字节码为 double 预算版 |
+| AMS `powerfulExpMending` | 默认 `false`，用户 `carpet.conf` 亦为 `false` |
+| FGA `experienceLevelCost` | 只会返回 7/107，与 `XpP×24610` 为整数矛盾 |
+| 本模组有客户端逻辑 | `fabric.mod.json` 无 client entrypoint，纯服务端 |
+| 客户端不读 `experienceProgress` | `ExperienceBar` 明确 `(int)(experienceProgress*183.0f)` |
+| **Gnetum HUD 缓存** | `gnetum$wrapInfoBar` 确实会跳过 `extractBackground`，但它只能造成**滞后**，**无法解释「吸经验就恢复」**；而定位条机制能同时解释全部四条现象 |
+| `ImmediatelyFast` / `Ixeris` / `ModernUI` | 均未替换槽位仲裁；ModernUI 只接管字体 |
+| LPCTools `barTweaks` | 五项全 `false`，且其语义是「互换两根条」而非清空 |
+
+### 可直接给用户的一段话（复述口径）
+
+> 这条空条其实不是经验条，是 26.3 新增的**定位条**：它和经验条共用屏幕上同一个位置。
+> 只要世界里存在其他玩家（你的日志里 19:34 有 `OWHP` 进来过），HUD 默认显示定位条，
+> 经验条**只在经验发生变化后的 5 秒内**临时抢回位置；等级数字是单独画的，所以它一直在。
+> 自动修补会扣经验 ⇒ 经验条闪 5 秒（你恰好看到它在「一半」）⇒ 窗口一过定位条收回 ⇒ 看起来像被扣空了。
+> 输入 `/gamerule locator_bar false` 就能让经验条永久显示回去。

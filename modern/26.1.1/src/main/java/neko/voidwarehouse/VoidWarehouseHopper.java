@@ -268,28 +268,23 @@ public final class VoidWarehouseHopper {
         if (payload.isEmpty()) {
             return false;
         }
-        boolean moved = false;
-        int stackLimit = Math.max(1, payload.getMaxStackSize());
-        // 只切「超过一堆」的那部分：常规情况根本进不了这个循环
-        while (payload.getCount() > stackLimit) {
-            ItemStack slice = payload.copyWithCount(stackLimit);
-            ItemStack leftover = HopperBlockEntity.addItem(null, hopper, slice, null);
-            int accepted = stackLimit - leftover.getCount();
-            if (accepted <= 0) {
-                // 漏斗已经吃不下任何东西了 —— 剩下的留在实体身上，下一个 tick 继续
-                return moved;
-            }
-            payload.shrink(accepted);
-            moved = true;
+        int before = payload.getCount();
+        // 与「上方容器」那一走路同一份 {@link #absorbStack}：两份逻辑必须永远一致
+        ItemStack leftover = absorbStack(null, hopper, payload);
+        if (leftover.getCount() == before) {
+            // 漏斗一个都吃不下 —— 实体原地留着，下一个 tick 再来
+            return false;
         }
-        if (payload.isEmpty()) {
-            // 全进去了：按原版 addItem(Container, ItemEntity) 的收尾方式处理
-            entity.setItem(ItemStack.EMPTY);
-            entity.discard();
-            return moved;
+        // absorbStack 已经把实体身上那份 ItemStack 就地 shrink 成「还剩多少」，
+        // leftover 与它就是同一个对象；这里显式写回，让 ItemEntity 自己的记账同步。
+        if (!leftover.isEmpty()) {
+            entity.setItem(leftover);
+            return true;
         }
-        // 剩下的不超过一堆，交给原版一次性收尾（数量已经在 limitSize 不会吃亏的范围里了）
-        return HopperBlockEntity.addItem(hopper, entity) || moved;
+        // 全进去了：按原版 addItem(Container, ItemEntity) 的收尾方式处理
+        entity.setItem(ItemStack.EMPTY);
+        entity.discard();
+        return true;
     }
 
     /**
@@ -312,15 +307,10 @@ public final class VoidWarehouseHopper {
      *       还是原版 {@code suckInItems} 的吸掉落物分支。</li>
      * </ul>
      *
-     * <p><b>绝不丢东西</b>：{@code addItem} 返回「没放进去的剩余」，这里把它并回上方容器的
-     * 原格；只有当 {@code leftover} 为空（全部放进去了）才真正把上方格清掉。</p>
+     * <p>塞不进漏斗的那部分 <b>原样放回上方容器的原格</b> —— 一丝不苟地还回去，
+     * 从来没有「取出来却没地方放」这种事发生。</p>
      *
-     * <p>容器由调用方查好传进来（{@link #intake} 要用它判断走哪条进货分支，
-     * 同一次 tick 里不该查第二遍）。</p>
-     *
-     * @param source 漏斗正上方那个容器；{@code null} 表示上方没有容器，直接返回 false
-     * @param hopper 入库漏斗（口朝向仓库终端）
-     * @return 是否真的吸进来了东西
+     * @return 是否真的吸进来了东西（至少有一个物品进了漏斗）
      */
     public static boolean suckUnlimited(Container source, HopperBlockEntity hopper) {
         if (source == null) {
@@ -337,36 +327,86 @@ public final class VoidWarehouseHopper {
             if (!canTakeFrom(source, hopper, stack, slot)) {
                 continue;
             }
-            int count = stack.getCount();
-            // 整格拿走（不绕过原版，因为上面已经用 canTakeFrom 判定过）
-            ItemStack taken = source.removeItem(slot, count);
+            int available = stack.getCount();
+            // 整格取走（不绕过原版，因为上面已经用 canTakeFrom 判定过）
+            ItemStack taken = source.removeItem(slot, available);
             if (taken.isEmpty()) {
                 continue;
             }
-            // 放进漏斗：走原版 addItem 的全部合并 / 上限 / 放料判定，direction 传 null
-            // 与「吸料」这一路原版语义一致（跳过 WorldlyContainer 的放料侧面过滤）
-            ItemStack leftover = HopperBlockEntity.addItem(hopper, source, taken, null);
-            if (leftover.isEmpty()) {
-                moved = true;
-            } else {
-                // 漏斗放不下的部分：并回上方容器的原格（原格此时要么空、要么同种）
-                ItemStack rest = source.getItem(slot);
-                if (rest.isEmpty()) {
-                    source.setItem(slot, leftover);
-                } else if (ItemStack.isSameItemSameComponents(rest, leftover)) {
-                    rest.grow(leftover.getCount());
-                } else {
-                    // 理论到不了这里（removeItem 后原格只剩同种或空），防御性兜底
-                    source.setItem(slot, leftover);
-                }
+            // 塞进入库漏斗：<b>参数顺序</b>必须与原版一致 —— addItem(source, destination, ...)。
+            // 这里曾经把 source / destination 写反过：东西被「取出来又塞回自己」，漏斗一个都没收到，
+            // 实测上方容器的速率退化成 1 个/tick（而掉落物是每 tick 全收，相差 320 倍），
+            // 分类物白名单也因为「关卡认错了目标容器」而整条失效。
+            ItemStack leftover = absorbStack(source, hopper, taken);
+            int accepted = available - leftover.getCount();
+            if (!leftover.isEmpty()) {
+                // 漏斗吃不下（或只吃下半口）的部分：并回上方容器的原格
+                // （原格此时要么空、要么同种 —— removeItem 过后不可能出现第三种情况）
+                mergeBack(source, slot, leftover);
+            }
+            if (accepted > 0) {
                 moved = true;
             }
-            source.setChanged();
         }
         if (moved) {
+            source.setChanged();
             hopper.setChanged();
         }
         return moved;
+    }
+
+    /**
+     * 把一份物品塞进漏斗，返回<b>没塞进去的部分</b>。
+     *
+     * <h2>为什么要自己切一刀（实测发现的原版坑）</h2>
+     * <p>原版 {@code tryMoveInItem} 往<b>空格子</b>里放东西时写的是：</p>
+     * <pre>{@code
+     * destination.setItem(slot, stack);   // 整摞塞进去
+     * stack = ItemStack.EMPTY;            // 然后声称「全搬完了」
+     * }</pre>
+     * <p>而 {@code HopperBlockEntity#setItem} 里有一句 {@code limitSize}，会把数量截到堆叠上限
+     * —— <b>多出来的部分就这样被静默吞掉了</b>。掉落物路径实测过：一个带 200 个圆石的实体
+     * 落到空格子的入库漏斗上，仓库只进了 64，136 个凭空消失。</p>
+     *
+     * <p>所以这里先把「超过一堆」的那部分<b>按堆切片</b>喂给漏斗：每片都 ≤ 物品自身的堆叠上限，
+     * 正好落在 {@code limitSize} 不会动手的范围里。常见的 ≤1 堆情况完全走原版路径，一个字节都不改。</p>
+     *
+     * @param source 物品来自哪个容器（可以是 {@code null}，例如掉落物路径）
+     * @param destination 目标漏斗
+     * @param payload 待塞的物品；<b>会被就地消耗</b>（吃进去多少就少多少）
+     * @return 没被吃下去的剩余（可能为空）
+     */
+    private static ItemStack absorbStack(Container source, HopperBlockEntity destination, ItemStack payload) {
+        if (payload.isEmpty()) {
+            return ItemStack.EMPTY;
+        }
+        int stackLimit = Math.max(1, payload.getMaxStackSize());
+        // 只切「超过一堆」的那部分：常规情况根本进不了这个循环
+        while (payload.getCount() > stackLimit) {
+            ItemStack slice = payload.copyWithCount(stackLimit);
+            ItemStack leftover = HopperBlockEntity.addItem(source, destination, slice, null);
+            int accepted = stackLimit - leftover.getCount();
+            if (accepted <= 0) {
+                // 漏斗已经吃不下任何东西了 —— 剩下的原样退回
+                return payload;
+            }
+            payload.shrink(accepted);
+        }
+        // 剩下的不超过一堆，交给原版一次性收尾（数量已经在 limitSize 不会吃亏的范围里了）
+        return HopperBlockEntity.addItem(source, destination, payload, null);
+    }
+
+    /** 把 leftover 并回容器的某一格：能合并就合并，不能（该格已空）就直接写入。 */
+    private static void mergeBack(Container container, int slot, ItemStack leftover) {
+        ItemStack rest = container.getItem(slot);
+        if (rest.isEmpty()) {
+            container.setItem(slot, leftover);
+        } else if (ItemStack.isSameItemSameComponents(rest, leftover)) {
+            rest.grow(leftover.getCount());
+        } else {
+            // 理论到不了这里（removeItem 后原格只剩同种或空），防御性兜底
+            container.setItem(slot, leftover);
+        }
     }
 
     /**

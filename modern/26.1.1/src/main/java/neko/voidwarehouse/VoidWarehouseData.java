@@ -488,6 +488,17 @@ public final class VoidWarehouseData extends SavedData {
     private int loadedBrokenCount;
 
     /**
+     * 「这一份是不是空壳」—— <b>在构造函数里一次性定下来，之后永不改变</b>。
+     *
+     * <p>必须这么做：判据里有一半是「此刻 {@link #entries} 是不是空的」，而
+     * <b>仓库随时会被玩家取空</b>。若等到用的时候才判定，玩家把仓库搬空的那一刻
+     * 就会被误判成「读到空壳」，每次访问都抛异常、仓库彻底不可用
+     * （实测踩过：载入 2 条 → 清空 → 闸门误报）。「载入成不成」是<b>当时的事实</b>，
+     * 只能在当时记账。</p>
+     */
+    private boolean loadedSuspicious;
+
+    /**
      * 物品 → 装它的那些格（增量维护的查找索引，见类注释「性能」一节）。
      *
      * <p>与 {@link #entries} 严格同步：新增一格、删除一格、清空仓库时都会跟着改。
@@ -526,6 +537,10 @@ public final class VoidWarehouseData extends SavedData {
         }
         this.loadedEntryCount = this.entries.size();
         this.loadedBrokenCount = this.brokenEntries.size();
+        // 「读到空壳」这件事只在<b>此刻</b>有意义 —— entries 之后会随着玩家存取变化，
+        // 那一半判据必须就地冻结。全是坏条目（一条都读不懂）不算空壳：
+        // 那是 ITEMS_CODEC 有意保留下来的原文，会在下次写盘时原样写回。
+        this.loadedSuspicious = !loaded.isEmpty() && this.entries.isEmpty() && this.brokenEntries.isEmpty();
         // 这里不排序：载入进来的顺序可能是旧文件的乱序，但第一次读之前
         // ensureSorted() 一定会把它整成创造栏顺序（见 sortedGeneration 的初值 -1）。
     }
@@ -1053,12 +1068,16 @@ public final class VoidWarehouseData extends SavedData {
      * 闸门 —— 一旦为 true，说明数据层出了严重问题（文件里有记录，却没能变成任何一格），
      * 此时<b>绝不能</b>让这个空壳继续工作并写盘，必须直接拒绝服务。</p>
      *
-     * <p>判据很严：必须「文件里确实有条目」且「一条都没变成可用的格子」。
-     * 真的空仓库（玩家自己清空的、或从来没存过东西的）{@code loadedEntryCount} 是 0，
-     * 不会误报。</p>
+     * <p>判据很严：必须「文件里确实有条目」且「一条都没变成可用的格子」，也不存在
+     * 被特意保留下来的坏条目。</p>
+     *
+     * <p><b>这个结论在构造的那一刻就定死了</b>（见 {@link #loadedSuspicious}）：
+     * 玩家可以随时把仓库里的东西取空，那时 {@link #entries} 为空是<b>正常的</b>，
+     * 不能反过来说它是空壳 —— 实测踩过：载入 2 条合法数据 → 玩家清空 → 闸门误报、
+     * 整个仓库再也访问不了。true 空仓库（新世界 / 玩家自己清空的）不会误报。</p>
      */
     public boolean isSuspiciouslyEmpty() {
-        return this.loadedEntryCount > 0 && this.entries.isEmpty();
+        return this.loadedSuspicious;
     }
 
     /** 从存档里一共读到了多少条（含读不懂的）。0 表示文件本来就是空的 / 新建的。 */

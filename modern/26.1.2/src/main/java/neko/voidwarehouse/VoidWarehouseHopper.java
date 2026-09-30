@@ -5,11 +5,14 @@ import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.Container;
 import net.minecraft.world.WorldlyContainer;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.HopperBlock;
 import net.minecraft.world.level.block.entity.HopperBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+
+import java.util.List;
 
 /**
  * 漏斗 → 虚空仓库 的搬运。
@@ -18,6 +21,20 @@ import net.minecraft.world.level.block.state.BlockState;
  * <p>漏斗口（{@code HopperBlock.FACING} 指向的那一面）对着仓库终端时，漏斗格子里
  * 的物品会被<b>一次性全部</b>搬进仓库：既不遵循原版「每 8 gt 才搬 1 个」的节流，
  * 也不受一组 64 个的限制 —— 漏斗里有多少就搬多少，<b>1 tick 搬空</b>。</p>
+ *
+ * <h2>整条链都无速率上限（本轮修复）</h2>
+ * <p>光有上面那一条不够 —— 瓶颈在<b>进货</b>那一端：原版 {@code suckInItems} 不管是从
+ * 上方容器取料（{@code tryTakeInItemFromSlot}）还是收掉落物（{@code addItem}），
+ * 都是「找到第一个能动的就 {@code return true}」，<b>一次只处理一个</b>；
+ * 再叠上 {@code tryMoveItems} 结尾那个无条件的 {@code setCooldown(8)}，
+ * 实际速率是「每 8 gt 一个」= 2.5 个/秒。物品在水里一秒能跑好几格，
+ * 绝大多数<b>根本来不及进漏斗就被冲过去了</b> —— 这就是「东西从入库漏斗上方经过却没入库」。</p>
+ * <p>现在的做法是<b>每 tick 一次全量清扫</b>（见 {@link #intake}）：既认同范围 ItemEntity 全收，
+ * 也把上方容器能给的整格搬来，收完当场 {@link #drain} 进仓库。
+ * 冷却则在 {@code pushItemsTick} 收尾处清零 —— 这一手与 Carpet-TIS 的
+ * {@code hopperCountersUnlimitedSpeed} 是同一个思路（它在一轮里循环到无事可做、
+ * 收尾 {@code setCooldown(0)}），区别只是我们不依赖 {@code tryMoveItems} 有没有被走到：
+ * {@code pushItemsTick} 的 HEAD <b>每 tick 必然执行</b>，冷却对它没有约束力。</p>
  *
  * <h2>哪几个面算数</h2>
  * <p>漏斗的朝向只有「下 / 东南西北」五种（原版 {@code FACING_HOPPER} 没有「上」），
@@ -68,7 +85,8 @@ public final class VoidWarehouseHopper {
     }
 
     /**
-     * 这个漏斗现在是不是一条「入库漏斗」：规则开着，而且口朝向的那个方块是仓库终端。
+     * 这个漏斗现在是不是一条「入库漏斗」：规则开着，而且口朝向的那个方块是工作台
+     * （{@link VoidWarehouseTerminals#isWorkbench}，不要求登记为终端）。
      *
      * <p>调用方（{@code HopperBlockEntityMixin} 的 tick 钩子、以及
      * {@code canPlaceItemInContainer} 上的分类物过滤）共用同一个判定，
@@ -128,6 +146,140 @@ public final class VoidWarehouseHopper {
             hopper.setChanged();
         }
         return moved;
+    }
+
+    /**
+     * 入库漏斗每 tick 要做的全部事：<b>先清空 → 尽量吸 → 吸完立刻入库</b>。
+     *
+     * <p>三步都必须在<b>同一个 tick</b>里完成，否则物品会在漏斗里多躺一 tick 才入库；
+     * 而原版的 8 gt 节流会让它躺得更久。入口是 {@code HopperBlockEntity#pushItemsTick}
+     * 的 HEAD —— 那是漏斗每 tick 的必经之处，<b>不受搬运冷却约束</b>
+     * （原来的 {@code suckInItems} 注入受制于 {@code tryMoveItems} 开头的
+     * {@code isOnCooldown()} 检查，实际只能 8 gt 跑一次）。</p>
+     *
+     * <h2>两条进货路径二选一（与原版一致）</h2>
+     * <ul>
+     *   <li>上方<b>是容器</b>：整格搬（{@link #suckUnlimited}）—— 与原版同一分支。</li>
+     *   <li>上方<b>不是容器</b>（空气 / 水流 / 掉落物打在上面的方块）：
+     *       收掉落物（{@link #suckEntitiesUnlimited}）。</li>
+     * </ul>
+     * <p>这里刻意保持「二选一」而不是两样都做：否则一个头顶放着箱子的入库漏斗会顺带把
+     * 旁边地面上同一高度的掉落物也吸走（吸力盒横向比漏斗宽一格），那是<b>玩家没预期的行为</b>。
+     * 原版怎么选演员表，我们就怎么选。</p>
+     *
+     * @param keepClassifiers 见 {@link #drain}
+     */
+    public static void intake(ServerLevel level, HopperBlockEntity hopper, boolean keepClassifiers) {
+        // ① 先把上一 tick 残留的（含 vanilla 亲手吸进来的）搬空，让下面能吃到 5 格全空
+        drain(level, hopper, keepClassifiers);
+        // ② 进货
+        if (HopperBlockEntity.getContainerAt(level, hopper.getBlockPos().above()) != null) {
+            suckUnlimited(level, hopper);
+        } else {
+            suckEntitiesUnlimited(level, hopper);
+        }
+        // ③ 本 tick 刚收进来的当场入库，不让它在漏斗里多待一刻
+        drain(level, hopper, keepClassifiers);
+    }
+
+    /**
+     * 「上方经过的掉落物 → 漏斗」的全量吸取：把原版吸力范围内<b>所有</b>掉落物一次收进漏斗。
+     *
+     * <h2>为什么原版会吸不完</h2>
+     * <p>原版 {@code suckInItems} 的掉落物分支是这样写的（已逐行核对字节码）：</p>
+     * <pre>{@code
+     * for (ItemEntity item : getItemsAtAndAbove(level, hopper)) {
+     *     if (addItem(hopper, item)) return true;   // ← 收到一个就收工
+     * }
+     * return false;
+     * }</pre>
+     * <p><b>一次只收 1 个实体</b>，再由 {@code tryMoveItems} 结尾的 {@code setCooldown(8)}
+     * 变成「8 gt 收 1 个」。水流传物的速度是每秒好几格，绝大多数根本来不及进漏斗就被冲过去了。</p>
+     *
+     * <h2>这里改成「遍历全部」</h2>
+     * <p>用<b>原版自己的</b> {@link HopperBlockEntity#getItemsAtAndAbove} 取范围
+     * （同一个吸力盒，不擅自放大也不缩小），再逐个走<b>原版自己的</b>
+     * {@link HopperBlockEntity#addItem} 塞进漏斗 ——
+     * 于是合并、堆叠上限、以及 {@code canPlaceItemInContainer} 上的分类物白名单
+     * <b>全部照旧生效</b>：不是分类物的掉落物会原样留在地上，不会绕过滤波器。</p>
+     *
+     * <h2>绝不丢东西</h2>
+     * <p>{@code addItem(Container, ItemEntity)} 对单个实体是原子的：<b>能全收走才
+     * {@code discard()}</b>；只收得下一部分就把剩下那截 {@code setItem} 回实体身上。
+     * 既不会让 64 个圆石硬塞成 65 个，也不会出现「实体没了但物品没进漏斗」。</p>
+     *
+     * @return 收走了几个<b>实体</b>（按实体个数算，不是物品个数）。只用于诊断 / 自检。
+     */
+    public static int suckEntitiesUnlimited(ServerLevel level, HopperBlockEntity hopper) {
+        List<ItemEntity> nearby = HopperBlockEntity.getItemsAtAndAbove(level, hopper);
+        if (nearby.isEmpty()) {
+            return 0;
+        }
+        int taken = 0;
+        for (ItemEntity entity : nearby) {
+            // getItemsAtAndAbove 已经按 ENTITY_STILL_ALIVE 过滤过一层；这里再挡住
+            // 「同一 tick 里被旁边的入库漏斗先收走」的情况 —— 那种实体已被 discard，
+            // 但还留在这次查询的快照里。少了这一句，计数会虚高（东西早就进库了）。
+            if (entity.isRemoved() || entity.getItem().isEmpty()) {
+                continue;
+            }
+            if (absorbEntity(hopper, entity)) {
+                taken++;
+            }
+        }
+        return taken;
+    }
+
+    /**
+     * 把一个掉落物实体收进漏斗；实体没能全进去时，剩下的继续留在它身上。
+     *
+     * <h2>为什么要自己切一刀（实测发现的原版坑）</h2>
+     * <p>实体带的物品<b>可以超过一堆</b>（多个 »64 的物品在地面上合并时止于一堆，
+     * 但别的方式造出来的堆叠没这个限制）。而原版 {@code tryMoveInItem} 往<b>空格子</b>里放东西时写的是：</p>
+     * <pre>{@code
+     * destination.setItem(slot, stack);   // 整摞塞进去
+     * stack = ItemStack.EMPTY;            // 然后声称「全搬完了」
+     * }</pre>
+     * <p>{@code HopperBlockEntity#setItem} 里有一句 {@code limitSize}，会把数量截到漏斗的上限
+     * （64）—— <b>多出来的部分就这样被静默吞掉了</b>，实体那边却已经 {@code discard()}。
+     * 实测：一个带 200 个圆石的实体落到空格子的入库漏斗上，仓库只进了 64，136 个凭空消失。</p>
+     *
+     * <p>所以这里先把「超过一堆」的那部分<b>按堆切片</b>喂给漏斗：每片都 ≤ 物品自身的堆叠上限，
+     * 正好落在 {@code limitSize} 不会动手的范围里。常见的 ≤1 堆情况完全走原版路径，一个字节都不改。</p>
+     *
+     * <h2>绝不丢东西</h2>
+     * <p>喂不进去的部分 {@code addItem} 会作为剩菜还回来，这里把它<b>原样放回实体身上</b>
+     * （实体不删除），下一个 tick 再来 —— 宁可慢一 tick，也不让任何一个物品消失。</p>
+     *
+     * @return 是否有进展（至少进去了一部分）
+     */
+    private static boolean absorbEntity(HopperBlockEntity hopper, ItemEntity entity) {
+        ItemStack payload = entity.getItem();
+        if (payload.isEmpty()) {
+            return false;
+        }
+        boolean moved = false;
+        int stackLimit = Math.max(1, payload.getMaxStackSize());
+        // 只切「超过一堆」的那部分：常规情况根本进不了这个循环
+        while (payload.getCount() > stackLimit) {
+            ItemStack slice = payload.copyWithCount(stackLimit);
+            ItemStack leftover = HopperBlockEntity.addItem(null, hopper, slice, null);
+            int accepted = stackLimit - leftover.getCount();
+            if (accepted <= 0) {
+                // 漏斗已经吃不下任何东西了 —— 剩下的留在实体身上，下一个 tick 继续
+                return moved;
+            }
+            payload.shrink(accepted);
+            moved = true;
+        }
+        if (payload.isEmpty()) {
+            // 全进去了：按原版 addItem(Container, ItemEntity) 的收尾方式处理
+            entity.setItem(ItemStack.EMPTY);
+            entity.discard();
+            return moved;
+        }
+        // 剩下的不超过一堆，交给原版一次性收尾（数量已经在 limitSize 不会吃亏的范围里了）
+        return HopperBlockEntity.addItem(hopper, entity) || moved;
     }
 
     /**

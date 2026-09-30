@@ -33,12 +33,13 @@ public interface VoidWarehouseHopperFilter {
     /**
      * 把原版搬运冷却（{@code cooldownTime}）清零。
      *
-     * <p>入库漏斗做「上方容器 → 漏斗」无上限吸取时，复用了原版
-     * {@link HopperBlockEntity#addItem} 往漏斗里放东西，而它内部会顺手把目标漏斗设成
-     * 8 gt 冷却（{@code tryMoveInItem} 里的 {@code setCooldown(8)} 副作用）。
-     * 若不及时清零，下一个 tick 原版 {@code tryMoveItems} 会因 {@code isOnCooldown()}
-     * 直接跳过、再也不调 {@code suckInItems}，无上限就退化成「8 gt 吸 1 个」。
-     * 所以吸完必须清零，让每个 tick 都能继续吸。</p>
+     * <p>原版漏斗「每 8 gt 才动一次」的节流全靠这个字段：{@code tryMoveItems} 开头检查
+     * {@code isOnCooldown()}（>0 就直接出队），结尾只要搬成了就 {@code setCooldown(8)}。
+     * 入库漏斗要无速率上限，就必须在<b>整条 tick 走完之后</b>把它清掉。</p>
+     *
+     * <p><b>位置很关键</b>：早先在 {@code suckInItems} 中途清零是<b>无效的</b> ——
+     * 紧接着 {@code tryMoveItems} 收尾就把 8 写回去了。现在改到
+     * {@code pushItemsTick} 的 TAIL 才真的解掉节流。</p>
      */
     void resetCooldown();
 }

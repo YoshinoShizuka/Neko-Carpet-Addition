@@ -70,6 +70,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * 上方容器吸料、邻居漏斗推料、掉落物被吸入三条路都从这里过）。
  * 玩家手动放物品走的是 {@code Slot#setByPlayer}，<b>不经过这里</b> ——
  * 所以在这个关卡上做过滤，效果正好是「只有分类物进得来、玩家的手不受限制」。</p>
+ * <p>过滤是<b>两道</b>：先 {@link VoidWarehouseClassifier#matchesAny} 问
+ * 「是不是白名单上的物品」，再 {@link VoidWarehouseClassifier#isOwnSlot} 问
+ * 「这一格是不是它的格子」。第二道不能省 —— 少了它，分类物会被原版
+ * {@code addItem} 的逐格试放摊到 5 个格子上（详见
+ * {@link VoidWarehouseClassifier#isOwnSlot} 里记的那次事故）。</p>
  * <p>过滤模式本身是个<b>跟着方块实体一起存进存档</b>的布尔标记（见
  * {@link VoidWarehouseHopperFilter}），由 {@code SlotMixin} 在玩家手动放东西时打开、
  * 在漏斗被掏空时关掉。标记只在「口朝向终端」的入库漏斗上生效，
@@ -245,6 +250,17 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
         }
         if (!VoidWarehouseClassifier.matchesAny(hopper, stack)) {
             // 不是分类物 → 原样留在上游容器 / 上游漏斗里，不进这个漏斗
+            cir.setReturnValue(false);
+            return;
+        }
+        if (!VoidWarehouseClassifier.isOwnSlot(hopper, stack, slot)) {
+            // 是分类物，但这一格不是它的格子 → 拒绝。
+            //
+            // 少了这一句就是「分类物摊开」事故：原版 addItem 按 slot 0→N 逐个试，
+            // tryMoveInItem 对空格子直接 setItem 整摞写入，于是 slot0 那格被补满之后，
+            // 多出来的那 1 个就去开垦 slot1 —— 一 tick 下来 5 格全变成 1 1 1 1 1
+            // （玩家手动摆的分类只剩第一格，后面四格被货物占住了）。
+            // 这里卡住之后，分类物只进得了自己的格子，「哪格是哪种」就永远是玩家摆的样子。
             cir.setReturnValue(false);
         }
     }

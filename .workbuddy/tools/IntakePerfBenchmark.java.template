@@ -52,7 +52,7 @@ import java.util.List;
  */
 public final class IntakePerfBenchmark {
 
-    private static final int GRID = 16;                 // 16 × 16 = 256 个漏斗；改成 32 即 1024 个（规模档）
+    private static final int GRID = 32;                 // 16 × 16 = 256 个漏斗；改成 32 即 1024 个（规模档）
     private static final int STEP = 2;                  // 间距（吸力盒横向正好 1 格，2 格足够不重叠）
     private static final int N = GRID * GRID;
     private static final int BASE_X = 64;               // 离上一轮自检的场景远一点
@@ -64,7 +64,7 @@ public final class IntakePerfBenchmark {
     private static final int ROUNDS = 200;              // 计时轮数
     private static final int SAMPLE_TICKS = 300;        // 真实 tick 采样数（>100 才能刷满 ring buffer）
     private static final int SETTLE_TICKS = 60;         // 采样前先空转，躲开区块生成/首次加载的抖动
-    private static final int LOAD_PER_HOPPER = 4;       // 满载时每个漏斗上方每 tick 撒几个（×N = 1024 个/tick）
+    private static final int LOAD_PER_HOPPER = 4;       // 满载时每个漏斗上方每 tick 撒几个（×N = 4096 个/tick @ N=1024）
     private static final int[] DENSITIES = {0, 500, 2000};  // 实体密度扫描
 
     private static final List<HopperBlockEntity> hoppers = new ArrayList<>();
@@ -446,8 +446,8 @@ public final class IntakePerfBenchmark {
         }, () -> refillAbove(level));
         benchRefill("suckUnlimited(上方有货)", ROUNDS, () -> {
             for (HopperBlockEntity h : hoppers) {
-                VoidWarehouseHopper.suckUnlimited(
-                        HopperBlockEntity.getContainerAt(level, h.getBlockPos().above()), h);
+                VoidWarehouseHopper.suckUnlimited(level,
+                        HopperBlockEntity.getContainerAt(level, h.getBlockPos().above()), h, false);
             }
         }, () -> refillAbove(level));
         benchRefill("intake(上方容器全流程)", ROUNDS, () -> {

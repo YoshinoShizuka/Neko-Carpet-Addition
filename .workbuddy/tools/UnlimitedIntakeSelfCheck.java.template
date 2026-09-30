@@ -4,6 +4,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -19,7 +20,7 @@ import java.math.BigInteger;
 import java.util.List;
 
 /**
- * 【临时自检】验证「物品从入库漏斗上方经过却没被吸走」的修复；验证完连同 hook 一起删掉。
+ * 【临时自检】入库漏斗的「无上限吸取」+「分类物只进自己的格子」；验证完连同 hook 一起删掉。
  *
  * <p>要证的事：</p>
  * <ol>
@@ -28,7 +29,13 @@ import java.util.List;
  *   <li><b>该守的规矩一个没破</b>：分类物白名单照样过滤、不是入库漏斗的一个不碰、
  *       红石锁存时照样停摆；</li>
  *   <li><b>8 gt 冷却真的被清掉了</b>（{@code pushItemsTick} 收尾的 TAIL 注入有效）；</li>
- *   <li><b>玩家把仓库清空之后闸门不许误报</b>（上一轮埋的最严重的那个坑）。</li>
+ *   <li><b>玩家把仓库清空之后闸门不许误报</b>（上一轮埋的最严重的那个坑）；</li>
+ *   <li><b>上方容器一 tick 全收</b>，速率与掉落物那条路一致（H 组）；</li>
+ *   <li><b>白名单在容器这条路上也拦得住</b>（I 组，上一轮整条失效过）；</li>
+ *   <li><b>分类物不许摊开</b>：上方灌进来的同种货物只进它自己那一格，
+ *       5 格不会被开垦成 {@code 1 1 1 1 1}（J 组，本轮修的那个）；</li>
+ *   <li><b>多个分类物各守各的格子</b>（K 组）；</li>
+ *   <li><b>吞吐不被漏斗 5 格容量卡住</b>：一整桶 1728 个一 tick 搬空（L 组）。</li>
  * </ol>
  *
  * <h2>为什么按 tick 分步推进</h2>
@@ -45,7 +52,10 @@ public final class UnlimitedIntakeSelfCheck {
     private static final BlockPos LOOSE = new BlockPos(8, 6, 0);   // 不对着终端的普通漏斗
 
     /** 最后一个场景的编号（跑完它下一步就是收尾） */
-    private static final int LAST = 26;
+    private static final int LAST = 46;
+
+    /** 上方容器用桶：单格方块、27 格，不会像箱子那样被合并成大箱子 */
+    private static final int BARREL_SLOTS = 27;
 
     private static int checks = 0;
     private static int failures = 0;
@@ -167,6 +177,66 @@ public final class UnlimitedIntakeSelfCheck {
             case 26:
                 emptyingAfterLoadMustNotTripTheGuard(level, data);
                 break;
+            // ---------------- H. 上方容器一 tick 全收 ----------------
+            case 27:
+                wideCleanup(level);
+                break;
+            case 28:
+                setupContainerRate(level, data);
+                break;
+            case 29:
+                break;
+            case 30:
+                assertContainerRate(level, data);
+                break;
+            // ---------------- I. 白名单在容器这条路上也拦得住 ----------------
+            case 31:
+                wideCleanup(level);
+                break;
+            case 32:
+                setupContainerWhitelist(level, data);
+                break;
+            case 33:
+                break;
+            case 34:
+                assertContainerWhitelist(level, data);
+                break;
+            // ---------------- J. 分类物不许摊开（本轮修的那个） ----------------
+            case 35:
+                wideCleanup(level);
+                break;
+            case 36:
+                setupNoSpread(level, data);
+                break;
+            case 37:
+                break;
+            case 38:
+                assertNoSpread(level, data);
+                break;
+            // ---------------- K. 多个分类物各守各的格子 ----------------
+            case 39:
+                wideCleanup(level);
+                break;
+            case 40:
+                setupMultiClassifier(level, data);
+                break;
+            case 41:
+                break;
+            case 42:
+                assertMultiClassifier(level, data);
+                break;
+            // ---------------- L. 吞吐不被漏斗 5 格容量卡住 ----------------
+            case 43:
+                wideCleanup(level);
+                break;
+            case 44:
+                setupThroughput(level, data);
+                break;
+            case 45:
+                break;
+            case 46:
+                assertThroughput(level, data);
+                break;
             default:
                 finish(server);
                 return;
@@ -184,6 +254,7 @@ public final class UnlimitedIntakeSelfCheck {
         data.clearContent();
         level.setBlock(T, Blocks.AIR.defaultBlockState(), 3);
         level.setBlock(H, Blocks.AIR.defaultBlockState(), 3);
+        level.setBlock(H.above(), Blocks.AIR.defaultBlockState(), 3);
         level.setBlock(LOOSE, Blocks.AIR.defaultBlockState(), 3);
         // 故意留下 2 条合法数据：下一轮加载它，验证「空壳闸门」不会误伤一份正常存档
         data.insert(new ItemStack(Items.COBBLESTONE, 1234));
@@ -247,8 +318,8 @@ public final class UnlimitedIntakeSelfCheck {
             check("A1 入库漏斗还在", false);
             return;
         }
-        int left = HopperBlockEntity.getItemsAtAndAbove(level, hopper).size();
-        check("A2 一个 tick 收得一个不剩（剩 " + left + " 个实体）", left == 0);
+        long left = itemsAbove(level, hopper);
+        check("A2 一个 tick 收得一个不剩（剩 " + left + " 个物品）", left == 0);
         check("A3 漏斗已搬空（没留在漏斗里过夜）", hopper.isEmpty());
 
         long stored = amount(data, Items.COBBLESTONE) + amount(data, Items.DIAMOND)
@@ -290,7 +361,8 @@ public final class UnlimitedIntakeSelfCheck {
             check("B1 入库漏斗还在", false);
             return;
         }
-        check("B1 一个实体也被收走", HopperBlockEntity.getItemsAtAndAbove(level, hopper).size() == 0);
+        check("B1 一个实体也被收走（剩 " + itemsAbove(level, hopper) + " 个物品）",
+                itemsAbove(level, hopper) == 0);
         check("B2 200 个一个不少全进库（入库 " + amount(data, Items.COBBLESTONE) + "）",
                 amount(data, Items.COBBLESTONE) == 200);
         teardown(level, data, T, H);
@@ -366,7 +438,7 @@ public final class UnlimitedIntakeSelfCheck {
             check("D1 普通漏斗还在", false);
             return;
         }
-        int left = HopperBlockEntity.getItemsAtAndAbove(level, hopper).size();
+        long left = itemsAbove(level, hopper);
         check("D1 普通漏斗没被无上限接管（剩 " + left + " / 6）", left >= 5);
         check("D2 普通漏斗的东西一个都没进库", amount(data, Items.OAK_LOG) == 0);
         level.setBlock(LOOSE, Blocks.AIR.defaultBlockState(), 3);
@@ -392,7 +464,7 @@ public final class UnlimitedIntakeSelfCheck {
 
     private static void assertRedstoneLock(ServerLevel level, VoidWarehouseData data) {
         HopperBlockEntity hopper = hopperAt(level, H);
-        int left = hopper == null ? -1 : HopperBlockEntity.getItemsAtAndAbove(level, hopper).size();
+        long left = hopper == null ? -1L : itemsAbove(level, hopper);
         check("E1 红石锁存时一个都不收（剩 " + left + " / 6）", left == 6);
         check("E2 红石锁存时仓库没进货", amount(data, Items.DIAMOND) == 0);
         teardown(level, data, T, H);
@@ -460,10 +532,253 @@ public final class UnlimitedIntakeSelfCheck {
         data.clearContent();
     }
 
+    // ------------------------------------------------------------------ H. 上方容器一 tick 全收
+
+    /**
+     * 上方桶里 5 格 × 64 圆石 = 320，<b>不设分类物</b>。
+     *
+     * <p>这一组盯的是「上方容器」那条路的速率：它必须和掉落物那条路一样，
+     * 一个 tick 全收。上一轮这里的实测是「每 tick 1 个」，差了 320 倍。</p>
+     */
+    private static void setupContainerRate(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("H0 入库漏斗造出来了", false);
+            return;
+        }
+        check("H0 入库漏斗造出来了", true);
+        data.clearContent();
+        Container barrel = placeBarrel(level, H.above());
+        if (barrel == null) {
+            check("H0 上方桶造出来了", false);
+            return;
+        }
+        fillBarrel(barrel, Items.COBBLESTONE, 5, 64);
+    }
+
+    private static void assertContainerRate(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        Container barrel = barrelAt(level, H.above());
+        if (hopper == null || barrel == null) {
+            check("H1 漏斗 / 上方桶都还在", false);
+            return;
+        }
+        long stored = amount(data, Items.COBBLESTONE);
+        long leftAbove = countIn(barrel, Items.COBBLESTONE);
+        System.out.println("H 实测：1 tick 后仓库 " + stored + " 个，上方剩 " + leftAbove + " 个");
+        check("H1 上方容器的 320 个一 tick 全进库（实际 " + stored + "）", stored == 320);
+        check("H2 上方容器被抽空（剩 " + leftAbove + "）", leftAbove == 0);
+        check("H3 总量守恒 320 = " + (stored + leftAbove + countIn(hopper, Items.COBBLESTONE)),
+                stored + leftAbove + countIn(hopper, Items.COBBLESTONE) == 320);
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ I. 白名单在容器这条路上也拦得住
+
+    /**
+     * 开了分类物（橡木）的入库漏斗，上方桶里放着<b>圆石（不在白名单）+ 橡木（在）</b>。
+     *
+     * <p>这一组是上一轮那个事故的连带回归：{@code addItem} 的参数写反之后，
+     * 白名单关卡认错了「目标容器」，于是「上方容器 → 漏斗」这条路上的白名单<b>整条失效</b>
+     * —— 而当时的自检只测了掉落物那条路，所以没人发现。</p>
+     */
+    private static void setupContainerWhitelist(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("I0 入库漏斗造出来了", false);
+            return;
+        }
+        data.clearContent();
+        Container barrel = placeBarrel(level, H.above());
+        if (barrel == null) {
+            check("I0 上方桶造出来了", false);
+            return;
+        }
+        // 玩家手动往漏斗里放了 1 个橡木原木当分类物
+        hopper.setItem(0, new ItemStack(Items.OAK_LOG, 1));
+        ((VoidWarehouseHopperFilter) hopper).setClassifierFilter(true);
+        barrel.setItem(0, new ItemStack(Items.COBBLESTONE, 10));
+        barrel.setItem(1, new ItemStack(Items.OAK_LOG, 10));
+    }
+
+    private static void assertContainerWhitelist(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        Container barrel = barrelAt(level, H.above());
+        if (hopper == null || barrel == null) {
+            check("I1 漏斗 / 上方桶都还在", false);
+            return;
+        }
+        System.out.println("I 实测：仓库 oak=" + amount(data, Items.OAK_LOG)
+                + " cobble=" + amount(data, Items.COBBLESTONE)
+                + "；上方剩 oak=" + countIn(barrel, Items.OAK_LOG)
+                + " cobble=" + countIn(barrel, Items.COBBLESTONE)
+                + "；漏斗格 " + snapshot(hopper));
+        check("I1 白名单内的橡木全进库（" + amount(data, Items.OAK_LOG) + "）",
+                amount(data, Items.OAK_LOG) == 10);
+        check("I2 白名单外的圆石一个没进库（" + amount(data, Items.COBBLESTONE) + "）",
+                amount(data, Items.COBBLESTONE) == 0);
+        check("I3 圆石原样留在上方桶里（" + countIn(barrel, Items.COBBLESTONE) + "）",
+                countIn(barrel, Items.COBBLESTONE) == 10);
+        check("I4 分类物还留在漏斗里（格 " + snapshot(hopper) + "）", countIn(hopper, Items.OAK_LOG) >= 1);
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ J. 分类物不许摊开
+
+    /**
+     * <b>本轮修的那个。</b>上方桶里<b>塞满</b>橡木原木（27 格 × 64 = 1728），
+     * 漏斗 slot0 手动摆 1 个橡木原木当分类物。
+     *
+     * <p>修复前：原版 {@code addItem} 按 slot 0→N 逐个试，slot0 被补满之后多出来的那 1 个
+     * 就去开垦 slot1，一 tick 下来 5 格全变成 {@code 1 1 1 1 1} —— 玩家手动摆的分类只剩第一格，
+     * 后面四格被货物占住，想加第二种分类物都没地方。</p>
+     * <p>修复后：货物只进得了 slot0，而且 {@code drain} 只留 {@code KEEP} 个当种子，
+     * 所以漏斗必须一直是 {@code 1 0 0 0 0}。</p>
+     */
+    private static void setupNoSpread(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("J0 入库漏斗造出来了", false);
+            return;
+        }
+        data.clearContent();
+        Container barrel = placeBarrel(level, H.above());
+        if (barrel == null) {
+            check("J0 上方桶造出来了", false);
+            return;
+        }
+        hopper.setItem(0, new ItemStack(Items.OAK_LOG, 1));
+        ((VoidWarehouseHopperFilter) hopper).setClassifierFilter(true);
+        fillBarrel(barrel, Items.OAK_LOG, BARREL_SLOTS, 64);
+    }
+
+    private static void assertNoSpread(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        Container barrel = barrelAt(level, H.above());
+        if (hopper == null || barrel == null) {
+            check("J1 漏斗 / 上方桶都还在", false);
+            return;
+        }
+        long stored = amount(data, Items.OAK_LOG);
+        long leftAbove = countIn(barrel, Items.OAK_LOG);
+        System.out.println("J 实测：仓库 oak=" + stored + "；上方剩 " + leftAbove
+                + "；漏斗格 " + snapshot(hopper));
+        // 分类物不许摊开：只有 slot0 有东西，后面 4 格必须全空
+        boolean spread = false;
+        for (int i = 1; i < hopper.getContainerSize(); i++) {
+            if (!hopper.getItem(i).isEmpty()) {
+                spread = true;
+            }
+        }
+        check("J1 分类物没被摊到别的格子（格 " + snapshot(hopper) + "）", !spread);
+        check("J2 slot0 只剩分类物余量 1 个（实际 " + hopper.getItem(0).getCount() + "）",
+                hopper.getItem(0).getCount() == VoidWarehouseClassifier.KEEP);
+        check("J3 1728 个橡木全进库（实际 " + stored + "）", stored == 1728L);
+        check("J4 上方桶被抽空（剩 " + leftAbove + "）", leftAbove == 0);
+        check("J5 总量守恒 1729 = " + (stored + leftAbove + countIn(hopper, Items.OAK_LOG)),
+                stored + leftAbove + countIn(hopper, Items.OAK_LOG) == 1729L);
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ K. 多个分类物各守各的格子
+
+    /**
+     * 漏斗 slot0 = 橡木、slot1 = 圆石（两种分类物），上方桶里三种货物各 10 个：
+     * 橡木、圆石各进各的格子，泥土（不在白名单）一个都进不来。
+     */
+    private static void setupMultiClassifier(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("K0 入库漏斗造出来了", false);
+            return;
+        }
+        data.clearContent();
+        Container barrel = placeBarrel(level, H.above());
+        if (barrel == null) {
+            check("K0 上方桶造出来了", false);
+            return;
+        }
+        hopper.setItem(0, new ItemStack(Items.OAK_LOG, 1));
+        hopper.setItem(1, new ItemStack(Items.COBBLESTONE, 1));
+        ((VoidWarehouseHopperFilter) hopper).setClassifierFilter(true);
+        barrel.setItem(0, new ItemStack(Items.OAK_LOG, 10));
+        barrel.setItem(1, new ItemStack(Items.COBBLESTONE, 10));
+        barrel.setItem(2, new ItemStack(Items.DIRT, 10));
+    }
+
+    private static void assertMultiClassifier(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        Container barrel = barrelAt(level, H.above());
+        if (hopper == null || barrel == null) {
+            check("K1 漏斗 / 上方桶都还在", false);
+            return;
+        }
+        System.out.println("K 实测：仓库 oak=" + amount(data, Items.OAK_LOG)
+                + " cobble=" + amount(data, Items.COBBLESTONE)
+                + " dirt=" + amount(data, Items.DIRT)
+                + "；上方剩 dirt=" + countIn(barrel, Items.DIRT)
+                + "；漏斗格 " + snapshot(hopper));
+        check("K1 橡木进库 10（" + amount(data, Items.OAK_LOG) + "）", amount(data, Items.OAK_LOG) == 10);
+        check("K2 圆石进库 10（" + amount(data, Items.COBBLESTONE) + "）",
+                amount(data, Items.COBBLESTONE) == 10);
+        check("K3 泥土一个没进库（" + amount(data, Items.DIRT) + "）", amount(data, Items.DIRT) == 0);
+        check("K4 泥土原样留在上方桶里（" + countIn(barrel, Items.DIRT) + "）",
+                countIn(barrel, Items.DIRT) == 10);
+        check("K5 slot0 还是橡木（" + hopper.getItem(0).getItem() + "）",
+                hopper.getItem(0).getItem() == Items.OAK_LOG);
+        check("K6 slot1 还是圆石（" + hopper.getItem(1).getItem() + "）",
+                hopper.getItem(1).getItem() == Items.COBBLESTONE);
+        check("K7 slot2~4 没被开垦", hopper.getItem(2).isEmpty()
+                && hopper.getItem(3).isEmpty() && hopper.getItem(4).isEmpty());
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ L. 吞吐不被 5 格容量卡住
+
+    /**
+     * 上方桶整整 27 格 × 64 = 1728 个圆石，<b>不设分类物</b>，一个 tick 必须全搬空。
+     *
+     * <p>漏斗只有 5 格（320 个容量）。不「边吸边入库、啃完同一格再走」的话，
+     * 一 tick 的上限就是 320，剩下的要等下一 tick。</p>
+     */
+    private static void setupThroughput(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("L0 入库漏斗造出来了", false);
+            return;
+        }
+        data.clearContent();
+        Container barrel = placeBarrel(level, H.above());
+        if (barrel == null) {
+            check("L0 上方桶造出来了", false);
+            return;
+        }
+        fillBarrel(barrel, Items.COBBLESTONE, BARREL_SLOTS, 64);
+    }
+
+    private static void assertThroughput(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        Container barrel = barrelAt(level, H.above());
+        if (hopper == null || barrel == null) {
+            check("L1 漏斗 / 上方桶都还在", false);
+            return;
+        }
+        long stored = amount(data, Items.COBBLESTONE);
+        long leftAbove = countIn(barrel, Items.COBBLESTONE);
+        System.out.println("L 实测：1 tick 后仓库 " + stored + " 个，上方剩 " + leftAbove + " 个");
+        check("L1 一整桶 1728 个一 tick 全进库（实际 " + stored + "）", stored == 1728L);
+        check("L2 上方桶被抽空（剩 " + leftAbove + "）", leftAbove == 0);
+        check("L3 总量守恒 1728 = " + (stored + leftAbove + countIn(hopper, Items.COBBLESTONE)),
+                stored + leftAbove + countIn(hopper, Items.COBBLESTONE) == 1728L);
+        teardown(level, data, T, H);
+    }
+
     // ------------------------------------------------------------------ 工具
 
     /** 摆一个「口朝下指工作台」的入库漏斗（工作台登记为仓库终端），返回它的方块实体。 */
     private static HopperBlockEntity setup(ServerLevel level, BlockPos table, BlockPos pos) {
+        // 上面几组可能在漏斗头顶留了桶，先清掉 —— 否则这一组会走去「上方容器」那条分支
+        level.setBlock(pos.above(), Blocks.AIR.defaultBlockState(), 3);
         level.setBlock(table, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
         level.setBlock(pos, Blocks.HOPPER.defaultBlockState()
                 .setValue(HopperBlock.FACING, Direction.DOWN)
@@ -477,15 +792,54 @@ public final class UnlimitedIntakeSelfCheck {
         return raw instanceof HopperBlockEntity hopper ? hopper : null;
     }
 
+    /** 在指定位置摆一个桶并把它清空，返回它的容器视图。 */
+    private static Container placeBarrel(ServerLevel level, BlockPos pos) {
+        level.setBlock(pos, Blocks.BARREL.defaultBlockState(), 3);
+        Container barrel = barrelAt(level, pos);
+        if (barrel != null) {
+            for (int i = 0; i < barrel.getContainerSize(); i++) {
+                barrel.setItem(i, ItemStack.EMPTY);
+            }
+        }
+        return barrel;
+    }
+
+    private static Container barrelAt(ServerLevel level, BlockPos pos) {
+        BlockEntity raw = level.getBlockEntity(pos);
+        return raw instanceof Container container ? container : null;
+    }
+
+    /** 往桶里前 {@code slots} 格各塞 {@code perSlot} 个。 */
+    private static void fillBarrel(Container barrel, Item item, int slots, int perSlot) {
+        for (int i = 0; i < slots && i < barrel.getContainerSize(); i++) {
+            barrel.setItem(i, new ItemStack(item, perSlot));
+        }
+        barrel.setChanged();
+    }
+
     private static void teardown(ServerLevel level, VoidWarehouseData data, BlockPos table, BlockPos pos) {
         HopperBlockEntity hopper = hopperAt(level, pos);
         if (hopper != null) {
             clearEntitiesAbove(level, hopper);
         }
+        level.setBlock(pos.above(), Blocks.AIR.defaultBlockState(), 3);
         level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
         level.setBlock(table, Blocks.AIR.defaultBlockState(), 3);
         VoidWarehouseTerminals.remove(level, table);
         data.clearContent();
+    }
+
+    /** 漏斗 5 格的数量快照，形如 {@code 1 0 0 0 0}，失败时一眼看出摊没摊开。 */
+    private static String snapshot(HopperBlockEntity hopper) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < hopper.getContainerSize(); i++) {
+            if (i > 0) {
+                sb.append(' ');
+            }
+            ItemStack stack = hopper.getItem(i);
+            sb.append(stack.isEmpty() ? "0" : stack.getCount());
+        }
+        return sb.toString();
     }
 
     /**
@@ -526,6 +880,23 @@ public final class UnlimitedIntakeSelfCheck {
         }
     }
 
+    /**
+     * 数吸力范围内还剩多少个<b>物品</b>（不是实体个数）。
+     *
+     * <p>必须数物品、不能数实体：原版每 tick 会把<b>同坐标、同组件</b>的掉落物合并，
+     * 6 个 count=1 的钻石会并成 1 个 count=6 的实体。数实体的话，
+     * 「红石锁存时一个都不收」这种断言会间歇性地假失败（实测报过「剩 1 / 6」）。</p>
+     */
+    private static long itemsAbove(ServerLevel level, HopperBlockEntity hopper) {
+        long total = 0;
+        for (ItemEntity entity : HopperBlockEntity.getItemsAtAndAbove(level, hopper)) {
+            if (!entity.isRemoved()) {
+                total += entity.getItem().getCount();
+            }
+        }
+        return total;
+    }
+
     /** 清掉吸力范围内的掉落物。幂等硬要求：上一轮的残渣不能污染这一轮的断言。 */
     private static void clearEntitiesAbove(ServerLevel level, HopperBlockEntity hopper) {
         for (ItemEntity entity : HopperBlockEntity.getItemsAtAndAbove(level, hopper)) {
@@ -536,6 +907,18 @@ public final class UnlimitedIntakeSelfCheck {
     private static long amount(VoidWarehouseData data, Item item) {
         BigInteger value = data.amountOf(item);
         return value == null ? 0L : value.longValue();
+    }
+
+    /** 数一个容器里某种物品的总个数（桶 / 漏斗都适用）。 */
+    private static long countIn(Container container, Item item) {
+        long total = 0;
+        for (int i = 0; i < container.getContainerSize(); i++) {
+            ItemStack stack = container.getItem(i);
+            if (!stack.isEmpty() && stack.getItem() == item) {
+                total += stack.getCount();
+            }
+        }
+        return total;
     }
 
     private static final Field COOLDOWN_FIELD = findCooldownField();

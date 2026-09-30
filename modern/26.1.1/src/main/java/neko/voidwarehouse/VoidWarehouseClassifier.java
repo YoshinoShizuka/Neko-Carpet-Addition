@@ -78,4 +78,36 @@ public final class VoidWarehouseClassifier {
         }
         return false;
     }
+
+    /**
+     * {@code slot} 这一格是不是「{@code stack} 这件分类物<b>自己的格子</b>」。
+     *
+     * <h2>为什么必须有这一条（实测事故）</h2>
+     * <p>光有 {@link #matchesAny} 只回答了「这物品在不在白名单里」，没回答
+     * 「它该进哪一格」。而原版 {@code HopperBlockEntity#addItem} 是<b>按 slot 0→N
+     * 逐个试</b>的（字节码已核对：一个 {@code for} 循环里对每个 slot 调
+     * {@code tryMoveInItem}，直到物品被分光），{@code tryMoveInItem} 对<b>空格子</b>
+     * 又是直接 {@code setItem} 整摞写入。</p>
+     * <p>于是：漏斗 slot0 摆着 1 个橡木原木时，来一堆橡木原木 → 先合并进 slot0（补到 64），
+     * <b>剩下那 1 个顺手开垦了 slot1</b>；上方容器货一多，5 格就被逐个开垦成
+     * {@code 1 1 1 1 1}。手动填充看不出来，是因为玩家只写一次、只碰一格。</p>
+     *
+     * <h2>规则</h2>
+     * <p>分类物<b>只许合并进已经放着同种分类物的格子，不许开垦新格子</b>。
+     * 于是「哪格是哪种」永远等于玩家摆出来的样子，白名单不会自己长大，
+     * 玩家想加第二种分类物时那个格子也还空着。</p>
+     *
+     * <p>注意这一条在语义上<b>已经蕴含</b>了 {@link #matchesAny}：格子里的东西与
+     * {@code stack} 同种，那漏斗里当然存在这个分类物。两道检查都保留，
+     * 是为了让「是不是白名单物品」与「该进哪一格」这两件事在代码里各自说清楚。</p>
+     *
+     * @param slot 机器正打算往哪一格塞（原版 {@code tryMoveInItem} 给的槽位号）
+     */
+    public static boolean isOwnSlot(HopperBlockEntity hopper, ItemStack stack, int slot) {
+        if (stack.isEmpty() || slot < 0 || slot >= hopper.getContainerSize()) {
+            return false;
+        }
+        ItemStack resident = hopper.getItem(slot);
+        return !resident.isEmpty() && ItemStack.isSameItemSameComponents(resident, stack);
+    }
 }

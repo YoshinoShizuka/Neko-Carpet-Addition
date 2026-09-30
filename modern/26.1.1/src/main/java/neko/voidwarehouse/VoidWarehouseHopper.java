@@ -49,9 +49,11 @@ import java.util.List;
  * 漏斗里的非空潜影盒会被同样的逻辑<b>拆开</b>入库（盒内物品按真实数量存，
  * 盒子变成 2 潜影壳 + 1 箱子）；空盒子则整盒入库，不拆。</p>
  *
- * <h2>只搬漏斗自己</h2>
- * <p>这里只动「漏斗格子里的物品」。漏斗上方容器 → 漏斗那一段仍走原版逻辑（原版速率），
- * 所以整条链的速度由漏斗的抽取速率决定，虚空仓库这一端不再是瓶颈。</p>
+ * <h2>上游那一段也是无上限的</h2>
+ * <p>「上方容器 → 漏斗」「掉落物 → 漏斗」这两段由 {@link #suckUnlimited} /
+ * {@link #suckEntitiesUnlimited} 自己接管，同样不受 8 gt 节流管；
+ * 漏斗 5 格塞满时当场 {@link #drain} 腾位再继续，所以一 tick 的吞吐量
+ * 只取决于上游有多少货，不再被漏斗容量卡住。</p>
  *
  * <h2>不丢东西</h2>
  * <p>搬运走的是仓库自己的 {@code insert}：仓库收下多少、漏斗就少多少，两者记的是同一笔账；
@@ -64,6 +66,9 @@ import java.util.List;
  *   <li><b>只有与分类物相同的物品才进得来</b>：机器搬运（上方容器吸料、邻居漏斗推料、
  *       掉落物被吸入）都要先过 {@link VoidWarehouseClassifier#matchesAny} 这一关，
  *       不匹配的物品<b>原封不动留在上游</b>（不是丢在漏斗里堆着）；</li>
+ *   <li><b>而且只进得了它自己那一格</b>（{@link VoidWarehouseClassifier#isOwnSlot}）：
+ *       不许开垦空格子，否则原版 {@code addItem} 的逐格试放会把同一种分类物
+ *       摊到 5 个格子上，「哪格是哪种」就不是玩家摆出来的样子了；</li>
  *   <li><b>只有它们才存得进仓库</b>：{@code drain} 只搬「与分类物相同」的东西
  *       —— 其实漏斗里也只剩得下这些东西了；</li>
  *   <li><b>每格留 {@link VoidWarehouseClassifier#KEEP} 个当分类物</b>
@@ -81,6 +86,16 @@ import java.util.List;
  * 两者靠「漏斗口朝哪」区分；一条漏斗两个条件都满足时<b>以入库为准</b>。</p>
  */
 public final class VoidWarehouseHopper {
+
+    /**
+     * 「上方容器某一格没被一次吸完」时，回头再啃的次数上限。
+     *
+     * <p>漏斗 5 格塞满 = 320 个，而上方容器一格最多 64 个，所以<b>腾一次位必定够</b>，
+     * 正常只会用到 1 次。留 4 次是给「潜影盒拆出来的内容物」之类超出常规堆叠的情况兜底；
+     * 真正的终止条件是 {@code drain} 搬不动任何东西（仓库拒收），那时立刻退出。</p>
+     */
+    private static final int MAX_RETRY_PER_SLOT = 4;
+
     private VoidWarehouseHopper() {
     }
 
@@ -181,10 +196,12 @@ public final class VoidWarehouseHopper {
         // ① 先把上一 tick 残留的（含 vanilla 亲手吸进来的）搬空，让下面能吃到 5 格全空
         drain(level, hopper, keepClassifiers);
         // ② 进货：上方是容器 → 整格搬；否则 → 收掉落物（与原版同样的二选一）
+        //    两条路都在「漏斗吃不下」的那一刻当场入库腾位（见各自的方法注释），
+        //    所以一 tick 里能搬多少只取决于上游有多少货，不再被漏斗 5 格的容量卡住。
         Container above = HopperBlockEntity.getContainerAt(level, hopper.getBlockPos().above());
         boolean got = above != null
-                ? suckUnlimited(above, hopper)
-                : suckEntitiesUnlimited(level, hopper) > 0;
+                ? suckUnlimited(level, above, hopper, keepClassifiers)
+                : suckEntitiesUnlimited(level, hopper, keepClassifiers) > 0;
         // ③ 本 tick 刚收进来的当场入库，不让它在漏斗里多待一刻。
         //    一条都没收到时这一步无事可做 —— 跳过它，空转的漏斗就不用白跑第二趟。
         if (got) {
@@ -218,9 +235,17 @@ public final class VoidWarehouseHopper {
      * {@code discard()}</b>；只收得下一部分就把剩下那截 {@code setItem} 回实体身上。
      * 既不会让 64 个圆石硬塞成 65 个，也不会出现「实体没了但物品没进漏斗」。</p>
      *
+     * <h2>边吸边入库</h2>
+     * <p>漏斗只有 5 格，塞满之后原版 {@code addItem} 就一分都吃不下了。
+     * 所以每当一个实体<b>没被整个吞掉</b>（漏斗满了 / 只剩半个格子的余量），
+     * 就当场 {@link #drain} 一次把位置腾出来，接着收下一个 ——
+     * 于是一 tick 的吞吐量不再被「漏斗容量 320」卡住。
+     * 只在真吃不下时才 {@code drain}，绝大多数时候（漏斗有空位）这一步完全不跑。</p>
+     *
+     * @param keepClassifiers 见 {@link #drain}
      * @return 收走了几个<b>实体</b>（按实体个数算，不是物品个数）。只用于诊断 / 自检。
      */
-    public static int suckEntitiesUnlimited(ServerLevel level, HopperBlockEntity hopper) {
+    public static int suckEntitiesUnlimited(ServerLevel level, HopperBlockEntity hopper, boolean keepClassifiers) {
         List<ItemEntity> nearby = HopperBlockEntity.getItemsAtAndAbove(level, hopper);
         if (nearby.isEmpty()) {
             return 0;
@@ -235,6 +260,10 @@ public final class VoidWarehouseHopper {
             }
             if (absorbEntity(hopper, entity)) {
                 taken++;
+            }
+            if (!entity.isRemoved()) {
+                // 没整个吞掉 = 漏斗吃不下（或只吃下半口）→ 入库腾位，下一个实体接着来
+                drain(level, hopper, keepClassifiers);
             }
         }
         return taken;
@@ -310,43 +339,68 @@ public final class VoidWarehouseHopper {
      * <p>塞不进漏斗的那部分 <b>原样放回上方容器的原格</b> —— 一丝不苟地还回去，
      * 从来没有「取出来却没地方放」这种事发生。</p>
      *
+     * <h2>边吸边入库</h2>
+     * <p>与掉落物那条路同一个道理：漏斗只有 5 格，塞满就吃不下了。
+     * 所以每当一格货物<b>没被整个吞掉</b>，就当场 {@link #drain} 一次腾位，
+     * 下一格接着吸。这条在<b>分类物模式</b>下尤其要紧：分类物只进得了自己那一格，
+     * 而那一格还永久占着 {@link VoidWarehouseClassifier#KEEP} 个当种子，
+     * 单次最多只能吃 {@code 64 - KEEP} 个 —— 不边吸边腾，速率会掉回 63 个/tick。</p>
+     * <p>只在真吃不下时才 {@code drain}：上方容器前几格通常一口气填满 5 格、
+     * 一次都不用腾，空转与常规场景的开销和改之前一样。</p>
+     *
+     * @param keepClassifiers 见 {@link #drain}
      * @return 是否真的吸进来了东西（至少有一个物品进了漏斗）
      */
-    public static boolean suckUnlimited(Container source, HopperBlockEntity hopper) {
+    public static boolean suckUnlimited(ServerLevel level, Container source, HopperBlockEntity hopper,
+                                        boolean keepClassifiers) {
         if (source == null) {
             return false;
         }
         boolean moved = false;
         int size = source.getContainerSize();
-        for (int slot = 0; slot < size; slot++) {
-            ItemStack stack = source.getItem(slot);
-            if (stack.isEmpty()) {
-                continue;
-            }
-            // 原版判定：这个格子的东西能不能被「取」出来（WorldlyContainer 侧面过滤等）
-            if (!canTakeFrom(source, hopper, stack, slot)) {
-                continue;
-            }
-            int available = stack.getCount();
-            // 整格取走（不绕过原版，因为上面已经用 canTakeFrom 判定过）
-            ItemStack taken = source.removeItem(slot, available);
-            if (taken.isEmpty()) {
-                continue;
-            }
-            // 塞进入库漏斗：<b>参数顺序</b>必须与原版一致 —— addItem(source, destination, ...)。
-            // 这里曾经把 source / destination 写反过：东西被「取出来又塞回自己」，漏斗一个都没收到，
-            // 实测上方容器的速率退化成 1 个/tick（而掉落物是每 tick 全收，相差 320 倍），
-            // 分类物白名单也因为「关卡认错了目标容器」而整条失效。
-            ItemStack leftover = absorbStack(source, hopper, taken);
-            int accepted = available - leftover.getCount();
-            if (!leftover.isEmpty()) {
+        int slot = 0;
+        while (slot < size) {
+            int retries = 0;
+            while (true) {
+                ItemStack stack = source.getItem(slot);
+                if (stack.isEmpty()) {
+                    break;
+                }
+                // 原版判定：这个格子的东西能不能被「取」出来（WorldlyContainer 侧面过滤等）
+                if (!canTakeFrom(source, hopper, stack, slot)) {
+                    break;
+                }
+                int available = stack.getCount();
+                // 整格取走（不绕过原版，因为上面已经用 canTakeFrom 判定过）
+                ItemStack taken = source.removeItem(slot, available);
+                if (taken.isEmpty()) {
+                    break;
+                }
+                // 塞进入库漏斗：<b>参数顺序</b>必须与原版一致 —— addItem(source, destination, ...)。
+                // 这里曾经把 source / destination 写反过：东西被「取出来又塞回自己」，漏斗一个都没收到，
+                // 实测上方容器的速率退化成 1 个/tick（而掉落物是每 tick 全收，相差 320 倍），
+                // 分类物白名单也因为「关卡认错了目标容器」而整条失效。
+                ItemStack leftover = absorbStack(source, hopper, taken);
+                int accepted = available - leftover.getCount();
+                if (accepted > 0) {
+                    moved = true;
+                }
+                if (leftover.isEmpty()) {
+                    break;
+                }
                 // 漏斗吃不下（或只吃下半口）的部分：并回上方容器的原格
                 // （原格此时要么空、要么同种 —— removeItem 过后不可能出现第三种情况）
                 mergeBack(source, slot, leftover);
+                // 当场入库腾位，然后<b>回头再啃同一格</b> ——
+                // 只腾位不回头的话，撞上「漏斗满了」的那一格货物会留到下一 tick，
+                // 一 tick 的吞吐就永远卡在「5 格容量」这个数上。
+                // 次数上限是硬保险：drain 没搬动任何东西（仓库拒收）时立刻退出，不存在转不出来的情况。
+                if (drain(level, hopper, keepClassifiers) <= 0 || retries >= MAX_RETRY_PER_SLOT) {
+                    break;
+                }
+                retries++;
             }
-            if (accepted > 0) {
-                moved = true;
-            }
+            slot++;
         }
         if (moved) {
             source.setChanged();

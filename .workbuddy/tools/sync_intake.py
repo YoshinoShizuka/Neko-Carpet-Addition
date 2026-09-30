@@ -26,6 +26,7 @@ FILES = [
     "VoidWarehouseHopper.java",
     "mixin/HopperBlockEntityMixin.java",
     "VoidWarehouseHopperFilter.java",
+    "VoidWarehouseClassifier.java",
     "VoidWarehouse.java",
 ]
 

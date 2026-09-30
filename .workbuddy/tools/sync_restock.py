@@ -30,6 +30,9 @@ TARGETS = {
             # 1.21.11 走 officialMojangMappings，这些名字一致，可以整文件复制。
             "src/main/java/neko/voidwarehouse/VoidWarehouse.java",
             "src/main/java/neko/automending/AutoMendingMod.java",
+            # AutoMending：只依赖 ServerPlayer / EnchantmentHelper / EnchantmentEffectComponents
+            # / ItemStack，五个版本（含 1.21.11 的 Mojang 官方映射）名字完全一致，可整文件复制。
+            "src/main/java/neko/automending/AutoMending.java",
             "src/main/java/neko/voidwarehouse/VoidWarehouseExtension.java",
             "src/main/resources/assets/carpet_neko_addition/lang/zh_cn.json",
             "src/main/resources/assets/carpet_neko_addition/lang/en_us.json",
@@ -51,6 +54,10 @@ WHOLE_FILES = [
     # 所以 info()/count() 由 package-private 提成了 public。五个版本内容完全一致。
     "src/main/java/neko/voidwarehouse/VoidWarehouseText.java",
     "src/main/java/neko/automending/AutoMendingMod.java",
+    # AutoMending：自动经验修补的经验记账。它【不在】common 里，而是每个版本一份，
+    # 所以改了必须五版本一起同步 —— 否则会出现「26.3 修好了、别的版本还是旧的 2 倍扣减」。
+    # 只用 ServerPlayer / EnchantmentHelper / ItemStack，五个版本内容本来就必须一致。
+    "src/main/java/neko/automending/AutoMending.java",
     "src/main/java/neko/voidwarehouse/VoidWarehouseExtension.java",
     "src/main/resources/assets/carpet_neko_addition/lang/zh_cn.json",
     "src/main/resources/assets/carpet_neko_addition/lang/en_us.json",

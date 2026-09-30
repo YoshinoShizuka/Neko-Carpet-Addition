@@ -1,0 +1,187 @@
+package neko.automending;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.core.Holder;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.enchantment.Enchantment;
+import net.minecraft.world.item.enchantment.Enchantments;
+
+import java.util.UUID;
+
+/**
+ * 【临时自检】验证自动经验修补的经验记账；验证完连同 {@code AutoMendingExtension} 里的 hook 一起删掉。
+ *
+ * <p>要守住的不变量只有两条，但正是玩家报的那个 bug：</p>
+ * <ol>
+ *   <li><b>等级恒定不变</b> —— {@code mending()} 只能花「进度条里已有的经验」，绝不能扣穿。</li>
+ *   <li><b>{@code experienceProgress} 始终落在 {@code [0,1)}</b> —— 一旦变负，原版的降级回弹
+ *       循环就会把进度条弹到 ~98%，玩家看到的就是「只看得见等级在变、看不出真实进度」。</li>
+ * </ol>
+ *
+ * <p>S 组最后还放了一条<b>反证</b>：手工多扣 1 点经验，确认「扣穿 ⇒ 掉级 + 进度条弹回高位」
+ * 这个机制真实存在。没有这条反证，S2/S3 全绿也可能只是因为断言本身没牙。</p>
+ */
+public final class AutoMendingSelfCheck {
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private AutoMendingSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        ServerLevel level = server.overworld();
+        if (level == null) {
+            return;
+        }
+        done = true;
+
+        System.out.println("==== AutoMendingSelfCheck begin ====");
+
+        ServerPlayer player = fakePlayer(server, level);
+        if (player == null) {
+            check("S0 假玩家构造成功", false);
+            report();
+            return;
+        }
+        check("S0 假玩家构造成功", true);
+
+        // ---- 取 mending 附魔 Holder（附魔是数据驱动的，必须在数据包加载之后取）----
+        Holder<Enchantment> mending;
+        try {
+            Registry<Enchantment> reg = level.registryAccess().lookupOrThrow(Registries.ENCHANTMENT);
+            mending = reg.getOrThrow(Enchantments.MENDING);
+        } catch (Throwable t) {
+            System.out.println("   取 mending 附魔失败: " + t);
+            check("S0b 取到 mending 附魔", false);
+            report();
+            return;
+        }
+        check("S0b 取到 mending 附魔", true);
+
+        // ---- 装备：一件「受损的、带经验修补」的鞘翅 ----
+        ItemStack elytra = new ItemStack(Items.ELYTRA);
+        elytra.enchant(mending, 1);
+        elytra.setDamageValue(400);
+        int maxDamage = elytra.getMaxDamage();
+        player.setItemSlot(EquipmentSlot.CHEST, elytra);
+        check("S0c 鞘翅带上了经验修补", player.getItemBySlot(EquipmentSlot.CHEST).isEnchanted());
+
+        // ================= S 组正例：模拟鞘翅滑行 40 秒 =================
+        player.setExperienceLevels(30);
+        player.setExperiencePoints(56); // needed(30)=112 → progress = 0.5
+        int startLevel = player.experienceLevel;
+        System.out.println("S1 起始：等级 " + startLevel + "（needed=" + player.getXpNeededForNextLevel()
+                + "） 进度 " + player.experienceProgress + " 进度条经验=" + barXp(player));
+
+        boolean levelStable = true;
+        boolean progressInRange = true;
+        boolean costMatches = true;
+        int totalRepaired = 0;
+        int totalSpent = 0;
+
+        for (int sec = 0; sec < 40; sec++) {
+            // 滑行：每 tick 掉 1 点耐久 → 20 tick（1 秒）掉 20 点
+            ItemStack chest = player.getItemBySlot(EquipmentSlot.CHEST);
+            chest.setDamageValue(Math.min(maxDamage - 1, chest.getDamageValue() + 20));
+
+            int xpBefore = barXp(player);
+            int dmgBefore = player.getItemBySlot(EquipmentSlot.CHEST).getDamageValue();
+
+            AutoMending.mending(player);
+
+            int dmgAfter = player.getItemBySlot(EquipmentSlot.CHEST).getDamageValue();
+            int xpAfter = barXp(player);
+            int repaired = dmgBefore - dmgAfter;
+            int spent = Math.max(0, xpBefore - xpAfter);
+
+            if (player.experienceLevel != startLevel) {
+                levelStable = false;
+            }
+            if (!(player.experienceProgress >= 0.0F && player.experienceProgress < 1.0F)) {
+                progressInRange = false;
+            }
+            // 消耗的经验必须 = 修好的耐久 / 2（repair_with_xp = multiply 2.0 的线性反算）
+            if (repaired > 0 && spent != repaired / 2) {
+                costMatches = false;
+                System.out.println("   第 " + (sec + 1) + " 秒记账不符：修 " + repaired + " 耐久却扣了 " + spent + " 经验");
+            }
+            totalRepaired += repaired;
+            totalSpent += spent;
+        }
+
+        System.out.println("S1 滑行 40 秒后：等级 " + player.experienceLevel
+                + " 进度 " + player.experienceProgress
+                + " 累计修耐久 " + totalRepaired + " 累计耗经验 " + totalSpent);
+        check("S2 修补全程等级恒定不变（旧代码会掉级）", levelStable);
+        check("S3 experienceProgress 全程落在 [0,1)", progressInRange);
+        check("S4 等级没被消耗（仍为 " + startLevel + "）", player.experienceLevel == startLevel);
+        check("S5 耗经验 == 修耐久 / 2（无 2 倍过度扣减）", costMatches);
+        check("S6 确实修了东西（不是全程空转）", totalRepaired > 0);
+
+        // ================= S 组反证：证明「扣穿 ⇒ 掉级 + 进度条弹回」 =================
+        player.setExperienceLevels(30);
+        player.setExperiencePoints(56);
+        int bar = barXp(player);
+        int levelBefore = player.experienceLevel;
+        player.giveExperiencePoints(-(bar + 1)); // 只多扣 1 点，就足以扣穿
+        System.out.println("S7 反证：多扣 1 点后 等级 " + levelBefore + " → " + player.experienceLevel
+                + "，进度 " + player.experienceProgress);
+        check("S7 反证成立：扣穿会掉 1 级", player.experienceLevel == levelBefore - 1);
+        check("S8 反证成立：掉级同时进度条被弹回高位（>0.9）", player.experienceProgress > 0.9F);
+
+        report();
+    }
+
+    /** 进度条里当前攒着的经验 = 进度 × 升到下一级所需经验 */
+    private static int barXp(ServerPlayer player) {
+        return (int) Math.floor(player.experienceProgress * (float) player.getXpNeededForNextLevel());
+    }
+
+    /**
+     * 造一个「没真正连上线」的玩家。与 RestockSelfCheck 同一套写法：
+     * {@code Connection} 没有 channel，包只会入队不会真的发出去。
+     */
+    private static ServerPlayer fakePlayer(MinecraftServer server, ServerLevel level) {
+        try {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "AutoMendingSelfCheck");
+            ServerPlayer player = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
+            player.connection = new ServerGamePacketListenerImpl(
+                    server, new Connection(PacketFlow.SERVERBOUND), player,
+                    CommonListenerCookie.createInitial(profile, false));
+            return player;
+        } catch (Throwable t) {
+            System.out.println("   假玩家构造失败: " + t);
+            return null;
+        }
+    }
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("FAIL: " + name);
+        }
+    }
+
+    private static void report() {
+        System.out.println("SMOKE RESULT automending/26.3 checks=" + checks + " failures=" + failures);
+        System.out.println("==== AutoMendingSelfCheck end ====");
+    }
+}

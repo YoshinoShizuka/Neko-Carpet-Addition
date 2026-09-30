@@ -26,10 +26,10 @@ import static carpet.api.settings.RuleCategory.SURVIVAL;
  * 那是给单个玩家用的（比如同一台服务器里只有某个人在用仓库）。</p>
  *
  * <h2>默认值的取舍</h2>
- * <p>默认开，理由与 {@link VoidWarehouseSettings#voidWarehouse} 一致：
- * 装这个扩展的服就是冲着功能来的，真不需要的服一条指令就能关。
- * 代价是——服务器主必须知道，开着的规则意味着<b>任何装了对应打印机客户端的玩家
- * 都能从全服共享的仓库里领取物品</b>。这条写在 {@code .desc} 里了，/carpet 列表时能看到。</p>
+ * <p><b>默认关</b>。理由：开着的规则意味着<b>任何装了对应打印机客户端的玩家都能从全服共享的
+ * 仓库里领取物品</b>——这是服务器主需要主动知情的授权，不该由模组替它默认打开。
+ * 要用就 {@code /carpet voidWarehouseRestock true}，并接受上面那条代价
+ * （该代价也写在 {@code .desc} 里，{@code /carpet} 列表时能看到）。</p>
  */
 public class VoidWarehouseRestockSettings {
 
@@ -41,5 +41,5 @@ public class VoidWarehouseRestockSettings {
      * 免得出现「规则看着是开的、实际取不出东西」的莫名其妙状态。</p>
      */
     @Rule(categories = {VoidWarehouseSettings.NEKO, SURVIVAL})
-    public static boolean voidWarehouseRestock = true;
+    public static boolean voidWarehouseRestock = false;
 }

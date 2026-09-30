@@ -257,6 +257,15 @@ public final class UnlimitedIntakeSelfCheck {
             case 52:
                 assertStrayResidue(level, data);
                 break;
+            // ---------------- P. 旧存档污染治愈（本轮根因修复）
+            case 53:
+                setupLegacyHeal(level, data);
+                break;
+            case 54:
+                break;
+            case 55:
+                assertLegacyHeal(level, data);
+                break;
             default:
                 finish(server);
                 return;
@@ -917,6 +926,74 @@ public final class UnlimitedIntakeSelfCheck {
         check("N5 那一格只剩分类物余量 " + VoidWarehouseClassifier.KEEP + " 个（实际 "
                 + hopper.getItem(0).getCount() + "）", hopper.getItem(0).getCount() == VoidWarehouseClassifier.KEEP);
         check("N6 橡木照常全进库（" + storedOak + " / 896）", storedOak == 896);
+        teardown(level, data, T, H);
+    }
+
+    // ------------------------------------------------------------------ P. 旧存档污染治愈（本轮根因修复）
+
+    /**
+     * 模拟「种子清单上线前写下的污染旧存档」：漏斗里 {@code 橡木 石头}、filter 开关开着、
+     * 但没有逐格种子（旧版没这概念）。加载这种存档原本会触发 {@code adoptLegacy}，
+     * 把石头也认成分类物、写成永久的逐格种子，于是永远 {@code 橡木 石头 空 空 空}。
+     *
+     * <p>修复后：{@link VoidWarehouseClassifier#healLegacy} 在加载旧存档时直接清掉种子、关掉过滤；
+     * 玩家重新手动指定（只放橡木）后，上方桶一半圆石一半橡木、圆石一个都进不来。</p>
+     */
+    private static void setupLegacyHeal(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = setup(level, T, H);
+        if (hopper == null) {
+            check("P0 入库漏斗造出来了", false);
+            return;
+        }
+        data.clearContent();
+        // 模拟「旧版写下的污染存档」：橡木 + 石头躺在漏斗里，filter 开着，没有逐格种子
+        hopper.setItem(0, new ItemStack(Items.OAK_LOG, 1));
+        hopper.setItem(1, new ItemStack(Items.COBBLESTONE, 1));
+        VoidWarehouseHopperFilter filter = (VoidWarehouseHopperFilter) hopper;
+        filter.setClassifierFilter(true);
+        // 用 healLegacy(filter, false) 模拟「加载旧存档」这一步（schema 标记缺失 = 旧存档）
+        VoidWarehouseClassifier.healLegacy(filter, false);
+        check("P1 旧存档加载后过滤被关掉（实际 " + filter.hasClassifierFilter() + "）", !filter.hasClassifierFilter());
+        check("P2 污染种子被清空（seed0=" + filter.getClassifierSeed(0)
+                + " seed1=" + filter.getClassifierSeed(1) + "）",
+                filter.getClassifierSeed(0).isEmpty() && filter.getClassifierSeed(1).isEmpty());
+        // 玩家重新手动指定：只放橡木
+        hopper.setItem(0, new ItemStack(Items.OAK_LOG, 1));
+        filter.setClassifierSeed(0, new ItemStack(Items.OAK_LOG, 1));
+        filter.setClassifierFilter(true);
+        Container barrel = placeBarrel(level, H.above());
+        if (barrel == null) {
+            check("P0 上方桶造出来了", false);
+            return;
+        }
+        for (int i = 0; i < 13; i++) {
+            barrel.setItem(i, new ItemStack(Items.COBBLESTONE, 64));
+        }
+        for (int i = 13; i < BARREL_SLOTS; i++) {
+            barrel.setItem(i, new ItemStack(Items.OAK_LOG, 64));
+        }
+        barrel.setChanged();
+    }
+
+    private static void assertLegacyHeal(ServerLevel level, VoidWarehouseData data) {
+        HopperBlockEntity hopper = hopperAt(level, H);
+        Container barrel = barrelAt(level, H.above());
+        if (hopper == null || barrel == null) {
+            check("P3 漏斗 / 上方桶都还在", false);
+            return;
+        }
+        long storedOak = amount(data, Items.OAK_LOG);
+        long storedCobble = amount(data, Items.COBBLESTONE);
+        long leftCobble = countIn(barrel, Items.COBBLESTONE);
+        System.out.println("P 实测：仓库 oak=" + storedOak + " cobble=" + storedCobble
+                + "；上方剩 cobble=" + leftCobble + "；漏斗格 " + snapshot(hopper));
+        // 注意：setup 里放在漏斗 slot1 的「残留石头」不属于任何种子，会被 drain 当杂物清掉
+        // 进库（cobble=1）；上方桶里的 832 个圆石因为不在白名单，一个都进不来。二者要分开看。
+        check("P3 上方桶的圆石全被拦住，仅漏斗里残留的 1 个石头被清掉进库（cobble=" + storedCobble + "，应为 1）",
+                storedCobble == 1);
+        check("P4 圆石原样留在上方桶里（" + leftCobble + " / 832）", leftCobble == 832);
+        check("P5 橡木全进库（" + storedOak + " / 896）", storedOak == 896);
+        check("P6 漏斗里只剩玩家指定的那一格（格 " + snapshot(hopper) + "）", !spreadBeyond(hopper, 0));
         teardown(level, data, T, H);
     }
 

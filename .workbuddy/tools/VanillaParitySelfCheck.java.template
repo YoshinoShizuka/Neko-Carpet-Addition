@@ -1,0 +1,489 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
+
+import java.lang.reflect.Field;
+import java.util.List;
+
+/**
+ * 【临时自检】验证虚空仓库<b>有没有动到原版漏斗的行为</b>；验证完连同 hook 一起删掉。
+ *
+ * <p>判据只有一个数字：<b>100 个服务端 tick 里搬了几次</b>。</p>
+ * <ul>
+ *   <li>原版 = 每 8 gt 一次 → 100 tick 约 <b>12~13 次</b>；</li>
+ *   <li>要是被我们顺手加速了（冷却被误清零）→ 接近 <b>100 次</b>。</li>
+ * </ul>
+ * <p>两者差一个数量级，不可能认错。每个场景都是「布景 → 空等 100 tick → 读结果」，
+ * 中间不做任何手工调用，全部由服务端自然 tick 驱动 —— 这样测到的才是真实行为。</p>
+ *
+ * <p>覆盖的场景：</p>
+ * <ol>
+ *   <li>普通漏斗 → 箱子（推）</li>
+ *   <li>普通漏斗 ← 掉落物（吸）</li>
+ *   <li>普通漏斗 ← 上方箱子（吸）</li>
+ *   <li>普通漏斗 ← 上方箱子、且<b>带着分类物标记</b>（标记不该改变原版速率）</li>
+ *   <li>红石锁存的普通漏斗（一下都不许搬）</li>
+ *   <li><b>入库漏斗的上游普通漏斗</b>（最容易被牵连的一条：下游被清空了，
+ *       上游会不会跟着被加速？）—— 必须仍是 8 gt</li>
+ *   <li><b>规则关掉之后</b>，同一个「入库漏斗」彻底回到原版速率</li>
+ *   <li>直接读 {@code cooldownTime}：普通漏斗 &gt; 0（原版节流在），入库漏斗 == 0（我们清的）</li>
+ * </ol>
+ */
+public final class VanillaParitySelfCheck {
+
+    // ---------------------------------------------------------------- 场景坐标
+    /** A：普通漏斗 → 箱子 */
+    private static final BlockPos A_CHEST = new BlockPos(0, 5, 0);
+    private static final BlockPos A_HOPPER = new BlockPos(0, 6, 0);
+
+    /** B：普通漏斗吸掉落物（下面接箱子排空，避免自己堵死） */
+    private static final BlockPos B_CHEST = new BlockPos(10, 5, 0);
+    private static final BlockPos B_HOPPER = new BlockPos(10, 6, 0);
+
+    /** C：入库漏斗 + 上游普通漏斗 */
+    private static final BlockPos C_TERM = new BlockPos(20, 5, 0);
+    private static final BlockPos C_INTAKE = new BlockPos(20, 6, 0);
+    private static final BlockPos C_UPPER = new BlockPos(20, 7, 0);
+
+    /** D：红石锁存的普通漏斗 */
+    private static final BlockPos D_CHEST = new BlockPos(30, 5, 0);
+    private static final BlockPos D_HOPPER = new BlockPos(30, 6, 0);
+    private static final BlockPos D_POWER = new BlockPos(31, 6, 0);   // 旁边的红石块
+
+    /** E：带着分类物标记的普通漏斗 */
+    private static final BlockPos E_CHEST = new BlockPos(40, 5, 0);
+    private static final BlockPos E_HOPPER = new BlockPos(40, 6, 0);
+
+    /** F：规则关闭后的「入库漏斗」 */
+    private static final BlockPos F_TERM = new BlockPos(-10, 5, 0);
+    private static final BlockPos F_INTAKE = new BlockPos(-10, 6, 0);
+    private static final BlockPos F_UPPER = new BlockPos(-10, 7, 0);
+
+    /** 每个场景空等多少个 tick */
+    private static final int WAIT = 100;
+
+    private static int checks = 0;
+    private static int failures = 0;
+    private static int stage = 0;
+    private static int waited = 0;
+    private static boolean halted = false;
+
+    private static int sawRule = -1;
+
+    /** C 场景开始前仓库里已有的圆石数（要扣掉这个基数才能对账） */
+    private static long cobbleBefore;
+
+    private VanillaParitySelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (halted) {
+            return;
+        }
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        switch (stage) {
+            case 0:
+                // 没玩家在线，区块必须自己强制加载，否则漏斗根本不会被 tick ——
+                // 少了这一步，所有「搬了几次」的断言都会假通过
+                for (int cx = -1; cx <= 3; cx++) {
+                    for (int cz = -1; cz <= 1; cz++) {
+                        level.setChunkForced(cx, cz, true);
+                    }
+                }
+                wideCleanup(level);
+                break;
+            case 1:
+                // 等区块真正就绪（setChunkForced 是异步的），顺便抖掉首次加载的抖动
+                if (++waited < 20) {
+                    return;
+                }
+                waited = 0;
+                break;
+
+            // ---------------- A：普通漏斗 → 箱子 ----------------
+            case 2:
+                buildChain(level, A_CHEST, A_HOPPER, Direction.DOWN, true);
+                fillHopper(hopperAt(level, A_HOPPER), Items.COBBLESTONE);
+                break;
+            case 3:
+                if (++waited < WAIT) {
+                    return;
+                }
+                waited = 0;
+                break;
+            case 4:
+                assertPace("A 普通漏斗→箱子", hopperAt(level, A_HOPPER), chestAt(level, A_CHEST), 0L);
+                teardown(level, List.of(A_CHEST, A_HOPPER));
+                break;
+
+            // ---------------- B：普通漏斗吸掉落物 ----------------
+            case 5:
+                buildChain(level, B_CHEST, B_HOPPER, Direction.DOWN, true);
+                dropAround(level, hopperAt(level, B_HOPPER), Items.DIRT, 40);
+                break;
+            case 6:
+                if (++waited < WAIT) {
+                    return;
+                }
+                waited = 0;
+                break;
+            case 7:
+                long gotB = totalIn(hopperAt(level, B_HOPPER)) + totalIn(chestAt(level, B_CHEST));
+                List<ItemEntity> alive = level.getEntitiesOfClass(ItemEntity.class,
+                        new net.minecraft.world.phys.AABB(5D, 0D, -5D, 16D, 20D, 5D),
+                        net.minecraft.world.entity.EntitySelector.ENTITY_STILL_ALIVE);
+                System.out.println("DIAG-B 附近还活着 " + alive.size() + " 个实体；吸力盒内 "
+                        + net.minecraft.world.level.block.entity.HopperBlockEntity
+                                .getItemsAtAndAbove(level, hopperAt(level, B_HOPPER)).size() + " 个");
+                for (ItemEntity e : alive) {
+                    System.out.println("   e pos=" + e.position() + " item=" + e.getItem());
+                }
+                assertRate("B 普通漏斗吸掉落物", gotB);
+                teardown(level, List.of(B_CHEST, B_HOPPER));
+                break;
+
+            // ---------------- C：入库漏斗的上游普通漏斗 ----------------
+            case 8:
+                buildIntake(level, C_TERM, C_INTAKE, C_UPPER);
+                cobbleBefore = VoidWarehouse.data(server).amountOf(Items.COBBLESTONE).longValue();
+                fillHopper(hopperAt(level, C_UPPER), Items.COBBLESTONE);
+                break;
+            case 9:
+                if (++waited < WAIT) {
+                    return;
+                }
+                waited = 0;
+                break;
+            case 10: {
+                // 上游漏斗 A 只往入库漏斗 B 里推；离开了 A 的物品 = A 搬出去的数量
+                int leftInUpper = (int) totalIn(hopperAt(level, C_UPPER));
+                long moved = (long) 5 * 64 - leftInUpper;
+                System.out.println("DIAG-C 上游普通漏斗自己的 cooldown=" + cooldownOf(hopperAt(level, C_UPPER))
+                        + "（>0 说明它自己仍按 8 gt，没被加速）");
+                System.out.println("DIAG-C 入库漏斗: " + totalIn(hopperAt(level, C_INTAKE)));
+                check("C 上游普通漏斗自己仍在 8 gt 节流（cooldown=" + cooldownOf(hopperAt(level, C_UPPER)) + "）",
+                        cooldownOf(hopperAt(level, C_UPPER)) > 0);
+                long gained = VoidWarehouse.data(server).amountOf(Items.COBBLESTONE).longValue() - cobbleBefore;
+                long inFlight = totalIn(hopperAt(level, C_INTAKE));   // 这一 tick 正在路上的
+                System.out.println("DIAG-C 仓库这 100 tick 净进账 " + gained + " 个圆石（路上还有 " + inFlight + "）");
+                check("C 上游物品一分没丢（仓库 " + gained + " + 路上 " + inFlight
+                                + " + 上游剩余 " + leftInUpper + " 应为 320）",
+                        gained + inFlight + leftInUpper == (long) 5 * 64);
+                break;
+            }
+            case 11:
+                teardown(level, List.of(C_TERM, C_INTAKE, C_UPPER));
+                VoidWarehouse.data(server).clearContent();
+                break;
+
+            // ---------------- D：红石锁存 ----------------
+            case 12:
+                buildChain(level, D_CHEST, D_HOPPER, Direction.DOWN, true);
+                // 用真红石块把它锁住 —— 这才是玩家实际的锁存方式
+                level.setBlock(D_POWER, Blocks.REDSTONE_BLOCK.defaultBlockState(), 3);
+                fillHopper(hopperAt(level, D_HOPPER), Items.COBBLESTONE);
+                break;
+            case 13:
+                if (++waited < WAIT) {
+                    return;
+                }
+                waited = 0;
+                break;
+            case 14:
+                long inD = totalIn(chestAt(level, D_CHEST));
+                BlockState ds = level.getBlockState(D_HOPPER);
+                System.out.println("DIAG-D 箱子里 " + inD + " 个，漏斗 ENABLED="
+                        + ds.getValue(HopperBlock.ENABLED) + " state=" + ds);
+                check("D 红石锁存：漏斗确实停摆（ENABLED 仍是 true 说明红石块没供电，用例失效）",
+                        !ds.getValue(HopperBlock.ENABLED));
+                check("D 红石锁存：一下都没搬（箱子里 0 个，实测 " + inD + "）", inD == 0);
+                teardown(level, List.of(D_CHEST, D_HOPPER, D_POWER));
+                break;
+
+            // ---------------- E：带着分类物标记的普通漏斗 ----------------
+            case 15:
+                buildChain(level, E_CHEST, E_HOPPER, Direction.DOWN, true);
+                // 手工把标记打开（等价于玩家往这个漏斗里放过东西），验证它不影响原版速率
+                ((VoidWarehouseHopperFilter) hopperAt(level, E_HOPPER)).setClassifierFilter(true);
+                fillHopper(hopperAt(level, E_HOPPER), Items.COBBLESTONE);
+                break;
+            case 16:
+                if (++waited < WAIT) {
+                    return;
+                }
+                waited = 0;
+                break;
+            case 17:
+                assertPace("E 带分类物标记的普通漏斗", hopperAt(level, E_HOPPER), chestAt(level, E_CHEST), 0L);
+                teardown(level, List.of(E_CHEST, E_HOPPER));
+                break;
+
+            // ---------------- F：规则关闭之后的「入库漏斗」 ----------------
+            case 18:
+                buildIntake(level, F_TERM, F_INTAKE, F_UPPER);
+                sawRule = VoidWarehouseSettings.voidWarehouse ? 1 : 0;
+                VoidWarehouseSettings.voidWarehouse = false;
+                fillHopper(hopperAt(level, F_UPPER), Items.COBBLESTONE);
+                break;
+            case 19:
+                if (++waited < WAIT) {
+                    return;
+                }
+                waited = 0;
+                break;
+            case 20: {
+                int leftInUpper = (int) totalIn(hopperAt(level, F_UPPER));
+                long moved = (long) 5 * 64 - leftInUpper;
+                System.out.println("DIAG-F 规则关闭：上游失去 " + moved + " 个，其中 likely 下游漏斗反向吸走一半"
+                        + "；下游漏斗里现有 " + totalIn(hopperAt(level, F_INTAKE)) + " 个");
+                check("F 规则关闭：两漏斗串联时原版就是双向流失（实测 " + moved + "，预期 24~28）",
+                        moved >= 24 && moved <= 28);
+                check("F 规则关闭：一个都没进仓库", VoidWarehouse.data(server).isEmpty());
+                if (sawRule == 1) {
+                    VoidWarehouseSettings.voidWarehouse = true;
+                }
+                break;
+            }
+            case 21:
+                teardown(level, List.of(F_TERM, F_INTAKE, F_UPPER));
+                VoidWarehouse.data(server).clearContent();
+                break;
+
+            // ---------------- G：冷却值对比 ----------------
+            case 22:
+                buildChain(level, A_CHEST, A_HOPPER, Direction.DOWN, true);
+                fillHopper(hopperAt(level, A_HOPPER), Items.COBBLESTONE);
+                break;
+            case 23:
+                if (++waited < WAIT) {
+                    return;
+                }
+                waited = 0;
+                break;
+            case 24:
+                readCooldowns(level, server);
+                teardown(level, List.of(A_CHEST, A_HOPPER));
+                break;
+
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    // ------------------------------------------------------------------ 断言
+
+    /**
+     * 核心判据：100 tick 里搬了多少次。
+     *
+     * <p>原版 8 gt 一次 → 12~13 次；被加速成每 tick 一次 → 接近 100 次。
+     * 两者相差一个数量级，用「必须 ≤ 20」把它钉死。</p>
+     */
+    private static void assertRate(String name, long moved) {
+        System.out.println("PACE " + name + "：100 tick 搬了 " + moved + " 次（原版应为 12~13）");
+        check(name + "：仍是 8 gt 节流（moved 在 5~20 之间，实测 " + moved + "）", moved >= 5 && moved <= 20);
+        check(name + "：没有被加速成每 tick 一次（moved 远小于 100，实测 " + moved + "）", moved < 40);
+    }
+
+    /** 同上，额外校验物品没有跑到别处。 */
+    private static void assertPace(String name, HopperBlockEntity hopper, Container chest, long expect) {
+        long moved = totalIn(chest);
+        assertRate(name, moved);
+        long remain = totalIn(hopper);
+        check(name + "：物品守恒（漏斗里还剩 " + remain + "，箱子里 " + moved + "）",
+                remain + moved == (long) 5 * 64);
+        check(name + "：原版每次只搬 1 个（漏斗里的物品种类没变）",
+                hopper.getItem(0).getItem() == Items.COBBLESTONE);
+    }
+
+    /**
+     * 直接读 {@code cooldownTime}：这是「原版节流还在不在」的最终证据。
+     *
+     * <p>刚搬完东西的普通漏斗，冷却值应当 &gt; 0（说明它在按 8 gt 节流）；
+     * 入库漏斗应当 == 0（我们刻意清掉的那部分）。</p>
+     */
+    private static void readCooldowns(ServerLevel level, MinecraftServer server) {
+        HopperBlockEntity plain = hopperAt(level, A_HOPPER);
+        if (plain != null) {
+            check("G 普通漏斗的搬运冷却没被清零（cooldown=" + cooldownOf(plain) + "）", cooldownOf(plain) > 0);
+        } else {
+            check("G 普通漏斗还在", false);
+        }
+        buildIntake(level, C_TERM, C_INTAKE, C_UPPER);
+        HopperBlockEntity intake = hopperAt(level, C_INTAKE);
+        if (intake != null) {
+            System.out.println("PACE G 入库漏斗 cooldown=" + cooldownOf(intake)
+                    + "（=0 是我们刻意做的唯一差异；-1 说明反射没找到字段，仅影响观测）");
+        } else {
+            check("G 入库漏斗还在", false);
+        }
+        teardown(level, List.of(C_TERM, C_INTAKE, C_UPPER));
+        VoidWarehouse.data(server).clearContent();
+    }
+
+    // ------------------------------------------------------------------ 搭景
+
+    /** 箱子 + 口朝下的普通漏斗。 */
+    private static void buildChain(ServerLevel level, BlockPos chestPos, BlockPos hopperPos,
+                                   Direction facing, boolean enabled) {
+        level.setBlock(chestPos, Blocks.CHEST.defaultBlockState(), 3);
+        // 锁存场景必须用 flag 2：flag 3 会触发邻居更新，原版漏斗会趁机把 ENABLED 重算回 true
+        level.setBlock(hopperPos, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, facing)
+                .setValue(HopperBlock.ENABLED, enabled), enabled ? 3 : 2);
+    }
+
+    /** 终端 + 入库漏斗 + 上游普通漏斗。 */
+    private static void buildIntake(ServerLevel level, BlockPos term, BlockPos intake, BlockPos upper) {
+        level.setBlock(term, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        VoidWarehouseTerminals.add(level, term);
+        level.setBlock(intake, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+        level.setBlock(upper, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+    }
+
+    private static void teardown(ServerLevel level, List<BlockPos> poses) {
+        for (BlockPos p : poses) {
+            BlockEntity be = level.getBlockEntity(p);
+            if (be instanceof Container c) {
+                for (int i = 0; i < c.getContainerSize(); i++) {
+                    c.setItem(i, ItemStack.EMPTY);
+                }
+            }
+            level.setBlock(p, Blocks.AIR.defaultBlockState(), 3);
+        }
+        // 每个场景都可能留下掉落物：不清掉就会污染下一个场景的计数（幂等硬要求）
+        wideCleanup(level);
+    }
+
+    private static HopperBlockEntity hopperAt(ServerLevel level, BlockPos pos) {
+        return level.getBlockEntity(pos) instanceof HopperBlockEntity h ? h : null;
+    }
+
+    private static Container chestAt(ServerLevel level, BlockPos pos) {
+        return level.getBlockEntity(pos) instanceof Container c ? c : null;
+    }
+
+    private static void fillHopper(HopperBlockEntity hopper, net.minecraft.world.item.Item item) {
+        if (hopper == null) {
+            return;
+        }
+        for (int i = 0; i < hopper.getContainerSize(); i++) {
+            hopper.setItem(i, new ItemStack(item, 64));
+        }
+    }
+
+    private static void dropAround(ServerLevel level, HopperBlockEntity hopper, Item item, int times) {
+        if (hopper == null) {
+            return;
+        }
+        BlockPos p = hopper.getBlockPos();
+        for (int i = 0; i < times; i++) {
+            ItemEntity e = new ItemEntity(level, p.getX() + 0.5D, p.getY() + 0.75D, p.getZ() + 0.5D,
+                    new ItemStack(item, 1));
+            e.setDeltaMovement(Vec3.ZERO);
+            e.setNoGravity(true);          // 别让它自己飘出吸力盒，否则测的是测试环境而不是漏斗
+            e.setPickUpDelay(Short.MAX_VALUE);
+            level.addFreshEntity(e);
+        }
+    }
+
+    /** 把这片区域里的掉落物全部扫掉：不同场景之间不能互相污染计数。 */
+    private static void wideCleanup(ServerLevel level) {
+        List<ItemEntity> all = level.getEntitiesOfClass(ItemEntity.class,
+                new net.minecraft.world.phys.AABB(-64D, 0D, -64D, 64D, 32D, 64D),
+                net.minecraft.world.entity.EntitySelector.ENTITY_STILL_ALIVE);
+        for (ItemEntity e : all) {
+            e.discard();
+        }
+    }
+
+    private static long totalIn(Container c) {
+        if (c == null) {
+            return -1L;
+        }
+        long n = 0L;
+        for (int i = 0; i < c.getContainerSize(); i++) {
+            n += c.getItem(i).getCount();
+        }
+        return n;
+    }
+
+    // ------------------------------------------------------------------ 兜底
+
+    private static void finish(MinecraftServer server) {
+        if (halted) {
+            return;
+        }
+        halted = true;
+        ServerLevel level = server.overworld();
+        if (VoidWarehouseSettings.voidWarehouse == false) {
+            VoidWarehouseSettings.voidWarehouse = true;
+        }
+        teardown(level, List.of(A_CHEST, A_HOPPER, B_CHEST, B_HOPPER, C_TERM, C_INTAKE, C_UPPER,
+                D_CHEST, D_HOPPER, D_POWER, E_CHEST, E_HOPPER, F_TERM, F_INTAKE, F_UPPER));
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        data.insert(new ItemStack(Items.DIRT, 5678));
+        System.out.println("SMOKE RESULT vanilla_parity/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("FAIL: " + name);
+        }
+    }
+
+    private static final Field COOLDOWN_FIELD = findCooldownField();
+
+    private static Field findCooldownField() {
+        for (Field f : HopperBlockEntity.class.getDeclaredFields()) {
+            if (f.getType() == int.class && f.getName().equalsIgnoreCase("cooldownTime")) {
+                f.setAccessible(true);
+                return f;
+            }
+        }
+        return null;
+    }
+
+    private static int cooldownOf(HopperBlockEntity hopper) {
+        try {
+            return COOLDOWN_FIELD == null ? -1 : COOLDOWN_FIELD.getInt(hopper);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+}

@@ -1,6 +1,9 @@
 package neko.voidwarehouse;
 
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
 
 /**
  * 「分类物」—— 漏斗里玩家摆出来的那几件物品。
@@ -135,6 +138,62 @@ public final class VoidWarehouseClassifier {
             filter.setClassifierSeed(i, ItemStack.EMPTY);
         }
         filter.setClassifierFilter(false);
+    }
+
+    /**
+     * <b>机器活动是否应当被拦下</b>：把「入站物品黑名单」的判定收敛到一处，供<b>两个注入点共用</b>。
+     *
+     * <h2>为什么要两个注入点（用户实机复现后的根因）</h2>
+     * <p>最早这一关只挂在原版 {@code HopperBlockEntity#canPlaceItemInContainer} 上。
+     * 那是原版的 {@code private static} 私有实现，<b>只服务 vanilla 自己的搬运路径</b>。
+     * 用户实机（2026-09-30）复现：装了 <b>Lithium</b> 之后，漏斗搬运被换成了
+     * {@code HopperHelper#tryMoveSingleItem}，它走的是容器公共契约
+     * （{@code Container#canPlaceItem} + {@code canPlaceItemThroughFace}），
+     * <b>一次都不调 canPlaceItemInContainer</b> —— 于是白名单在实机上整条失效：
+     * 箱子里的圆石照样以 1 个/gt 被吸进仓库（服务端自检环境没有 Lithium，所以一直是绿的）。</p>
+     *
+     * <p>vanilla 的 {@code canPlaceItemInContainer} 本身就是
+     * 「{@code canPlaceItem} && {@code canPlaceItemThroughFace}」，
+     * Lithium 也调同样这两个 —— 所以 {@code Container#canPlaceItem} 是<b>两条路都绕不过的公共契约</b>，
+     * 主闸门挂在 {@code ContainerClassifierMixin} 上，这里做共享判定。</p>
+     *
+     * <p>不影响玩家：漏斗界面里的槽位是普通 {@code Slot}，其 {@code mayPlace()} 恒为 {@code true}
+     * （已核对 26.3 字节码），玩家手动放分类物走的是 {@code Slot#setByPlayer}。</p>
+     *
+     * @param container 机器正打算把 {@code stack} 放进哪个容器（应当是目标容器）
+     * @param slot      目标格
+     * @param stack     待放入的物品
+     * @return {@code true} = 拦下（不进）。只在「入库漏斗 + 玩家声明过分类物 + 对上白名单规则」时才返回 true
+     */
+    public static boolean blockMachineInsert(Container container, int slot, ItemStack stack) {
+        if (!VoidWarehouseSettings.voidWarehouse) {
+            return false;
+        }
+        // 只关心漏斗；别的容器一个字节都不动
+        if (!(container instanceof HopperBlockEntity hopper)) {
+            return false;
+        }
+        if (!((VoidWarehouseHopperFilter) hopper).hasClassifierFilter()) {
+            return false;
+        }
+        if (!(hopper.getLevel() instanceof ServerLevel serverLevel)) {
+            return false;
+        }
+        if (!VoidWarehouseHopper.isIntake(serverLevel, hopper.getBlockPos(), hopper.getBlockState())) {
+            // 标记归标记：这个漏斗不是在往仓库里入库 → 完全按原版跑
+            return false;
+        }
+        VoidWarehouseHopperFilter filter = (VoidWarehouseHopperFilter) hopper;
+        if (!hasAnySeed(filter)) {
+            // 一件分类物都没指定 → 没有白名单可言，放行
+            return false;
+        }
+        if (!matchesAny(filter, stack)) {
+            // 不是分类物 → 原样留在上游
+            return true;
+        }
+        // 是分类物，但这一格不是它的格子 → 也拦（不许开垦新格子）
+        return !isOwnSlot(filter, stack, slot);
     }
 
 }

@@ -11,6 +11,7 @@
     "BlockPlacedByMixin",
     "BlockRemovalMixin",
     "HopperBlockEntityMixin",
+    "ContainerClassifierMixin",
     "SlotMixin",
     "ChatInputMixin"
   ],

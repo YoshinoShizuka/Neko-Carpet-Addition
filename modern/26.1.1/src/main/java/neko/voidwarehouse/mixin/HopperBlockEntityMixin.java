@@ -66,12 +66,18 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * 下游容器的各种限制仍然照旧生效）。</p>
  * <p>非出料模式的漏斗一个字节都不碰，走的还是原版方法体。</p>
  *
- * <h2>④ 入库分类物白名单 —— 接管 {@code canPlaceItemInContainer}</h2>
- * <p>{@code canPlaceItemInContainer} 是<b>机器把物品放进一个容器的唯一关卡</b>
- * （已核对字节码：{@code addItem → tryMoveInItem → canPlaceItemInContainer}，
- * 上方容器吸料、邻居漏斗推料、掉落物被吸入三条路都从这里过）。
- * 玩家手动放物品走的是 {@code Slot#setByPlayer}，<b>不经过这里</b> ——
- * 所以在这个关卡上做过滤，效果正好是「只有分类物进得来、玩家的手不受限制」。</p>
+ * <h2>④ 入库分类物白名单 —— 主闸门在 {@code Container#canPlaceItem}，这里是一份兜底</h2>
+ * <p><b>契约层主闸门</b>见 {@code ContainerClassifierMixin}：它挂在
+ * {@code Container#canPlaceItem} 上。vanilla 的 {@code canPlaceItemInContainer} 本身就是
+ * 「{@code canPlaceItem} && {@code canPlaceItemThroughFace}」，而会整个换掉漏斗搬运的优化模组
+ * （实测：Lithium 的 {@code HopperHelper#tryMoveSingleItem}）<b>只读容器契约、从不调
+ * canPlaceItemInContainer</b> —— 所以白名单必须挂在契约层，否则在实机上整条失效
+ * （服务端自检没有这些优化模组，会一直是绿的）。</p>
+ * <p>本类下面那份 {@code canPlaceItemInContainer} 注入只是<b>防御性副本</b>，
+ * 判定逻辑与契约层共用 {@link VoidWarehouseClassifier#blockMachineInsert} 一份代码。
+ * 玩家手动放物品走的是 {@code Slot#setByPlayer}，而漏斗界面槽位的
+ * {@code Slot#mayPlace} 恒为 {@code true}（已核对字节码），<b>不经过任何 canPlaceItem</b> ——
+ * 所以过滤的效果正好是「只有分类物进得来、玩家的手不受限制」。</p>
  * <p>过滤是<b>两道</b>：先 {@link VoidWarehouseClassifier#matchesAny} 问
  * 「是不是白名单上的物品」，再 {@link VoidWarehouseClassifier#isOwnSlot} 问
  * 「这一格是不是它的格子」。第二道不能省 —— 少了它，分类物会被原版
@@ -303,50 +309,27 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
     }
 
     /**
-     * <b>机器往漏斗里塞东西的唯一关卡</b>：分类物白名单就落在这里。
+     * <b>分类物白名单的防御性副本</b>（主闸门在 {@code ContainerClassifierMixin} 上）。
      *
-     * <p>只对「开着过滤标记 + 口朝向终端」的漏斗生效；其余情况第一行就返回原版判断，
-     * 一个字节都不动。方法签名与原版完全一致（{@code private static}），
-     * 所以普通漏斗这一段的开销就是一次 {@code instanceof} + 一次布尔读。</p>
+     * <p>判定逻辑与 {@link VoidWarehouseClassifier#blockMachineInsert} 完全共用一份代码 ——
+     * 这里保留一份注入纯粹是兜底：万一某个环境里 {@code Container#canPlaceItem} 那条路
+     * 没走到（或被人覆盖），vanilla 自己的 {@code canPlaceItemInContainer} 仍然会被拦住。</p>
+     *
+     * <p>反过来单独挂这里是不够的：{@code canPlaceItemInContainer} 是原版
+     * {@code private static} 私有实现，Lithium 等优化模组会用
+     * {@code HopperHelper#tryMoveSingleItem} 整个换掉搬运，一次都不调这个方法
+     * （用户实机 2026-09-30 复现）。所以主闸门必须在契约层（{@code Container#canPlaceItem}）。</p>
+     *
+     * <p>写 {@code require = 0} 的理由不变：原版以后把这个私有实现内联掉是完全可能的，
+     * 那一天宁可「这一份兜底悄悄失效」，也不要「整个模组加载失败」——而且它失效也不影响
+     * 契约层闸门继续生效。</p>
      */
     @Inject(method = "canPlaceItemInContainer", at = @At("HEAD"), cancellable = true, require = 0)
     private static void carpetAutomending$classifierFilter(Container container, ItemStack stack, int slot,
                                                            Direction direction,
                                                            CallbackInfoReturnable<Boolean> cir) {
-        if (!VoidWarehouseSettings.voidWarehouse) {
-            return;
-        }
-        if (!(container instanceof HopperBlockEntity hopper)) {
-            return;
-        }
-        if (!((VoidWarehouseHopperFilter) hopper).hasClassifierFilter()) {
-            return;
-        }
-        if (!(hopper.getLevel() instanceof ServerLevel serverLevel)) {
-            return;
-        }
-        if (!VoidWarehouseHopper.isIntake(serverLevel, hopper.getBlockPos(), hopper.getBlockState())) {
-            // 标记归标记：这个漏斗不是在往仓库里入库 → 完全按原版跑
-            return;
-        }
-        VoidWarehouseHopperFilter filter = (VoidWarehouseHopperFilter) hopper;
-        if (!VoidWarehouseClassifier.hasAnySeed(filter)) {
-            // 防御：一件分类物都没有就没有白名单可言，放行（正常路径上开关已经被关掉了）
-            return;
-        }
-        if (!VoidWarehouseClassifier.matchesAny(filter, stack)) {
-            // 不是分类物 → 原样留在上游容器 / 上游漏斗里，不进这个漏斗
-            cir.setReturnValue(false);
-            return;
-        }
-        if (!VoidWarehouseClassifier.isOwnSlot(filter, stack, slot)) {
-            // 是分类物，但这一格不是它的格子 → 拒绝。
-            //
-            // 少了这一句就是「分类物摊开」事故：原版 addItem 按 slot 0→N 逐个试，
-            // tryMoveInItem 对空格子直接 setItem 整摞写入，于是 slot0 那格被补满之后，
-            // 多出来的那 1 个就去开垦 slot1 —— 一 tick 下来 5 格全变成 1 1 1 1 1
-            // （玩家手动摆的分类只剩第一格，后面四格被货物占住了）。
-            // 这里卡住之后，分类物只进得了自己的格子，「哪格是哪种」就永远是玩家摆的样子。
+        if (VoidWarehouseClassifier.blockMachineInsert(container, slot, stack)) {
+            // 不是分类物（或不是它自己的格子）→ 原样留在上游容器 / 上游漏斗里，不进这个漏斗
             cir.setReturnValue(false);
         }
     }

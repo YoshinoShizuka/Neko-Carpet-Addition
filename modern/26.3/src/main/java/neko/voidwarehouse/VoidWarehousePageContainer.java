@@ -264,7 +264,7 @@ final class VoidWarehousePageContainer implements Container {
         this.data.markChanged();
     }
 
-    /** 距离 / 存活校验统一放在 {@link VoidWarehouseMenu#stillValid(Player)}，这里没有「有效范围」概念 */
+    /** 生效 / 失效的判定统一放在 {@link VoidWarehouseMenu#stillValid(Player)}，这里没有「有效范围」概念 */
     @Override
     public boolean stillValid(Player player) {
         return true;

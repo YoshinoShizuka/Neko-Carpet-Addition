@@ -14,7 +14,6 @@ import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.phys.Vec3;
 
 import java.math.BigInteger;
 
@@ -107,10 +106,6 @@ import java.math.BigInteger;
  * </ol>
  */
 public class VoidWarehouseMenu extends ChestMenu {
-    /** 打开界面的位置允许的最大距离（单位：格），对齐原版箱子的 8 格 */
-    public static final double MAX_DISTANCE = 8.0;
-    private static final double MAX_DISTANCE_SQ = MAX_DISTANCE * MAX_DISTANCE;
-
     /** 装一个潜影盒需要的潜影壳 / 箱子数量（{@link BigInteger} 形式，方便和仓库数量直接比） */
     private static final BigInteger SHELL_NEED = BigInteger.valueOf(VoidWarehouseShulker.SHELL_COST);
     private static final BigInteger CHEST_NEED = BigInteger.valueOf(VoidWarehouseShulker.CHEST_COST);
@@ -137,7 +132,6 @@ public class VoidWarehouseMenu extends ChestMenu {
 
     private final VoidWarehouseData data;
     private final VoidWarehousePageContainer pageContainer;
-    private final Vec3 openPos;
     private final ResourceKey<Level> openDimension;
 
     public VoidWarehouseMenu(int syncId, Inventory playerInventory, VoidWarehouseData data, Player opener) {
@@ -150,7 +144,6 @@ public class VoidWarehouseMenu extends ChestMenu {
 
         this.data = data;
         this.pageContainer = (VoidWarehousePageContainer) this.getContainer();
-        this.openPos = opener.position();
         this.openDimension = opener.level().dimension();
 
         this.installNavSlots();
@@ -232,8 +225,21 @@ public class VoidWarehouseMenu extends ChestMenu {
     // ------------------------------------------------------------------ 生命周期
 
     /**
-     * 对应 Yarn 的 {@code canUse}。返回 false 时原版会安全地关掉界面，
+     * 对应 Yarn 的 {@code canUse}。返回 false 时原版会在下一次 tick 安全地关掉界面
+     * （{@code ServerPlayer#tick} 里就是 {@code if (!containerMenu.stillValid(this)) closeContainer()}），
      * 而本类的 {@link #removed(Player)} 不会丢弃仓库内容，所以关掉不会丢东西。
+     *
+     * <p><b>这里刻意没有「离打开位置不能超过 8 格」这类距离限制</b>。
+     * 曾经有（对齐原版箱子的 8 格），但那是把虚拟仓库当成了「世界里的一个方块容器」：
+     * 玩家鞘翅滑翔时右键开界面，飞出 8 格后界面就被原版强行关掉（约两秒），
+     * 疾跑 / 骑马 / 划船同理。而实际上：</p>
+     * <ul>
+     *   <li>触发物是<b>手里的物品</b> —— {@link VoidWarehouseTrigger#isVoidWarehouse} 只判
+     *       「工作台 + 自定义名」，对空气右键也能开，压根没有「容器方块」可以走远；</li>
+     *   <li>内容存在 {@link VoidWarehouseData}（按维度的 SavedData）里，不在任何方块上。</li>
+     * </ul>
+     * 所以位置在语义上就是不相关的量，拿来当闸门只会误伤。仍然保留的三道闸门是：
+     * 规则开关、玩家存活、维度一致（跨维度时坐标没有可比性，且仓库数据本身就是按维度存的）。
      */
     @Override
     public boolean stillValid(Player player) {
@@ -245,10 +251,7 @@ public class VoidWarehouseMenu extends ChestMenu {
             return false;
         }
         // 切维度校验：跨维度时坐标没有可比性，直接让界面失效
-        if (!player.level().dimension().equals(this.openDimension)) {
-            return false;
-        }
-        return player.distanceToSqr(this.openPos) <= MAX_DISTANCE_SQ;
+        return player.level().dimension().equals(this.openDimension);
     }
 
     /**

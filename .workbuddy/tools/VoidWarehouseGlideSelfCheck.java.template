@@ -1,0 +1,273 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.Connection;
+import net.minecraft.network.PacketListener;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.network.protocol.game.ServerboundUseItemPacket;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.phys.Vec3;
+
+import java.lang.reflect.Field;
+import java.util.UUID;
+
+/**
+ * 【临时自检】虚空仓库「滑翔时开界面 2 秒后被强制关闭」——验证完删掉。
+ *
+ * <h2>现象</h2>
+ * <p>鞘翅滑翔时右键名为「虚空仓库」的工作台，界面能打开，两秒后被强制关掉。</p>
+ *
+ * <h2>取证链</h2>
+ * <pre>
+ *   VoidWarehouseMenu#stillValid   →  player.distanceToSqr(this.openPos) <= 8^2
+ *   ServerPlayer#tick()            →  containerMenu.broadcastChanges();
+ *                                     if (!containerMenu.stillValid(this)) {
+ *                                         closeContainer();
+ *                                         containerMenu = inventoryMenu;
+ *                                     }
+ * </pre>
+ * <p>即：仓库界面被绑死在「打开时的那个坐标」上，走远 8 格原版就把它关掉。
+ * <b>滑翔只是让人最快突破 8 格的方式</b> —— 疾跑、骑马、划船、鞘翅都一样，
+ * 站着不动才碰不到这条线，所以站着永远不复现。</p>
+ *
+ * <p>而这个约束本身就不成立：触发物是<b>手里的物品</b>（{@code VoidWarehouseTrigger#isVoidWarehouse}
+ * 只判「工作台 + 自定义名」），对空气右键也能开，压根没有「容器方块」可走远；
+ * 仓库内容存在 {@code VoidWarehouseData}（按维度的 SavedData）里，也不在任何方块上。</p>
+ *
+ * <h2>断言走的是原版契约本身</h2>
+ * <p>{@code stillValid(Player)} 就是原版 tick 里调用的那个方法（javap 实证，见文档），
+ * 所以这里直接断言它 —— 假玩家没进实体表，真跑 {@code player.tick()} 会被重力带着位移，
+ * 反而让「站着不动」的对照组变得不确定。</p>
+ */
+public final class VoidWarehouseGlideSelfCheck {
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private VoidWarehouseGlideSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        VoidWarehouseSettings.voidWarehouse = true;
+        try {
+            lifecycleChecks(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT vw-glide/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ---------------------------------------------------------------- 断言
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + name);
+        }
+    }
+
+    // ---------------------------------------------------------------- 工具
+
+    private static ServerPlayer player(MinecraftServer server, ServerLevel level) {
+        try {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "NekoGlideSelfCheck");
+            ClientInformation info = ClientInformation.createDefault();
+            ServerPlayer p = new ServerPlayer(server, level, profile, info);
+            PacketListener listener = new ServerGamePacketListenerImpl(
+                    server, new Connection(PacketFlow.SERVERBOUND), p,
+                    CommonListenerCookie.createInitial(profile, false));
+            p.connection = (ServerGamePacketListenerImpl) listener;
+            forceClientLoaded(p.connection);
+            return p;
+        } catch (Throwable t) {
+            System.out.println("   假玩家构造失败: " + t);
+            return null;
+        }
+    }
+
+    /** 手工造的连接没走完握手，不摁成已加载的话 handleUseItem 首行就 return */
+    private static void forceClientLoaded(ServerGamePacketListenerImpl conn) {
+        for (String name : new String[]{"waitingForRespawn", "clientLoadedTimeoutTimer"}) {
+            try {
+                Field f = ServerGamePacketListenerImpl.class.getDeclaredField(name);
+                f.setAccessible(true);
+                if (f.getType() == boolean.class) {
+                    f.setBoolean(conn, false);
+                } else {
+                    f.setInt(conn, 0);
+                }
+            } catch (Throwable t) {
+                System.out.println("   [diag] 强制已加载失败(" + name + "): " + t);
+            }
+        }
+    }
+
+    private static ItemStack namedWarehouse() {
+        ItemStack stack = new ItemStack(Items.CRAFTING_TABLE);
+        stack.set(DataComponents.CUSTOM_NAME, Component.literal(VoidWarehouseTrigger.ITEM_NAME));
+        return stack;
+    }
+
+    /** 走真实包链路开一次界面，返回打开出来的菜单（失败返回 null） */
+    private static VoidWarehouseMenu openMenu(ServerPlayer player) {
+        player.containerMenu = player.inventoryMenu;
+        player.setItemInHand(InteractionHand.MAIN_HAND, namedWarehouse());
+        try {
+            player.connection.handleUseItem(new ServerboundUseItemPacket(
+                    InteractionHand.MAIN_HAND, 0, player.getYRot(), player.getXRot()));
+        } catch (Throwable t) {
+            System.out.println("   [diag] 包路径抛异常: " + t);
+        }
+        return player.containerMenu instanceof VoidWarehouseMenu
+                ? (VoidWarehouseMenu) player.containerMenu : null;
+    }
+
+    private static void moveTo(ServerPlayer player, double x, double y, double z) {
+        player.setPos(x, y, z);
+        player.setDeltaMovement(Vec3.ZERO);
+    }
+
+    // ---------------------------------------------------------------- 主体
+
+    private static void lifecycleChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        if (player == null) {
+            check("D0 假玩家可构造", false);
+            return;
+        }
+        check("D0 假玩家可构造", true);
+        player.getInventory().clearContent();
+        player.containerMenu = player.inventoryMenu;
+        moveTo(player, 100.0, 100.0, 100.0);
+
+        // ---- D1 对照：原地不动，界面必须一直是开的
+        //     （没有这一组，「走远就关」的断言可能只是因为界面压根没打开）
+        VoidWarehouseMenu menu = openMenu(player);
+        check("D1 能打开虚空仓库界面", menu != null);
+        if (menu == null) {
+            return;
+        }
+        check("D1 刚打开时 stillValid=true", menu.stillValid(player));
+        boolean stayed = true;
+        for (int i = 0; i < 40; i++) {
+            if (!menu.stillValid(player)) {
+                stayed = false;
+            }
+        }
+        check("D1 原地 40 tick 后 stillValid 仍为 true", stayed);
+
+        // ---- D2 复现：走远 10 格 ⇒ 修复前必 FAIL（界面被原版关掉）
+        moveTo(player, 110.0, 100.0, 100.0);
+        boolean far10 = menu.stillValid(player);
+        System.out.println("   [D2] 走远 10 格 → stillValid=" + far10
+                + "（距离平方=" + player.distanceToSqr(new Vec3(100.0, 100.0, 100.0)) + "）");
+        check("D2 走远 10 格后界面仍然有效", far10);
+
+        // ---- D3 走远 200 格（疾跑 / 骑马 / 划船都够得着）
+        moveTo(player, 300.0, 100.0, 100.0);
+        boolean far200 = menu.stillValid(player);
+        System.out.println("   [D3] 走远 200 格 → stillValid=" + far200);
+        check("D3 走远 200 格后界面仍然有效", far200);
+
+        // ---- D4 滑翔仿真：开界面后开始鞘翅滑翔，每 tick 前进约 0.5 格，跑满 2 秒（40 tick）
+        //     这正是玩家报的场景。修复前大约第 17 tick 突破 8 格 ⇒ 界面被关。
+        player.containerMenu = player.inventoryMenu;
+        moveTo(player, 100.0, 100.0, 100.0);
+        VoidWarehouseMenu glide = openMenu(player);
+        check("D4 滑翔前能打开界面", glide != null);
+        if (glide == null) {
+            return;
+        }
+        player.startFallFlying();
+        boolean glidingStays = true;
+        int closedAt = -1;
+        for (int i = 1; i <= 40; i++) {
+            moveTo(player, 100.0 + i * 0.5, 100.0, 100.0);
+            if (!glide.stillValid(player) && closedAt < 0) {
+                closedAt = i;
+            }
+            if (!glide.stillValid(player)) {
+                glidingStays = false;
+            }
+        }
+        System.out.println("   [D4] 滑翔 40 tick（共 20 格）→ 全程有效=" + glidingStays
+                + (closedAt < 0 ? "" : "，第 " + closedAt + " tick 失效"));
+        check("D4 滑翔 2 秒（40 tick）后界面仍有效", glidingStays);
+        player.stopFallFlying();
+
+        // ---- D5 反证一：滑翔状态本身不是原因 —— 原地滑翔不动，界面当然还是开的
+        //     （这一组证明上面 D4 断言的是「位移」，不是「滑翔这个状态」）
+        player.containerMenu = player.inventoryMenu;
+        moveTo(player, 100.0, 100.0, 100.0);
+        VoidWarehouseMenu still = openMenu(player);
+        check("D5 原地滑翔对照能打开界面", still != null);
+        if (still != null) {
+            player.startFallFlying();
+            boolean ok = true;
+            for (int i = 0; i < 40; i++) {
+                if (!still.stillValid(player)) {
+                    ok = false;
+                }
+            }
+            check("D5 原地滑翔 40 tick 后仍有效（证明无关滑翔状态）", ok);
+            player.stopFallFlying();
+        }
+
+        // ---- D6 闸门还在：跨维度必须失效（跨维度坐标没有可比性，且仓库数据是按维度存的）
+        ServerLevel nether = server.getLevel(Level.NETHER);
+        if (nether == null) {
+            System.out.println("   [diag] 没有下界，跳过 D6");
+        } else {
+            ServerPlayer netherPlayer = player(server, nether);
+            check("D6 下界假玩家可构造", netherPlayer != null);
+            if (netherPlayer != null) {
+                boolean cross = menu.stillValid(netherPlayer);
+                System.out.println("   [D6] 用下界玩家去判 overworld 开的界面 → valid=" + cross);
+                check("D6 跨维度时界面失效（闸门保留）", !cross);
+            }
+        }
+
+        // ---- D7 闸门还在：玩家死亡时必须失效
+        moveTo(player, 100.0, 100.0, 100.0);
+        boolean aliveBefore = menu.stillValid(player);
+        player.setHealth(0.0F);
+        boolean aliveAfter = menu.stillValid(player);
+        System.out.println("   [D7] 死亡前后 valid=" + aliveBefore + " → " + aliveAfter);
+        check("D7 死亡前界面有效（对照）", aliveBefore);
+        check("D7 死亡后界面失效（闸门保留）", !aliveAfter);
+        player.setHealth(20.0F);
+
+        // ---- D8 闸门还在：规则关掉时必须失效
+        boolean ruleBefore = menu.stillValid(player);
+        VoidWarehouseSettings.voidWarehouse = false;
+        boolean ruleAfter = menu.stillValid(player);
+        VoidWarehouseSettings.voidWarehouse = true;
+        System.out.println("   [D8] 规则开关 valid=" + ruleBefore + " → " + ruleAfter);
+        check("D8 规则开启时界面有效（对照）", ruleBefore);
+        check("D8 规则关掉后界面失效（闸门保留）", !ruleAfter);
+
+        player.getInventory().clearContent();
+        player.containerMenu = player.inventoryMenu;
+    }
+}

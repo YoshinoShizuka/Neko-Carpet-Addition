@@ -925,6 +925,64 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
+     * 「装 {@code totalBoxes} 个盒子」需要哪些材料。
+     *
+     * <p>= 尽量用<b>仓库里已有的空盒</b>，用完了的那部分才退化成原版配方
+     * （每盒 {@code SHELL_COST} 个潜影壳 + {@code CHEST_COST} 个箱子）。</p>
+     *
+     * <p>两条使用口（界面点击取一盒 / 聊天按数量取货）必须共用这一份算法：
+     * 早期只有「聊天按数量取货」做了空盒优先，界面里点格子却硬要壳 + 箱，
+     * 于是玩家会遇到「同一个操作，在聊天里能取、点格子却说材料不够」的分裂行为。</p>
+     *
+     * @param totalBoxes 这一次一共要几个盒子（含「散货顺手装出来的那个」）
+     */
+    public BoxMaterials planBoxMaterials(long totalBoxes) {
+        BigInteger want = BigInteger.valueOf(Math.max(0L, totalBoxes));
+        BigInteger empty = this.emptyBoxCount().min(want);
+        BigInteger craft = want.subtract(empty);
+        return new BoxMaterials(
+                empty.intValueExact(),
+                craft.multiply(BigInteger.valueOf(VoidWarehouseShulker.SHELL_COST)).intValueExact(),
+                craft.multiply(BigInteger.valueOf(VoidWarehouseShulker.CHEST_COST)).intValueExact());
+    }
+
+    /**
+     * 这些材料的库存够不够。
+     *
+     * <p>只在 {@code plan} 里「需要现合成」的那些盒子对应的壳 / 箱上做校验 ——
+     * 空盒能吃下的部分不需要再看壳 + 箱。</p>
+     */
+    public boolean hasBoxMaterials(BoxMaterials plan) {
+        if (plan.shells() > 0 && this.amountOf(Items.SHULKER_SHELL)
+                .compareTo(BigInteger.valueOf(plan.shells())) < 0) {
+            return false;
+        }
+        return plan.chests() <= 0
+                || this.amountOf(Items.CHEST).compareTo(BigInteger.valueOf(plan.chests())) >= 0;
+    }
+
+    /**
+     * 按 {@link #planBoxMaterials} 的结果扣账。
+     *
+     * <p>返回实际扣掉的空盒数量（正常应等于 {@code plan.emptyBoxes()}）；
+     * 少扣了说明并发操作把空盒抢走了，调用方不必在意 —— 那部分材料本来就不该花出去。</p>
+     */
+    public int consumeBoxMaterials(BoxMaterials plan) {
+        int taken = plan.emptyBoxes() > 0 ? this.takeEmptyBoxes(plan.emptyBoxes()) : 0;
+        if (plan.shells() > 0) {
+            this.takeItem(Items.SHULKER_SHELL, plan.shells());
+        }
+        if (plan.chests() > 0) {
+            this.takeItem(Items.CHEST, plan.chests());
+        }
+        return taken;
+    }
+
+    /** 一次「装盒」操作的材料账：几个用空盒、剩下要多少潜影壳 / 箱子 */
+    public record BoxMaterials(int emptyBoxes, int shells, int chests) {
+    }
+
+    /**
      * 这个堆叠允不允许存进虚空仓库。
      *
      * <p>规则：<b>只要非空就收</b>。带 NBT（数据组件）的物品 —— 受损工具 / 附魔物品 /

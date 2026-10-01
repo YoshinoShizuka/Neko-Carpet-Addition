@@ -1,0 +1,429 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.Connection;
+import net.minecraft.network.PacketListener;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ServerboundUseItemPacket;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ServerPlayerGameMode;
+
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.math.BigInteger;
+import java.util.UUID;
+
+/**
+ * 【临时自检】虚空仓库两个 bug 的回归验证 —— 验证完删掉。
+ *
+ * <h2>bug 1：潜影盒模式取出没有「空盒优先」</h2>
+ * <p>界面里点格子取一盒（{@code VoidWarehouseMenu#withdrawShulkerBox}）只认潜影壳 + 箱子，
+ * 而「聊天按数量取货」（{@code VoidWarehouseWithdraw}）早就有空盒优先。于是仓库明明有空盒、
+ * 却没有壳和箱时，界面里取不出、聊天里却取得出。</p>
+ *
+ * <h2>bug 2：对空气右键被 QuickShulker 抢走</h2>
+ * <p>QuickShulker 注册了 Fabric {@code UseItemCallback}，并且把 <b>CraftingTableBlock</b>
+ * 注册成「可快速打开」（{@code container.crafting}）。虚空仓库的触发物恰好就是改名的工作台，
+ * 所以两个回调都挂在 {@code Item#use} 的 HEAD 上竞争，谁后执行谁生效 —— 实机是 QuickShulker 赢，
+ * 结果是「打开了一个原版合成界面」。</p>
+ *
+ * <p>修复最终落在服务端「收到 use-item 包」的那一步
+ * {@code ServerGamePacketListenerImpl#handleUseItem}（详见 {@code ServerGamePacketListenerImplMixin}）：
+ * 那里早于 {@code ServerPlayerGameMode#useItem}、也早于 {@code Item#use}，
+ * 因此早于 Fabric 的所有交互回调。这里<b>也注册一个抢注用的 UseItemCallback</b> 复刻 QuickShulker：
+ * 只要这条第三方回调被调用了，就说明我们的拦截还不够早 —— 这条断言是有牙的。</p>
+ */
+public final class VoidWarehouseBoxSelfCheck {
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    /** 抢注用的 UseItemCallback 有没有被调用（复刻 QuickShulker 的行为） */
+    private static volatile boolean hijacked = false;
+
+    private VoidWarehouseBoxSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        VoidWarehouseSettings.voidWarehouse = true;
+
+        // 复刻 QuickShulker：抢在 Item#use 上返回 SUCCESS_SERVER。
+        // 修复到位时，服务端在 [...handleUseItem] 那一步就返回了，这条回调根本不会被调用。
+        UseItemCallback.EVENT.register((player, world, hand) -> {
+            hijacked = true;
+            return InteractionResult.SUCCESS_SERVER;
+        });
+
+        try {
+            boxMaterialChecks(server);
+            withdrawCountChecks(server);
+            airRightClickChecks(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT vw-box/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ---------------------------------------------------------------- 断言
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("FAIL: " + name);
+        }
+    }
+
+    // ---------------------------------------------------------------- 场景搭建
+
+    /**
+     * 手工造的连接没有走完真实握手，{@code waitingForRespawn / clientLoadedTimeoutTimer}
+     * 会让 {@code hasClientLoaded()} 返回 false，于是 handleUseItem 在第一步就 return。
+     * 这是在测 Paper Moon —— 真机上这两个值是正常的，所以这里用反射把它们摁成「已加载」。
+     */
+    private static void forceClientLoaded(ServerGamePacketListenerImpl conn) {
+        for (String name : new String[]{"waitingForRespawn", "clientLoadedTimeoutTimer"}) {
+            try {
+                Field f = ServerGamePacketListenerImpl.class.getDeclaredField(name);
+                f.setAccessible(true);
+                if (f.getType() == boolean.class) {
+                    f.setBoolean(conn, false);
+                } else {
+                    f.setInt(conn, 0);
+                }
+            } catch (Throwable t) {
+                System.out.println("   [diag] 强制已加载失败(" + name + "): " + t);
+            }
+        }
+    }
+
+    private static ServerPlayer player(MinecraftServer server, ServerLevel level) {
+        try {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "NekoBoxSelfCheck");
+            ClientInformation info = ClientInformation.createDefault();
+            ServerPlayer p = new ServerPlayer(server, level, profile, info);
+            PacketListener listener = new ServerGamePacketListenerImpl(
+                    server, new Connection(PacketFlow.SERVERBOUND), p,
+                    CommonListenerCookie.createInitial(profile, false));
+            p.connection = (ServerGamePacketListenerImpl) listener;
+            forceClientLoaded(p.connection);
+            return p;
+        } catch (Throwable t) {
+            System.out.println("   假玩家构造失败: " + t);
+            return null;
+        }
+    }
+
+    private static void clearInv(ServerPlayer p) {
+        p.getInventory().clearContent();
+        p.containerMenu = p.inventoryMenu;
+    }
+
+    /** 往背包里塞 {@code n} 个空潜影盒（走 insert，等价于把它们存进仓库） */
+    private static void stock(VoidWarehouseData data, Item item, long n) {
+        if (n > 0) {
+            data.insert(new ItemStack(item, (int) Math.min(n, Integer.MAX_VALUE)));
+        }
+    }
+
+    /** 找到界面里 cobblestone 那一格的槽位号（仓库排序后的实际位置） */
+    private static int slotOf(VoidWarehouseMenu menu, Item looking) {
+        for (int i = 0; i < VoidWarehouseData.TOTAL_SLOTS; i++) {
+            ItemStack stack = menu.getSlot(i).getItem();
+            if (!stack.isEmpty() && stack.getItem() == looking) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 一次「界面里点击取出一盒」。
+     *
+     * @return 是否真的取到了（界面提示会走聊天栏，这里直接看账目 + 背包）
+     */
+    private static boolean clickOneBox(MinecraftServer server, ServerPlayer player,
+                                       VoidWarehouseData data, long cobble, long emptyBoxes,
+                                       long shells, long chests, String tag) {
+        ServerLevel level = server.overworld();
+        data.clearContent();
+        clearInv(player);
+        stock(data, Items.COBBLESTONE, cobble);
+        stock(data, Items.SHULKER_BOX, emptyBoxes);
+        stock(data, Items.SHULKER_SHELL, shells);
+        stock(data, Items.CHEST, chests);
+
+        BigInteger beforeCobble = data.amountOf(Items.COBBLESTONE);
+        BigInteger beforeEmpty = data.emptyBoxCount();
+        BigInteger beforeShell = data.amountOf(Items.SHULKER_SHELL);
+        BigInteger beforeChest = data.amountOf(Items.CHEST);
+
+        VoidWarehouseViews.viewFor(player).setShulkerMode(true);
+        VoidWarehouseMenu menu = new VoidWarehouseMenu(1, player.getInventory(), data, player);
+        int slot = slotOf(menu, Items.COBBLESTONE);
+        if (slot < 0) {
+            System.out.println("   [" + tag + "] 找不到目标槽位");
+            return false;
+        }
+        menu.clicked(slot, 0, ContainerInput.PICKUP, player);
+
+        // 背包里有没有多出一个装满 1728 个圆石的潜影盒？
+        int inBox = 0;
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            ItemStack s = player.getInventory().getItem(i);
+            if (VoidWarehouseShulker.isShulkerBox(s)) {
+                for (ItemStack inside : VoidWarehouseShulker.contentsOf(s)) {
+                    if (inside.getItem() == Items.COBBLESTONE) {
+                        inBox += inside.getCount();
+                    }
+                }
+            }
+        }
+        boolean took = inBox > 0;
+        System.out.println("   [" + tag + "] 取到盒内 " + inBox + " 个；"
+                + "圆石 " + beforeCobble + "→" + data.amountOf(Items.COBBLESTONE)
+                + "，空盒 " + beforeEmpty + "→" + data.emptyBoxCount()
+                + "，壳 " + beforeShell + "→" + data.amountOf(Items.SHULKER_SHELL)
+                + "，箱 " + beforeChest + "→" + data.amountOf(Items.CHEST));
+        return took;
+    }
+
+    // ---------------------------------------------------------------- bug 1
+
+    private static void boxMaterialChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        if (player == null) {
+            check("A0 假玩家可构造", false);
+            return;
+        }
+        check("A0 假玩家可构造", true);
+        VoidWarehouseData data = VoidWarehouse.data(server);
+
+        // A1：仓库只有空盒、没有壳也没有箱 —— 这正是玩家报的场景：应当直接消耗空盒取出
+        boolean took = clickOneBox(server, player, data, 3456, 1, 0, 0, "A1 只有空盒");
+        check("A1 只有空盒也能取出满盒", took);
+        check("A1 圆石恰好扣 1728", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(1728)));
+        check("A1 空盒被消耗（1→0）", data.emptyBoxCount().signum() == 0);
+        check("A1 没有动壳 / 箱", data.amountOf(Items.SHULKER_SHELL).signum() == 0
+                && data.amountOf(Items.CHEST).signum() == 0);
+
+        // A2 反证：一样的操作，把空盒去掉就不该成功（否则这条断言没意义）
+        took = clickOneBox(server, player, data, 3456, 0, 0, 0, "A2 空壳箱都没有");
+        check("A2 什么材料都没有时拒绝取出", !took);
+        check("A2 拒绝时圆石一分没动（all-or-nothing）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(3456)));
+
+        // A3：老 behaviour 不能坏 —— 有壳有箱、没有空盒也要能取
+        took = clickOneBox(server, player, data, 3456, 0, 2, 1, "A3 只有壳+箱");
+        check("A3 只有壳 + 箱也能取出", took);
+        check("A3 壳扣 2", data.amountOf(Items.SHULKER_SHELL).signum() == 0);
+        check("A3 箱扣 1", data.amountOf(Items.CHEST).signum() == 0);
+
+        // A4：两者都有时优先用空盒（不花壳箱）
+        took = clickOneBox(server, player, data, 3456, 1, 2, 1, "A4 空盒+壳箱");
+        check("A4 有空盒也有壳箱时能取出", took);
+        check("A4 优先消耗空盒（扣到 0）", data.emptyBoxCount().signum() == 0);
+        check("A4 壳一个没花", data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(2)));
+        check("A4 箱一个没花", data.amountOf(Items.CHEST).equals(BigInteger.valueOf(1)));
+
+        // A5：索引安全 —— 目标格旁边还有别的物品时，扣材料不能把别的格子扣错
+        data.clearContent();
+        clearInv(player);
+        stock(data, Items.COBBLESTONE, 2000);
+        stock(data, Items.DIAMOND, 10);
+        stock(data, Items.SHULKER_BOX, 1);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(true);
+        VoidWarehouseMenu menu = new VoidWarehouseMenu(1, player.getInventory(), data, player);
+        int slot = slotOf(menu, Items.COBBLESTONE);
+        menu.clicked(slot, 0, ContainerInput.PICKUP, player);
+        System.out.println("   [A5] 圆石=" + data.amountOf(Items.COBBLESTONE)
+                + " 钻石=" + data.amountOf(Items.DIAMOND)
+                + " 空盒=" + data.emptyBoxCount());
+        check("A5 圆石扣到 272（2000-1728）", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(272)));
+        check("A5 旁边那格钻石没被误扣", data.amountOf(Items.DIAMOND).equals(BigInteger.valueOf(10)));
+        check("A5 空盒只扣 1 个", data.emptyBoxCount().signum() == 0);
+
+        data.clearContent();
+        clearInv(player);
+    }
+
+    // ---------------------------------------------------------------- bug 1（另一条路：聊天按数量取货）
+
+    private static void withdrawCountChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        if (player == null) {
+            check("B0 假玩家可构造", false);
+            return;
+        }
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        ItemStack cobbleTemplate = new ItemStack(Items.COBBLESTONE);
+
+        // B1：2 盒量（3456），仓库只有 1 个空盒且没有壳箱 → 应当整次取消
+        data.clearContent();
+        clearInv(player);
+        stock(data, Items.COBBLESTONE, 4000);
+        stock(data, Items.SHULKER_BOX, 1);
+        VoidWarehouseWithdraw.request(player, cobbleTemplate.copyWithCount(1));
+        VoidWarehouseWithdraw.onChat(player, "3456");
+        System.out.println("   [B1] 圆石=" + data.amountOf(Items.COBBLESTONE)
+                + " 空盒=" + data.emptyBoxCount());
+        check("B1 空盒不够且无壳箱时整次取消",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(4000)));
+        check("B1 取消时空盒也没被扣", data.emptyBoxCount().equals(BigInteger.valueOf(1)));
+
+        // B2：同样 2 盒量，补上 2 壳 1 箱 → 用 1 个空盒 + 1 组壳箱，成功
+        data.clearContent();
+        clearInv(player);
+        stock(data, Items.COBBLESTONE, 4000);
+        stock(data, Items.SHULKER_BOX, 1);
+        stock(data, Items.SHULKER_SHELL, 2);
+        stock(data, Items.CHEST, 1);
+        VoidWarehouseWithdraw.request(player, cobbleTemplate.copyWithCount(1));
+        VoidWarehouseWithdraw.onChat(player, "3456");
+        System.out.println("   [B2] 圆石=" + data.amountOf(Items.COBBLESTONE)
+                + " 空盒=" + data.emptyBoxCount()
+                + " 壳=" + data.amountOf(Items.SHULKER_SHELL)
+                + " 箱=" + data.amountOf(Items.CHEST));
+        check("B2 2 盒量取出成功（扣 3456）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(544)));
+        check("B2 空盒全花掉", data.emptyBoxCount().signum() == 0);
+        check("B2 补的那部分扣了 2 壳", data.amountOf(Items.SHULKER_SHELL).signum() == 0);
+        check("B2 补的那部分扣了 1 箱", data.amountOf(Items.CHEST).signum() == 0);
+
+        // B3：空盒足量 → 一个壳一个箱都不该花
+        data.clearContent();
+        clearInv(player);
+        stock(data, Items.COBBLESTONE, 4000);
+        stock(data, Items.SHULKER_BOX, 2);
+        stock(data, Items.SHULKER_SHELL, 2);
+        stock(data, Items.CHEST, 1);
+        VoidWarehouseWithdraw.request(player, cobbleTemplate.copyWithCount(1));
+        VoidWarehouseWithdraw.onChat(player, "3456");
+        System.out.println("   [B3] 圆石=" + data.amountOf(Items.COBBLESTONE)
+                + " 空盒=" + data.emptyBoxCount()
+                + " 壳=" + data.amountOf(Items.SHULKER_SHELL)
+                + " 箱=" + data.amountOf(Items.CHEST));
+        check("B3 空盒足量时取出成功",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(544)));
+        check("B3 空盒扣 2", data.emptyBoxCount().signum() == 0);
+        check("B3 壳一个没花", data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(2)));
+        check("B3 箱一个没花", data.amountOf(Items.CHEST).equals(BigInteger.valueOf(1)));
+
+        data.clearContent();
+        clearInv(player);
+    }
+
+    // ---------------------------------------------------------------- bug 2
+
+    private static ItemStack namedWarehouse() {
+        ItemStack stack = new ItemStack(Items.CRAFTING_TABLE);
+        stack.set(DataComponents.CUSTOM_NAME, Component.literal(VoidWarehouseTrigger.ITEM_NAME));
+        return stack;
+    }
+
+    private static void airRightClickChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        if (player == null) {
+            check("C0 假玩家可构造", false);
+            return;
+        }
+        clearInv(player);
+
+        String frag = "";
+        boolean appliedListener = false;
+        for (Method m : ServerGamePacketListenerImpl.class.getDeclaredMethods()) {
+            if (m.getName().contains("voidWarehouse")) {
+                frag += m.getName() + " | ";
+                // Mixin 会给回调加上 handler$xxx$modid$ 前缀，只能看后缀
+                if (m.getName().endsWith("carpetAutomending$voidWarehouseHandleUseItem")) {
+                    appliedListener = true;
+                }
+            }
+        }
+        System.out.println("   [C1] ServerGamePacketListenerImpl 上的 mixin 方法: " + frag);
+        check("C1 use-item 包处理层已挂上我们的 mixin", appliedListener);
+
+        // C2：手持「虚空仓库」对空气右键 → 开仓库，且第三方回调没机会插手。
+        //     走的是真实链路：客户端发 use-item 包 → ServerGamePacketListenerImpl#handleUseItem。
+        player.setItemInHand(InteractionHand.MAIN_HAND, namedWarehouse());
+        hijacked = false;
+        try {
+            ServerboundUseItemPacket pkt = new ServerboundUseItemPacket(
+                    InteractionHand.MAIN_HAND, 0, player.getYRot(), player.getXRot());
+            player.connection.handleUseItem(pkt);
+        } catch (Throwable t) {
+            System.out.println("   [C2] 包路径抛异常: " + t);
+        }
+        System.out.println("   [C2] menu=" + player.containerMenu.getClass().getSimpleName()
+                + " hijacked=" + hijacked
+                + " 手上还有=" + player.getItemInHand(InteractionHand.MAIN_HAND).getCount());
+        check("C2 打开的是虚空仓库界面", player.containerMenu instanceof VoidWarehouseMenu);
+        // 有牙的一条：主拦截层设在「收到 use-item 包」那一步，比 Fabric 的
+        // UseItemCallback（QuickShulker 就挂在它上面）更早，所以那条回调根本没被调用。
+        // 修复前这条必 FAIL —— 那正是「打开了合成界面」的原因。
+        check("C3 第三方 UseItemCallback 没被调用（入口比它早）", !hijacked);
+
+        // C4 反证：手里拿普通工作台 → 不拦，也不开虚空仓库。
+        //    这时第三方回调【必须】被调用 —— 证明上面 C3 的「没被调用」
+        //    不是因为这条抢注回调压根没注册成功。
+        player.containerMenu = player.inventoryMenu;
+        ItemStack plain = new ItemStack(Items.CRAFTING_TABLE);
+        player.setItemInHand(InteractionHand.MAIN_HAND, plain);
+        hijacked = false;
+        try {
+            player.connection.handleUseItem(new ServerboundUseItemPacket(
+                    InteractionHand.MAIN_HAND, 0, player.getYRot(), player.getXRot()));
+        } catch (Throwable t) {
+            System.out.println("   [C4] 包路径抛异常: " + t);
+        }
+        System.out.println("   [C4] menu=" + player.containerMenu.getClass().getSimpleName()
+                + " hijacked=" + hijacked);
+        check("C4 普通工作台不开虚空仓库", !(player.containerMenu instanceof VoidWarehouseMenu));
+        check("C5 反证有效：这次第三方回调被调用了", hijacked);
+
+        // C6：规则关掉时完全交还原版
+        VoidWarehouseSettings.voidWarehouse = false;
+        player.containerMenu = player.inventoryMenu;
+        player.setItemInHand(InteractionHand.MAIN_HAND, namedWarehouse());
+        hijacked = false;
+        try {
+            player.connection.handleUseItem(new ServerboundUseItemPacket(
+                    InteractionHand.MAIN_HAND, 0, player.getYRot(), player.getXRot()));
+        } catch (Throwable t) {
+            System.out.println("   [C6] 包路径抛异常: " + t);
+        }
+        System.out.println("   [C6] menu=" + player.containerMenu.getClass().getSimpleName()
+                + " hijacked=" + hijacked);
+        check("C6 规则关掉时不开虚空仓库", !(player.containerMenu instanceof VoidWarehouseMenu));
+        check("C6 规则关掉时把这次右键交还原版链路", hijacked);
+        VoidWarehouseSettings.voidWarehouse = true;
+
+        clearInv(player);
+    }
+}

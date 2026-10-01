@@ -5,7 +5,6 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -205,13 +204,10 @@ public final class VoidWarehouseWithdraw {
             return;
         }
 
-        // ② 校验盒子材料：优先空盒，不够的用壳 + 箱（按 totalBoxes 算，含散货装出来的那个）
-        long emptyBoxes = data.emptyBoxCount().min(BigInteger.valueOf(totalBoxes)).longValue();
-        long needCraft = totalBoxes - emptyBoxes;
-        BigInteger needShells = BigInteger.valueOf(needCraft * VoidWarehouseShulker.SHELL_COST);
-        BigInteger needChests = BigInteger.valueOf(needCraft * VoidWarehouseShulker.CHEST_COST);
-        if (data.amountOf(Items.SHULKER_SHELL).compareTo(needShells) < 0
-                || data.amountOf(Items.CHEST).compareTo(needChests) < 0) {
+        // ② 校验盒子材料：优先空盒，不够的用壳 + 箱（按 totalBoxes 算，含散货装出来的那个）。
+        //    与界面里「点击取一盒」共用同一份算法，两边行为必须一致。
+        VoidWarehouseData.BoxMaterials plan = data.planBoxMaterials(totalBoxes);
+        if (!data.hasBoxMaterials(plan)) {
             player.sendSystemMessage(MSG_NO_PARTS);
             return;
         }
@@ -242,15 +238,9 @@ public final class VoidWarehouseWithdraw {
             moveIntoInventory(player, out);
         }
 
-        // ⑥ 扣账：物品 + 空盒 + 壳 + 箱
+        // ⑥ 扣账：物品 + 盒子材料（空盒优先，不够的才用壳 + 箱；材料在 ② 里验过）
         data.takeExact(sample, (int) requested);
-        data.takeEmptyBoxes((int) emptyBoxes);
-        if (needShells.signum() > 0) {
-            data.takeItem(Items.SHULKER_SHELL, needShells.intValue());
-        }
-        if (needChests.signum() > 0) {
-            data.takeItem(Items.CHEST, needChests.intValue());
-        }
+        data.consumeBoxMaterials(plan);
         // 提示里如实反映「散货是散着给的还是装盒给的」，玩家一眼知道自己拿到了什么
         StringBuilder summary = new StringBuilder("已取出 ").append(requested).append(" 个（");
         boolean hasPrefix = false;

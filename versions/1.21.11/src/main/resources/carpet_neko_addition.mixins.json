@@ -7,6 +7,8 @@
     "ItemUseMixin",
     "BlockItemUseOnMixin",
     "ServerPlayerGameModeMixin",
+    "ServerPlayerGameModeUseItemMixin",
+    "ServerGamePacketListenerImplMixin",
     "PlayerInteractOnMixin",
     "BlockPlacedByMixin",
     "BlockRemovalMixin",

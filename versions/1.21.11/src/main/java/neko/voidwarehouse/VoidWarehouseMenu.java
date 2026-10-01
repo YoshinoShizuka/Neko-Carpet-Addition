@@ -491,9 +491,11 @@ public class VoidWarehouseMenu extends ChestMenu {
             return;
         }
 
-        // ① 潜影壳 / 箱子够不够？不够就整次拒绝，只发提示
-        if (this.data.amountOf(Items.SHULKER_SHELL).compareTo(SHELL_NEED) < 0
-                || this.data.amountOf(Items.CHEST).compareTo(CHEST_NEED) < 0) {
+        // ① 盒子材料够不够？—— 优先消耗仓库里现成的空潜影盒，不够的那些才动用潜影壳 + 箱子。
+        //    必须与「聊天按数量取货」用同一份算法（VoidWarehouseData.planBoxMaterials），
+        //    否则玩家会遇到「库里有空盒，却在界面里被要求补潜影壳」的分裂行为。
+        VoidWarehouseData.BoxMaterials plan = this.data.planBoxMaterials(1);
+        if (!this.data.hasBoxMaterials(plan)) {
             this.message(player, MSG_NO_BOX_PARTS);
             return;
         }
@@ -507,10 +509,11 @@ public class VoidWarehouseMenu extends ChestMenu {
             return;
         }
 
-        // ③ 盒子已经进背包了，这才扣账：物品 + 潜影壳 + 箱子（两样都在 ① 里验过，不会失败）
+        // ③ 盒子已经进背包了，这才扣账。三步都不能失败（① 已验过库存），但顺序有讲究：
+        //    take(index) 必须排在最前 —— 扣空盒 / 壳 / 箱移除了别的格子会让 entries 前移，
+        //    若先扣材料再按 index 取物，index 就可能已经指向别的物品了。
         this.data.take(index, fill);
-        this.data.takeItem(Items.SHULKER_SHELL, VoidWarehouseShulker.SHELL_COST);
-        this.data.takeItem(Items.CHEST, VoidWarehouseShulker.CHEST_COST);
+        this.data.consumeBoxMaterials(plan);
     }
 
     /**

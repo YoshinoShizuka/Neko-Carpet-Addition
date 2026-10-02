@@ -81,8 +81,10 @@ public final class VoidWarehouseWithdraw {
     private static final Component MSG_CANCELLED = VoidWarehouseText.info("已取消本次取货");
     private static final Component MSG_INVALID =
             VoidWarehouseText.info("不是有效数量，已取消本次取货");
-    private static final Component MSG_TOO_LARGE =
-            VoidWarehouseText.info("数量过大（最多 " + MAX_REQUEST + "），已取消本次取货");
+    private static final Component MSG_TOO_LARGE = VoidWarehouseText.info(
+            VoidWarehouseText.body("数量过大（最多 ")
+                    .append(VoidWarehouseText.key(VoidWarehouseText.count(MAX_REQUEST)))
+                    .append(VoidWarehouseText.body("），已取消本次取货")));
     private static final Component MSG_NO_STOCK =
             VoidWarehouseText.info("仓库里这种物品不够，本次取消");
     private static final Component MSG_NO_PARTS =
@@ -241,19 +243,22 @@ public final class VoidWarehouseWithdraw {
         // ⑥ 扣账：物品 + 盒子材料（空盒优先，不够的才用壳 + 箱；材料在 ② 里验过）
         data.takeExact(sample, (int) requested);
         data.consumeBoxMaterials(plan);
-        // 提示里如实反映「散货是散着给的还是装盒给的」，玩家一眼知道自己拿到了什么
-        StringBuilder summary = new StringBuilder("已取出 ").append(requested).append(" 个（");
+        // 提示里如实反映「散货是散着给的还是装盒给的」，玩家一眼知道自己拿到了什么。
+        // 「取了多少个」是这条消息里唯一的关键信息 → 亮绿；装盒明细是补充说明 → 灰。
+        StringBuilder detail = new StringBuilder();
         boolean hasPrefix = false;
         if (fullBoxes > 0) {
-            summary.append(fullBoxes).append(" 满盒");
+            detail.append(fullBoxes).append(" 满盒");
             hasPrefix = true;
         }
         if (packLoose) {
-            summary.append(hasPrefix ? " + " : "").append("散货 ").append(loose).append(" 已装盒");
+            detail.append(hasPrefix ? " + " : "").append("散货 ").append(loose).append(" 已装盒");
         } else if (loose > 0) {
-            summary.append(hasPrefix ? " + " : "").append(loose).append(" 散货");
+            detail.append(hasPrefix ? " + " : "").append(loose).append(" 散货");
         }
-        player.sendSystemMessage(VoidWarehouseText.info(summary.append("）").toString()));
+        player.sendSystemMessage(VoidWarehouseText.info(VoidWarehouseText.body("已取出 ")
+                .append(VoidWarehouseText.key(VoidWarehouseText.count(requested)))
+                .append(VoidWarehouseText.body(" 个（" + detail + "）"))));
     }
 
     // ------------------------------------------------------------------ 背包

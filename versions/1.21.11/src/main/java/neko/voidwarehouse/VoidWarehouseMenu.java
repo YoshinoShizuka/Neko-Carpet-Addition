@@ -110,7 +110,8 @@ public class VoidWarehouseMenu extends ChestMenu {
     private static final BigInteger SHELL_NEED = BigInteger.valueOf(VoidWarehouseShulker.SHELL_COST);
     private static final BigInteger CHEST_NEED = BigInteger.valueOf(VoidWarehouseShulker.CHEST_COST);
 
-    // 聊天提示统一走 VoidWarehouseText.info()：带金色 [信息] 前缀，一眼能和普通聊天分开
+    // 聊天提示统一走 VoidWarehouseText.info()：亮金色 [信息] 前缀 + 灰色正文，
+    // 一眼能和普通聊天分开；正文里的关键数字用 VoidWarehouseText.key() 标亮绿。
     private static final Component MSG_FULL = VoidWarehouseText.info("虚空仓库已满，放不进去了");
     private static final Component MSG_RESCUED =
             VoidWarehouseText.info("背包已满，手上的物品已存入虚空仓库");
@@ -123,8 +124,11 @@ public class VoidWarehouseMenu extends ChestMenu {
     private static final Component MSG_SHULKER_ON = VoidWarehouseText.info("潜影盒模式开");
     private static final Component MSG_SHULKER_OFF = VoidWarehouseText.info("潜影盒模式关");
     private static final Component MSG_NO_BOX_PARTS = VoidWarehouseText.info(
-            "潜影壳或箱子不足，无法装盒（每盒需 潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
-                    + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST + "）");
+            VoidWarehouseText.body("潜影壳或箱子不足，无法装盒（每盒需 潜影壳 ×")
+                    .append(VoidWarehouseText.key(String.valueOf(VoidWarehouseShulker.SHELL_COST)))
+                    .append(VoidWarehouseText.body(" + 箱子 ×"))
+                    .append(VoidWarehouseText.key(String.valueOf(VoidWarehouseShulker.CHEST_COST)))
+                    .append(VoidWarehouseText.body("）")));
     private static final Component MSG_BOX_INV_FULL =
             VoidWarehouseText.info("背包放不下盒子，本次取消（仓库未扣减）");
     private static final Component MSG_SORT_ON = VoidWarehouseText.info("数量排序开");

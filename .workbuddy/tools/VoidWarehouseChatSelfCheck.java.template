@@ -1,0 +1,488 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemLore;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+import neko.voidwarehouse.restock.PrinterTakeResultPayload;
+import neko.voidwarehouse.restock.PrinterTakeService;
+
+/**
+ * 【临时自检】聊天提示改配色 + 全局去粗去斜 + 「取出 1 组（64 个）」改「取出 64 个」。
+ * 验证完删掉。
+ *
+ * <h2>这次改了什么</h2>
+ * <ol>
+ *   <li><b>全局不加粗、不倾斜</b>：所有造文本的方法显式 {@code withItalic(false)}；
+ *       聊天前缀去掉 {@code BOLD}。为什么必须显式写 —— 原版
+ *       {@code ItemLore.LORE_STYLE = DARK_PURPLE + italic(true)}，合并时
+ *       「自己没设的字段沿用对方的」，光不设置是会被顶成斜体的；</li>
+ *   <li><b>物品格文案</b>：「右键：取出 1 组（64 个）」→「右键：取出 64 个」；</li>
+ *   <li><b>聊天提示三段式</b>：{@code [信息] } 亮金 #FFD700 + 正文浅灰 #AAAAAA
+ *       + 关键数字亮绿 #55FF55；</li>
+ *   <li><b>中键取货</b>：只有「取走 X 个」的 X 亮绿，「仓库剩余 Y 个」<b>保持灰色</b>
+ *       （玩家明确的口径）。</li>
+ * </ol>
+ *
+ * <h2>断言为什么算「有牙」</h2>
+ * <p>每条都配<b>反证</b>，保证「代码没改时一定挂」：</p>
+ * <ul>
+ *   <li>斜体：断言 {@code == Boolean.FALSE}。修复前是 {@code null}（没设）→ 挂；</li>
+ *   <li>加粗：断言 {@code != Boolean.TRUE}。修复前前缀是 {@code TRUE} → 挂；</li>
+ *   <li>正文色：断言 {@code == 新灰} 且 {@code != 旧金 #FFAA00}。改成别的颜色也会挂；</li>
+ *   <li>「取走」数字：断言有一段文本 == 数字且色 == 亮绿。修复前整条同色 → 挂；</li>
+ *   <li>「剩余」数字：<b>反证组</b>，断言它 == 灰 且 != 亮绿。
+ *       万一我把两个数字都涂绿了，这条会挂 —— 专门守「玩家只要取走数亮绿」这个口径。</li>
+ * </ul>
+ */
+public final class VoidWarehouseChatSelfCheck {
+
+    // ---- 新配色（与 VoidWarehouseText 里的常量一一对应）----
+    private static final int PREFIX_RGB = 0xFFD700;
+    private static final int BODY_RGB = 0xAAAAAA;
+    private static final int KEY_RGB = 0x55FF55;
+
+    // ---- 旧配色：反证用 ----
+    private static final int OLD_GOLD = 0xFFAA00;   // GOLD
+    private static final int OLD_GREEN = 0x55FF55;  // GREEN（关键数字若沿用会撞上）
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private VoidWarehouseChatSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        try {
+            loreChecks(server);
+            toolChecks();
+            messageConstantChecks();
+            printerTakeChecks(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT vw-chat/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ================================================================ A 组：物品格 lore
+
+    private static void loreChecks(MinecraftServer server) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));   // 可堆叠：左键 1 个 / 右键 64 个
+        data.insert(new ItemStack(Items.DIAMOND_SWORD, 1));  // 不可堆叠：合并成一行
+
+        VoidWarehouseData.Entry cobble = entryOf(data, Items.COBBLESTONE);
+        check("圆石那一格存在", cobble != null);
+        if (cobble != null) {
+            plainMode(cobble);
+            boxMode(cobble);
+        }
+        VoidWarehouseData.Entry sword = entryOf(data, Items.DIAMOND_SWORD);
+        check("钻石剑那一格存在", sword != null);
+        if (sword != null) {
+            unstackableMode(sword);
+        }
+    }
+
+    private static void plainMode(VoidWarehouseData.Entry entry) {
+        List<Component> lore = loreOf(entry.display());
+        dump("plain", lore);
+        check("普通模式一共 4 行", lore.size() == 4);
+        if (lore.size() != 4) {
+            return;
+        }
+
+        // 文本：右键那行从「1 组（64 个）」改成直接写数字
+        Component right = lore.get(3);
+        check("右键行 = 「右键：取出 64 个」", right.getString().equals("右键：取出 64 个"));
+        check("反证：右键行不再有「1 组」", !right.getString().contains("1 组"));
+        check("左键行 = 「左键：取出 1 个」", lore.get(2).getString().equals("左键：取出 1 个"));
+
+        // 全局：每一行都不许是斜体、不许是加粗
+        for (int i = 0; i < lore.size(); i++) {
+            noStyle("普通模式第 " + i + " 行", lore.get(i));
+            // 行为断言：按原版 ItemLore.LORE_STYLE 合并后仍是正体。
+            // 修复前 italic 是 null，会被原版的 italic(true) 顶掉 → 这里会挂。
+            check("普通模式第 " + i + " 行经原版合并后仍不是斜体",
+                    !italicAfterVanillaMerge(lore.get(i)));
+        }
+        // 数量行的两段也要各自去斜（分段是拼 Component，容易只给一段加了）
+        Component qty = lore.get(0);
+        check("数量行由 2 段拼成", qty.getSiblings().size() == 1);
+        if (!qty.getSiblings().isEmpty()) {
+            noStyle("数量行数值段", qty.getSiblings().get(0));
+        }
+    }
+
+    private static void boxMode(VoidWarehouseData.Entry entry) {
+        List<Component> lore = loreOf(entry.displayInBoxMode());
+        dump("box  ", lore);
+        check("盒模式一共 5 行", lore.size() == 5);
+        for (int i = 0; i < lore.size(); i++) {
+            noStyle("盒模式第 " + i + " 行", lore.get(i));
+        }
+        if (lore.size() == 5) {
+            check("盒模式「消耗」行仍是红色 #FF5555（这轮没动它）",
+                    colorOf(lore.get(4)) == 0xFF5555);
+        }
+    }
+
+    private static void unstackableMode(VoidWarehouseData.Entry entry) {
+        List<Component> lore = loreOf(entry.display());
+        dump("sword", lore);
+        Component merged = lore.get(lore.size() - 1);
+        check("不可堆叠行 = 「左键 / 右键：取出 1 个」",
+                merged.getString().equals("左键 / 右键：取出 1 个"));
+        noStyle("不可堆叠行", merged);
+    }
+
+    /**
+     * 一条 lore 行：不许斜体、不许加粗。
+     *
+     * <p><b>为什么必须反射读私有字段</b>：{@code Style} 只暴露 {@code isItalic()} / {@code isBold()}，
+     * 返回的是原始 {@code boolean} —— 「没设置（null）」和「显式 false」都返回 {@code false}，
+     * 用它断言的话<b>代码没改也能通过</b>，断言就没有牙了。
+     * 这里直接读 {@code Style.italic} / {@code Style.bold} 这两个 {@code Boolean} 字段，
+     * 要求它们是 {@code FALSE}（不是 null）。</p>
+     */
+    private static void noStyle(String label, Component c) {
+        check(label + " 斜体显式为 false（不是 null）", italicRaw(c) == Boolean.FALSE);
+        check(label + " 加粗不是 TRUE", boldRaw(c) != Boolean.TRUE);
+    }
+
+    /** 反射读 {@code Style.italic}：null = 没设置（原版会把它合并成 true） */
+    private static Boolean italicRaw(Component c) {
+        return styleField(c, "italic");
+    }
+
+    private static Boolean boldRaw(Component c) {
+        return styleField(c, "bold");
+    }
+
+    private static Boolean styleField(Component c, String name) {
+        try {
+            Field f = net.minecraft.network.chat.Style.class.getDeclaredField(name);
+            f.setAccessible(true);
+            return (Boolean) f.get(c.getStyle());
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 读 Style." + name + " 失败: " + t);
+            return null;
+        }
+    }
+
+    /**
+     * 模拟原版渲染：拿 {@code ItemLore.LORE_STYLE}（深紫 + 斜体 true）合并一遍。
+     * 修复前整行会被顶成斜体，修复后仍是正体 —— 这是玩家真正看到的效果。
+     */
+    private static boolean italicAfterVanillaMerge(Component c) {
+        try {
+            Field f = ItemLore.class.getDeclaredField("LORE_STYLE");
+            f.setAccessible(true);
+            net.minecraft.network.chat.Style loreStyle =
+                    (net.minecraft.network.chat.Style) f.get(null);
+            return net.minecraft.network.chat.ComponentUtils.mergeStyles(c, loreStyle)
+                    .getStyle().isItalic();
+        } catch (Throwable t) {
+            System.out.println("   [diag] 取 LORE_STYLE 失败: " + t);
+            return true;
+        }
+    }
+
+    // ================================================================ B 组：工具方法本身
+
+    private static void toolChecks() {
+        noStyle("VoidWarehouseText.line(rgb)", VoidWarehouseText.line("测试", 0x123456));
+        noStyle("VoidWarehouseText.line(枚举)", VoidWarehouseText.line("测试",
+                net.minecraft.ChatFormatting.AQUA));
+        noStyle("VoidWarehouseText.name(开)", VoidWarehouseText.name("测试", Boolean.TRUE));
+        noStyle("VoidWarehouseText.name(关)", VoidWarehouseText.name("测试", Boolean.FALSE));
+        noStyle("VoidWarehouseText.body", VoidWarehouseText.body("测试"));
+        noStyle("VoidWarehouseText.key", VoidWarehouseText.key("测试"));
+
+        check("body 的颜色 = 灰 #AAAAAA", colorOf(VoidWarehouseText.body("x")) == BODY_RGB);
+        check("key 的颜色 = 亮绿 #55FF55", colorOf(VoidWarehouseText.key("x")) == KEY_RGB);
+    }
+
+    // ================================================================ C 组：聊天提示常量
+
+    private static void messageConstantChecks() {
+        // 没有关键数字的普通提示：前缀亮金 + 正文灰
+        Component sortOn = constant("neko.voidwarehouse.VoidWarehouseMenu", "MSG_SORT_ON");
+        if (sortOn != null) {
+            dumpOne("sortOn", sortOn);
+            check("MSG_SORT_ON 前缀文本 = 「[信息] 」", ownText(firstLeaf(sortOn)).equals("[信息] "));
+            check("MSG_SORT_ON 前缀 = 亮金 #FFD700", colorOf(firstLeaf(sortOn)) == PREFIX_RGB);
+            noStyle("MSG_SORT_ON 前缀", firstLeaf(sortOn));
+            check("MSG_SORT_ON 正文 = 灰 #AAAAAA", colorOf(leafWith(sortOn, "数量排序开")) == BODY_RGB);
+            check("反证：MSG_SORT_ON 正文不再是旧金 #FFAA00",
+                    colorOf(leafWith(sortOn, "数量排序开")) != OLD_GOLD);
+        }
+
+        // 有关键数字的：上限那行
+        Component tooLarge = constant("neko.voidwarehouse.VoidWarehouseWithdraw", "MSG_TOO_LARGE");
+        if (tooLarge != null) {
+            dumpOne("tooLrg", tooLarge);
+            check("MSG_TOO_LARGE 全文 = 「[信息] 数量过大（最多 2,000,000），已取消本次取货」",
+                    tooLarge.getString()
+                            .equals("[信息] 数量过大（最多 2,000,000），已取消本次取货"));
+            Component num = leafWith(tooLarge, "2,000,000");
+            check("MSG_TOO_LARGE 里存在「2,000,000」这一段（真的分了段）", num != null);
+            if (num != null) {
+                check("MSG_TOO_LARGE 的「2,000,000」= 亮绿 #55FF55", colorOf(num) == KEY_RGB);
+            }
+            Component tail = leafWith(tooLarge, "），已取消本次取货");
+            check("MSG_TOO_LARGE 的尾部 = 灰 #AAAAAA", tail != null && colorOf(tail) == BODY_RGB);
+        }
+
+        // 材料提示：两个数字都要亮绿
+        Component parts = constant("neko.voidwarehouse.VoidWarehouseMenu", "MSG_NO_BOX_PARTS");
+        if (parts != null) {
+            dumpOne("parts ", parts);
+            Component shell = leafWith(parts, "2");
+            Component chest = leafWith(parts, "1");
+            check("MSG_NO_BOX_PARTS 的「2」= 亮绿 #55FF55", shell != null && colorOf(shell) == KEY_RGB);
+            check("MSG_NO_BOX_PARTS 的「1」= 亮绿 #55FF55", chest != null && colorOf(chest) == KEY_RGB);
+        }
+    }
+
+    // ================================================================ D 组：中键取货提示
+
+    private static void printerTakeChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        CapturingPlayer player = null;
+        try {
+            player = new CapturingPlayer(server, level,
+                    new GameProfile(UUID.randomUUID(), "NekoChatSelfCheck"),
+                    ClientInformation.createDefault());
+        } catch (Throwable t) {
+            System.out.println("   假玩家构造失败: " + t);
+        }
+        check("假玩家构造成功", player != null);
+        if (player == null) {
+            return;
+        }
+
+        try {
+            Method m = Class.forName("neko.voidwarehouse.restock.PrinterRestockNetwork")
+                    .getDeclaredMethod("notifyTaken", ServerPlayer.class,
+                            PrinterTakeService.TakeOutcome.class);
+            m.setAccessible(true);
+            m.invoke(null, player, new PrinterTakeService.TakeOutcome(
+                    PrinterTakeResultPayload.OK, 64, BigInteger.valueOf(1234),
+                    new ItemStack(Items.COBBLESTONE)));
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! notifyTaken 反射调用失败: " + t);
+            t.printStackTrace(System.out);
+            return;
+        }
+
+        Component msg = player.last;
+        check("中键取货确实发了一条消息", msg != null);
+        if (msg == null) {
+            return;
+        }
+        dumpOne("take  ", msg);
+
+        check("取货提示前缀 = 亮金 #FFD700", colorOf(firstLeaf(msg)) == PREFIX_RGB);
+        noStyle("取货提示前缀", firstLeaf(msg));
+
+        // 玩家口径：只有「取走 X 个」的 X 亮绿
+        Component taken = leafWith(msg, "64");
+        check("取货提示里有「64」这一段", taken != null);
+        if (taken != null) {
+            check("「取走 64」的 64 = 亮绿 #55FF55", colorOf(taken) == KEY_RGB);
+        }
+        // 反证组：剩余数量必须是灰色，不许跟着变绿
+        Component remainingPart = leafContaining(msg, "1,234");
+        check("取货提示里有剩余数量「1,234」", remainingPart != null);
+        if (remainingPart != null) {
+            check("「仓库剩余 1,234」= 灰 #AAAAAA（玩家要剩余保持灰）",
+                    colorOf(remainingPart) == BODY_RGB);
+            check("反证：剩余数量没有跟着变绿", colorOf(remainingPart) != KEY_RGB);
+        }
+
+        // 整条消息不许有任何加粗 / 斜体
+        for (Component leaf : leaves(msg)) {
+            noStyle("取货提示片段「" + leaf.getString() + "」", leaf);
+        }
+    }
+
+    /** 覆写 sendSystemMessage 的假玩家：把消息接住，不真的发包 */
+    private static final class CapturingPlayer extends ServerPlayer {
+        private Component last;
+
+        CapturingPlayer(MinecraftServer server, ServerLevel level, GameProfile profile,
+                        ClientInformation info) {
+            super(server, level, profile, info);
+        }
+
+        @Override
+        public void sendSystemMessage(Component message) {
+            this.last = message;
+        }
+    }
+
+    // ================================================================ 工具
+
+    /** 反射取一个 private static Component 常量 */
+    private static Component constant(String className, String fieldName) {
+        try {
+            Field f = Class.forName(className).getDeclaredField(fieldName);
+            f.setAccessible(true);
+            return (Component) f.get(null);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 取常量失败 " + className + "." + fieldName + ": " + t);
+            return null;
+        }
+    }
+
+    private static VoidWarehouseData.Entry entryOf(VoidWarehouseData data, Item item) {
+        for (int i = 0; i < VoidWarehouseData.TOTAL_SLOTS; i++) {
+            VoidWarehouseData.Entry e = data.entryAt(i);
+            if (e != null && e.template().getItem() == item) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    private static List<Component> loreOf(ItemStack stack) {
+        ItemLore lore = stack.get(DataComponents.LORE);
+        return lore == null ? List.of() : lore.lines();
+    }
+
+    /** 把「根 + 所有子孙」摊平成一串叶子（每片叶子带自己的文本与颜色） */
+    private static List<Component> leaves(Component c) {
+        List<Component> out = new ArrayList<>();
+        collect(c, out);
+        return out;
+    }
+
+    private static void collect(Component c, List<Component> out) {
+        out.add(c);
+        for (Component s : c.getSiblings()) {
+            collect(s, out);
+        }
+    }
+
+    /**
+     * 这一片叶子<b>自己的</b>字面文本。
+     *
+     * <p>不能用 {@code getString()} —— 它会把子片段的文本一起拼进来，
+     * 于是根节点返回整句话，「找前缀 / 找某个数字」就会匹配错对象。</p>
+     */
+    private static String ownText(Component c) {
+        if (c.getContents() instanceof net.minecraft.network.chat.contents
+                .PlainTextContents.LiteralContents literal) {
+            return literal.text();
+        }
+        return c.getString();
+    }
+
+    private static Component firstLeaf(Component c) {
+        return leaves(c).get(0);
+    }
+
+    /** 找自己的文本<b>完全相等</b>的那一片叶子 */
+    private static Component leafWith(Component c, String text) {
+        for (Component leaf : leaves(c)) {
+            if (ownText(leaf).equals(text)) {
+                return leaf;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 找自己的文本<b>包含</b>目标串、且自己没有子片段的那一片叶子。
+     *
+     * <p>「仓库剩余 1,234 个」这种数字嵌在一整段灰字里，只能包含匹配；
+     * 但必须排除根节点（它的 getString() 是整句话，会误命中），
+     * 所以要求 {@code getSiblings().isEmpty()}。</p>
+     */
+    private static Component leafContaining(Component c, String text) {
+        for (Component leaf : leaves(c)) {
+            if (leaf.getSiblings().isEmpty() && ownText(leaf).contains(text)) {
+                return leaf;
+            }
+        }
+        return null;
+    }
+
+    private static int colorOf(Component c) {
+        var color = c.getStyle().getColor();
+        return color == null ? -1 : color.getValue();
+    }
+
+    private static String hex(int rgb) {
+        return rgb < 0 ? "(无色)" : String.format("#%06X", rgb);
+    }
+
+    private static void dump(String tag, List<Component> lore) {
+        for (int i = 0; i < lore.size(); i++) {
+            Component c = lore.get(i);
+            StringBuilder sb = new StringBuilder();
+            sb.append("   [").append(tag).append(" ").append(i).append("] '")
+                    .append(c.getString()).append("'");
+            List<Component> parts = leaves(c);
+            if (parts.size() > 1) {
+                sb.append("  段=").append(parts.size());
+                for (Component p : parts) {
+                    sb.append("  {").append(ownText(p)).append(" ").append(hex(colorOf(p)))
+                            .append("}");
+                }
+            } else {
+                sb.append("  ").append(hex(colorOf(c)));
+            }
+            sb.append("  斜体=").append(italicRaw(c));
+            System.out.println(sb);
+        }
+    }
+
+    private static void dumpOne(String tag, Component c) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("   [").append(tag).append("] '").append(c.getString()).append("'");
+        for (Component leaf : leaves(c)) {
+            sb.append("\n        {").append(ownText(leaf)).append(" ")
+                    .append(hex(colorOf(leaf)))
+                    .append(" 斜体=").append(italicRaw(leaf))
+                    .append(" 加粗=").append(boldRaw(leaf)).append("}");
+        }
+        System.out.println(sb);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + label);
+        }
+    }
+}

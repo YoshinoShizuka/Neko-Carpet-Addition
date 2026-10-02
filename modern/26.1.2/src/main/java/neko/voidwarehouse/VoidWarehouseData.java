@@ -48,7 +48,7 @@ import java.util.Optional;
  * （{@code count = 1}，原版就不会在右下角渲染数字）。真实数量动辄大于一组、
  * 甚至远超一组的量级，画在格子里既不合理也会糊到隔壁格，所以格子只当图标用，
  * 真实数量与操作提示全部写在物品描述的 lore 上
- * （「数量：N / 左键：取出 1 个 / 右键：取出一组」）。展示堆叠是从 template
+ * （「数量：N / 左键：取出 1 个 / 右键：取出 64 个」）。展示堆叠是从 template
  * 复制出来的<b>另一个实例</b>，给它加 lore 永远不会污染仓库里的真品。</p>
  *
  * <h2>排列顺序：只取决于物品本身，与存取历史无关</h2>
@@ -201,7 +201,7 @@ public final class VoidWarehouseData extends SavedData {
          * 潜影盒模式的展示堆叠，缓存复用。
          *
          * <p>这里<b>不是</b>在普通说明后面追加几行 —— 而是换一套说明：盒模式下
-         * 「左键取出 1 个 / 右键取出一组」<b>根本不成立</b>（左键交出的是一整盒），
+         * 「左键取出 1 个 / 右键取出一整组」<b>根本不成立</b>（左键交出的是一整盒），
          * 留着它们既占地方又误导人。两套说明各自精简，行数都控制在 5 行以内。</p>
          */
         public ItemStack displayInBoxMode() {
@@ -248,8 +248,10 @@ public final class VoidWarehouseData extends SavedData {
                         + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST, VoidWarehouseText.COST));
             } else if (max > 1) {
                 lore.add(VoidWarehouseText.line("左键：取出 1 个", VoidWarehouseText.ACTION_RGB));
+                // 直接写数字而不是「1 组（64 个）」：玩家真正要读的是「右键给我多少个」，
+                // 括号里那个数字和「组」说的是同一件事，绕一道反而更慢。
                 lore.add(VoidWarehouseText.line(
-                        "右键：取出 1 组（" + max + " 个）", VoidWarehouseText.ACTION_RGB));
+                        "右键：取出 " + max + " 个", VoidWarehouseText.ACTION_RGB));
             } else {
                 // 不可堆叠物品（剑、工具…）左右键都是取 1 个，合成一行说，不重复两遍
                 lore.add(VoidWarehouseText.line("左键 / 右键：取出 1 个", VoidWarehouseText.ACTION_RGB));

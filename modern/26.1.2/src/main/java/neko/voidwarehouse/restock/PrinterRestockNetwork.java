@@ -141,9 +141,13 @@ public final class PrinterRestockNetwork {
             return;
         }
         String name = outcome.sample().getHoverName().getString();
-        String body = "取走 " + VoidWarehouseText.count(outcome.takenCount()) + " 个 " + name
-                + "，仓库剩余 " + VoidWarehouseText.count(outcome.remaining()) + " 个";
-        player.sendSystemMessage(VoidWarehouseText.info(body));
+        // 配色按玩家的口径：只有「取走了多少个」是这条消息里要跳出来的关键数字（亮绿），
+        // 其余——含「仓库还剩多少」——一律灰色。剩下的量是背景信息，亮着反而抢走注意力。
+        player.sendSystemMessage(VoidWarehouseText.info(
+                VoidWarehouseText.body("取走 ")
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(outcome.takenCount())))
+                        .append(VoidWarehouseText.body(" 个 " + name
+                                + "，仓库剩余 " + VoidWarehouseText.count(outcome.remaining()) + " 个"))));
     }
 
     /**

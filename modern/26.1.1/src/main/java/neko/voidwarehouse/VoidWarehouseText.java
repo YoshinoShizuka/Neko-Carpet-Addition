@@ -2,6 +2,7 @@ package neko.voidwarehouse;
 
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.chat.Style;
 
 import java.math.BigInteger;
@@ -38,6 +39,18 @@ import java.util.Locale;
  * <h2>为什么不再用「≈」</h2>
  * <p>「X 盒 X 组 X 个」是<b>精确换算</b>而不是估算（口径与 {@link VoidWarehouseShulker}
  * 的装盒逻辑完全一致），加约等于号反而让人以为数字不准。</p>
+ *
+ * <h2>全局：不加粗、不倾斜</h2>
+ * <p>玩家明确要求<b>所有提示文本都不要加粗和斜体</b>。这两个属性都得<b>显式摁成 false</b>
+ * 才作数，光「不设置」是没用的 —— 原版会在渲染前再合并一次样式：</p>
+ * <ul>
+ *   <li><b>lore</b>：{@code ItemLore.LORE_STYLE = DARK_PURPLE + italic(true)}；</li>
+ *   <li><b>物品名</b>：{@code CUSTOM_NAME_STYLE = italic(true)}。</li>
+ * </ul>
+ * <p>合并走 {@code ComponentUtils.mergeStyles} → {@code Style.applyTo}，
+ * 规则是「<b>自己设过（非 null）的字段赢，没设的就沿用对方的</b>」。
+ * 所以颜色只要我们自己设了就能保住，而斜体必须显式写 {@code false} 才不会被
+ * 原版的 {@code true} 顶掉。所有造文本的方法都统一加了这一句。</p>
  */
 public final class VoidWarehouseText {
     /** 核心数值：数量、盒 / 组 / 个换算 */
@@ -67,12 +80,29 @@ public final class VoidWarehouseText {
     /** 操作行（左键 / 右键）的青色：整行同色，和「数量」行形成明确的上下分层 */
     static final int ACTION_RGB = 0x55FFFF;
 
+    // ---- 聊天提示用的 RGB ----
+    // 玩家反馈「金色正文太炸、斜体不好读」，改成三段式：前缀抓眼 → 正文退后 → 关键数字跳出。
+
+    /** 聊天提示的 {@code [信息] } 前缀：亮金，一眼认出「这是虚空仓库在跟我说话」 */
+    static final int INFO_PREFIX_RGB = 0xFFD700;
+    /** 聊天提示正文：浅灰。前缀抓眼、正文退后，读起来是「谁在说 → 说了什么」 */
+    static final int INFO_BODY_RGB = 0xAAAAAA;
+    /** 聊天提示里的关键数字：亮绿。整条消息<b>只有</b>这类数字允许跳出来 */
+    static final int INFO_KEY_RGB = 0x55FF55;
+
     private VoidWarehouseText() {
     }
 
-    /** 任意 RGB 造一行 lore（原版 16 色枚举装不下全部需求） */
+    /**
+     * 任意 RGB 造一行 lore（原版 16 色枚举装不下全部需求）。
+     *
+     * <p><b>必须显式 {@code withItalic(false)}</b>：原版 {@code ItemLore.LORE_STYLE} 是
+     * {@code DARK_PURPLE + italic(true)}，经 {@code ComponentUtils.mergeStyles} 合并时
+     * 「自己没设的字段就用它的」—— 我们只设了颜色，斜体就漏成了 {@code true}。
+     * 想要正体只能自己摁死。</p>
+     */
     static Component line(String text, int rgb) {
-        return Component.literal(text).withStyle(Style.EMPTY.withColor(rgb));
+        return Component.literal(text).withStyle(Style.EMPTY.withColor(rgb).withItalic(false));
     }
 
     /**
@@ -83,36 +113,78 @@ public final class VoidWarehouseText {
      * 玩家找的是数字，标签只需要存在、不需要抢眼。</p>
      */
     static Component pair(String label, int labelRgb, String value, int valueRgb) {
-        return Component.literal(label).withStyle(Style.EMPTY.withColor(labelRgb))
-                .append(Component.literal(value).withStyle(Style.EMPTY.withColor(valueRgb)));
+        return Component.literal(label).withStyle(Style.EMPTY.withColor(labelRgb).withItalic(false))
+                .append(Component.literal(value)
+                        .withStyle(Style.EMPTY.withColor(valueRgb).withItalic(false)));
     }
 
-    /** 按语义造一行 lore */
+    /** 按语义造一行 lore（同样去斜体，理由见 {@link #line(String, int)}） */
     static Component line(String text, ChatFormatting style) {
-        return Component.literal(text).withStyle(style);
-    }
-
-    /** 物品名 / 图标名：{@code on} 决定用「开」还是「关」的颜色（null = 中性青色） */
-    static Component name(String text, Boolean on) {
-        ChatFormatting style = on == null ? FACT : (on ? ON : OFF);
-        return Component.literal(text).withStyle(style);
+        return Component.literal(text).withStyle(style)
+                .withStyle(Style.EMPTY.withItalic(false));
     }
 
     /**
-     * 聊天栏提示：{@code [信息] } 前缀（加粗金色）+ 金色正文。
+     * 物品名 / 图标名：{@code on} 决定用「开」还是「关」的颜色（null = 中性青色）。
+     *
+     * <p>去斜体在这里尤其重要：这些文本会被设成 {@code CUSTOM_NAME} 组件，而原版
+     * {@link net.minecraft.world.item.ItemStack#getStyledHoverName} 会拿
+     * {@code CUSTOM_NAME_STYLE}（{@code italic(true)}）去合并 —— 不摁死就会显示斜体。</p>
+     */
+    static Component name(String text, Boolean on) {
+        ChatFormatting style = on == null ? FACT : (on ? ON : OFF);
+        return Component.literal(text).withStyle(style)
+                .withStyle(Style.EMPTY.withItalic(false));
+    }
+
+    /**
+     * 聊天栏提示：亮金色 {@code [信息] } 前缀 + 灰色正文。<b>不加粗、不倾斜</b>。
      *
      * <p>统一带前缀是为了让玩家一眼分清「这是虚空仓库在跟我说话」，
      * 而不是自己或别人的聊天消息。</p>
+     *
+     * <p>配色是「前缀抓眼 → 正文退后」：前缀亮金负责吸引注意，正文浅灰不喧宾夺主。
+     * 正文里如果有关键数字（数量、上限…），用 {@link #body}/{@link #key} 拼好再走
+     * {@link #info(MutableComponent)}。</p>
+     *
+     * <p><b>为什么去掉加粗</b>：加粗会让整条消息糊成一坨，长句尤其难读；
+     * 而且前缀本身已经靠颜色区分开了，不需要再加一层强调。</p>
+     */
+    public static Component info(String body) {
+        return info(body(body));
+    }
+
+    /**
+     * 正文里混了关键数字的提示。
      *
      * <p>{@code public} 是因为 {@code neko.voidwarehouse.restock}（打印机补货）也在
      * 别的包外，它发的「取走多少 / 还剩多少」提示必须和仓库 UI 里那套前缀一致，
      * 各写各的迟早会分叉。</p>
      */
-    public static Component info(String body) {
+    public static Component info(MutableComponent body) {
         return Component.literal("[信息] ")
-                .withStyle(ChatFormatting.GOLD)
-                .withStyle(ChatFormatting.BOLD)
-                .append(Component.literal(body).withStyle(ChatFormatting.GOLD));
+                .withStyle(Style.EMPTY
+                        .withColor(INFO_PREFIX_RGB)
+                        .withItalic(false)
+                        .withBold(false))
+                .append(body);
+    }
+
+    /** 提示正文（非关键信息）：浅灰、正体 */
+    public static MutableComponent body(String text) {
+        return Component.literal(text)
+                .withStyle(Style.EMPTY.withColor(INFO_BODY_RGB).withItalic(false));
+    }
+
+    /**
+     * 提示里的关键数字：亮绿、正体。
+     *
+     * <p>整条消息里只有「玩家真正要读的那个数字」用这个 —— 比如取走的数量、
+     * 数量上限。滥用就失去了「一眼定位关键值」的作用。</p>
+     */
+    public static MutableComponent key(String text) {
+        return Component.literal(text)
+                .withStyle(Style.EMPTY.withColor(INFO_KEY_RGB).withItalic(false));
     }
 
     /** 千分位：一盒上千个、库存上亿，不分隔符没法一眼读出位数 */

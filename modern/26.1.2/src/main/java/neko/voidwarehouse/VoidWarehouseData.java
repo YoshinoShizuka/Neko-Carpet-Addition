@@ -244,8 +244,9 @@ public final class VoidWarehouseData extends SavedData {
                         "左键：交出 1 盒（" + VoidWarehouseText.count(capacity) + " 个）",
                         VoidWarehouseText.ACTION_RGB));
                 lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line("消耗：潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
-                        + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST, VoidWarehouseText.COST));
+                // 这里原先还有一行，写明装盒要额外消耗多少个潜影壳与箱子（红色）。玩家要求去掉：
+                // 物品格是「拿东西」的地方，代价那行挤进来只会让人以为「取这一份要额外掏材料」。
+                // 材料账本身没变，说明留在「潜影盒模式」开关那个图标的 tooltip 上（VoidWarehouseNav）。
             } else if (max > 1) {
                 lore.add(VoidWarehouseText.line("左键：取出 1 个", VoidWarehouseText.ACTION_RGB));
                 // 直接写数字而不是「1 组（64 个）」：玩家真正要读的是「右键给我多少个」，

@@ -83,12 +83,22 @@ public final class VoidWarehouseText {
     // ---- 聊天提示用的 RGB ----
     // 玩家反馈「金色正文太炸、斜体不好读」，改成三段式：前缀抓眼 → 正文退后 → 关键数字跳出。
 
-    /** 聊天提示的 {@code [信息] } 前缀：亮金，一眼认出「这是虚空仓库在跟我说话」 */
+    /** 聊天提示前缀：亮金，一眼认出「这是虚空仓库在跟我说话」 */
     static final int INFO_PREFIX_RGB = 0xFFD700;
     /** 聊天提示正文：浅灰。前缀抓眼、正文退后，读起来是「谁在说 → 说了什么」 */
     static final int INFO_BODY_RGB = 0xAAAAAA;
-    /** 聊天提示里的关键数字：亮绿。整条消息<b>只有</b>这类数字允许跳出来 */
+    /** 聊天提示里的关键数字：亮绿。整条消息里只有这类数字允许跳出来 */
     static final int INFO_KEY_RGB = 0x55FF55;
+
+    /** 默认前缀：方括号本身就把「谁在说话」和「说了什么」隔开了 */
+    public static final String INFO_PREFIX = "[信息] ";
+    /**
+     * 中键补货提示专用前缀。
+     *
+     * <p>玩家指定：中键从虚空仓库补货的那条提示，开头要直接写「虚空仓库」而不是泛泛的
+     * 「[信息]」—— 这条消息是自动、高频发的，玩家一眼得知道「是谁在给我东西」。</p>
+     */
+    public static final String RESTOCK_PREFIX = "虚空仓库 ";
 
     private VoidWarehouseText() {
     }
@@ -155,14 +165,23 @@ public final class VoidWarehouseText {
     }
 
     /**
-     * 正文里混了关键数字的提示。
+     * 正文里混了关键数字的提示（默认 {@code [信息] } 前缀）。
      *
-     * <p>{@code public} 是因为 {@code neko.voidwarehouse.restock}（打印机补货）也在
-     * 别的包外，它发的「取走多少 / 还剩多少」提示必须和仓库 UI 里那套前缀一致，
-     * 各写各的迟早会分叉。</p>
+     * <p>{@code public} 是因为 {@code neko.voidwarehouse.restock}（打印机补货）在别的包外，
+     * 它发的「取走多少 / 还剩多少」提示必须和仓库 UI 里那套配色一致，各写各的迟早会分叉。</p>
+     *
+     * @see #info(String, MutableComponent) 换前缀的版本（中键补货用「虚空仓库」）
      */
     public static Component info(MutableComponent body) {
-        return Component.literal("[信息] ")
+        return info(INFO_PREFIX, body);
+    }
+
+    /**
+     * 换前缀的聊天提示。中键补货走 {@link #RESTOCK_PREFIX}（「虚空仓库」），其余走默认的
+     * {@link #INFO_PREFIX}（「[信息]」）。
+     */
+    public static Component info(String prefix, MutableComponent body) {
+        return Component.literal(prefix)
                 .withStyle(Style.EMPTY
                         .withColor(INFO_PREFIX_RGB)
                         .withItalic(false)
@@ -174,6 +193,31 @@ public final class VoidWarehouseText {
     public static MutableComponent body(String text) {
         return Component.literal(text)
                 .withStyle(Style.EMPTY.withColor(INFO_BODY_RGB).withItalic(false));
+    }
+
+    /**
+     * 提示正文里夹一段<b>不能提前解析成字符串</b>的内容（目前只有物品名）。
+     *
+     * <p><b>为什么非要留成组件</b>：{@code ItemStack#getHoverName()} 拿到的是
+     * 「可翻译组件」（{@code {"translate":"block.minecraft.dirt"}}），它<b>必须由客户端
+     * 按自己的语言渲染</b>。一旦在服务端调 {@code getString()}，就会用<b>服务端的语言表</b>
+     * 当场解析：</p>
+     * <ul>
+     *   <li>单人存档：客户端和服务端在同一个 JVM 里，客户端启动时把语言表
+     *       「注入」进静态单例（{@code LanguageManager} → {@code Language.inject}），
+     *       所以服务端代码也拿到中文 → 显示「泥土」，看起来一切正常；</li>
+     *   <li><b>专用服务器</b>：没有客户端来注入，静态单例一直是启动时那份
+     *       {@code Language.loadDefault()}（读 {@code /assets/minecraft/lang/en_us.json}）
+     *       → 同一个 {@code getString()} 解析成「dirt」，玩家在中文客户端上也只能看到英文。</li>
+     * </ul>
+     * <p>所以这里只做「套上正文颜色」，内容原样保留为组件，让本地化发生在客户端。</p>
+     *
+     * <p>{@code copy()} 一定会返回可变的 {@link MutableComponent}（内容、子片段、样式都带过来），
+     * 然后把样式<b>整个覆盖</b>成「正文灰 + 正体」—— 物品名自身可能带的样式（改过名的物品）
+     * 在这条提示里不该冒出来，统一成正文的样子最好读。</p>
+     */
+    public static MutableComponent body(Component text) {
+        return text.copy().setStyle(Style.EMPTY.withColor(INFO_BODY_RGB).withItalic(false));
     }
 
     /**

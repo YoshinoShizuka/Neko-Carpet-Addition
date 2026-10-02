@@ -1,0 +1,565 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import io.netty.buffer.Unpooled;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.locale.Language;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.ComponentSerialization;
+import net.minecraft.network.chat.FormattedText;
+import net.minecraft.network.chat.Style;
+import net.minecraft.network.chat.contents.TranslatableContents;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.FormattedCharSequence;
+import net.minecraft.util.FormattedCharSink;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemLore;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+import neko.voidwarehouse.restock.PrinterRestockNetwork;
+import neko.voidwarehouse.restock.PrinterTakeResultPayload;
+import neko.voidwarehouse.restock.PrinterTakeService;
+
+/**
+ * 【临时自检】本轮三件事。验证完删掉。
+ *
+ * <ol>
+ *   <li><b>盒模式物品格去掉「消耗：潜影壳 ×2 + 箱子 ×1」那行；</b></li>
+ *   <li><b>中键补货提示</b>：前缀 {@code [信息] } → {@code 虚空仓库 }；
+ *       「仓库剩余 X 个」的 X 也从灰改成亮绿；</li>
+ *   <li><b>修 bug</b>：专用服务器上物品名被解析成英文（泥土 → dirt）。</li>
+ * </ol>
+ *
+ * <h2>第 3 条为什么是那样修的（本自检的核心）</h2>
+ * <p>{@code ItemStack#getHoverName()} 返回的是「可翻译组件」（{@code {"translate":"block.minecraft.dirt"}}）。
+ * 旧代码在服务端 {@code .getString()}，等于用<b>服务端那一份</b>
+ * {@code net.minecraft.locale.Language} 静态单例当场解析：</p>
+ * <ul>
+ *   <li>单人存档：客户端与服务端同进程，{@code LanguageManager} 启动时
+ *       {@code Language.inject(客户端语言表)} 把单例换成了中文 → 服务端也算出「泥土」，看着正常；</li>
+ *   <li>专用服务器：没人注入，单例一直是 {@code Language.loadDefault()}
+ *       （读 {@code /assets/minecraft/lang/en_us.json}）→ 同一个 getString() 得到 "Dirt"。</li>
+ * </ul>
+ * <p>所以修法是「保持组件原样发出去，让客户端本地化」。本自检把这条链路完整钉住：</p>
+ * <ul>
+ *   <li>D1 取证：本进程（专用服务端）的 Language 单例就是 {@code DEFAULT_INSTANCE}，
+ *       旧写法解析出的是英文 —— <b>离线复现玩家的现象</b>；</li>
+ *   <li>D2 修复：新消息里物品名仍是 {@code TranslatableContents}，key 完好；</li>
+ *   <li>D3 网络往返：过一遍 {@code ComponentSerialization.STREAM_CODEC} 后仍是可翻译组件；</li>
+ *   <li>D4 <b>端到端</b>：往 Language 里注入一张「把 block.minecraft.dirt 翻成 泥土」的假中文表，
+ *       再走原版渲染链路（{@code getVisualOrderText()} → 逐字符的有效样式），
+ *       屏幕上那句话真的变成了「泥土」—— 这才叫「客户端能按自己的语言渲染」；</li>
+ *   <li>D5 反证：拿旧写法（先 getString 再拼字符串）造的同款消息，注入假中文表后<b>仍是 dirt</b>
+ *       —— 证明 D4 的成功不是假象。</li>
+ * </ul>
+ */
+public final class VoidWarehouseRestockSelfCheck {
+
+    // ---- 新配色（与 VoidWarehouseText 里的常量一一对应）----
+    private static final int PREFIX_RGB = 0xFFD700;
+    private static final int BODY_RGB = 0xAAAAAA;
+    private static final int KEY_RGB = 0x55FF55;
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private VoidWarehouseRestockSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        try {
+            boxLoreChecks(server);
+            navReverseProof();
+            resendMessageChecks(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT vw-restock/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ================================================================ A 组：盒模式物品格
+
+    private static void boxLoreChecks(MinecraftServer server) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+
+        VoidWarehouseData.Entry cobble = entryOf(data, Items.COBBLESTONE);
+        check("圆石那一格存在", cobble != null);
+        if (cobble == null) {
+            return;
+        }
+
+        List<Component> box = loreOf(cobble.displayInBoxMode());
+        dump("box  ", box);
+        // 数量行 + 换算行（「1 组」）+ 左键行 + 右键行
+        check("盒模式一共 4 行（原先是 5 行，少掉的正是「消耗」那行）", box.size() == 4);
+        check("盒模式里没有任何一行提到「消耗」", !anyContains(box, "消耗"));
+        check("盒模式里也没有「潜影壳 ×」的字样", !anyContains(box, "潜影壳 ×"));
+        check("盒模式保留「左键：交出 1 盒（1,728 个）」",
+                box.size() > 2 && box.get(box.size() - 2).getString().equals("左键：交出 1 盒（1,728 个）"));
+        check("盒模式保留「右键：按数量取货」",
+                !box.isEmpty() && box.get(box.size() - 1).getString().equals("右键：按数量取货"));
+        check("盒模式每行都不是斜体",
+                box.stream().noneMatch(VoidWarehouseRestockSelfCheck::italicAfterVanillaMerge));
+
+        List<Component> plain = loreOf(cobble.display());
+        dump("plain", plain);
+        check("普通模式仍是 4 行", plain.size() == 4);
+        check("普通模式也没有「消耗」行", !anyContains(plain, "消耗"));
+        check("普通模式右键行仍是「右键：取出 64 个」",
+                !plain.isEmpty() && plain.get(plain.size() - 1).getString().equals("右键：取出 64 个"));
+    }
+
+    /**
+     * <b>反证组</b>：证明 {@code anyContains(list, "消耗")} 这个方法是有牙的。
+     *
+     * <p>「潜影盒模式」开关那个图标的 tooltip <b>仍然保留</b>材料账（玩家只要求去掉物品格上那行），
+     * 所以用它当阳性对照：如果 {@code anyContains} 被写坏了（永远返回 false），
+     * A 组会全绿而这里会挂。</p>
+     */
+    private static void navReverseProof() {
+        try {
+            Method m = VoidWarehouseNav.class.getDeclaredMethod("shulkerToggle", boolean.class);
+            m.setAccessible(true);
+            ItemStack stack = (ItemStack) m.invoke(null, true);
+            List<Component> lore = loreOf(stack);
+            dump("nav  ", lore);
+            check("反证：潜影盒模式开关的 tooltip 仍含「消耗」（说明 anyContains 有牙）",
+                    anyContains(lore, "消耗"));
+            check("反证：它还写着潜影壳 ×2", anyContains(lore, "潜影壳 ×2"));
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 反射调用 VoidWarehouseNav.shulkerToggle 失败: " + t);
+            t.printStackTrace(System.out);
+        }
+    }
+
+    // ================================================================ B/C/D 组：中键补货提示
+
+    private static void resendMessageChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        CapturingPlayer player = null;
+        try {
+            player = new CapturingPlayer(server, level,
+                    new GameProfile(UUID.randomUUID(), "NekoRestockSelfCheck"),
+                    ClientInformation.createDefault());
+        } catch (Throwable t) {
+            System.out.println("   假玩家构造失败: " + t);
+        }
+        check("假玩家构造成功", player != null);
+        if (player == null) {
+            return;
+        }
+
+        ItemStack dirt = new ItemStack(Items.DIRT);
+        try {
+            Method m = PrinterRestockNetwork.class.getDeclaredMethod(
+                    "notifyTaken", ServerPlayer.class, PrinterTakeService.TakeOutcome.class);
+            m.setAccessible(true);
+            m.invoke(null, player, new PrinterTakeService.TakeOutcome(
+                    PrinterTakeResultPayload.OK, 64, BigInteger.valueOf(1234), dirt));
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! notifyTaken 反射调用失败: " + t);
+            t.printStackTrace(System.out);
+            return;
+        }
+
+        Component msg = player.last;
+        check("中键取货确实发了一条消息", msg != null);
+        if (msg == null) {
+            return;
+        }
+        dumpOne("take ", msg);
+
+        // ---------------------------------------------------------- B 组：前缀
+        Component prefix = firstLeaf(msg);
+        check("取货提示前缀文本 = 「虚空仓库 」", ownText(prefix).equals("虚空仓库 "));
+        check("反证：前缀不再是「[信息] 」", !ownText(prefix).equals("[信息] "));
+        check("取货提示前缀 = 亮金 #FFD700", colorOf(prefix) == PREFIX_RGB);
+        noStyle("取货提示前缀", prefix);
+
+        // ---------------------------------------------------------- C 组：两个数字都亮绿
+        Component taken = leafWith(msg, "64");
+        check("取货提示里有「64」这一段（单独成段，不是混在一整句里）", taken != null);
+        if (taken != null) {
+            check("「取走 64」的 64 = 亮绿 #55FF55", colorOf(taken) == KEY_RGB);
+        }
+        Component remaining = leafWith(msg, "1,234");
+        check("取货提示里有「1,234」这一段", remaining != null);
+        if (remaining != null) {
+            check("「仓库剩余 1,234」的 1,234 = 亮绿 #55FF55（本轮改成亮绿）",
+                    colorOf(remaining) == KEY_RGB);
+            check("反证：剩余数量不再是灰 #AAAAAA", colorOf(remaining) != BODY_RGB);
+        }
+        for (Component leaf : leaves(msg)) {
+            noStyle("取货提示片段「" + ownText(leaf) + "」", leaf);
+        }
+
+        // ---------------------------------------------------------- D 组：物品名不被提前解析
+        itemNameChecks(server, msg, dirt);
+    }
+
+    private static void itemNameChecks(MinecraftServer server, Component msg, ItemStack dirt) {
+        // ---- D1 取证：服务端那份语言表是 en_us，旧写法必然得到英文 ----
+        Language lang = Language.getInstance();
+        System.out.println("   [diag] Language.getInstance() == DEFAULT_INSTANCE ? "
+                + (lang == Language.DEFAULT_INSTANCE));
+        System.out.println("   [diag] getOrDefault(block.minecraft.dirt) = '"
+                + lang.getOrDefault("block.minecraft.dirt") + "'");
+
+        String oldWay = dirt.getHoverName().getString();
+        System.out.println("   [diag] 旧写法 getHoverName().getString() = '" + oldWay + "'");
+        check("反证：旧写法在这个进程里解析不出中文", !oldWay.equals("泥土"));
+        if (Language.getInstance().has("block.minecraft.dirt")) {
+            check("反证：服务端语言表就是 en_us，旧写法输出英文 dirt（玩家在服务器上看到的那一幕）",
+                    oldWay.equalsIgnoreCase("dirt"));
+        } else {
+            check("反证：语言表没加载时旧写法输出的是未翻译的 key",
+                    oldWay.equals("block.minecraft.dirt"));
+        }
+
+        // ---- D2 新写法：物品名仍是可翻译组件 ----
+        TranslatableContents tr = findTranslatable(msg, "block.minecraft.dirt");
+        check("聊天提示里的物品名保持为可翻译组件（key = block.minecraft.dirt）", tr != null);
+
+        // ---- D3 网络往返后依然是可翻译组件 ----
+        try {
+            RegistryFriendlyByteBuf buf =
+                    new RegistryFriendlyByteBuf(Unpooled.buffer(), server.registryAccess());
+            ComponentSerialization.STREAM_CODEC.encode(buf, msg);
+            Component back = ComponentSerialization.STREAM_CODEC.decode(buf);
+            check("网络往返后没有残留字节", buf.readableBytes() == 0);
+            check("网络往返后物品名仍是可翻译组件", findTranslatable(back, "block.minecraft.dirt") != null);
+            check("网络往返后前缀颜色不变", colorOf(firstLeaf(back)) == PREFIX_RGB);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 组件网络往返失败: " + t);
+            t.printStackTrace(System.out);
+        }
+
+        // ---- D4 端到端：注入一张「dirt → 泥土」的假中文表，走真实渲染链路 ----
+        String oldWayMsgText = null;
+        try {
+            Language.inject(new FakeChineseLanguage());
+            Render now = render(msg);
+            String nowText = now.text();
+            System.out.println("   [diag] 注入中文语言表后渲染: '" + nowText + "'");
+            check("注入中文语言表后，整句以「虚空仓库 」开头", nowText.startsWith("虚空仓库 "));
+            check("注入中文语言表后，物品名真的渲染成「泥土」", nowText.contains("泥土"));
+            check("注入中文语言表后，「泥土」那一段的颜色是正文灰 #AAAAAA",
+                    allColorsAre(now, "泥土", BODY_RGB));
+            check("注入中文语言表后，「泥土」那一段不是斜体", allUpright(now, "泥土"));
+            check("注入中文语言表后，「64」仍是亮绿", allColorsAre(now, "64", KEY_RGB));
+            check("注入中文语言表后，「1,234」也是亮绿", allColorsAre(now, "1,234", KEY_RGB));
+            check("注入中文语言表后，没有出现英文 dirt",
+                    !nowText.toLowerCase().contains("dirt"));
+
+            // ---- D5 反证：旧写法（先 getString 再拼字符串）换成中文语言表也救不回来 ----
+            Component oldMsg = VoidWarehouseText.info(VoidWarehouseText.RESTOCK_PREFIX,
+                    VoidWarehouseText.body("取走 " + 64 + " 个 " + oldWay
+                            + "，仓库剩余 1,234 个"));
+            oldWayMsgText = render(oldMsg).text();
+            System.out.println("   [diag] 旧写法那版消息（同样注入中文语言表）渲染: '"
+                    + oldWayMsgText + "'");
+            check("反证：旧写法那版消息里根本没有可翻译组件（findTranslatable 有牙）",
+                    findTranslatable(oldMsg, "block.minecraft.dirt") == null);
+            check("反证：旧写法那版消息换成中文语言表后仍然不是「泥土」",
+                    !oldWayMsgText.contains("泥土"));
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 语言表注入 / 渲染失败: " + t);
+            t.printStackTrace(System.out);
+        } finally {
+            Language.inject(Language.DEFAULT_INSTANCE);
+        }
+        System.out.println("   [diag] 恢复后 getOrDefault(block.minecraft.dirt) = '"
+                + Language.getInstance().getOrDefault("block.minecraft.dirt") + "'");
+        check("语言表单例已还原成 DEFAULT_INSTANCE", Language.getInstance() == Language.DEFAULT_INSTANCE);
+    }
+
+    /**
+     * 把 {@code block.minecraft.dirt} 翻成「泥土」的假语言表，其余全部委托给真实的默认表。
+     *
+     * <p>它不是「模拟」：{@code TranslatableContents} 解析走的正是
+     * {@code Language.getInstance().getOrDefault(...)}，注入之后这条链路真的会拿到「泥土」。</p>
+     */
+    private static final class FakeChineseLanguage extends Language {
+        @Override
+        public String getOrDefault(String key, String fallback) {
+            if (key.equals("block.minecraft.dirt")) {
+                return "泥土";
+            }
+            return Language.DEFAULT_INSTANCE.getOrDefault(key, fallback);
+        }
+
+        @Override
+        public boolean has(String key) {
+            return key.equals("block.minecraft.dirt") || Language.DEFAULT_INSTANCE.has(key);
+        }
+
+        @Override
+        public boolean isDefaultRightToLeft() {
+            return false;
+        }
+
+        @Override
+        public FormattedCharSequence getVisualOrder(FormattedText text) {
+            return Language.DEFAULT_INSTANCE.getVisualOrder(text);
+        }
+    }
+
+    /** 一整条消息走过原版渲染链路后的结果：文字 + 每个字符的<b>有效</b>样式 */
+    private static final class Render {
+        final StringBuilder buf = new StringBuilder();
+        final List<Style> styles = new ArrayList<>();
+
+        String text() {
+            return this.buf.toString();
+        }
+
+        int indexOf(String needle) {
+            return this.buf.indexOf(needle);
+        }
+    }
+
+    /**
+     * 走原版渲染链路：{@code getVisualOrderText()} 用的是
+     * {@code Language#getVisualOrder(FormattedText)}，而 {@code Component#visit} 会把父样式
+     * 逐层合并下传（{@code 自己的非 null 字段赢，没设的沿用父级}）。
+     * 所以拿到的每个字符的样式，就是玩家肉眼看到的那一份。
+     */
+    private static Render render(Component c) {
+        Render r = new Render();
+        FormattedCharSequence seq = c.getVisualOrderText();
+        FormattedCharSink sink = (index, style, codepoint) -> {
+            r.buf.appendCodePoint(codepoint);
+            r.styles.add(style);
+            return true;
+        };
+        seq.accept(sink);
+        return r;
+    }
+
+    private static boolean allColorsAre(Render r, String needle, int rgb) {
+        int at = r.indexOf(needle);
+        if (at < 0) {
+            return false;
+        }
+        for (int i = at; i < at + needle.length(); i++) {
+            Style s = r.styles.get(i);
+            if (s.getColor() == null || s.getColor().getValue() != rgb) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean allUpright(Render r, String needle) {
+        int at = r.indexOf(needle);
+        if (at < 0) {
+            return false;
+        }
+        for (int i = at; i < at + needle.length(); i++) {
+            if (r.styles.get(i).isItalic()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 覆写 sendSystemMessage 的假玩家：把消息接住，不真的发包 */
+    private static final class CapturingPlayer extends ServerPlayer {
+        private Component last;
+
+        CapturingPlayer(MinecraftServer server, ServerLevel level, GameProfile profile,
+                        ClientInformation info) {
+            super(server, level, profile, info);
+        }
+
+        @Override
+        public void sendSystemMessage(Component message) {
+            this.last = message;
+        }
+    }
+
+    // ================================================================ 工具
+
+    private static VoidWarehouseData.Entry entryOf(VoidWarehouseData data, Item item) {
+        for (int i = 0; i < VoidWarehouseData.TOTAL_SLOTS; i++) {
+            VoidWarehouseData.Entry e = data.entryAt(i);
+            if (e != null && e.template().getItem() == item) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    private static List<Component> loreOf(ItemStack stack) {
+        ItemLore lore = stack.get(DataComponents.LORE);
+        return lore == null ? List.of() : lore.lines();
+    }
+
+    private static boolean anyContains(List<Component> lines, String needle) {
+        for (Component c : lines) {
+            if (c.getString().contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<Component> leaves(Component c) {
+        List<Component> out = new ArrayList<>();
+        collect(c, out);
+        return out;
+    }
+
+    private static void collect(Component c, List<Component> out) {
+        out.add(c);
+        for (Component s : c.getSiblings()) {
+            collect(s, out);
+        }
+    }
+
+    /** 这一片叶子<b>自己的</b>文本（{@code getString()} 会把子孙的文本一起拼进来，不能用来定位） */
+    private static String ownText(Component c) {
+        if (c.getContents() instanceof net.minecraft.network.chat.contents
+                .PlainTextContents.LiteralContents literal) {
+            return literal.text();
+        }
+        return c.getString();
+    }
+
+    private static Component firstLeaf(Component c) {
+        return leaves(c).get(0);
+    }
+
+    private static Component leafWith(Component c, String text) {
+        for (Component leaf : leaves(c)) {
+            if (ownText(leaf).equals(text)) {
+                return leaf;
+            }
+        }
+        return null;
+    }
+
+    /** 在整棵组件树里找 key 匹配的可翻译组件 */
+    private static TranslatableContents findTranslatable(Component c, String key) {
+        for (Component leaf : leaves(c)) {
+            if (leaf.getContents() instanceof TranslatableContents t && t.getKey().equals(key)) {
+                return t;
+            }
+        }
+        return null;
+    }
+
+    private static int colorOf(Component c) {
+        var color = c.getStyle().getColor();
+        return color == null ? -1 : color.getValue();
+    }
+
+    private static String hex(int rgb) {
+        return rgb < 0 ? "(无色)" : String.format("#%06X", rgb);
+    }
+
+    private static void noStyle(String label, Component c) {
+        check(label + " 斜体显式为 false（不是 null）", italicRaw(c) == Boolean.FALSE);
+        check(label + " 加粗不是 TRUE", boldRaw(c) != Boolean.TRUE);
+    }
+
+    private static Boolean italicRaw(Component c) {
+        return styleField(c, "italic");
+    }
+
+    private static Boolean boldRaw(Component c) {
+        return styleField(c, "bold");
+    }
+
+    private static Boolean styleField(Component c, String name) {
+        try {
+            Field f = Style.class.getDeclaredField(name);
+            f.setAccessible(true);
+            return (Boolean) f.get(c.getStyle());
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 读 Style." + name + " 失败: " + t);
+            return null;
+        }
+    }
+
+    /** 按原版 ItemLore.LORE_STYLE（深紫 + 斜体 true）合并后是否仍是斜体 */
+    private static boolean italicAfterVanillaMerge(Component c) {
+        try {
+            Field f = ItemLore.class.getDeclaredField("LORE_STYLE");
+            f.setAccessible(true);
+            Style loreStyle = (Style) f.get(null);
+            return net.minecraft.network.chat.ComponentUtils.mergeStyles(c, loreStyle)
+                    .getStyle().isItalic();
+        } catch (Throwable t) {
+            System.out.println("   [diag] 取 LORE_STYLE 失败: " + t);
+            return true;
+        }
+    }
+
+    private static void dump(String tag, List<Component> lore) {
+        for (int i = 0; i < lore.size(); i++) {
+            Component c = lore.get(i);
+            StringBuilder sb = new StringBuilder();
+            sb.append("   [").append(tag).append(" ").append(i).append("] '")
+                    .append(c.getString()).append("'");
+            List<Component> parts = leaves(c);
+            if (parts.size() > 1) {
+                sb.append("  段=").append(parts.size());
+                for (Component p : parts) {
+                    sb.append("  {").append(ownText(p)).append(" ").append(hex(colorOf(p)))
+                            .append("}");
+                }
+            } else {
+                sb.append("  ").append(hex(colorOf(c)));
+            }
+            sb.append("  斜体=").append(italicRaw(c));
+            System.out.println(sb);
+        }
+    }
+
+    private static void dumpOne(String tag, Component c) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("   [").append(tag).append("] '").append(c.getString()).append("'");
+        for (Component leaf : leaves(c)) {
+            sb.append("\n        {").append(ownText(leaf)).append(" ").append(hex(colorOf(leaf)))
+                    .append(" 斜体=").append(italicRaw(leaf))
+                    .append(" 加粗=").append(boldRaw(leaf)).append("}");
+        }
+        System.out.println(sb);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + label);
+        }
+    }
+}

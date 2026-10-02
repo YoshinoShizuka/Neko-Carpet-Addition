@@ -2,6 +2,8 @@ package neko.voidwarehouse;
 
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.DyeColor;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemContainerContents;
@@ -22,12 +24,17 @@ import java.util.List;
  * <h2>换算规则（原版配方）</h2>
  * <pre>
  *   1 个潜影盒 = 2 个潜影壳 + 1 个箱子
+ *   1 个染色潜影盒 = 2 个潜影壳 + 1 个箱子 + 1 个对应颜色的染料
  *   1 盒能装 = 27 格 × 该物品的堆叠上限
  *              （圆石这类 64 → 1728；末影珍珠这类 16 → 432；床这类 1 → 27）
  * </pre>
  * <p>所以「取出 1 个装满圆石的潜影盒」= 扣 1728 个圆石 + 2 个潜影壳 + 1 个箱子；
  * 「存入 1 个装着 3 种东西的潜影盒」= 加那 3 种物品各自的真实数量 + 2 个潜影壳 + 1 个箱子。
  * 两个方向都严格守恒，不多不少。</p>
+ *
+ * <p><b>染色盒的染料也要还</b>：原版里染色盒是「任意潜影盒 + 1 个对应染料」合成的，
+ * 所以拆一个染色盒必须吐出 {@code 2 壳 + 1 箱 + 1 染料} —— 只还壳和箱等于把玩家那个
+ * 染料吞了。见 {@link #dyeOf(ItemStack)}。</p>
  *
  * <h2>识别</h2>
  * <p>26.3 里没有 {@code ShulkerBoxItem} 这个类，潜影盒是 <b>普通 {@code BlockItem}</b>
@@ -44,6 +51,9 @@ public final class VoidWarehouseShulker {
     /** 合成 1 个潜影盒需要的箱子数量（原版配方） */
     public static final int CHEST_COST = 1;
 
+    /** 合成 1 个<i>染色</i>潜影盒需要的染料数量（原版配方：染色盒 = 潜影盒 + 1 染料） */
+    public static final int DYE_COST = 1;
+
     private VoidWarehouseShulker() {
     }
 
@@ -59,6 +69,65 @@ public final class VoidWarehouseShulker {
         }
         return stack.getItem() instanceof BlockItem blockItem
                 && blockItem.getBlock() instanceof ShulkerBoxBlock;
+    }
+
+    /**
+     * 这个盒子的颜色；<b>无色盒返回 {@code null}</b>。
+     *
+     * <p>颜色记在<b>方块</b>上（{@link ShulkerBoxBlock#getColor()}），物品只是个
+     * {@code BlockItem}，所以要从方块反查。</p>
+     */
+    public static DyeColor colorOf(ItemStack box) {
+        if (box == null || box.isEmpty()) {
+            return null;
+        }
+        return box.getItem() instanceof BlockItem blockItem
+                && blockItem.getBlock() instanceof ShulkerBoxBlock shulker
+                ? shulker.getColor() : null;
+    }
+
+    /**
+     * 拆解这个盒子时应当<b>归还的染料</b>（无色盒返回 {@link ItemStack#EMPTY}）。
+     *
+     * <p>原版配方是「任意潜影盒 + 1 个对应染料 → 染色盒」，所以拆染色盒时除了
+     * {@code 2 壳 + 1 箱} 还得把那个染料吐回来。少了这一步，玩家每存一次染色盒就
+     * 平白少一个染料 —— 而仓库对外承诺的是「拆开 = 逆向合成、严格守恒」。</p>
+     *
+     * <p>这个版本里 16 种染料还是<b>各自独立的 {@code Items} 字段</b>（{@code Items.RED_DYE}…），
+     * 26.2 起才统一收进 {@code ColorCollection}（{@code Items.DYE.pick(color)}），
+     * 所以这里枚举一遍。</p>
+     */
+    public static ItemStack dyeOf(ItemStack box) {
+        DyeColor color = colorOf(box);
+        return color == null ? ItemStack.EMPTY : new ItemStack(dyeItem(color), DYE_COST);
+    }
+
+    /**
+     * 颜色 → 染料物品。
+     *
+     * <p>{@link DyeColor} 的 16 个常量与 {@code Items} 里的 16 个染料字段一一对应，
+     * 但字段名是「颜色名 + _DYE」，只能用 {@code switch} 显式列出来 —— 拿枚举名拼字符串
+     * 再用反射查字段，拼错了要等运行期才知道，不值得。</p>
+     */
+    private static Item dyeItem(DyeColor color) {
+        return switch (color) {
+            case WHITE -> Items.WHITE_DYE;
+            case ORANGE -> Items.ORANGE_DYE;
+            case MAGENTA -> Items.MAGENTA_DYE;
+            case LIGHT_BLUE -> Items.LIGHT_BLUE_DYE;
+            case YELLOW -> Items.YELLOW_DYE;
+            case LIME -> Items.LIME_DYE;
+            case PINK -> Items.PINK_DYE;
+            case GRAY -> Items.GRAY_DYE;
+            case LIGHT_GRAY -> Items.LIGHT_GRAY_DYE;
+            case CYAN -> Items.CYAN_DYE;
+            case PURPLE -> Items.PURPLE_DYE;
+            case BLUE -> Items.BLUE_DYE;
+            case BROWN -> Items.BROWN_DYE;
+            case GREEN -> Items.GREEN_DYE;
+            case RED -> Items.RED_DYE;
+            case BLACK -> Items.BLACK_DYE;
+        };
     }
 
     /** 一盒装满能装多少个「这种物品」 */

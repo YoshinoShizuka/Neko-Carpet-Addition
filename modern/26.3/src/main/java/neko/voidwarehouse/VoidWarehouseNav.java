@@ -134,18 +134,22 @@ final class VoidWarehouseNav {
      * 潜影盒模式开关。
      *
      * <p>图标固定是潜影盒，开 / 关只体现在名字颜色和说明文字里，所以位置和图形完全不跳。
-     * 说明只留「现在是什么模式 / 一盒多大 / 要点什么代价 / 什么情况会被拒」这四件事，
+     * 说明只留「现在是什么模式 / 要点什么代价 / 什么情况会被拒」这三件事，
      * 每件事一行，不再把边界说明和「怎么切换」重复写两遍。</p>
+     *
+     * <p><b>不再写「1 盒 = 27 格 × 堆叠上限」那条换算</b>（玩家要求去掉）：潜影盒本来
+     * 就是 27 格，玩家自己数得出来；把「圆石 1,728」这种算例摆在开关上，既占一行，
+     * 又容易让人以为「这个数字是这个模式特有的规矩」。想知道具体能装多少，看物品格
+     * 上那行换算（{@code VoidWarehouseData#buildDisplay} 的 {@code 「N 盒 M 组 K 个」}）就够。</p>
      */
     private static ItemStack shulkerToggle(boolean on) {
         ItemStack stack = new ItemStack(Items.SHULKER_BOX);
         stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.name("潜影盒模式：" + (on ? "开" : "关"), on));
-        List<Component> lore = new ArrayList<>(5);
+        List<Component> lore = new ArrayList<>(4);
         // 当前模式
         lore.add(VoidWarehouseText.line(
                 on ? "取出改为交出「装满的潜影盒」" : "当前：按普通方式取出", VoidWarehouseText.FACT));
-        // 一盒多大（圆石 1728 是玩家最熟悉的参照，写出来比只给公式好读）
-        lore.add(VoidWarehouseText.line("1 盒 = 27 格 × 堆叠上限（圆石 1,728 个）", VoidWarehouseText.FACT));
+        // 一盒多大的换算行按玩家要求去掉了（见方法 javadoc）
         // 代价
         lore.add(VoidWarehouseText.line("消耗：潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
                 + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST + "（优先用空盒）", VoidWarehouseText.COST));

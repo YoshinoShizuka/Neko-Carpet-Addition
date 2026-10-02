@@ -1,0 +1,273 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.item.DyeColor;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemContainerContents;
+import net.minecraft.world.item.component.ItemLore;
+
+import java.lang.reflect.Method;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 【临时自检】本轮两件事。验证完删掉。
+ *
+ * <ol>
+ *   <li><b>潜影盒模式开关的说明去掉「1 盒 = 27 格 × 堆叠上限（圆石 1,728 个）」那一行；</b></li>
+ *   <li><b>修 bug：染色潜影盒入库拆包时，染料必须一起归还</b>（原先只吐 2 壳 + 1 箱）。</li>
+ * </ol>
+ *
+ * <h2>第 2 条为什么要专门测「颜色对得上」</h2>
+ * <p>26.3 把 16 种染料收进了 {@code ColorCollection}（{@code Items.DYE}），
+ * 用 {@code pick(DyeColor)} 取色。这里有个很容易写错的地方：<b>颜色和物品的对应关系</b>。
+ * 如果只断言「有染料入库了」，那么把红色盒吐成蓝色染料也能过。所以本自检对
+ * <b>16 种颜色逐个</b>校验「盒子注册名 → 染料注册名」同色（{@code red_shulker_box → red_dye}），
+ * 这样 {@code pick} 取错色、或者 {@code DyeColor} 与 {@code ColorCollection} 顺序错位，
+ * 都会当场挂掉。</p>
+ *
+ * <p>另外配了三条反证，保证断言不是空转：</p>
+ * <ul>
+ *   <li>无色盒拆包<b>不许</b>产生任何染料（否则「有染料」这条断言没有区分力）；</li>
+ *   <li>空染色盒整盒入库、<b>不拆</b>（壳 / 箱 / 染料一个都不许出现）；</li>
+ *   <li>{@code anyContains} 拿一条手工造的、确实含「1 盒」的文本必须判真
+ *       （否则 A 组「不含 1 盒」是永远为真的废话）。</li>
+ * </ul>
+ */
+public final class VoidWarehouseDyeSelfCheck {
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private VoidWarehouseDyeSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        try {
+            navLoreChecks();
+            dyeMappingChecks();
+            unpackChecks(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT vw-dye/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ================================================================ A 组：潜影盒模式开关的说明
+
+    private static void navLoreChecks() {
+        try {
+            Method m = VoidWarehouseNav.class.getDeclaredMethod("shulkerToggle", boolean.class);
+            m.setAccessible(true);
+            for (boolean on : new boolean[]{true, false}) {
+                ItemStack stack = (ItemStack) m.invoke(null, on);
+                List<Component> lore = loreOf(stack);
+                dump("nav" + (on ? "-on " : "-off"), lore);
+                String tag = "潜影盒模式(" + (on ? "开" : "关") + ")的说明";
+                check(tag + " 不再有「1 盒」", !anyContains(lore, "1 盒"));
+                check(tag + " 不再有「27 格」", !anyContains(lore, "27 格"));
+                check(tag + " 不再有「1,728」", !anyContains(lore, "1,728"));
+                check(tag + " 不再有「堆叠上限」", !anyContains(lore, "堆叠上限"));
+                // 反证：材料账那行还在 —— 说明 anyContains 真的在扫这些行，不是空转
+                check("反证：" + tag + " 仍写着「消耗：潜影壳 ×2」（anyContains 有牙）",
+                        anyContains(lore, "消耗：潜影壳 ×2"));
+                check(tag + " 行数 = " + (on ? 4 : 3) + "（开：模式/代价/边界/切换）",
+                        lore.size() == (on ? 4 : 3));
+            }
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 反射调用 VoidWarehouseNav.shulkerToggle 失败: " + t);
+            t.printStackTrace(System.out);
+        }
+
+        // 反证 2：anyContains 对一条确实含「1 盒」的文本必须判真
+        List<Component> fake = List.of(VoidWarehouseText.line(
+                "1 盒 = 27 格 × 堆叠上限（圆石 1,728 个）", VoidWarehouseText.FACT));
+        check("反证：anyContains 对含「1 盒」的文本判真", anyContains(fake, "1 盒"));
+        check("反证：anyContains 对不含「1 盒」的文本判假", !anyContains(List.of(
+                VoidWarehouseText.line("消耗：潜影壳 ×2", VoidWarehouseText.COST)), "1 盒"));
+    }
+
+    // ================================================================ B 组：颜色 → 染料 映射
+
+    private static void dyeMappingChecks() {
+        ItemStack plain = new ItemStack(Items.SHULKER_BOX);
+        check("无色盒被认成潜影盒", VoidWarehouseShulker.isShulkerBox(plain));
+        check("无色盒没有颜色", VoidWarehouseShulker.colorOf(plain) == null);
+        check("无色盒不产染料", VoidWarehouseShulker.dyeOf(plain).isEmpty());
+        check("反证：非潜影盒（圆石）不产染料", VoidWarehouseShulker.dyeOf(new ItemStack(Items.COBBLESTONE)).isEmpty());
+
+        int hit = 0;
+        for (DyeColor color : DyeColor.values()) {
+            String name = color.getSerializedName();
+            ItemStack box = new ItemStack(Items.DYED_SHULKER_BOX.pick(color));
+            String boxId = idOf(box.getItem());
+            check("盒子注册名与颜色一致: " + boxId + " == " + name + "_shulker_box",
+                    boxId.equals(name + "_shulker_box"));
+            check(name + " 色盒的 colorOf 就是 " + name,
+                    VoidWarehouseShulker.colorOf(box) == color);
+
+            ItemStack dye = VoidWarehouseShulker.dyeOf(box);
+            String dyeId = dye.isEmpty() ? "<empty>" : idOf(dye.getItem());
+            boolean ok = !dye.isEmpty() && dyeId.equals(name + "_dye") && dye.getCount() == 1;
+            if (ok) {
+                hit++;
+            } else {
+                System.out.println("   FAIL: " + name + " 色盒 → " + dyeId + " x" + dye.getCount()
+                        + "（期望 " + name + "_dye x1）");
+            }
+        }
+        check("16 种染色盒都能吐出「同色 1 个」染料", hit == 16);
+    }
+
+    // ================================================================ C 组：真拆包
+
+    private static void unpackChecks(MinecraftServer server) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+
+        // ---- C1：无色盒（反证组：不许产生任何染料） ----
+        data.clearContent();
+        ItemStack plainBox = box(Items.SHULKER_BOX, List.of(
+                new ItemStack(Items.COBBLESTONE, 64), new ItemStack(Items.DIAMOND, 3)));
+        check("无色盒入库成功", data.insert(plainBox));
+        check("无色盒里的圆石按真实数量入库", amount(data, Items.COBBLESTONE) == 64);
+        check("无色盒里的钻石按真实数量入库", amount(data, Items.DIAMOND) == 3);
+        check("无色盒 → 2 个潜影壳", amount(data, Items.SHULKER_SHELL) == VoidWarehouseShulker.SHELL_COST);
+        check("无色盒 → 1 个箱子", amount(data, Items.CHEST) == VoidWarehouseShulker.CHEST_COST);
+        check("反证：无色盒不产生任何染料", totalDye(data) == 0);
+        check("盒子本身被消耗（count = 0）", plainBox.getCount() == 0);
+
+        // ---- C2：16 种染色盒各入一个，每种装 10 个泥土 ----
+        data.clearContent();
+        int accepted = 0;
+        for (DyeColor color : DyeColor.values()) {
+            ItemStack colored = box(Items.DYED_SHULKER_BOX.pick(color),
+                    List.of(new ItemStack(Items.DIRT, 10)));
+            if (data.insert(colored)) {
+                accepted++;
+            }
+        }
+        check("16 个染色盒全部入库成功", accepted == 16);
+        check("16 个染色盒里的泥土 = 160", amount(data, Items.DIRT) == 160);
+        check("16 个染色盒 → 潜影壳 32", amount(data, Items.SHULKER_SHELL) == 16 * VoidWarehouseShulker.SHELL_COST);
+        check("16 个染色盒 → 箱子 16", amount(data, Items.CHEST) == 16 * VoidWarehouseShulker.CHEST_COST);
+        int dyeHit = 0;
+        for (DyeColor color : DyeColor.values()) {
+            if (amount(data, Items.DYE.pick(color)) == VoidWarehouseShulker.DYE_COST) {
+                dyeHit++;
+            }
+        }
+        check("16 种染料各 +1（合计 " + (16 * VoidWarehouseShulker.DYE_COST) + " 个）", dyeHit == 16);
+        check("仓库里一格潜影盒都不剩（全拆干净了）", findShulkerEntry(data) == null);
+
+        // ---- C3：空染色盒整盒入库（反证组：不许拆） ----
+        data.clearContent();
+        Item limeBoxItem = Items.DYED_SHULKER_BOX.pick(DyeColor.LIME);
+        ItemStack emptyColored = new ItemStack(limeBoxItem);
+        check("空染色盒入库成功", data.insert(emptyColored));
+        check("空染色盒整盒入库，占一格记 1 个", amount(data, limeBoxItem) == 1);
+        check("反证：空盒没有拆出潜影壳", amount(data, Items.SHULKER_SHELL) == 0);
+        check("反证：空盒没有拆出箱子", amount(data, Items.CHEST) == 0);
+        check("反证：空盒没有拆出染料", totalDye(data) == 0);
+
+        // ---- C4：满盒守恒（27 组圆石 + 1 红盒 → 1728 圆石 + 2 壳 + 1 箱 + 1 红染料） ----
+        data.clearContent();
+        List<ItemStack> full = new ArrayList<>();
+        for (int i = 0; i < VoidWarehouseShulker.BOX_SLOTS; i++) {
+            full.add(new ItemStack(Items.COBBLESTONE, 64));
+        }
+        ItemStack fullRed = box(Items.DYED_SHULKER_BOX.pick(DyeColor.RED), full);
+        check("装满圆石的红色盒入库成功", data.insert(fullRed));
+        check("满盒里的 1,728 个圆石全入库", amount(data, Items.COBBLESTONE) == 1728);
+        check("满盒同时吐出 2 壳 + 1 箱", amount(data, Items.SHULKER_SHELL) == 2
+                && amount(data, Items.CHEST) == 1);
+        check("满盒同时吐出 1 个红色染料", amount(data, Items.DYE.pick(DyeColor.RED)) == 1);
+        check("反证：没有多吐别的颜色的染料", totalDye(data) == 1);
+        check("满盒本身被消耗（count = 0）", fullRed.getCount() == 0);
+
+        data.clearContent();
+    }
+
+    // ================================================================ 工具
+
+    private static ItemStack box(Item item, List<ItemStack> contents) {
+        ItemStack stack = new ItemStack(item);
+        if (!contents.isEmpty()) {
+            stack.set(DataComponents.CONTAINER, ItemContainerContents.fromItems(contents));
+        }
+        return stack;
+    }
+
+    private static String idOf(Item item) {
+        Identifier id = BuiltInRegistries.ITEM.getKey(item);
+        return id == null ? "<unregistered>" : id.getPath();
+    }
+
+    private static long amount(VoidWarehouseData data, Item item) {
+        BigInteger n = data.amountOf(item);
+        return n == null ? -1 : n.longValueExact();
+    }
+
+    /** 仓库里当前的染料总数（16 色全加一遍） */
+    private static long totalDye(VoidWarehouseData data) {
+        long total = 0;
+        for (DyeColor color : DyeColor.values()) {
+            total += amount(data, Items.DYE.pick(color));
+        }
+        return total;
+    }
+
+    /** 找一个「模板是潜影盒」的格子（C2 用它验证盒子全被拆了） */
+    private static VoidWarehouseData.Entry findShulkerEntry(VoidWarehouseData data) {
+        for (int i = 0; i < VoidWarehouseData.TOTAL_SLOTS; i++) {
+            VoidWarehouseData.Entry e = data.entryAt(i);
+            if (e != null && VoidWarehouseShulker.isShulkerBox(e.template())) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    private static List<Component> loreOf(ItemStack stack) {
+        ItemLore lore = stack.get(DataComponents.LORE);
+        return lore == null ? List.of() : lore.lines();
+    }
+
+    private static boolean anyContains(List<Component> lines, String needle) {
+        for (Component c : lines) {
+            if (c.getString().contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void dump(String tag, List<Component> lore) {
+        for (int i = 0; i < lore.size(); i++) {
+            System.out.println("   [" + tag + " " + i + "] '" + lore.get(i).getString() + "'");
+        }
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + label);
+        }
+    }
+}

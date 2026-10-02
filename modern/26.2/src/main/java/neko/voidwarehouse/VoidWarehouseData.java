@@ -99,7 +99,8 @@ import java.util.Optional;
  * <b>打包单位</b>，而不是普通物品（{@link VoidWarehouseShulker}）：</p>
  * <ul>
  *   <li><b>入库</b>：非空盒子被<b>拆开</b> —— 盒里的每种物品各按真实数量入库，盒子本身变成
- *       {@code 2 个潜影壳 + 1 个箱子}（原版配方）。<b>空盒子不拆</b>，直接整盒入库，
+ *       {@code 2 个潜影壳 + 1 个箱子}（原版配方），染色盒再额外吐出 {@code 1 个对应颜色的染料}。
+ *       <b>空盒子不拆</b>，直接整盒入库，
  *       占一格记 1 个「潜影盒」；</li>
  *   <li><b>校验</b>：盒内物品不再做数据组件校验（带 NBT 的物品现在也允许入库）。</li>
  * </ul>
@@ -755,11 +756,12 @@ public final class VoidWarehouseData extends SavedData {
 
     /**
      * 把潜影盒<b>拆开</b>入库：盒内物品按各自数量入库，盒子本身变成
-     * {@code 2 个潜影壳 + 1 个箱子}（原版配方）。
+     * {@code 2 个潜影壳 + 1 个箱子}（原版配方）；<b>染色盒再额外吐出 1 个对应颜色的染料</b>
+     * （原版：染色盒 = 潜影盒 + 1 染料）。见 {@link VoidWarehouseShulker#dyeOf(ItemStack)}。
      *
      * <p><b>空盒子不拆</b>：一个东西都没装的潜影盒，直接当成普通物品整盒入库
      * （占一格，记 1 个「潜影盒」）。这样玩家手里那个空盒子不会被偷偷换成壳和箱子，
-     * 语义也最直观 —— 空盒子就是空盒子。</p>
+     * 语义也最直观 —— 空盒子就是空盒子。染色空盒同理，整盒入库、颜色原样保留。</p>
      *
      * <p><b>盒内物品照单全收</b>：不再校验盒内物品是否带数据组件（带 NBT 的物品
      * 现在也允许入库），拆出来的每件都按各自数量入库。</p>
@@ -782,6 +784,12 @@ public final class VoidWarehouseData extends SavedData {
         }
         this.put(new ItemStack(Items.SHULKER_SHELL, VoidWarehouseShulker.SHELL_COST));
         this.put(new ItemStack(Items.CHEST, VoidWarehouseShulker.CHEST_COST));
+        // 染色盒：原版是「潜影盒 + 1 染料」合成的，拆开时染料必须一起还回来。
+        // 无色盒这里拿到的是 EMPTY，直接跳过（不要 put 一个空堆叠）。
+        ItemStack dye = VoidWarehouseShulker.dyeOf(box);
+        if (!dye.isEmpty()) {
+            this.put(dye);
+        }
         // 盒子本身已被「拆解」消耗掉
         box.setCount(0);
         this.markChanged();

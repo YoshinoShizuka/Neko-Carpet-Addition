@@ -2,6 +2,7 @@ package neko.voidwarehouse;
 
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.Style;
 
 import java.math.BigInteger;
 import java.util.Locale;
@@ -55,7 +56,35 @@ public final class VoidWarehouseText {
     /** 开关「关」时的名字颜色 */
     static final ChatFormatting OFF = ChatFormatting.GRAY;
 
+    // ---- 物品格提示用的 RGB 色（原版 16 色枚举里没有这几个颜色，只能用十六进制）----
+    // 玩家反馈「原来的配色不方便读」，改成「浅灰标签 + 亮金数值 + 青色操作」这一套：
+    // 标签退到背景里、数值最抓眼、操作行整行统一，扫一眼就能分清哪行是数字、哪行是能做的事。
+
+    /** 数量行的标签色：浅灰，退到背景里不抢视线（原版 16 色里 GRAY 偏暗，用 #AAAAAA） */
+    static final int LABEL_RGB = 0xAAAAAA;
+    /** 数量数值的亮金色：比 {@link #VALUE}（GOLD #FFAA00）更亮、更偏金，一眼能读出位数 */
+    static final int VALUE_RGB = 0xFFD700;
+    /** 操作行（左键 / 右键）的青色：整行同色，和「数量」行形成明确的上下分层 */
+    static final int ACTION_RGB = 0x55FFFF;
+
     private VoidWarehouseText() {
+    }
+
+    /** 任意 RGB 造一行 lore（原版 16 色枚举装不下全部需求） */
+    static Component line(String text, int rgb) {
+        return Component.literal(text).withStyle(Style.EMPTY.withColor(rgb));
+    }
+
+    /**
+     * 两段行：标签一种颜色、数值另一种颜色。
+     *
+     * <p>用来做「{@code 数量：} 灰 + {@code 1,234,567} 亮金」这种效果 ——
+     * 一行里两个 Component 拼起来，各带各的颜色。分段比整行一个颜色好读：
+     * 玩家找的是数字，标签只需要存在、不需要抢眼。</p>
+     */
+    static Component pair(String label, int labelRgb, String value, int valueRgb) {
+        return Component.literal(label).withStyle(Style.EMPTY.withColor(labelRgb))
+                .append(Component.literal(value).withStyle(Style.EMPTY.withColor(valueRgb)));
     }
 
     /** 按语义造一行 lore */

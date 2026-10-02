@@ -225,28 +225,34 @@ public final class VoidWarehouseData extends SavedData {
             List<Component> lore = new ArrayList<>(5);
 
             // ---- 数据行：数量 +（够多时的）盒 / 组 / 个换算 ----
-            lore.add(VoidWarehouseText.line("数量：" + format(amount), VoidWarehouseText.VALUE));
+            // 「数量：」标签用浅灰、数字用亮金 —— 分段着色。玩家扫 tooltip 找的是「有多少」，
+            // 让数字跳出来、标签退到背景里；整行一个颜色时两者会互相抢视线。
+            // 亮金 #FFD700 不在原版 16 色枚举里（GOLD 偏橙），所以走 RGB 重载。
+            lore.add(VoidWarehouseText.pair("数量：", VoidWarehouseText.LABEL_RGB,
+                    format(amount), VoidWarehouseText.VALUE_RGB));
             String packing = describePacking(amount, max);
             if (packing != null) {
-                lore.add(VoidWarehouseText.line(packing, VoidWarehouseText.VALUE));
+                lore.add(VoidWarehouseText.line(packing, VoidWarehouseText.VALUE_RGB));
             }
 
             // ---- 操作行：两种模式各说各的，绝不混着显示 ----
+            // 整行统一青色（ACTION_RGB）：与上面金色的数字行形成明确分层，
+            // 一眼分得出「哪行是数据、哪行是能做的事」。
             if (boxMode) {
                 int capacity = VoidWarehouseShulker.capacity(template);
                 lore.add(VoidWarehouseText.line(
                         "左键：交出 1 盒（" + VoidWarehouseText.count(capacity) + " 个）",
-                        VoidWarehouseText.ACTION));
-                lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION));
+                        VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION_RGB));
                 lore.add(VoidWarehouseText.line("消耗：潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
                         + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST, VoidWarehouseText.COST));
             } else if (max > 1) {
-                lore.add(VoidWarehouseText.line("左键：取出 1 个", VoidWarehouseText.ACTION));
+                lore.add(VoidWarehouseText.line("左键：取出 1 个", VoidWarehouseText.ACTION_RGB));
                 lore.add(VoidWarehouseText.line(
-                        "右键：取出 1 组（" + max + " 个）", VoidWarehouseText.ACTION));
+                        "右键：取出 1 组（" + max + " 个）", VoidWarehouseText.ACTION_RGB));
             } else {
                 // 不可堆叠物品（剑、工具…）左右键都是取 1 个，合成一行说，不重复两遍
-                lore.add(VoidWarehouseText.line("左键 / 右键：取出 1 个", VoidWarehouseText.ACTION));
+                lore.add(VoidWarehouseText.line("左键 / 右键：取出 1 个", VoidWarehouseText.ACTION_RGB));
             }
 
             stack.set(DataComponents.LORE, new ItemLore(lore));

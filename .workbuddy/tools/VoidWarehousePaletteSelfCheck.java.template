@@ -1,0 +1,217 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemLore;
+
+import java.util.List;
+
+/**
+ * 【临时自检】虚空仓库物品格提示的「配色」改动 —— 验证完删掉。
+ *
+ * <h2>这次改了什么都不许猜，逐条断言</h2>
+ * <ul>
+ *   <li>数量行改成<b>分段着色</b>：「数量：」浅灰 #AAAAAA + 数字亮金 #FFD700；</li>
+ *   <li>换算行（「1 组」）改成亮金 #FFD700（原来是 GOLD #FFAA00）；</li>
+ *   <li>操作行（左键 / 右键）整行改青色 #55FFFF（原来是 GREEN #55FF55）；</li>
+ *   <li>盒模式的「消耗：」行保持红色 #FF5555 不变（它是代价，不参与这次调整）；</li>
+ *   <li><b>文字一个字都没动</b> —— 玩家明确要求「只改配色、不改文字」，所以断言里
+ *       专门查「没有出现参考图里的措辞」（{@code 提取 / 当前库存}）。</li>
+ * </ul>
+ *
+ * <h2>断言为什么算「有牙」</h2>
+ * <p>每条颜色断言都配一条<b>反证</b>：既要求「等于新色」，也要求「不等于旧色」。
+ * 代码没改时，{@code == 新色} 与 {@code != 旧色} 会同时失败；改成别的颜色时前者失败。
+ * 只断言前者的话，把颜色改成任意值都可能蒙混过关。</p>
+ *
+ * <p>另：分段着色要断言的是「这一行确实由两个 Component 拼成」——
+ * 只比 {@code getString()} 的话，整行一个颜色（「数量：64」单段）也能通过。</p>
+ */
+public final class VoidWarehousePaletteSelfCheck {
+
+    /** 新配色（与 VoidWarehouseText 里的常量一一对应） */
+    private static final int LABEL_RGB = 0xAAAAAA;
+    private static final int VALUE_RGB = 0xFFD700;
+    private static final int ACTION_RGB = 0x55FFFF;
+    /** 旧配色：反证用，代码回退时这两条会亮 */
+    private static final int OLD_GOLD = 0xFFAA00;
+    private static final int OLD_GREEN = 0x55FF55;
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private VoidWarehousePaletteSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        try {
+            displayChecks(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT vw-palette/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ---------------------------------------------------------------- 场景
+
+    private static void displayChecks(MinecraftServer server) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));   // 可堆叠：走「左键 1 个 / 右键 1 组」分支
+        data.insert(new ItemStack(Items.DIAMOND_SWORD, 1));  // 不可堆叠：走合并成一行那个分支
+
+        VoidWarehouseData.Entry cobble = entryOf(data, Items.COBBLESTONE);
+        check("圆石那一格存在", cobble != null);
+        if (cobble != null) {
+            plainMode(cobble);
+            boxMode(cobble);
+        }
+
+        VoidWarehouseData.Entry sword = entryOf(data, Items.DIAMOND_SWORD);
+        check("钻石剑那一格存在", sword != null);
+        if (sword != null) {
+            unstackableMode(sword);
+        }
+    }
+
+    /** 普通模式：数量（分段）+ 换算 + 左键 / 右键 */
+    private static void plainMode(VoidWarehouseData.Entry entry) {
+        List<Component> lore = loreOf(entry.display());
+        dump("plain", lore);
+        check("普通模式一共 4 行", lore.size() == 4);
+        if (lore.size() != 4) {
+            return;
+        }
+
+        // 第 0 行：数量行，两段
+        Component qty = lore.get(0);
+        check("数量行文字没改 = 「数量：64」", qty.getString().equals("数量：64"));
+        check("数量行由 2 段拼成（真的分段了）", qty.getSiblings().size() == 1);
+        check("数量行标签 = 浅灰 #AAAAAA", colorOf(qty) == LABEL_RGB);
+        check("数量行数值 = 亮金 #FFD700", colorOf(firstSibling(qty)) == VALUE_RGB);
+        check("反证：标签不再是旧金 #FFAA00", colorOf(qty) != OLD_GOLD);
+        check("反证：数值不再是旧金 #FFAA00", colorOf(firstSibling(qty)) != OLD_GOLD);
+
+        // 第 1 行：换算行（64 个圆石 = 1 组）
+        Component pack = lore.get(1);
+        check("换算行文字没改 = 「1 组」", pack.getString().equals("1 组"));
+        check("换算行 = 亮金 #FFD700", colorOf(pack) == VALUE_RGB);
+        check("反证：换算行不再是旧金 #FFAA00", colorOf(pack) != OLD_GOLD);
+
+        // 第 2、3 行：操作行
+        Component left = lore.get(2);
+        Component right = lore.get(3);
+        check("左键行文字没改 = 「左键：取出 1 个」", left.getString().equals("左键：取出 1 个"));
+        check("右键行文字没改 = 「右键：取出 1 组（64 个）」",
+                right.getString().equals("右键：取出 1 组（64 个）"));
+        check("左键行 = 青色 #55FFFF", colorOf(left) == ACTION_RGB);
+        check("右键行 = 青色 #55FFFF", colorOf(right) == ACTION_RGB);
+        check("反证：左键行不再是旧绿 #55FF55", colorOf(left) != OLD_GREEN);
+        check("反证：右键行不再是旧绿 #55FF55", colorOf(right) != OLD_GREEN);
+
+        // 玩家要求「只改配色、不改文字」——参考图里那两句措辞一个字都不许出现
+        for (Component c : lore) {
+            String text = c.getString();
+            check("没照抄参考图措辞「提取」: " + text, !text.contains("提取"));
+            check("没照抄参考图措辞「当前库存」: " + text, !text.contains("当前库存"));
+        }
+    }
+
+    /** 潜影盒模式：数量同样分段；消耗行保持红色 */
+    private static void boxMode(VoidWarehouseData.Entry entry) {
+        List<Component> lore = loreOf(entry.displayInBoxMode());
+        dump("box  ", lore);
+        check("盒模式一共 5 行", lore.size() == 5);
+        if (lore.size() != 5) {
+            return;
+        }
+        check("盒模式数量行标签 = 浅灰 #AAAAAA", colorOf(lore.get(0)) == LABEL_RGB);
+        check("盒模式数量行数值 = 亮金 #FFD700", colorOf(firstSibling(lore.get(0))) == VALUE_RGB);
+
+        Component hand = lore.get(2);   // 左键：交出 1 盒（1,728 个）
+        check("盒模式操作行 = 青色 #55FFFF", colorOf(hand) == ACTION_RGB);
+        check("反证：盒模式操作行不再是旧绿 #55FF55", colorOf(hand) != OLD_GREEN);
+
+        Component cost = lore.get(4);   // 消耗：潜影壳 ×2 + 箱子 ×1
+        check("盒模式「消耗」行文案没改", cost.getString().startsWith("消耗：潜影壳 ×"));
+        check("盒模式「消耗」行仍是红色 #FF5555（本次未调整）", colorOf(cost) == 0xFF5555);
+    }
+
+    /** 不可堆叠物品：左右键合并成一行，颜色也要跟着青 */
+    private static void unstackableMode(VoidWarehouseData.Entry entry) {
+        List<Component> lore = loreOf(entry.display());
+        dump("sword ", lore);
+        Component merged = lore.get(lore.size() - 1);
+        check("不可堆叠行文字没改 = 「左键 / 右键：取出 1 个」",
+                merged.getString().equals("左键 / 右键：取出 1 个"));
+        check("不可堆叠行 = 青色 #55FFFF", colorOf(merged) == ACTION_RGB);
+        check("反证：不可堆叠行不再是旧绿 #55FF55", colorOf(merged) != OLD_GREEN);
+    }
+
+    // ---------------------------------------------------------------- 工具
+
+    private static VoidWarehouseData.Entry entryOf(VoidWarehouseData data, Item item) {
+        for (int i = 0; i < VoidWarehouseData.TOTAL_SLOTS; i++) {
+            VoidWarehouseData.Entry e = data.entryAt(i);
+            if (e != null && e.template().getItem() == item) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    private static List<Component> loreOf(ItemStack stack) {
+        ItemLore lore = stack.get(DataComponents.LORE);
+        return lore == null ? List.of() : lore.lines();
+    }
+
+    private static Component firstSibling(Component c) {
+        List<Component> siblings = c.getSiblings();
+        return siblings.isEmpty() ? c : siblings.get(0);
+    }
+
+    /** 取组件自身 style 里的颜色；没设颜色时返回 -1（而不是 0，免得撞上黑色） */
+    private static int colorOf(Component c) {
+        var color = c.getStyle().getColor();
+        return color == null ? -1 : color.getValue();
+    }
+
+    private static String hex(int rgb) {
+        return rgb < 0 ? "(无色)" : String.format("#%06X", rgb);
+    }
+
+    private static void dump(String tag, List<Component> lore) {
+        for (int i = 0; i < lore.size(); i++) {
+            Component c = lore.get(i);
+            StringBuilder sb = new StringBuilder();
+            sb.append("   [").append(tag).append(" ").append(i).append("] '")
+                    .append(c.getString()).append("'");
+            sb.append("  段=").append(1 + c.getSiblings().size());
+            sb.append("  首段色=").append(hex(colorOf(c)));
+            if (!c.getSiblings().isEmpty()) {
+                sb.append("  次段色=").append(hex(colorOf(firstSibling(c))));
+            }
+            System.out.println(sb);
+        }
+    }
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+        }
+        System.out.println("   " + (ok ? "ok  " : "FAIL") + " " + name);
+    }
+}

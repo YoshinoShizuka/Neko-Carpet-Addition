@@ -5,5 +5,7 @@
   "carpet.rule.voidWarehouse.name": "Void Warehouse",
   "carpet.rule.voidWarehouse.desc": "A crafting table renamed via anvil becomes a server-wide shared warehouse",
   "carpet.rule.voidWarehouseRestock.name": "Void Warehouse Restock",
-  "carpet.rule.voidWarehouseRestock.desc": "Lets a printer that ran out of blocks while building take a full stack straight from the Void Warehouse. Warning: while enabled, any player with a compatible printer can draw from the shared stock"
+  "carpet.rule.voidWarehouseRestock.desc": "Lets a printer that ran out of blocks while building take a full stack straight from the Void Warehouse. Warning: while enabled, any player with a compatible printer can draw from the shared stock",
+  "carpet.rule.concretePowderToGlass.name": "Smelt Concrete Powder Into Stained Glass",
+  "carpet.rule.concretePowderToGlass.desc": "Lets a regular furnace smelt all 16 concrete powder colours into the matching stained glass (0.1 xp / 200 ticks, same as sand into glass). Only regular furnaces are affected; blast furnaces and smokers still reject concrete powder"
 }

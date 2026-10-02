@@ -1,9 +1,11 @@
 # Carpet Neko Addition
 
-为 **Minecraft 26.3** 上的 **Carpet** 提供两条规则的 Carpet 扩展模组：
+为 **Minecraft 26.3** 上的 **Carpet** 提供三条规则的 Carpet 扩展模组：
 
 - **自动经验修补 (autoMending)** —— 逻辑移植自 [Carpet-GUGU-Addition](https://github.com/DaCong114514qwq/Carpet-GUGU-Addition) 的 `autoMending_new`
 - **虚空仓库 (voidWarehouse)** —— 把铁砧改名为「虚空仓库」的工作台变成全服共享、跨维度、可持久化的分页仓库，**每种物品只占一格，该格数量无上限**；配套**双向漏斗自动化**（口朝终端 = 入库；终端压在漏斗正上方 = 按分类物出料，分类物永远留 1 个余量）
+- **混凝土粉末烧制染色玻璃 (concretePowderToGlass)** —— 让普通熔炉把 16 种混凝土粉末烧成对应颜色的染色玻璃
+  （规则与数值抄 [Carpet DDS Addition](https://github.com/DDS-Studio/carpet-dds-addition) 的同名功能，但**故意改了规则名**，见下文）
 
 > **改名说明**：本模组原名 `carpet-automending`（Java 包 `carpetaddition`），现已改名为
 > **`carpet-Neko-Addition`**（Java 包 `neko`，mod id `carpet_neko_addition`，
@@ -68,6 +70,51 @@
 想把它摆下去必须**潜行 + 右键**，普通右键不会放置。
 
 这个功能**不需要注册任何新物品**，触发物就是原版工作台本身。
+
+---
+
+### 混凝土粉末烧制染色玻璃 (concretePowderToGlass)
+
+16 种混凝土粉末都能在**普通熔炉**里烧成**对应颜色**的染色玻璃，数值与原版「沙子 → 玻璃」完全一致
+（**0.1** 点经验 / **200** tick）。
+
+- 类型：`boolean`
+- 默认值：`false`
+- 分类：`neko`、`survival`
+- 用法：`/carpet concretePowderToGlass true`
+- **只影响普通熔炉**：高炉走 `RecipeType.BLASTING`、烟熏炉走 `SMOKING`，两者都不在覆盖范围内，
+  与原版「混凝土粉末不可烧」保持一致
+- **规则关掉后与原版逐字节一致**：查配方为空、不给经验、Shift 点击时粉末仍被当作燃料
+
+#### 规则名与 Carpet DDS Addition 不同（这是必须的）
+
+同一件事在 `Carpet DDS Addition` 里叫 `smeltConcretePowderToGlass`，这里叫 `concretePowderToGlass`。
+原因是 Carpet 的 `SettingsManager#addCarpetRule` 遇到重名会
+
+```java
+if (rules.containsKey(rule.name())) { throw new UnsupportedOperationException(...); }
+```
+
+**直接抛异常**（javap 实证）—— 沿用原名意味着「两个模组同时装 = 服务端起不来」。
+改名之后两者可以共存，最坏情况只是「两条开关做同一件事」。
+改名没有代价：DDS 从 26.3 消失时，Carpet 已经把存档里那行旧配置从 `carpet.conf` 删掉了。
+
+#### 为什么连「Shift 点击」也要一起改
+
+26.3 的 `AbstractFurnaceMenu#canSmelt` 整个方法体只有一句
+`return this.acceptedInputs.test(stack);`，而 `acceptedInputs` 是**开机时按已注册配方算出来的**
+`RecipePropertySet`。本模组的配方是**运行期**加入的（不注册进 `RecipeManager`，这样规则才能随时开关），
+所以它的唯一调用点 `quickMoveStack` 里会走 `isFuel` 分支 —— 混凝土粉末**确实**可燃，
+于是 Shift 点击会把粉末当成燃料塞进下面那格，看起来就像「模组没生效」。
+专门一个 Mixin 挡掉这一条，并且**限定 `FurnaceMenu`**，高炉 / 烟熏炉依旧不收。
+
+#### 经验是怎么发出去的
+
+原版烧完一个物品后，会拿「用过的配方 id」调 `RecipeManager#byKey` 反查配方，再取它的经验值
+发给玩家（`AbstractFurnaceBlockEntity#getRecipesToAwardAndPopExperience` 字节码实证）。
+本模组的配方不在配方表里，所以 `byKey` 也补了一钩 —— 不补的话玻璃烧得出来但**没经验**。
+
+> 移植过程、五版本 API 差异与踩坑记录：`docs/混凝土粉末烧制染色玻璃规则移植.md`
 
 ---
 
@@ -769,6 +816,21 @@ src/main/java/neko/voidwarehouse/
   mixin/                          8 个 Mixin：4 个交互入口 + 登记 / 注销 / 漏斗（入库 + 出料 + 分类物保护 + 白名单）/ Slot（只认玩家的手）
 ```
 
+### 代码结构（第三条规则：熔炉玩法）
+
+```
+neko/cooking/
+  ConcretePowderToGlass.java          16 条配方 + 两张查询表（输入→配方 / id→配方）+ 规则开关判断
+  CookingSettings.java                Carpet 规则 concretePowderToGlass
+  CookingExtension.java               Carpet 扩展（第三条线，独立注册，不动已有代码）
+  mixin/RecipeManagerMixin.java       getRecipeFor（3 参，覆盖 4 参那条路）+ byKey（发经验用）
+  mixin/AbstractFurnaceMenuMixin.java canSmelt（只放行普通熔炉，Shift 点击才进得了输入槽）
+resources/carpet_neko_addition.cooking.mixins.json   新的 Mixin 配置，与原有一份并列
+```
+
+> 三条规则各自一个 `CarpetExtension`、各自一个规则类，**互相之间没有耦合** ——
+> 摘掉任何一条都不影响另外两条。
+
 ### 性能：O(1) 的物品索引
 
 仓库把「一格一种物品」当成不变量，于是「找某种物品的格子」天然是一次**按物品查表**，
@@ -970,6 +1032,10 @@ public static final SavedDataType<VoidWarehouseData> TYPE =
 | 26.1.1 | `modern/26.1.1` | `carpet-Neko-Addition-mc26.1.1-1.0.3.jar` | ✅ 编译 + 自检（29 项全过） |
 | 26.1.2 | `modern/26.1.2` | `carpet-Neko-Addition-mc26.1.2-1.0.3.jar` | ✅ 编译 + 自检（29 项全过） |
 | 1.21.11 | `versions/1.21.11` | `carpet-Neko-Addition-mc1.21.11-1.0.3.jar` | ✅ 编译 + 自检（55 项全过） |
+
+> **第三条规则（混凝土粉末 → 染色玻璃）**另有一套 `ConcretePowderToGlassSelfCheck`，
+> **五个版本各跑一次真实 `runServer` 全绿（`checks=25 failures=0`）**，且带反证组。
+> 版本差异与踩坑记录见 `docs/混凝土粉末烧制染色玻璃规则移植.md`。
 
 - **26.x 四个版本**（26.1.1 / 26.1.2 / 26.2 / 26.3）同属「不混淆」体系，用
   `net.fabricmc.fabric-loom`（不 remap），源码差异极小（见 `docs/多版本架构说明.md`）。

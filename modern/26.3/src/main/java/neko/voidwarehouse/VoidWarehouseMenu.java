@@ -107,7 +107,7 @@ import java.math.BigInteger;
  * </ol>
  */
 public class VoidWarehouseMenu extends ChestMenu {
-    // 聊天提示统一走 VoidWarehouseText.info()：亮金色 [信息] 前缀 + 灰色正文，
+    // 聊天提示统一走 VoidWarehouseText.info()：亮金色 [虚空仓库] 前缀 + 灰色正文，
     // 一眼能和普通聊天分开；正文里的关键数字用 VoidWarehouseText.key() 标亮绿。
     private static final Component MSG_FULL = VoidWarehouseText.info("虚空仓库已满，放不进去了");
     private static final Component MSG_RESCUED =
@@ -118,8 +118,8 @@ public class VoidWarehouseMenu extends ChestMenu {
             VoidWarehouseText.info("带额外数据的物品（耐久 / 附魔 / 改名）拒收");
     private static final Component MSG_BOX_REJECTED =
             VoidWarehouseText.info("盒内有带额外数据的物品，整盒拒收");
-    private static final Component MSG_SHULKER_ON = VoidWarehouseText.info("潜影盒模式开");
-    private static final Component MSG_SHULKER_OFF = VoidWarehouseText.info("潜影盒模式关");
+    private static final Component MSG_SHULKER_ON = switchMessage("潜影盒模式", "开");
+    private static final Component MSG_SHULKER_OFF = switchMessage("潜影盒模式", "关");
     private static final Component MSG_NO_BOX_PARTS = VoidWarehouseText.info(
             VoidWarehouseText.body("潜影壳或箱子不足，无法装盒（每盒需 潜影壳 ×")
                     .append(VoidWarehouseText.key(String.valueOf(VoidWarehouseShulker.SHELL_COST)))
@@ -128,8 +128,19 @@ public class VoidWarehouseMenu extends ChestMenu {
                     .append(VoidWarehouseText.body("）")));
     private static final Component MSG_BOX_INV_FULL =
             VoidWarehouseText.info("背包放不下盒子，本次取消（仓库未扣减）");
-    private static final Component MSG_SORT_ON = VoidWarehouseText.info("数量排序开");
-    private static final Component MSG_SORT_OFF = VoidWarehouseText.info("数量排序关");
+    private static final Component MSG_SORT_ON = switchMessage("数量排序", "开");
+    private static final Component MSG_SORT_OFF = switchMessage("数量排序", "关");
+
+    /**
+     * 「xxx：开 / 关」这种模式开关提示。
+     *
+     * <p>名称用正文灰、<b>状态用亮绿</b>：玩家点开关时真正要读的是「现在开还是关」，
+     * 让这两个字自己跳出来，不用把整句读完再回头找结论。</p>
+     */
+    private static Component switchMessage(String name, String state) {
+        return VoidWarehouseText.info(VoidWarehouseText.body(name + "：")
+                .append(VoidWarehouseText.key(state)));
+    }
 
     private final VoidWarehouseData data;
     private final VoidWarehousePageContainer pageContainer;

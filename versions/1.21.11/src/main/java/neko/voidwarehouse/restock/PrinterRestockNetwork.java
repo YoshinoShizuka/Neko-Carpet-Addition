@@ -137,14 +137,14 @@ public final class PrinterRestockNetwork {
         }
         // 配色按玩家的口径：前缀亮金；正文灰；「取走了多少个」和「仓库还剩多少个」
         // 这两个数字是玩家真正要读的，都用亮绿跳出来。
-        // 前缀是「虚空仓库」而不是默认的「[信息]」—— 这条是自动、高频发的消息，
-        // 得让玩家一眼看出是谁在补货。
+        // 前缀走全局统一的「[虚空仓库]」—— 这条是自动、高频发的消息，
+        // 玩家得一眼看出是谁在补货。
         //
         // 物品名必须保持「可翻译组件」原样发出去，绝不能在服务端 getString()：
         // 单人存档里客户端与服务端同进程、客户端启动时已把语言表注入静态单例，
         // 所以看起来正常；专用服务器没人注入，单例一直是 en_us，
         // 同一个物品会解析成「dirt」发给中文客户端。
-        player.sendSystemMessage(VoidWarehouseText.info(VoidWarehouseText.RESTOCK_PREFIX,
+        player.sendSystemMessage(VoidWarehouseText.info(
                 VoidWarehouseText.body("取走 ")
                         .append(VoidWarehouseText.key(VoidWarehouseText.count(outcome.takenCount())))
                         .append(VoidWarehouseText.body(" 个 "))

@@ -90,15 +90,17 @@ public final class VoidWarehouseText {
     /** 聊天提示里的关键数字：亮绿。整条消息里只有这类数字允许跳出来 */
     static final int INFO_KEY_RGB = 0x55FF55;
 
-    /** 默认前缀：方括号本身就把「谁在说话」和「说了什么」隔开了 */
-    public static final String INFO_PREFIX = "[信息] ";
     /**
-     * 中键补货提示专用前缀。
+     * 聊天提示的<b>统一前缀</b>：{@code [虚空仓库] }。
      *
-     * <p>玩家指定：中键从虚空仓库补货的那条提示，开头要直接写「虚空仓库」而不是泛泛的
-     * 「[信息]」—— 这条消息是自动、高频发的，玩家一眼得知道「是谁在给我东西」。</p>
+     * <p>玩家指定：<b>所有</b>聊天提示开头都写「[虚空仓库]」。这个名字本身就是
+     * 「谁在说话」，方括号再把它和后面的正文隔开 —— 比泛泛的「[信息]」有用得多：
+     * 玩家扫一眼就知道这条消息来自虚空仓库，而不是自己或别人的聊天。</p>
+     *
+     * <p>前缀只有这一个来源（{@link #info(MutableComponent)}），不再有「某个功能
+     * 用另一套前缀」的分支 —— 各写各的前缀迟早会分叉。</p>
      */
-    public static final String RESTOCK_PREFIX = "虚空仓库 ";
+    public static final String INFO_PREFIX = "[虚空仓库] ";
 
     private VoidWarehouseText() {
     }
@@ -148,45 +150,29 @@ public final class VoidWarehouseText {
     }
 
     /**
-     * 聊天栏提示：亮金色 {@code [信息] } 前缀 + 灰色正文。<b>不加粗、不倾斜</b>。
+     * 聊天栏提示：亮金色 {@code [虚空仓库] } 前缀 + 灰色正文。<b>不加粗、不倾斜</b>。
      *
      * <p>统一带前缀是为了让玩家一眼分清「这是虚空仓库在跟我说话」，
      * 而不是自己或别人的聊天消息。</p>
      *
      * <p>配色是「前缀抓眼 → 正文退后」：前缀亮金负责吸引注意，正文浅灰不喧宾夺主。
-     * 正文里如果有关键数字（数量、上限…），用 {@link #body}/{@link #key} 拼好再走
-     * {@link #info(MutableComponent)}。</p>
+     * 正文里如果有关键数字（数量、上限…），用 {@link #body}/{@link #key} 拼好再传进来。</p>
      *
      * <p><b>为什么去掉加粗</b>：加粗会让整条消息糊成一坨，长句尤其难读；
      * 而且前缀本身已经靠颜色区分开了，不需要再加一层强调。</p>
      */
-    public static Component info(String body) {
-        return info(body(body));
-    }
-
-    /**
-     * 正文里混了关键数字的提示（默认 {@code [信息] } 前缀）。
-     *
-     * <p>{@code public} 是因为 {@code neko.voidwarehouse.restock}（打印机补货）在别的包外，
-     * 它发的「取走多少 / 还剩多少」提示必须和仓库 UI 里那套配色一致，各写各的迟早会分叉。</p>
-     *
-     * @see #info(String, MutableComponent) 换前缀的版本（中键补货用「虚空仓库」）
-     */
     public static Component info(MutableComponent body) {
-        return info(INFO_PREFIX, body);
-    }
-
-    /**
-     * 换前缀的聊天提示。中键补货走 {@link #RESTOCK_PREFIX}（「虚空仓库」），其余走默认的
-     * {@link #INFO_PREFIX}（「[信息]」）。
-     */
-    public static Component info(String prefix, MutableComponent body) {
-        return Component.literal(prefix)
+        return Component.literal(INFO_PREFIX)
                 .withStyle(Style.EMPTY
                         .withColor(INFO_PREFIX_RGB)
                         .withItalic(false)
                         .withBold(false))
                 .append(body);
+    }
+
+    /** 正文里没有关键数字的纯文字提示（「仓库已满」「已取消」这类） */
+    public static Component info(String body) {
+        return info(body(body));
     }
 
     /** 提示正文（非关键信息）：浅灰、正体 */

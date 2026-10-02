@@ -1,0 +1,437 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.Style;
+import net.minecraft.network.chat.contents.PlainTextContents;
+import net.minecraft.network.chat.contents.TranslatableContents;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.UUID;
+
+import neko.voidwarehouse.restock.PrinterRestockNetwork;
+import neko.voidwarehouse.restock.PrinterTakeResultPayload;
+import neko.voidwarehouse.restock.PrinterTakeService;
+
+/**
+ * 【临时自检】本轮四处文案改动。验证完删掉。
+ *
+ * <ol>
+ *   <li><b>聊天前缀统一</b>：{@code [信息] } → {@code [虚空仓库] }，<b>所有</b>提示都要改；</li>
+ *   <li><b>中键补货</b>：原本单独用的 {@code 虚空仓库 }（无方括号）并入统一前缀；</li>
+ *   <li><b>按数量取货成功提示</b>：数量后面补物品名，全散货时去掉「（200 散货）」这段废话；</li>
+ *   <li><b>模式开关提示</b>：{@code 潜影盒模式：开 / 关} 的「开 / 关」用亮绿。</li>
+ * </ol>
+ *
+ * <h2>第 1 条为什么要「反射遍历所有静态提示」</h2>
+ * <p>玩家的要求是<b>全量</b>的（「所有的聊天栏中出现的 [信息] 都应改为 [虚空仓库]」），
+ * 而提示散落在 {@link VoidWarehouseMenu}、{@link VoidWarehouseWithdraw} 的
+ * {@code static final Component} 字段里，还有一条是 {@code PrinterRestockNetwork} 里
+ * 方法内现拼的。逐条手写断言等于「我列出来的都改了」，<b>漏掉的那条永远不会报错</b>。
+ * 所以这里直接反射扫这两个类的所有静态 Component 字段全量校验，再单独用假玩家
+ * 把方法内拼的那条抓出来。扫描器本身也配了反证，证明它真的判得出违规。</p>
+ */
+public final class VoidWarehouseMessageSelfCheck {
+
+    // ---- 配色（与 VoidWarehouseText 里的常量一一对应）----
+    private static final int PREFIX_RGB = 0xFFD700;
+    private static final int BODY_RGB = 0xAAAAAA;
+    private static final int KEY_RGB = 0x55FF55;
+
+    /** 环境要跑起来几十 tick 才稳（世界、语言表加载完），别在第一 tick 就动手 */
+    private static final int START_TICK = 40;
+
+    private static boolean done = false;
+    private static int ticks = 0;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private VoidWarehouseMessageSelfCheck() {
+    }
+
+    public static void tick(MinecraftServer server) {
+        if (done || ++ticks < START_TICK) {
+            return;
+        }
+        done = true;
+        try {
+            prefixChecks();
+            restockChecks(server);
+            withdrawChecks();
+            switchChecks();
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT vw-message/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ================================================================ A 组：前缀全量
+
+    private static void prefixChecks() {
+        check("INFO_PREFIX = 「[虚空仓库] 」", VoidWarehouseText.INFO_PREFIX.equals("[虚空仓库] "));
+        check("反证：INFO_PREFIX 不再是「[信息] 」", !VoidWarehouseText.INFO_PREFIX.equals("[信息] "));
+
+        Component plain = VoidWarehouseText.info("仓库已满");
+        dumpOne("plain", plain);
+        check("info(\"仓库已满\") 渲染成「[虚空仓库] 仓库已满」",
+                plain.getString().equals("[虚空仓库] 仓库已满"));
+        Component prefix = firstLeaf(plain);
+        check("前缀那一片自己的文本 = 「[虚空仓库] 」", ownText(prefix).equals("[虚空仓库] "));
+        check("前缀 = 亮金 #FFD700", colorOf(prefix) == PREFIX_RGB);
+        noStyle("提示前缀", prefix);
+
+        // ---- 判定函数本身的反证：证明「扫描」是有牙的 ----
+        check("反证：判定函数对「[虚空仓库] x」判真",
+                visible(Component.literal("[虚空仓库] x")));
+        check("反证：判定函数对「[信息] x」判假",
+                !visible(Component.literal("[信息] x")));
+        check("反证：判定函数对「虚空仓库 x」（无方括号）判假",
+                !visible(Component.literal("虚空仓库 x")));
+
+        // ---- 全量：反射扫两个类的所有静态 Component 字段 ----
+        sweep("VoidWarehouseMenu", staticMessages(VoidWarehouseMenu.class), 8);
+        sweep("VoidWarehouseWithdraw", staticMessages(VoidWarehouseWithdraw.class), 4);
+    }
+
+    /**
+     * 把一个类里所有静态提示全扫一遍。
+     *
+     * @param min 至少应有这么多条。低于它就说明反射没抓到东西 ——
+     *            那样「全部合规」会变成永真的空断言，比漏测更危险
+     */
+    private static void sweep(String owner, List<Named> messages, int min) {
+        check("反射扫到 " + owner + " 的静态提示 >= " + min + " 条（实际 " + messages.size() + "）",
+                messages.size() >= min);
+        List<String> bad = new ArrayList<>();
+        for (Named n : messages) {
+            if (!visible(n.msg())) {
+                bad.add(n.name() + "='" + n.msg().getString() + "'");
+            }
+        }
+        System.out.println("   [sweep] " + owner + " 共 " + messages.size() + " 条静态提示：");
+        for (Named n : messages) {
+            System.out.println("        " + n.name() + " = '" + n.msg().getString() + "'");
+        }
+        check(owner + " 全部 " + messages.size() + " 条静态提示都以「[虚空仓库] 」开头且不含「[信息]」"
+                + (bad.isEmpty() ? "" : "  违规=" + bad), bad.isEmpty());
+    }
+
+    /** 一条提示合规吗：以统一前缀开头，且再没有任何「[信息]」字样 */
+    private static boolean visible(Component c) {
+        String text = c.getString();
+        return text.startsWith(VoidWarehouseText.INFO_PREFIX) && !text.contains("[信息]");
+    }
+
+    // ================================================================ B 组：中键补货
+
+    private static void restockChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        CapturingPlayer player = null;
+        try {
+            player = new CapturingPlayer(server, level,
+                    new GameProfile(UUID.randomUUID(), "NekoMessageSelfCheck"),
+                    ClientInformation.createDefault());
+        } catch (Throwable t) {
+            System.out.println("   假玩家构造失败: " + t);
+        }
+        check("假玩家构造成功", player != null);
+        if (player == null) {
+            return;
+        }
+
+        ItemStack dirt = new ItemStack(Items.DIRT);
+        try {
+            Method m = PrinterRestockNetwork.class.getDeclaredMethod(
+                    "notifyTaken", ServerPlayer.class, PrinterTakeService.TakeOutcome.class);
+            m.setAccessible(true);
+            m.invoke(null, player, new PrinterTakeService.TakeOutcome(
+                    PrinterTakeResultPayload.OK, 64, BigInteger.valueOf(1234), dirt));
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! notifyTaken 反射调用失败: " + t);
+            t.printStackTrace(System.out);
+            return;
+        }
+
+        Component msg = player.last;
+        check("中键补货确实发了一条消息", msg != null);
+        if (msg == null) {
+            return;
+        }
+        dumpOne("take ", msg);
+
+        check("中键补货前缀 = 「[虚空仓库] 」", ownText(firstLeaf(msg)).equals("[虚空仓库] "));
+        check("反证：不再是旧前缀「虚空仓库 」（无方括号）",
+                !ownText(firstLeaf(msg)).equals("虚空仓库 "));
+        check("反证：不再是「[信息] 」", !ownText(firstLeaf(msg)).equals("[信息] "));
+        check("中键补货前缀 = 亮金 #FFD700", colorOf(firstLeaf(msg)) == PREFIX_RGB);
+        noStyle("中键补货前缀", firstLeaf(msg));
+
+        Component taken = leafWith(msg, "64");
+        check("「64」那一段 = 亮绿 #55FF55", taken != null && colorOf(taken) == KEY_RGB);
+        Component remaining = leafWith(msg, "1,234");
+        check("「1,234」那一段 = 亮绿 #55FF55", remaining != null && colorOf(remaining) == KEY_RGB);
+        check("物品名仍是可翻译组件 block.minecraft.dirt",
+                findTranslatable(msg, "block.minecraft.dirt") != null);
+        for (Component leaf : leaves(msg)) {
+            noStyle("中键补货片段「" + ownText(leaf) + "」", leaf);
+        }
+    }
+
+    // ================================================================ C 组：按数量取货成功提示
+
+    private static void withdrawChecks() {
+        ItemStack dirt = new ItemStack(Items.DIRT);
+
+        // ---- C1 玩家看到的那条：输入 200（圆石堆叠 64 之类，全散货）----
+        Component c200 = VoidWarehouseWithdraw.successMessage(dirt, 200, 0, 200, false);
+        dumpOne("take200", c200);
+        check("全散货：文案以「[虚空仓库] 已取出 200 个 」开头（数量后跟物品名）",
+                c200.getString().startsWith("[虚空仓库] 已取出 200 个 "));
+        check("全散货：物品名真的跟在数量后面（服务端 en_us 解析为 Dirt）",
+                c200.getString().endsWith("Dirt"));
+        check("全散货：整条不含括号 —— 「（200 散货）」这段废话已去掉",
+                !c200.getString().contains("（") && !c200.getString().contains("散货"));
+        Component n200 = leafWith(c200, "200");
+        check("「200」那一段 = 亮绿 #55FF55", n200 != null && colorOf(n200) == KEY_RGB);
+        Component nameLeaf = firstTranslatable(c200);
+        check("物品名那一段 = 正文灰 #AAAAAA", nameLeaf != null && colorOf(nameLeaf) == BODY_RGB);
+        check("物品名那一段不是斜体/加粗", nameLeaf != null
+                && italicRaw(nameLeaf) == Boolean.FALSE && boldRaw(nameLeaf) != Boolean.TRUE);
+        check("物品名保持可翻译组件（没被服务端提前 getString）",
+                findTranslatable(c200, "block.minecraft.dirt") != null);
+        for (Component leaf : leaves(c200)) {
+            noStyle("取货提示片段「" + ownText(leaf) + "」", leaf);
+        }
+
+        // ---- C2 括号该保留的时候要保留（有满盒时散货数 != 总数，那是真信息）----
+        Component mixed = VoidWarehouseWithdraw.successMessage(dirt, 1729, 1, 1, false);
+        dumpOne("take1729", mixed);
+        check("有满盒：保留「（1 满盒 + 散货 1）」",
+                mixed.getString().contains("（1 满盒 + 散货 1）"));
+
+        Component oneBox = VoidWarehouseWithdraw.successMessage(dirt, 1728, 1, 0, false);
+        check("正好一盒：括号只剩「（1 满盒）」", oneBox.getString().endsWith("（1 满盒）"));
+
+        Component packed = VoidWarehouseWithdraw.successMessage(dirt, 2728, 1, 1000, true);
+        dumpOne("take2728", packed);
+        check("散货装盒：括号是「（1 满盒 + 散货 1,000 已装盒）」",
+                packed.getString().contains("（1 满盒 + 散货 1,000 已装盒）"));
+
+        // ---- C3 反证：旧的「（200 散货）」写法确实不可能再出现 ----
+        Component oldStyle = VoidWarehouseText.info(VoidWarehouseText.body("已取出 ")
+                .append(VoidWarehouseText.key("200"))
+                .append(VoidWarehouseText.body(" 个（200 散货）")));
+        check("反证：旧写法的「（200 散货）」会被 C1 的断言抓住（说明断言有牙）",
+                oldStyle.getString().contains("（200 散货）"));
+    }
+
+    // ================================================================ D 组：模式开关
+
+    private static void switchChecks() {
+        check("潜影盒模式开 = 「[虚空仓库] 潜影盒模式：开」",
+                msgOf("MSG_SHULKER_ON").getString().equals("[虚空仓库] 潜影盒模式：开"));
+        check("潜影盒模式关 = 「[虚空仓库] 潜影盒模式：关」",
+                msgOf("MSG_SHULKER_OFF").getString().equals("[虚空仓库] 潜影盒模式：关"));
+        check("数量排序开 = 「[虚空仓库] 数量排序：开」",
+                msgOf("MSG_SORT_ON").getString().equals("[虚空仓库] 数量排序：开"));
+        check("数量排序关 = 「[虚空仓库] 数量排序：关」",
+                msgOf("MSG_SORT_OFF").getString().equals("[虚空仓库] 数量排序：关"));
+
+        for (String field : List.of("MSG_SHULKER_ON", "MSG_SHULKER_OFF",
+                "MSG_SORT_ON", "MSG_SORT_OFF")) {
+            Component msg = msgOf(field);
+            dumpOne(field, msg);
+
+            String state = field.endsWith("ON") ? "开" : "关";
+            String name = field.contains("SHULKER") ? "潜影盒模式：" : "数量排序：";
+            Component stateLeaf = leafWith(msg, state);
+            Component nameLeaf = leafWith(msg, name);
+            check(field + "：「" + state + "」单独成段", stateLeaf != null);
+            check(field + "：「" + state + "」= 亮绿 #55FF55",
+                    stateLeaf != null && colorOf(stateLeaf) == KEY_RGB);
+            check("反证：" + field + "：「" + state + "」不再是正文灰 #AAAAAA",
+                    stateLeaf != null && colorOf(stateLeaf) != BODY_RGB);
+            check(field + "：「" + name + "」= 正文灰 #AAAAAA",
+                    nameLeaf != null && colorOf(nameLeaf) == BODY_RGB);
+            if (stateLeaf != null) {
+                noStyle(field + " 的状态字", stateLeaf);
+            }
+        }
+    }
+
+    // ================================================================ 反射 / 组件工具
+
+    private record Named(String name, Component msg) {
+    }
+
+    /** 反射读一个类的某个静态 Component 字段 */
+    private static Component msgOf(String field) {
+        try {
+            Field f = VoidWarehouseMenu.class.getDeclaredField(field);
+            f.setAccessible(true);
+            return (Component) f.get(null);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 读 VoidWarehouseMenu." + field + " 失败: " + t);
+            return Component.empty();
+        }
+    }
+
+    /** 一个类里所有静态 Component 字段（按名字排序，输出稳定） */
+    private static List<Named> staticMessages(Class<?> owner) {
+        List<Named> out = new ArrayList<>();
+        for (Field f : owner.getDeclaredFields()) {
+            if (!Modifier.isStatic(f.getModifiers())
+                    || !Component.class.isAssignableFrom(f.getType())) {
+                continue;
+            }
+            try {
+                f.setAccessible(true);
+                if (f.get(null) instanceof Component c) {
+                    out.add(new Named(f.getName(), c));
+                }
+            } catch (Throwable t) {
+                System.out.println("   [diag] 读 " + owner.getSimpleName() + "."
+                        + f.getName() + " 失败: " + t);
+            }
+        }
+        out.sort(Comparator.comparing(Named::name));
+        return out;
+    }
+
+    /** 覆写 sendSystemMessage 的假玩家：把消息接住，不真的发包 */
+    private static final class CapturingPlayer extends ServerPlayer {
+        private Component last;
+
+        CapturingPlayer(MinecraftServer server, ServerLevel level, GameProfile profile,
+                        ClientInformation info) {
+            super(server, level, profile, info);
+        }
+
+        @Override
+        public void sendSystemMessage(Component message) {
+            this.last = message;
+        }
+    }
+
+    private static List<Component> leaves(Component c) {
+        List<Component> out = new ArrayList<>();
+        collect(c, out);
+        return out;
+    }
+
+    private static void collect(Component c, List<Component> out) {
+        out.add(c);
+        for (Component s : c.getSiblings()) {
+            collect(s, out);
+        }
+    }
+
+    /** 这一片叶子<b>自己的</b>文本（{@code getString()} 会把子孙的文本一起拼进来，不能用来定位） */
+    private static String ownText(Component c) {
+        if (c.getContents() instanceof PlainTextContents.LiteralContents literal) {
+            return literal.text();
+        }
+        return c.getString();
+    }
+
+    private static Component firstLeaf(Component c) {
+        return leaves(c).get(0);
+    }
+
+    private static Component leafWith(Component c, String text) {
+        for (Component leaf : leaves(c)) {
+            if (ownText(leaf).equals(text)) {
+                return leaf;
+            }
+        }
+        return null;
+    }
+
+    private static Component firstTranslatable(Component c) {
+        for (Component leaf : leaves(c)) {
+            if (leaf.getContents() instanceof TranslatableContents) {
+                return leaf;
+            }
+        }
+        return null;
+    }
+
+    private static TranslatableContents findTranslatable(Component c, String key) {
+        for (Component leaf : leaves(c)) {
+            if (leaf.getContents() instanceof TranslatableContents t && t.getKey().equals(key)) {
+                return t;
+            }
+        }
+        return null;
+    }
+
+    private static int colorOf(Component c) {
+        var color = c.getStyle().getColor();
+        return color == null ? -1 : color.getValue();
+    }
+
+    private static String hex(int rgb) {
+        return rgb < 0 ? "(无色)" : String.format("#%06X", rgb);
+    }
+
+    private static void noStyle(String label, Component c) {
+        check(label + " 斜体显式为 false（不是 null）", italicRaw(c) == Boolean.FALSE);
+        check(label + " 加粗不是 TRUE", boldRaw(c) != Boolean.TRUE);
+    }
+
+    private static Boolean italicRaw(Component c) {
+        return styleField(c, "italic");
+    }
+
+    private static Boolean boldRaw(Component c) {
+        return styleField(c, "bold");
+    }
+
+    private static Boolean styleField(Component c, String name) {
+        try {
+            Field f = Style.class.getDeclaredField(name);
+            f.setAccessible(true);
+            return (Boolean) f.get(c.getStyle());
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 读 Style." + name + " 失败: " + t);
+            return null;
+        }
+    }
+
+    private static void dumpOne(String tag, Component c) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("   [").append(tag).append("] '").append(c.getString()).append("'");
+        for (Component leaf : leaves(c)) {
+            sb.append("\n        {").append(ownText(leaf)).append(" ").append(hex(colorOf(leaf)))
+                    .append(" 斜体=").append(italicRaw(leaf))
+                    .append(" 加粗=").append(boldRaw(leaf)).append("}");
+        }
+        System.out.println(sb);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + label);
+        }
+    }
+}

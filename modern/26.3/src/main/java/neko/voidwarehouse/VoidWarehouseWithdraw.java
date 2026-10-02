@@ -1,6 +1,7 @@
 package neko.voidwarehouse;
 
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
@@ -243,22 +244,54 @@ public final class VoidWarehouseWithdraw {
         // ⑥ 扣账：物品 + 盒子材料（空盒优先，不够的才用壳 + 箱；材料在 ② 里验过）
         data.takeExact(sample, (int) requested);
         data.consumeBoxMaterials(plan);
-        // 提示里如实反映「散货是散着给的还是装盒给的」，玩家一眼知道自己拿到了什么。
-        // 「取了多少个」是这条消息里唯一的关键信息 → 亮绿；装盒明细是补充说明 → 灰。
+        player.sendSystemMessage(successMessage(sample, requested, fullBoxes, loose, packLoose));
+    }
+
+    /**
+     * 取货成功的聊天提示：<b>一整条</b>（含 {@code [虚空仓库] } 前缀），只拼装、不发消息。
+     *
+     * <p>从 {@link #execute} 里抽出来是为了<b>能脱离世界单测</b>：这条消息的分支不少
+     * （有满盒 / 全散货 / 散货装盒），每改一次措辞就跑一局游戏去肉眼验，成本太高。
+     * 抽成纯函数后可以在真实服务端里直接构造各种组合断言。</p>
+     *
+     * <p>文案口径（玩家定）：</p>
+     * <ul>
+     *   <li>数量后面要跟<b>物品名</b> —— 只写「已取出 200 个」等于没说是取什么，还得回头看背包；</li>
+     *   <li>全散货时<b>不写</b>「（200 散货）」—— 括号里的数字和「已取出 200 个」完全一样，
+     *       只有真的多出来一个盒子（满盒 / 散货装盒）括号才有新信息，否则纯属啰嗦；</li>
+     *   <li>「取了多少个」是这条消息里唯一的关键信息 → 亮绿；物品名与装盒明细是补充 → 灰。</li>
+     * </ul>
+     *
+     * @param fullBoxes 装出来的满盒数
+     * @param loose     余下的散货数
+     * @param packLoose 散货是否已顺手装成一个盒子（那一盒没装满）
+     */
+    static Component successMessage(ItemStack sample, long requested,
+                                    long fullBoxes, long loose, boolean packLoose) {
         StringBuilder detail = new StringBuilder();
-        boolean hasPrefix = false;
         if (fullBoxes > 0) {
-            detail.append(fullBoxes).append(" 满盒");
-            hasPrefix = true;
+            detail.append(VoidWarehouseText.count(fullBoxes)).append(" 满盒");
         }
         if (packLoose) {
-            detail.append(hasPrefix ? " + " : "").append("散货 ").append(loose).append(" 已装盒");
-        } else if (loose > 0) {
-            detail.append(hasPrefix ? " + " : "").append(loose).append(" 散货");
+            if (detail.length() > 0) {
+                detail.append(" + ");
+            }
+            detail.append("散货 ").append(VoidWarehouseText.count(loose)).append(" 已装盒");
+        } else if (fullBoxes > 0 && loose > 0) {
+            // 有满盒时「散货数」不等于总数，括号里的数字是真信息，保留
+            detail.append(" + 散货 ").append(VoidWarehouseText.count(loose));
         }
-        player.sendSystemMessage(VoidWarehouseText.info(VoidWarehouseText.body("已取出 ")
+        MutableComponent message = VoidWarehouseText.body("已取出 ")
                 .append(VoidWarehouseText.key(VoidWarehouseText.count(requested)))
-                .append(VoidWarehouseText.body(" 个（" + detail + "）"))));
+                .append(VoidWarehouseText.body(" 个 "))
+                // 物品名保持「可翻译组件」原样，交给客户端本地化（理由见 PrinterRestockNetwork）
+                .append(VoidWarehouseText.body(sample.getHoverName()));
+        if (detail.length() > 0) {
+            message.append(VoidWarehouseText.body("（" + detail + "）"));
+        }
+        // 前缀在这里就套上：调用方只需「发出去」，不用记得再包一层 info()
+        // （本轮重构时就漏过一次 —— 自检里那条「以 [虚空仓库] 开头」把它抓了出来）
+        return VoidWarehouseText.info(message);
     }
 
     // ------------------------------------------------------------------ 背包

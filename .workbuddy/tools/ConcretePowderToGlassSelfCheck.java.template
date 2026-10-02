@@ -1,0 +1,420 @@
+package neko.cooking;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.inventory.AbstractFurnaceMenu;
+import net.minecraft.world.inventory.BlastFurnaceMenu;
+import net.minecraft.world.inventory.FurnaceMenu;
+import net.minecraft.world.inventory.SimpleContainerData;
+import net.minecraft.world.item.DyeColor;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.crafting.BlastingRecipe;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeHolder;
+import net.minecraft.world.item.crafting.RecipeType;
+import net.minecraft.world.item.crafting.SingleRecipeInput;
+import net.minecraft.world.item.crafting.SmeltingRecipe;
+import net.minecraft.world.item.crafting.SmokingRecipe;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.AbstractFurnaceBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
+
+import java.lang.reflect.Method;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * 【临时自检】混凝土粉末烧制染色玻璃 —— 验证完删掉。
+ *
+ * <h2>这一轮要证明的三件事</h2>
+ * <ol>
+ *   <li><b>16 条配方的颜色没串</b>：不是「有配方」就算过，而是逐色断言
+ *       {@code assemble()} 出来的<b>就是那个颜色</b>的染色玻璃、且只产 1 个、16 个产出互不相同。
+ *       取色写歪（比如两个颜色指到同一个物品）只有这些断言抓得住。</li>
+ *   <li><b>真实熔炉真的烧得出来</b>：摆一个真熔炉方块实体、喂粉末 + 煤，
+ *       逐 tick 驱动 {@code AbstractFurnaceBlockEntity.serverTick}，断言输出槽里出现
+ *       <b>对应颜色</b>的染色玻璃、输入被消耗、且 {@code getRecipeUsed()} 记下了我们的配方 id。
+ *       —— 这条走的是 {@code quickCheck → getRecipeFor} 那条<b>真实</b>链路。</li>
+ *   <li><b>Shift 点击能把粉末送进输入槽</b>：走真实的 {@code FurnaceMenu.quickMoveStack}
+ *       （{@code canSmelt} 在整个原版里唯一的调用点）。不修 {@code canSmelt} 的话粉末进不了
+ *       输入槽，玩家只能手动一个一个摆 —— 这条就是那个 Mixin 的牙。</li>
+ * </ol>
+ *
+ * <h2>反证组（没有它，上面全绿也可能只是断言没牙）</h2>
+ * <ul>
+ *   <li>A 组把规则<b>关着</b>跑一遍同样的链路：查配方必须为空、真熔炉烧 400 tick 必须
+ *       <b>一口没动</b>、Shift 点击必须进不了输入槽。修复前 A 组就是「全绿」的姿态，
+ *       所以 A 组绿 = 规则关掉后确实和原版一模一样。</li>
+ *   <li>G 组用反射确认两个 Mixin <b>真的挂上了</b>（有 class 但没进 mixins.json、
+ *       或字符串描述符写错，都会表现为「静默不生效」，build 照样成功）。</li>
+ *   <li>D3 证明 {@code instanceof FurnaceMenu} 的限定有效：同一份 Shift 点击，高炉不许收。</li>
+ * </ul>
+ */
+public final class ConcretePowderToGlassSelfCheck {
+
+    private static boolean done;
+    private static int checks;
+    private static int failures;
+
+    /** 熔炉三个槽：0 输入 / 1 燃料 / 2 产物 */
+    private static final int SLOT_INPUT = 0;
+    private static final int SLOT_FUEL = 1;
+    private static final int SLOT_RESULT = 2;
+
+    private ConcretePowderToGlassSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        long start = System.nanoTime();
+        try {
+            mixinAppliedChecks();
+            ruleOffChecks(server);
+            ruleOnRecipeChecks(server);
+            ruleOnFurnaceChecks(server);
+            shiftClickChecks(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT cooking/26.3 checks=" + checks + " failures=" + failures
+                + " elapsedMs=" + ((System.nanoTime() - start) / 1_000_000));
+        server.halt(false);
+    }
+
+    // ---------------------------------------------------------------- 断言
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("FAIL: " + name);
+        }
+    }
+
+    private static void note(String line) {
+        System.out.println("   [diag] " + line);
+    }
+
+    // ---------------------------------------------------------------- G 组：Mixin 真的挂上了吗
+
+    /**
+     * 「有 class 但没挂上」是本项目最贵的一类静默失效：{@code build} 照样成功、jar 里也有
+     * class，只是 Mixin 从来没被应用。所以先证明它挂上了，后面的断言才有意义。
+     */
+    private static void mixinAppliedChecks() {
+        check("G1 RecipeManager 上挂着我们的 mixin（getRecipeFor + byKey）",
+                countHandlers(net.minecraft.world.item.crafting.RecipeManager.class) >= 2);
+        check("G2 AbstractFurnaceMenu 上挂着我们的 mixin（canSmelt）",
+                countHandlers(AbstractFurnaceMenu.class) >= 1);
+        note("handler: RecipeManager[" + handlerNames(net.minecraft.world.item.crafting.RecipeManager.class)
+                + "] AbstractFurnaceMenu[" + handlerNames(AbstractFurnaceMenu.class) + "]");
+    }
+
+    private static String handlerNames(Class<?> type) {
+        StringBuilder sb = new StringBuilder();
+        for (Method m : type.getDeclaredMethods()) {
+            if (m.getName().contains("concretePowderToGlass")) {
+                sb.append(m.getName()).append(' ');
+            }
+        }
+        return sb.toString().trim();
+    }
+
+    private static int countHandlers(Class<?> type) {
+        int n = 0;
+        for (Method m : type.getDeclaredMethods()) {
+            if (m.getName().contains("concretePowderToGlass")) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    // ---------------------------------------------------------------- A 组：规则关（反证）
+
+    private static void ruleOffChecks(MinecraftServer server) {
+        CookingSettings.concretePowderToGlass = false;
+        ServerLevel level = server.overworld();
+        Item white = ConcretePowderToGlass.powderOf(DyeColor.WHITE);
+
+        check("A1 规则关：查不到白色粉末的配方",
+                lookupSmelting(level, new ItemStack(white)).isEmpty());
+        check("A2 规则关：byKey 也查不到（与原版完全一致）",
+                byKey(level, ConcretePowderToGlass.recipeId(DyeColor.WHITE)).isEmpty());
+        check("A3 规则关：isEnabledInput 为假",
+                !ConcretePowderToGlass.isEnabledInput(new ItemStack(white)));
+
+        // A4：真熔炉，规则关 → 400 tick 一口都不许动
+        BlockPos pos = furnacePos(server);
+        AbstractFurnaceBlockEntity be = placeFurnace(level, pos);
+        if (be == null) {
+            check("A4 熔炉方块实体可放置（位置 " + pos + "）", false);
+            return;
+        }
+        be.setItem(SLOT_INPUT, new ItemStack(white, 1));
+        be.setItem(SLOT_FUEL, new ItemStack(Items.COAL, 8));
+        be.setItem(SLOT_RESULT, ItemStack.EMPTY);
+        runFurnace(level, pos, be, 400);
+        note("A4 输出槽=" + describe(be.getItem(SLOT_RESULT))
+                + " 输入槽=" + describe(be.getItem(SLOT_INPUT)));
+        check("A4 规则关：真熔炉烧 400 tick 后输入原封不动（原版不认这条配方）",
+                be.getItem(SLOT_INPUT).getItem() == white);
+        check("A5 规则关：输出槽仍然是空的", be.getItem(SLOT_RESULT).isEmpty());
+        clearFurnace(level, pos);
+    }
+
+    // ---------------------------------------------------------------- B 组：规则开 · 配方表本身
+
+    private static void ruleOnRecipeChecks(MinecraftServer server) {
+        CookingSettings.concretePowderToGlass = true;
+        ServerLevel level = server.overworld();
+
+        Set<Item> outputs = new HashSet<>();
+        int missing = 0;
+        int wrongColor = 0;
+        int wrongCount = 0;
+        int wrongId = 0;
+
+        for (DyeColor color : DyeColor.values()) {
+            Item powder = ConcretePowderToGlass.powderOf(color);
+            Item glass = ConcretePowderToGlass.glassOf(color);
+            SingleRecipeInput input = new SingleRecipeInput(new ItemStack(powder));
+
+            Optional<? extends RecipeHolder<?>> found = lookupSmelting(level, input);
+            if (found.isEmpty()) {
+                missing++;
+                note("缺配方: " + color);
+                continue;
+            }
+            ItemStack out = assemble(found.get(), input);
+            if (out.getItem() != glass) {
+                wrongColor++;
+                note("颜色串了: " + color + " 粉末 → " + describe(out) + "（期望 " + glass + "）");
+            }
+            if (out.getCount() != 1) {
+                wrongCount++;
+                note("数量不对: " + color + " → " + describe(out));
+            }
+            outputs.add(out.getItem());
+
+            Optional<RecipeHolder<?>> byId = byKey(level, ConcretePowderToGlass.recipeId(color));
+            if (byId.isEmpty() || byId.get().id() != ConcretePowderToGlass.recipeId(color)) {
+                wrongId++;
+                note("byKey 对不上: " + color);
+            }
+        }
+
+        check("B1 16 色全都查得到配方", missing == 0);
+        check("B2 16 色的产出都是【对应颜色】的染色玻璃（颜色没串）", wrongColor == 0);
+        check("B3 每条只产 1 个", wrongCount == 0);
+        check("B4 16 色的产出互不相同（是真 16 条，不是同一条被查了 16 次）", outputs.size() == 16);
+        check("B5 byKey 能按 id 反查到（原版发经验走的就是这条路）", wrongId == 0);
+
+        // B6：原版配方不能被我们盖掉（RETURN 注入的意义就在这）
+        SingleRecipeInput sand = new SingleRecipeInput(new ItemStack(Items.SAND));
+        Optional<? extends RecipeHolder<?>> vanilla = lookupSmelting(level, sand);
+        check("B6 原版「沙子 → 玻璃」仍然交给原版（我们只在原版说没有时补）",
+                vanilla.isPresent() && assemble(vanilla.get(), sand).getItem() == Items.GLASS);
+
+        // B7 / B8：高炉、烟熏炉用的不是 SMELTING，拿不到
+        SingleRecipeInput red = new SingleRecipeInput(
+                new ItemStack(ConcretePowderToGlass.powderOf(DyeColor.RED)));
+        check("B7 高炉（BLASTING）拿不到这条配方", lookupBlasting(level, red).isEmpty());
+        check("B8 烟熏炉（SMOKING）拿不到这条配方", lookupSmoking(level, red).isEmpty());
+        // B9：没有配方的普通物品不会误命中
+        check("B9 石头不会误命中我们的表",
+                ConcretePowderToGlass.findRecipe(RecipeType.SMELTING,
+                        new SingleRecipeInput(new ItemStack(Items.STONE))).isEmpty());
+    }
+
+    // ---------------------------------------------------------------- C 组：规则开 · 真熔炉
+
+    private static void ruleOnFurnaceChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+
+        for (DyeColor color : new DyeColor[]{DyeColor.RED, DyeColor.LIGHT_BLUE}) {
+            Item powder = ConcretePowderToGlass.powderOf(color);
+            Item glass = ConcretePowderToGlass.glassOf(color);
+
+            BlockPos pos = furnacePos(server);
+            AbstractFurnaceBlockEntity be = placeFurnace(level, pos);
+            if (be == null) {
+                check("C0 熔炉方块实体可放置（" + color + "，位置 " + pos + "）", false);
+                return;
+            }
+            be.setItem(SLOT_INPUT, new ItemStack(powder, 3));
+            be.setItem(SLOT_FUEL, new ItemStack(Items.COAL, 8));
+            be.setItem(SLOT_RESULT, ItemStack.EMPTY);
+
+            runFurnace(level, pos, be, 260);
+            ItemStack out = be.getItem(SLOT_RESULT);
+            // 真·经验链路：原版烧完会按「用过的配方 id」走 RecipeManager#byKey 反查配方再发经验
+            // （AbstractFurnaceBlockEntity#getRecipesToAwardAndPopExperience 字节码实证：
+            //  recipesUsed.addTo(holder.id(), 1) → byKey(id) → ifPresent(加进列表 + createExperience)）。
+            // 所以我们补的 byKey 那一钩是不是真的生效，这条断言说了算。
+            List<RecipeHolder<?>> awarded = be.getRecipesToAwardAndPopExperience(level, Vec3.atCenterOf(pos));
+            note("C " + color + " 输出=" + describe(out) + " 输入剩=" + describe(be.getItem(SLOT_INPUT))
+                    + " 可发经验的配方=" + awarded.stream().map(h -> h.id().toString()).toList());
+            check("C1 " + color + " 真熔炉烧出了对应颜色的染色玻璃",
+                    !out.isEmpty() && out.getItem() == glass);
+            check("C2 " + color + " 输入槽被消耗了一个（3 → 2）",
+                    be.getItem(SLOT_INPUT).getItem() == powder && be.getItem(SLOT_INPUT).getCount() == 2);
+            check("C3 " + color + " 经验发放链路认得这条配方（原版按 id 走 byKey，正是我们补的那一钩）",
+                    awarded.stream().anyMatch(h -> h.id() == ConcretePowderToGlass.recipeId(color)));
+            clearFurnace(level, pos);
+        }
+    }
+
+    // ---------------------------------------------------------------- D 组：Shift 点击（canSmelt 的牙）
+
+    private static void shiftClickChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        Item powder = ConcretePowderToGlass.powderOf(DyeColor.WHITE);
+
+        CookingSettings.concretePowderToGlass = true;
+        check("D1 普通熔炉 + 规则开：Shift 点击把粉末送进输入槽",
+                shiftIntoFurnace(server, level, false, powder));
+
+        CookingSettings.concretePowderToGlass = false;
+        check("D2 反证：规则关时 Shift 点击进不了输入槽（原版行为）",
+                !shiftIntoFurnace(server, level, false, powder));
+
+        CookingSettings.concretePowderToGlass = true;
+        check("D3 高炉：规则开着也不收（instanceof FurnaceMenu 的限定生效）",
+                !shiftIntoFurnace(server, level, true, powder));
+    }
+
+    /**
+     * 走真实的 Shift 点击路径：{@code AbstractFurnaceMenu#quickMoveStack} 里的
+     * {@code canSmelt(stack)} 就是它在整个原版里唯一的调用点。
+     *
+     * @param blast true 用高炉菜单，false 用普通熔炉菜单
+     * @return 粉末是否落进了菜单的输入槽（slot 0）
+     */
+    private static boolean shiftIntoFurnace(MinecraftServer server, ServerLevel level,
+                                            boolean blast, Item powder) {
+        ServerPlayer player = player(server, level);
+        if (player == null) {
+            return false;
+        }
+        player.getInventory().clearContent();
+        // 菜单槽位 3 对应玩家背包的 9 号槽（前 3 个槽是熔炉自己的输入/燃料/产物）
+        player.getInventory().setItem(9, new ItemStack(powder, 4));
+
+        SimpleContainer container = new SimpleContainer(3);
+        SimpleContainerData data = new SimpleContainerData(AbstractFurnaceMenu.DATA_COUNT);
+        AbstractFurnaceMenu menu = blast
+                ? new BlastFurnaceMenu(0, player.getInventory(), container, data)
+                : new FurnaceMenu(0, player.getInventory(), container, data);
+
+        menu.quickMoveStack(player, 3);
+        ItemStack inInput = container.getItem(SLOT_INPUT);
+        note((blast ? "高炉" : "熔炉") + " shift 之后：输入槽=" + describe(inInput)
+                + "，燃料槽=" + describe(container.getItem(SLOT_FUEL)));
+        return !inInput.isEmpty() && inInput.getItem() == powder;
+    }
+
+    // ---------------------------------------------------------------- 工具
+
+    private static Optional<? extends RecipeHolder<?>> lookupSmelting(ServerLevel level, ItemStack input) {
+        return lookupSmelting(level, new SingleRecipeInput(input));
+    }
+
+    /**
+     * {@code getRecipeFor} 的返回类型是 {@code Optional<RecipeHolder<T>>}，而 {@code Optional}
+     * <b>不变</b>：{@code Optional<RecipeHolder<SmeltingRecipe>>} 既不是
+     * {@code Optional<RecipeHolder<?>>}，也推不出 {@code T} —— 所以既要显式给类型参数，
+     * 返回类型也要放宽成 {@code Optional<? extends RecipeHolder<?>>}。
+     */
+    private static Optional<? extends RecipeHolder<?>> lookupSmelting(ServerLevel level, SingleRecipeInput input) {
+        return level.recipeAccess()
+                .<SingleRecipeInput, SmeltingRecipe>getRecipeFor(RecipeType.SMELTING, input, level);
+    }
+
+    private static Optional<? extends RecipeHolder<?>> lookupBlasting(ServerLevel level, SingleRecipeInput input) {
+        return level.recipeAccess()
+                .<SingleRecipeInput, BlastingRecipe>getRecipeFor(RecipeType.BLASTING, input, level);
+    }
+
+    private static Optional<? extends RecipeHolder<?>> lookupSmoking(ServerLevel level, SingleRecipeInput input) {
+        return level.recipeAccess()
+                .<SingleRecipeInput, SmokingRecipe>getRecipeFor(RecipeType.SMOKING, input, level);
+    }
+
+    private static Optional<RecipeHolder<?>> byKey(ServerLevel level, ResourceKey<Recipe<?>> id) {
+        return level.recipeAccess().byKey(id);
+    }
+
+    /** 把配方真的「做」一次拿到产出 —— 比只断言「查到了」硬得多 */
+    private static ItemStack assemble(RecipeHolder<?> holder, SingleRecipeInput input) {
+        if (!(holder.value() instanceof SmeltingRecipe smelting)) {
+            return ItemStack.EMPTY;
+        }
+        return smelting.assemble(input);
+    }
+
+    /** 熔炉摆在存档出生点上方 12 格：那块区块开局就被加载，不依赖玩家在线 */
+    private static BlockPos furnacePos(MinecraftServer server) {
+        return server.overworld().getRespawnData().globalPos().pos().offset(0, 12, 0);
+    }
+
+    private static AbstractFurnaceBlockEntity placeFurnace(ServerLevel level, BlockPos pos) {
+        // 离线自检里没有玩家，出生点那一圈区块不保证是加载状态 → 先同步把区块拉起来。
+        // （实测第一次跑就是栽在这里：setBlockAndUpdate 在未加载的区块上静默什么都不做，
+        //   getBlockEntity 返回 null，看着像「熔炉摆不下去」。）
+        level.getChunkAt(pos);
+        if (!level.isLoaded(pos)) {
+            note("位置未加载: " + pos);
+            return null;
+        }
+        level.setBlockAndUpdate(pos, Blocks.FURNACE.defaultBlockState());
+        return level.getBlockEntity(pos) instanceof AbstractFurnaceBlockEntity be ? be : null;
+    }
+
+    private static void runFurnace(ServerLevel level, BlockPos pos, AbstractFurnaceBlockEntity be, int ticks) {
+        for (int i = 0; i < ticks; i++) {
+            BlockState state = level.getBlockState(pos);
+            AbstractFurnaceBlockEntity.serverTick(level, pos, state, be);
+        }
+    }
+
+    /** 幂等：自检连跑两次不该互相污染 */
+    private static void clearFurnace(ServerLevel level, BlockPos pos) {
+        level.setBlockAndUpdate(pos, Blocks.AIR.defaultBlockState());
+    }
+
+    private static ServerPlayer player(MinecraftServer server, ServerLevel level) {
+        try {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "NekoCookingCheck");
+            return new ServerPlayer(server, level, profile, ClientInformation.createDefault());
+        } catch (Throwable t) {
+            note("假玩家构造失败: " + t);
+            return null;
+        }
+    }
+
+    private static String describe(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return "(空)";
+        }
+        return stack.getCount() + "×" + BuiltInRegistries.ITEM.getKey(stack.getItem());
+    }
+}

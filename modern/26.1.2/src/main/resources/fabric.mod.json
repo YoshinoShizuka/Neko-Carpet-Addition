@@ -18,7 +18,8 @@
   },
 
   "mixins": [
-    "carpet_neko_addition.mixins.json"
+    "carpet_neko_addition.mixins.json",
+    "carpet_neko_addition.cooking.mixins.json"
   ],
 
   "depends": {

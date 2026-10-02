@@ -452,6 +452,29 @@ carpet-Neko-Addition-mc1.21.11-1.0.3.jar  自检残留:0  新mixin:2  md5=1c828a
 
 ---
 
+## 17.1 追加（2026-10-02）：`rightClickToOpen` 必须保持 `true`
+
+本轮的修复（把拦截上移到 `ServerGamePacketListenerImpl#handleUseItem`）只解决
+**「虚空仓库的右键被抢」**；它不改变一个事实：
+
+> **QuickShulker 的「手持潜影盒右键打开」完全由它自己的 `rightClickToOpen` 开关控制**
+> （`lambda$onInitialize$0` 的第一道闸门，`false` 时直接 `return PASS`），
+> 与任何其它模组无关。
+
+上一轮为绕开「对空气右键虚空仓库会打开合成界面」，曾把这个开关关掉当权宜之计 ——
+那是**同一个开关**（抢右键的正是这条回调）。关掉它自然会让「手持潜影盒右键」一起失效。
+**根因既已修掉，这个开关就应当复原成 `true`。**
+
+已实测（同代码 + 同 12 个实机模组，只切这一个布尔）：
+
+- `false` ⇒ 手持潜影盒右键 4/4 打不开（`menu=InventoryMenu`），且 `voidWarehouse` 开/关无差异；
+- `true`  ⇒ 4/4 打开；同时 R1 证明虚空仓库右键没被抢、R2 证明 QuickShulker 确实会抢普通工作台。
+
+详见 `docs/虚空仓库与QuickShulker手持潜影盒右键失效排查.md`。
+
+
+---
+
 # 第五部分：教训沉淀
 
 1. **同一条业务规则只有一个实现。** 「装盒材料账」被复制成两份、只改了一份，

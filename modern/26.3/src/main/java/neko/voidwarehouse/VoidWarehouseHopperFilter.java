@@ -63,7 +63,8 @@ public interface VoidWarehouseHopperFilter {
      *
      * <p>原版漏斗「每 8 gt 才动一次」的节流全靠这个字段：{@code tryMoveItems} 开头检查
      * {@code isOnCooldown()}（>0 就直接出队），结尾只要搬成了就 {@code setCooldown(8)}。
-     * 入库漏斗要无速率上限，就必须在<b>整条 tick 走完之后</b>把它清掉。</p>
+     * <b>入库漏斗与出料漏斗都要无速率上限</b>，所以两者都要在<b>整条 tick 走完之后</b>把它清掉
+     * （见 {@code HopperBlockEntityMixin#carpetAutomending$unlimitedCooldown}）。</p>
      *
      * <p><b>位置很关键</b>：早先在 {@code suckInItems} 中途清零是<b>无效的</b> ——
      * 紧接着 {@code tryMoveItems} 收尾就把 8 写回去了。现在改到

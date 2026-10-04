@@ -1,0 +1,424 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * 【临时基准】量一量「出料漏斗多了会不会拖慢服务端」；测完连同 hook 一起删掉。
+ *
+ * <h2>为什么要单独测一次</h2>
+ * <p>本轮把出料端的速率从「每 8 gt 搬 1 个」改成了「每 tick 整格搬 + 清冷却」。
+ * 频率上去了、每次搬的量也大了，所以要回答两件事：</p>
+ * <ol>
+ *   <li><b>空转成本</b>：N 个出料漏斗什么都不干（仓库空、下游满）时，每 tick 白烧多少？</li>
+ *   <li><b>满载成本</b>：仓库哗哗出货时，会不会把 tick 撑爆？</li>
+ * </ol>
+ *
+ * <h2>三组对照</h2>
+ * <ul>
+ *   <li>{@code idle}：N 个出料漏斗空转（下游塞满，谁都不动）；</li>
+ *   <li>{@code load}：N 个出料漏斗 + 每 tick 给每个补满仓库、下游留足空位 → 每 tick 满负荷搬；</li>
+ *   <li>{@code vanilla}：<b>同样这批漏斗</b>撤掉终端变普通漏斗，量「原版 8 gt 节流」下的基准。</li>
+ * </ul>
+ * <p>{@code load − vanilla} 才是本模组净加进去的开销；{@code idle − vanilla} 是空转的净开销。</p>
+ *
+ * <h2>微基准</h2>
+ * <p>把一次出料 tick 拆成「{@code isExtractor} / {@code pull} / {@code eject} / 整条
+ * {@code pushItemsTick}」分别量，单位 ns/漏斗。</p>
+ */
+public final class ExtractorPerfBenchmark {
+
+    private static final int GRID = 32;              // 32 × 32 = 1024 个漏斗；改成 16 即 256 个
+    private static final int STEP = 2;
+    private static final int N = GRID * GRID;
+    private static final int BASE_X = 800;           // 离自检场景远一点
+    private static final int BASE_Z = 800;
+    private static final int TABLE_Y = 120;          // 终端（工作台）
+    private static final int HOPPER_Y = 119;         // 出料漏斗（口朝下）
+    private static final int CHEST_Y = 118;          // 下游箱子
+
+    private static final int WARMUP = 100;
+    private static final int ROUNDS = 200;
+    private static final int SAMPLE_TICKS = 300;
+    private static final int SETTLE_TICKS = 60;
+
+    /** 每 tick 给每个<u>组</u>补进仓库多少个物品（要 ≥ 每 tick 的搬出量，否则测的是「饿着跑」） */
+    private static final int REFILL_PER_TICK = 320;
+
+    private static final List<BlockPos> tables = new ArrayList<>();
+    private static final List<BlockPos> hoppersPos = new ArrayList<>();
+    private static final List<BlockPos> chests = new ArrayList<>();
+    private static final List<HopperBlockEntity> hoppers = new ArrayList<>();
+    private static final List<BlockState> states = new ArrayList<>();
+
+    private static int stage = 0;
+    private static int counter = 0;
+    private static int waited = 0;
+    private static long refilled = 0;
+    private static boolean halted = false;
+
+    private ExtractorPerfBenchmark() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (halted) {
+            return;
+        }
+        VoidWarehouseSettings.voidWarehouse = true;
+        try {
+            step(server);
+        } catch (Throwable t) {
+            System.out.println("!! 基准抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        switch (stage) {
+            case 0:
+                int lastX = (BASE_X + (GRID - 1) * STEP) >> 4;
+                int lastZ = (BASE_Z + (GRID - 1) * STEP) >> 4;
+                for (int cx = BASE_X >> 4; cx <= lastX; cx++) {
+                    for (int cz = BASE_Z >> 4; cz <= lastZ; cz++) {
+                        level.setChunkForced(cx, cz, true);
+                    }
+                }
+                break;
+            case 1:
+                if (!level.isLoaded(new BlockPos(BASE_X, HOPPER_Y, BASE_Z))
+                        || !level.isLoaded(new BlockPos(BASE_X + (GRID - 1) * STEP, HOPPER_Y,
+                        BASE_Z + (GRID - 1) * STEP))) {
+                    if (++waited > 300) {
+                        System.out.println("PERF !! 区块 300 tick 没加载出来，放弃");
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                System.out.println("PERF 区块就绪，N=" + N + " 个出料漏斗");
+                break;
+            case 2:
+                resetField(level);
+                break;
+            case 3:
+                if (++counter < SETTLE_TICKS) {
+                    return;
+                }
+                counter = 0;
+                break;
+            case 4:     // ---- 基线：没有漏斗 ----
+                if (++counter < SAMPLE_TICKS) {
+                    return;
+                }
+                reportTicks(server, "baseline");
+                counter = 0;
+                break;
+            case 5:     // 搭 N 组「终端 + 出料漏斗 + 下游箱」
+                resetField(level);
+                build(level);
+                System.out.println("PERF 搭好 " + tables.size() + " / " + N + " 组「终端 + 出料漏斗 + 下游箱」");
+                break;
+            case 6:
+                collect(level);
+                if (hoppers.size() != N) {
+                    if (++waited > 100) {
+                        System.out.println("PERF !! 只拿到 " + hoppers.size() + " / " + N + " 个漏斗");
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                waited = 0;
+                break;
+            case 7:     // 先把下游填满（idle 场景谁都不动）
+                fillChests(level);
+                break;
+            case 8:     // ---- 微基准 ----
+                microAll(server, level);
+                break;
+            case 9:
+                if (++counter < SETTLE_TICKS) {
+                    return;
+                }
+                counter = 0;
+                break;
+            case 10:    // ---- 真实 tick：idle（下游满，仓库空，什么都不干）----
+                if (++counter < SAMPLE_TICKS) {
+                    return;
+                }
+                reportTicks(server, "idle");
+                counter = 0;
+                break;
+            case 11:    // 准备 load：下游腾空
+                emptyChests(level);
+                break;
+            case 12:
+                if (++counter < SETTLE_TICKS) {
+                    refill(level, data);
+                    return;
+                }
+                counter = 0;
+                break;
+            case 13:    // ---- 真实 tick：load（每 tick 补给 + 满负荷搬出）----
+                if (++counter < SAMPLE_TICKS) {
+                    refill(level, data);
+                    return;
+                }
+                reportTicks(server, "load");
+                System.out.println("PERF load 期间共从仓库取料 " + refilled + " 个"
+                        + "（每 tick 每漏斗 " + (refilled / Math.max(1, counter * N)) + " 个）");
+                refilled = 0;
+                counter = 0;
+                break;
+            case 14:    // 清场 + 撤掉终端 → 同样这批漏斗变普通漏斗
+                emptyChests(level);
+                for (BlockPos p : tables) {
+                    level.setBlock(p, Blocks.AIR.defaultBlockState(), 3);
+                }
+                collect(level);
+                break;
+            case 15:    // 普通漏斗 5 格塞满
+                for (HopperBlockEntity h : hoppers) {
+                    for (int i = 0; i < h.getContainerSize(); i++) {
+                        h.setItem(i, new ItemStack(Items.COBBLESTONE, 64));
+                    }
+                    h.setChanged();
+                }
+                break;
+            case 16:
+                if (++counter < SETTLE_TICKS) {
+                    return;
+                }
+                counter = 0;
+                break;
+            case 17:    // ---- 对照：同样这批漏斗（普通）满载 ----
+                if (++counter < SAMPLE_TICKS) {
+                    return;
+                }
+                reportTicks(server, "vanilla");
+                counter = 0;
+                break;
+            case 18:    // 微基准：撤掉终端后同样这批漏斗的原版 pushItemsTick
+                bench("vanilla_push(普通漏斗)", ROUNDS, () -> {
+                    for (int i = 0; i < hoppers.size(); i++) {
+                        HopperBlockEntity h = hoppers.get(i);
+                        HopperBlockEntity.pushItemsTick(level, h.getBlockPos(), states.get(i), h);
+                    }
+                });
+                break;
+            case 19:
+                resetField(level);
+                break;
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    // ------------------------------------------------------------------ 微基准
+
+    private static void microAll(MinecraftServer server, ServerLevel level) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+
+        bench("isExtractor", ROUNDS, () -> {
+            for (int i = 0; i < hoppers.size(); i++) {
+                HopperBlockEntity h = hoppers.get(i);
+                VoidWarehouseExtractor.isExtractor(level, h.getBlockPos(), states.get(i));
+            }
+        });
+        bench("data()(取仓库句柄)", ROUNDS, () -> {
+            for (int i = 0; i < hoppers.size(); i++) {
+                VoidWarehouse.data(server);
+            }
+        });
+        bench("getContainerAt(下游)", ROUNDS, () -> {
+            for (HopperBlockEntity h : hoppers) {
+                HopperBlockEntity.getContainerAt(level, h.getBlockPos().below());
+            }
+        });
+        bench("pull(仓库空)", ROUNDS, () -> {
+            for (HopperBlockEntity h : hoppers) {
+                VoidWarehouseExtractor.pull(level, h);
+            }
+        });
+        bench("eject(下游满)", ROUNDS, () -> {
+            for (HopperBlockEntity h : hoppers) {
+                VoidWarehouseExtractor.eject(level, h.getBlockPos(), h);
+            }
+        });
+        bench("extractor_push(出料漏斗)", ROUNDS, () -> {
+            for (int i = 0; i < hoppers.size(); i++) {
+                HopperBlockEntity h = hoppers.get(i);
+                HopperBlockEntity.pushItemsTick(level, h.getBlockPos(), states.get(i), h);
+            }
+        });
+
+        // ---- 满载：给每个漏斗 5 格各 64，下游腾空，量「整格搬」一轮 ----
+        emptyChests(level);
+        for (HopperBlockEntity h : hoppers) {
+            for (int i = 0; i < h.getContainerSize(); i++) {
+                h.setItem(i, new ItemStack(Items.COBBLESTONE, 64));
+            }
+            h.setChanged();
+        }
+        long t0 = System.nanoTime();
+        for (HopperBlockEntity h : hoppers) {
+            VoidWarehouseExtractor.eject(level, h.getBlockPos(), h);
+        }
+        long dt = System.nanoTime() - t0;
+        System.out.printf("PERF %-28s total=%8.3fms  per_hopper=%9.0fns  (每漏斗推 320 个)%n",
+                "eject(满载一轮)", dt / 1e6, (double) dt / N);
+        fillChests(level);
+        data.clearContent();
+    }
+
+    private static void bench(String label, int rounds, Runnable body) {
+        for (int i = 0; i < WARMUP; i++) {
+            body.run();
+        }
+        long t0 = System.nanoTime();
+        for (int i = 0; i < rounds; i++) {
+            body.run();
+        }
+        long dt = System.nanoTime() - t0;
+        System.out.printf("PERF %-28s total=%8.2fms  per_round=%10.3fus  per_hopper=%9.0fns%n",
+                label, dt / 1e6, dt / 1e3 / rounds, (double) dt / rounds / N);
+    }
+
+    private static void reportTicks(MinecraftServer server, String label) {
+        long[] times = server.getTickTimesNanos().clone();
+        Arrays.sort(times);
+        double median = times[times.length / 2] / 1e6;
+        double p95 = times[Math.min(times.length - 1, (int) (times.length * 0.95))] / 1e6;
+        double max = times[times.length - 1] / 1e6;
+        double mean = Arrays.stream(times).average().orElse(0D) / 1e6;
+        System.out.printf("PERF-TICK %-9s median=%7.3fms  p95=%7.3fms  max=%7.3fms  mean=%7.3fms%n",
+                label, median, p95, max, mean);
+    }
+
+    // ------------------------------------------------------------------ 场景
+
+    private static void resetField(ServerLevel level) {
+        for (int ix = 0; ix < GRID; ix++) {
+            for (int iz = 0; iz < GRID; iz++) {
+                BlockPos table = new BlockPos(BASE_X + ix * STEP, TABLE_Y, BASE_Z + iz * STEP);
+                level.setBlock(table, Blocks.AIR.defaultBlockState(), 3);
+                level.setBlock(table.below(), Blocks.AIR.defaultBlockState(), 3);
+                level.setBlock(table.below().below(), Blocks.AIR.defaultBlockState(), 3);
+            }
+        }
+        tables.clear();
+        hoppersPos.clear();
+        chests.clear();
+        hoppers.clear();
+        states.clear();
+    }
+
+    private static void build(ServerLevel level) {
+        tables.clear();
+        hoppersPos.clear();
+        chests.clear();
+        for (int ix = 0; ix < GRID; ix++) {
+            for (int iz = 0; iz < GRID; iz++) {
+                BlockPos table = new BlockPos(BASE_X + ix * STEP, TABLE_Y, BASE_Z + iz * STEP);
+                BlockPos hopper = table.below();
+                BlockPos chest = hopper.below();
+                level.setBlock(table, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+                level.setBlock(hopper, Blocks.HOPPER.defaultBlockState()
+                        .setValue(HopperBlock.FACING, Direction.DOWN)
+                        .setValue(HopperBlock.ENABLED, true), 3);
+                level.setBlock(chest, Blocks.CHEST.defaultBlockState(), 3);
+                tables.add(table);
+                hoppersPos.add(hopper);
+                chests.add(chest);
+            }
+        }
+    }
+
+    private static void collect(ServerLevel level) {
+        hoppers.clear();
+        states.clear();
+        for (BlockPos pos : hoppersPos) {
+            BlockEntity raw = level.getBlockEntity(pos);
+            if (raw instanceof HopperBlockEntity hopper) {
+                hoppers.add(hopper);
+                states.add(level.getBlockState(pos));
+            }
+        }
+    }
+
+    private static void fillChests(ServerLevel level) {
+        for (BlockPos p : chests) {
+            BlockEntity be = level.getBlockEntity(p);
+            if (be instanceof Container c) {
+                for (int i = 0; i < c.getContainerSize(); i++) {
+                    c.setItem(i, new ItemStack(Items.COBBLESTONE, 64));
+                }
+                c.setChanged();
+            }
+        }
+    }
+
+    private static void emptyChests(ServerLevel level) {
+        for (BlockPos p : chests) {
+            BlockEntity be = level.getBlockEntity(p);
+            if (be instanceof Container c) {
+                for (int i = 0; i < c.getContainerSize(); i++) {
+                    c.setItem(i, ItemStack.EMPTY);
+                }
+                c.setChanged();
+            }
+        }
+    }
+
+    /** 给仓库补足料，并保证每个出料漏斗 5 格各 64 个分类物。 */
+    private static void refill(ServerLevel level, VoidWarehouseData data) {
+        data.insert(new ItemStack(Items.COBBLESTONE, REFILL_PER_TICK * N));
+        refilled += (long) REFILL_PER_TICK * N;
+        // 漏斗里的分类物可能被搬空了（下游腾空后会一直搬），补回 5 格各 64
+        for (HopperBlockEntity h : hoppers) {
+            for (int i = 0; i < h.getContainerSize(); i++) {
+                if (h.getItem(i).isEmpty()) {
+                    h.setItem(i, new ItemStack(Items.COBBLESTONE, 64));
+                    h.setChanged();
+                }
+            }
+        }
+        // 下游满了就腾空（否则搬不动，速率会掉下来）
+        emptyChests(level);
+    }
+
+    private static void finish(MinecraftServer server) {
+        if (halted) {
+            return;
+        }
+        halted = true;
+        resetField(server.overworld());
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        data.insert(new ItemStack(Items.DIRT, 5678));
+        System.out.println("PERF SUMMARY N=" + N + " 轮数=" + ROUNDS + " 采样tick=" + SAMPLE_TICKS
+                + "（预算 50ms/tick；idle/load 与 vanilla 的差就是出料漏斗的净开销）");
+        server.halt(false);
+    }
+}

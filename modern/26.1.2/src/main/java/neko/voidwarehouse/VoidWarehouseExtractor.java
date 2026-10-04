@@ -38,15 +38,22 @@ import net.minecraft.world.level.block.state.BlockState;
  *   <li><b>匹配是「物品 + 数据组件」</b>（{@link VoidWarehouseData#takeExact}）：
  *       漏斗里那把改过名的钻石剑不会去匹配普通的钻石剑，与仓库「一格一种形态」的模型一致。</li>
  * </ul>
- * <p>补料<b>没有速率上限</b>：不踩原版「每 8 gt 搬 1 个」的节流，每个 tick 都会把格子补满，
- * 所以漏斗永远是个满仓的缓冲。往<b>下游容器</b>那一段仍是原版速率（每 8 gt 1 个）——
- * 虚空仓库这一端不再是瓶颈，瓶颈回到玩家自己搭的容器那一端。</p>
+ * <p><b>整条链都无速率上限</b>（两端都比原版快，谁也不拖累谁）：</p>
+ * <ul>
+ *   <li><b>仓库 → 漏斗</b>：{@link #pull} 不踩原版「每 8 gt 搬 1 个」的节流，
+ *       每个 tick 都会把格子补满，所以漏斗永远是个满仓的缓冲；</li>
+ *   <li><b>漏斗 → 下游容器</b>：{@link #eject} 接管原版的出料动作，<b>整格搬</b>
+ *       （原版是每次 1 个），再叠上 {@code pushItemsTick} 收尾清零冷却
+ *       （见 {@code HopperBlockEntityMixin#carpetAutomending$unlimitedCooldown}）——
+ *       于是下游每个 tick 都能拿到漏斗那一刻的全部存货。</li>
+ * </ul>
+ * <p>两段加起来 = 与入库漏斗同一个口径：<b>一 tick 搬空</b>，只取决于下游容器接得下多少。</p>
  *
  * <h2>分类物永不被抽走（本功能的硬约束）</h2>
  * <p>漏斗天生会把自己的东西往下游推，推干净了分类也就没了。所以在取出模式下
  * {@link #eject} 会<b>接管原版的出料动作</b>：每格物品的<b>最后 1 个</b>永远留在漏斗里。</p>
  * <ul>
- *   <li>仓库还有料时：格子被补满 → 下游按原版速率取用 → 格子始终 ≥ 2 → 正常出货；</li>
+ *   <li>仓库还有料时：格子被 {@link #pull} 补满 → 下游按「整格搬」取用 → 格子始终 ≥ 2 → 正常出货；</li>
  *   <li>仓库的该物品<b>被抽空</b>时：格子停在那 1 个上（这就是「余量」），
  *       下游再也拿不走它 —— 于是<b>分类不会丢</b>，玩家也不用重新摆一遍。</li>
  * </ul>
@@ -90,11 +97,11 @@ public final class VoidWarehouseExtractor {
      * <p>三个条件同时成立才是：</p>
      * <ol>
      *   <li>规则 {@code voidWarehouse} 开着；</li>
-     *   <li><b>正上方</b>是已登记的仓库终端（{@link VoidWarehouseTerminals#isTerminal}）；</li>
-     *   <li>漏斗口<b>朝向</b>的方块<b>不是</b>终端 —— 那条是入库。</li>
+     *   <li><b>正上方</b>是工作台（{@link VoidWarehouseTerminals#isWorkbench}，不要求登记）；</li>
+     *   <li>漏斗口<b>朝向</b>的方块<b>不是</b>工作台 —— 那条是入库。</li>
      * </ol>
      *
-     * <p>第 3 条是优先级规则：一条漏斗同时「上方是终端」且「口朝另一个终端」时，
+     * <p>第 3 条是优先级规则：一条漏斗同时「上方是工作台」且「口朝另一个工作台」时，
      * <b>入库优先</b>。这样本轮之前就搭好的机器行为一个字都不变，
      * 不会因为新功能突然开始往反方向倒料。</p>
      */
@@ -153,20 +160,29 @@ public final class VoidWarehouseExtractor {
 
     /**
      * 出料（接管原版 {@code ejectItems}）：把漏斗里的物品送进下游容器，
-     * <b>但每格永远留下 {@link #KEEP_AS_CLASSIFIER} 个</b>。
+     * <b>但每格永远留下 {@link #KEEP_AS_CLASSIFIER} 个</b>，而且<b>整格搬</b>（无速率上限）。
      *
-     * <p>原版的动作是「从头扫，谁非空就搬 1 个走」；这里的差别只有一处：
-     * <b>数量 ≤ 1 的格子直接跳过</b>。所以</p>
-     * <ul>
-     *   <li>正常出货时：格子被 {@link #pull} 补满，跳过规则完全不生效，出料速率与原版一致
-     *       （每次尝试搬 1 个、搬成功进 8 gt 冷却）；</li>
-     *   <li>仓库抽空后：格子只剩分类物，跳过规则接管，下游容器<b>吸不走</b>它。</li>
-     * </ul>
+     * <h2>与原版的差别（两处）</h2>
+     * <ol>
+     *   <li><b>整格搬</b>：原版 {@code ejectItems} 是「从头扫、谁非空就 {@code removeItem(slot, 1)}
+     *       搬走 1 个」；这里改成把该格<b>除余量以外的全部</b>一次性推下去。
+     *       配合调用方在 {@code pushItemsTick} 收尾把冷却清零，下游每个 tick
+     *       都能拿到漏斗那一刻的全部存货 —— 与入库端 {@code VoidWarehouseHopper}
+     *       的「整格搬」是同一个口径。</li>
+     *   <li><b>余量保护</b>：数量 ≤ {@link #KEEP_AS_CLASSIFIER} 的格子直接跳过 ——
+     *       那是分类物，绝不能外流。</li>
+     * </ol>
+     * <p>于是：正常出货时格子被 {@link #pull} 补满 → 整格推下去；仓库抽空后
+     * 格子只剩那 1 个分类物 → 跳过，下游容器<b>吸不走</b>它，分类不会丢。</p>
      *
-     * <p>搬运用的是原版自己的 {@link HopperBlockEntity#addItem}，所以下游容器的
-     * 各种限制（熔炉只收燃料、朝向过滤、堆叠上限…）全部照旧生效，一个都不绕过。</p>
+     * <h2>下游容器的限制一条都不绕过</h2>
+     * <p>搬运用的是原版自己的 {@link HopperBlockEntity#addItem}，所以「熔炉只收燃料、
+     * 朝向过滤、堆叠上限、容器白名单」全部照旧生效。<b>装不下就是装不下</b>：
+     * {@code addItem} 会把剩菜原样退回来，这里把退回来的那部分写回漏斗原格
+     * （不是丢掉，也不是硬塞）—— 既不会丢东西，也不会让一次出料越过下游容量的上限。</p>
      *
-     * @return 是否真的搬走了 1 个（原版用这个返回值决定要不要进 8 gt 冷却）
+     * @return 是否真的搬走了东西（原版用这个返回值决定要不要进 8 gt 冷却；
+     *         本模组在 {@code pushItemsTick} 收尾把冷却清零，所以这个 8 不再起作用）
      */
     public static boolean eject(ServerLevel level, BlockPos pos, HopperBlockEntity hopper) {
         BlockState state = level.getBlockState(pos);
@@ -183,6 +199,7 @@ public final class VoidWarehouseExtractor {
         if (isFullContainer(target, side)) {
             return false;
         }
+        boolean moved = false;
         int slots = hopper.getContainerSize();
         for (int i = 0; i < slots; i++) {
             ItemStack stack = hopper.getItem(i);
@@ -190,16 +207,24 @@ public final class VoidWarehouseExtractor {
                 // 空格子没东西可搬；只剩分类物的格子**不许搬** —— 下游容器不能吸收分类物
                 continue;
             }
-            // 每次只搬 1 个，与原版速率一致
-            ItemStack leftover = HopperBlockEntity.addItem(hopper, target, stack.copyWithCount(1), side);
-            if (leftover.isEmpty()) {
-                hopper.setItem(i, stack.copyWithCount(stack.getCount() - 1));
-                target.setChanged();
-                hopper.setChanged();
-                return true;
+            // 整格搬：留下 KEEP_AS_CLASSIFIER 个当分类物，其余全部推下去
+            int payload = stack.getCount() - KEEP_AS_CLASSIFIER;
+            ItemStack leftover = HopperBlockEntity.addItem(hopper, target, stack.copyWithCount(payload), side);
+            int accepted = payload - leftover.getCount();
+            if (accepted <= 0) {
+                // 下游这一格吃不下（满 / 不是它收的品类）→ 换下一格试试
+                continue;
             }
+            // 只减掉真被收下的那部分：退回来的（leftover）原样留在漏斗这一格里。
+            // 用 copyWithCount 造新实例，绝不把同一个 ItemStack 挂在两处（防复制）。
+            hopper.setItem(i, stack.copyWithCount(stack.getCount() - accepted));
+            moved = true;
         }
-        return false;
+        if (moved) {
+            target.setChanged();
+            hopper.setChanged();
+        }
+        return moved;
     }
 
     /**

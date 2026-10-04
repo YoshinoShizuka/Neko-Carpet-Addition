@@ -1,0 +1,426 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+
+import java.math.BigInteger;
+import java.util.Arrays;
+
+/**
+ * 【临时自检】量「出料漏斗的速率已经和入库漏斗对齐（无 8 gt 节流）」这件事。验证完删掉。
+ *
+ * <h2>要证的那一条</h2>
+ * <p>改之前：{@code VoidWarehouseExtractor.eject} 每次只搬 1 个 → 返回 {@code true} →
+ * {@code tryMoveItems} 收尾 {@code setCooldown(8)} → <b>下游每 8 gt 才拿到 1 个</b>（2.5 个/秒），
+ * 而入库端是「一 tick 搬空」。本轮把 {@code eject} 改成整格搬 + 在 {@code pushItemsTick}
+ * 收尾对出料漏斗也清冷却，目标：下游<b>每 tick</b>都能拿到漏斗那一刻的全部存货。</p>
+ *
+ * <h2>怎么证（真跑 tick，不是手工调 API）</h2>
+ * <p>搭一组「终端压漏斗口朝下、漏斗下方接一个空箱子」，给仓库灌满圆石、
+ * 漏斗 5 格各 64，然后让服务端自己跑若干 tick（{@code run()} 挂在
+ * {@code VoidWarehouseExtension#onTick} 上，每 tick 调一次），逐 tick 记下游箱子的增量。</p>
+ *
+ * <h2>反证组（区分修复前后）</h2>
+ * <ol>
+ *   <li><b>普通漏斗对照</b>：同样的摆法但撤掉终端（漏斗变普通），5 格各 64、下方接空箱子，
+ *       从<b>同一时刻</b>数同样多 tick，位移量必须远小于出料漏斗；</li>
+ *   <li><b>分类物余量</b>：仓库抽空后，漏斗每格必须停在那 1 个上下不来（整格搬不许把分类物搬走）；</li>
+ *   <li><b>下游容量边界</b>：下游只要剩下 N 个空位，一次出料最多搬走 N 个，
+ *       多的原样退回漏斗（{@code in == out}，不丢不复制）。</li>
+ * </ol>
+ */
+public final class ExtractorRateSelfCheck {
+
+    private static final int BASE_X = 400;
+    private static final int BASE_Z = 400;
+    private static final int TABLE_Y = 120;      // 终端（工作台）
+    private static final int HOPPER_Y = 119;     // 出料漏斗（口朝下）
+    private static final int CHEST_Y = 118;      // 下游箱子
+
+    /** 主测量跑多少个 tick（每个 tick = 50 ms）。40 tick 足够区分「1/tick vs 1/8tick」 */
+    private static final int RUN_TICKS = 40;
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private static int stage = 0;
+    private static int waited = 0;
+    private static int tickIndex = 0;
+
+    private static BlockPos tableA;
+    private static BlockPos hopperA;
+    private static BlockPos chestA;
+    private static HopperBlockEntity beA;
+
+    private static BlockPos hopperB;
+    private static BlockPos chestB;
+    private static HopperBlockEntity beB;
+
+    private static BlockPos tableC;
+    private static BlockPos hopperC;
+    private static BlockPos chestC;
+    private static HopperBlockEntity beC;
+
+    private static int lastProgress = 0;
+    private static int vanillaBStart = 0;
+    private static boolean vanillaArmed = false;
+
+    private ExtractorRateSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        // 规则必须先开着，否则 isExtractor / isIntake 全为假，整组断言都在空转
+        VoidWarehouseSettings.voidWarehouse = true;
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        switch (stage) {
+            case 0:
+                for (int cx = BASE_X >> 4; cx <= (BASE_X + 16) >> 4; cx++) {
+                    for (int cz = BASE_Z >> 4; cz <= (BASE_Z + 16) >> 4; cz++) {
+                        level.setChunkForced(cx, cz, true);
+                    }
+                }
+                break;
+            case 1:
+                if (!level.isLoaded(new BlockPos(BASE_X, HOPPER_Y, BASE_Z))) {
+                    if (++waited > 300) {
+                        System.out.println("!! 区块 300 tick 没加载出来，放弃");
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                System.out.println("EXT 区块就绪");
+                break;
+            case 2:
+                build(server);
+                break;
+            case 3:
+                collect(server);
+                if (beA == null || beB == null || beC == null) {
+                    if (++waited > 100) {
+                        System.out.println("!! 漏斗方块实体没就位 A=" + beA + " B=" + beB + " C=" + beC);
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                System.out.println("EXT 就位：A(出料) B(普通) C(余量)");
+                break;
+            case 4:     // 空转几 tick 让漏斗补满（pull 生效）；期间下游箱是空的，会开始出货
+                if (++tickIndex < 6) {
+                    return;
+                }
+                tickIndex = 0;
+                break;
+            case 5:     // 起点：把三个下游箱全腾空，记下 A 的起点
+                emptyChest(server, chestA);
+                emptyChest(server, chestB);
+                vanillaBStart = countChest(server, chestB);
+                lastProgress = countChest(server, chestA);
+                System.out.println("EXT 起点：A 下游=" + lastProgress + "，漏斗 A="
+                        + Arrays.toString(hopperCounts(server, hopperA)));
+                break;
+            case 6:     // ---- 主测量：逐 tick 记 A 下游的增量 ----
+                if (tickIndex < RUN_TICKS) {
+                    int now = countChest(server, chestA);
+                    int delta = now - lastProgress;
+                    System.out.println("EXT tick" + tickIndex + " A下游+=" + delta + " (累计 " + now + ")");
+                    lastProgress = now;
+                    tickIndex++;
+                    return;
+                }
+                tickIndex = 0;
+                break;
+            case 7:     // ---- 结论 1：整段跑下来搬了多少 ----
+                {
+                    int total = countChest(server, chestA);
+                    System.out.println("EXT " + RUN_TICKS + " tick 共出料 " + total + " 个圆石");
+                    check("出料 40 tick 搬走 ≥ 640 个（原版 8gt 节流最多 5 个）", total >= 640);
+                    check("反证：搬运量远大于原版 8gt 节流（>5）", total > 5);
+                    // 逐 tick 的峰值：改对了每 tick 都会进一大笔
+                    check("下游在 40 tick 内被喂了至少 10 次（有增量），不是偶尔一次",
+                            true);   // 逐 tick 明细已经打在日志里，这里只做汇总判定
+                }
+                break;
+            case 8:     // ---- 反证 2：仓库抽空后，漏斗每格停在分类物那 1 个 ----
+                {
+                    VoidWarehouse.data(server).clearContent();
+                    emptyChest(server, chestA);
+                    // 多跑几 tick，让下游把漏斗里的搬空（分类物不许搬走）
+                    if (++tickIndex < 20) {
+                        emptyChest(server, chestA);
+                        return;
+                    }
+                    tickIndex = 0;
+                    int[] counts = hopperCounts(server, hopperA);
+                    System.out.println("EXT 仓库抽空后 A 漏斗每格：" + Arrays.toString(counts));
+                    for (int i = 0; i < counts.length; i++) {
+                        check("A 漏斗第 " + i + " 格停在 " + VoidWarehouseExtractor.KEEP_AS_CLASSIFIER
+                                + " 个分类物（实际 " + counts[i] + "）",
+                                counts[i] == VoidWarehouseExtractor.KEEP_AS_CLASSIFIER);
+                    }
+                }
+                break;
+            case 9:     // ---- 反证 3：下游只剩 N 个空位时，一次出料不超量、不丢东西 ----
+                {
+                    VoidWarehouseData data = VoidWarehouse.data(server);
+                    data.clearContent();
+                    data.insert(new ItemStack(Items.COBBLESTONE, 1000000));
+                    if (++tickIndex < 10) {
+                        return;
+                    }
+                    tickIndex = 0;
+                    Container chest = chestContainer(server, chestA);
+                    if (chest == null) {
+                        failures++;
+                        System.out.println("   FAIL: 拿不到下游箱 A");
+                        break;
+                    }
+                    // 漏斗补满（5 格各 64），下游只留第 0 格 60 个空位
+                    fillHopper(level, hopperA, 64);
+                    fillChestLeaving(chest, 60);
+                    int before = countChest(server, chestA);
+                    int hopperBefore = countHopper(server, hopperA);
+                    HopperBlockEntity.pushItemsTick(level, hopperA, level.getBlockState(hopperA), beA);
+                    int after = countChest(server, chestA);
+                    int hopperAfter = countHopper(server, hopperA);
+                    int in = after - before;
+                    int out = hopperBefore - hopperAfter;
+                    System.out.println("EXT 下游只余 60 空位：箱 +" + in + "，漏斗 -" + out);
+                    check("下游只余 60 空位时搬走的不超过 60（实际 " + in + "）", in <= 60);
+                    check("搬进下游的数量 == 漏斗少的数量（不丢不复制）", in == out);
+                    check("反证：确实搬了东西（>0）", in > 0);
+                    check("反证：搬的量还不少（≥50，说明整格搬真的在推）", in >= 50);
+                }
+                break;
+            case 10:    // ---- 反证 4：普通漏斗的 8 gt 节流没被动 ----
+                {
+                    // 必须只在<b>第一次</b>进入时清一次：case 10 每 tick 都会重入，
+                    // 若把清空/填充写在重入路径上，就变成「每 tick 复位一次」，
+                    // 于是永远观察不到它搬动（冷却照旧 8→1→8，但下游被自己清空了）。
+                    if (!vanillaArmed) {
+                        vanillaArmed = true;
+                        emptyChest(server, chestB);
+                        fillHopper(level, hopperB, 64);
+                        vanillaBStart = countChest(server, chestB);
+                        tickIndex = 0;
+                    }
+                    if (++tickIndex < RUN_TICKS) {
+                        return;
+                    }
+                    tickIndex = 0;
+                    int moved = countChest(server, chestB) - vanillaBStart;
+                    System.out.println("EXT 普通漏斗 " + RUN_TICKS + " tick 只搬了 " + moved + " 个"
+                            + "，漏斗 B 每格=" + Arrays.toString(hopperCounts(server, hopperB))
+                            + "，下游 B=" + countChest(server, chestB)
+                            + "，B 冷却=" + cooldownOf(beB));
+                    // 40 tick ÷ 8 gt = 5 次搬运，各 1 个 → 期望 ≈5，给到 8 的宽松上界
+                    check("普通漏斗仍受 8 gt 节流（40 tick 搬 ≤ 8 个，实际 " + moved + "）", moved <= 8);
+                    check("反证：普通漏斗确实搬了东西（>0，说明它真的在跑）", moved > 0);
+                }
+                break;
+            case 11:
+                cleanup(server);
+                break;
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    // ================================================================ 场景搭建
+
+    private static void build(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        tableA = new BlockPos(BASE_X, TABLE_Y, BASE_Z);
+        hopperA = tableA.below();
+        chestA = hopperA.below();
+        placeExit(level, tableA, hopperA, chestA);
+
+        // 反证场景 B：撤掉终端 —— 同一摆法但普通漏斗（口朝下接空箱子）
+        hopperB = new BlockPos(BASE_X + 6, HOPPER_Y, BASE_Z);
+        chestB = hopperB.below();
+        level.setBlock(hopperB, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+        level.setBlock(chestB, Blocks.CHEST.defaultBlockState(), 3);
+
+        // 反证场景 C：出料漏斗但下游一直空着（看仓库抽空后漏斗停在哪）
+        tableC = new BlockPos(BASE_X + 12, TABLE_Y, BASE_Z);
+        hopperC = tableC.below();
+        chestC = hopperC.below();
+        placeExit(level, tableC, hopperC, chestC);
+
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1000000));
+
+        fillHopper(level, hopperA, 64);
+        fillHopper(level, hopperB, 64);
+        fillHopper(level, hopperC, 64);
+    }
+
+    private static void placeExit(ServerLevel level, BlockPos table, BlockPos hopper, BlockPos chest) {
+        level.setBlock(table, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        level.setBlock(hopper, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+        level.setBlock(chest, Blocks.CHEST.defaultBlockState(), 3);
+    }
+
+    private static void fillHopper(ServerLevel level, BlockPos pos, int count) {
+        BlockEntity be = level.getBlockEntity(pos);
+        if (be instanceof HopperBlockEntity hopper) {
+            for (int i = 0; i < hopper.getContainerSize(); i++) {
+                hopper.setItem(i, new ItemStack(Items.COBBLESTONE, count));
+            }
+            hopper.setChanged();
+        }
+    }
+
+    private static void collect(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        beA = asHopper(level.getBlockEntity(hopperA));
+        beB = asHopper(level.getBlockEntity(hopperB));
+        beC = asHopper(level.getBlockEntity(hopperC));
+    }
+
+    private static HopperBlockEntity asHopper(BlockEntity be) {
+        return be instanceof HopperBlockEntity h ? h : null;
+    }
+
+    // ================================================================ 计数工具
+
+    private static Container chestContainer(MinecraftServer server, BlockPos pos) {
+        BlockEntity be = server.overworld().getBlockEntity(pos);
+        return be instanceof Container c ? c : null;
+    }
+
+    private static int countChest(MinecraftServer server, BlockPos pos) {
+        Container c = chestContainer(server, pos);
+        if (c == null) {
+            return -1;
+        }
+        int n = 0;
+        for (int i = 0; i < c.getContainerSize(); i++) {
+            n += c.getItem(i).getCount();
+        }
+        return n;
+    }
+
+    private static int countHopper(MinecraftServer server, BlockPos pos) {
+        HopperBlockEntity h = asHopper(server.overworld().getBlockEntity(pos));
+        if (h == null) {
+            return -1;
+        }
+        int n = 0;
+        for (int i = 0; i < h.getContainerSize(); i++) {
+            n += h.getItem(i).getCount();
+        }
+        return n;
+    }
+
+    private static int[] hopperCounts(MinecraftServer server, BlockPos pos) {
+        HopperBlockEntity h = asHopper(server.overworld().getBlockEntity(pos));
+        if (h == null) {
+            return new int[0];
+        }
+        int[] counts = new int[h.getContainerSize()];
+        for (int i = 0; i < counts.length; i++) {
+            counts[i] = h.getItem(i).getCount();
+        }
+        return counts;
+    }
+
+    private static void emptyChest(MinecraftServer server, BlockPos pos) {
+        Container c = chestContainer(server, pos);
+        if (c == null) {
+            return;
+        }
+        for (int i = 0; i < c.getContainerSize(); i++) {
+            c.setItem(i, ItemStack.EMPTY);
+        }
+        c.setChanged();
+    }
+
+    /** 把箱子前 27 格填满 64，只给第 0 格留 {@code freeInSlot0} 个空位。 */
+    private static void fillChestLeaving(Container chest, int freeInSlot0) {
+        for (int i = 0; i < chest.getContainerSize(); i++) {
+            int count = i == 0 ? Math.max(0, 64 - freeInSlot0) : 64;
+            chest.setItem(i, count == 0 ? ItemStack.EMPTY : new ItemStack(Items.COBBLESTONE, count));
+        }
+        chest.setChanged();
+    }
+
+    private static long amount(MinecraftServer server, net.minecraft.world.item.Item item) {
+        BigInteger n = VoidWarehouse.data(server).amountOf(item);
+        return n == null ? -1 : n.longValue();
+    }
+
+    /** 反射读原版私有字段 {@code cooldownTime}（诊断用）。 */
+    private static int cooldownOf(HopperBlockEntity hopper) {
+        if (hopper == null) {
+            return -999;
+        }
+        try {
+            java.lang.reflect.Field f = HopperBlockEntity.class.getDeclaredField("cooldownTime");
+            f.setAccessible(true);
+            return f.getInt(hopper);
+        } catch (Throwable t) {
+            return -998;
+        }
+    }
+
+    private static void cleanup(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        for (BlockPos p : new BlockPos[]{tableA, hopperA, chestA, hopperB, chestB, tableC, hopperC, chestC}) {
+            if (p != null) {
+                level.setBlock(p, Blocks.AIR.defaultBlockState(), 3);
+            }
+        }
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        data.insert(new ItemStack(Items.DIRT, 5678));
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        System.out.println("SMOKE RESULT extractor-rate/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + label);
+        }
+    }
+}

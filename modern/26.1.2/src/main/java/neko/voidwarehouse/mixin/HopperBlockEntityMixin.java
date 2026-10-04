@@ -58,12 +58,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * 两个方向靠「漏斗口朝哪」区分；两者同时成立时<b>以入库为准</b>
  * （{@link VoidWarehouseExtractor#isExtractor} 里说明），所以本轮之前搭好的机器行为不变。</p>
  *
- * <h2>③ 分类物保护 —— 接管 {@code ejectItems}</h2>
+ * <h2>③ 分类物保护 + 无上限出料 —— 接管 {@code ejectItems}</h2>
  * <p>出料模式下，漏斗每格物品的<b>最后 1 个</b>是分类物，绝不能被下游容器吸走
  * （不然仓库一抽空，分类就没了）。原版 {@code ejectItems} 是「从头扫、谁非空就搬 1 个」，
  * 会毫不犹豫地把最后一并搬走，所以这里在 HEAD 处整段接管，换成
- * {@link VoidWarehouseExtractor#eject}（逻辑与原版只差「跳过数量 ≤ 1 的格子」这一处，
- * 下游容器的各种限制仍然照旧生效）。</p>
+ * {@link VoidWarehouseExtractor#eject}（跳过数量 ≤ 1 的格子，并把该格其余存货<b>整格</b>推下去）。</p>
+ * <p>整格搬 + 收尾清冷却（{@link #carpetAutomending$unlimitedCooldown}）合起来，
+ * 出料端就与入库端同一个速率口径：<b>一 tick 把漏斗能倒的全倒出去</b>，
+ * 下游容器的容量才是唯一的限制。</p>
  * <p>非出料模式的漏斗一个字节都不碰，走的还是原版方法体。</p>
  *
  * <h2>④ 入库分类物白名单 —— 主闸门在 {@code Container#canPlaceItem}，这里是一份兜底</h2>
@@ -268,7 +270,7 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
     }
 
     /**
-     * <b>把 8 gt 节流真正拆掉</b>：整条 tick 走完之后，把入库漏斗的搬运冷却清零。
+     * <b>把 8 gt 节流真正拆掉</b>：整条 tick 走完之后，把这条漏斗（入库<b>或</b>出料）的搬运冷却清零。
      *
      * <p>为什么必须放在 {@code pushItemsTick} 的<b>收尾</b>而不是中途（逐个核对字节码后的结论）：</p>
      * <pre>{@code
@@ -285,13 +287,22 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
      * 那一步<b>紧接着就被上面的 {@code setCooldown(8)} 盖掉</b>，等于白做 ——
      * 「无上限吸取」实际一直是 8 gt 一次。所以清零必须发生在 {@code tryMoveItems} <b>之后</b>。</p>
      *
+     * <h2>为什么出料端也要清（本轮新增）</h2>
+     * <p>出料漏斗的两段是「{@link VoidWarehouseExtractor#pull} 挂 HEAD 每 tick 补满」
+     * 与「{@link VoidWarehouseExtractor#eject} 接管原版出料」。第二段是走
+     * {@code ejectItems} 的，<b>它搬成功就会触发 {@code setCooldown(8)}</b> ——
+     * 只清入库不清出料的话，仓库这端每 tick 补满、下游却每 8 gt 才被喂一次，
+     * 「入库无上限、出库 2.5 个/秒」这种自相矛盾的状态就出现了。
+     * 现在两端共用同一个收尾，速率才真正对齐（都是「一 tick 搬空」）。</p>
+     *
      * <p>这一手与 Carpet-TIS 的 {@code hopperCountersUnlimitedSpeed} 收尾的
      * {@code setCooldown(0)} 是同一个意思：让漏斗永远处于「冷却已过」的状态。</p>
      *
-     * <p>注意：<b>搬运本身已经不依赖这个cool down了</b>（{@code intake} 挂在 HEAD，每 tick 必跑），
-     * 这里清零只是顺手把原版那两条路径（{@code suckInItems} 本体、
-     * 以及 {@code entityInside} 触发的 {@code tryMoveItems}）也放开，
-     * 让它们不再被 8 gt 卡着。只对入库漏斗生效，普通漏斗一个字节都不碰。</p>
+     * <p>注意：<b>搬运本身已经不依赖这个冷却了</b>（{@code intake} / {@code pull} 都挂在 HEAD，
+     * 每 tick 必跑），这里清零只是把原版那两条路径也放开 ——
+     * 对入库漏斗是 {@code suckInItems} 本体、{@code entityInside} 触发的那次；
+     * 对出料漏斗就是 {@code tryMoveItems} 里的 {@code ejectItems}。
+     * <b>普通漏斗一个字节都不碰</b>（两个判定都不满足时直接返回）。</p>
      */
     @Inject(method = "pushItemsTick", at = @At("TAIL"))
     private static void carpetAutomending$unlimitedCooldown(Level level, BlockPos pos, BlockState state,
@@ -302,7 +313,9 @@ public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilte
         if (!(level instanceof ServerLevel serverLevel)) {
             return;
         }
-        if (!VoidWarehouseHopper.isIntake(serverLevel, pos, state)) {
+        // 入库或出料，两者都是「本模组接管的漏斗」，一律清冷却；其余漏斗（普通漏斗）原样不动
+        if (!VoidWarehouseHopper.isIntake(serverLevel, pos, state)
+                && !VoidWarehouseExtractor.isExtractor(serverLevel, pos, state)) {
             return;
         }
         ((VoidWarehouseHopperFilter) hopper).resetCooldown();

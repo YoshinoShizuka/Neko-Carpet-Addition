@@ -1049,12 +1049,18 @@ public static final SavedDataType<VoidWarehouseData> TYPE =
 
 | MC 版本 | 子工程 | 产物（dist/） | 状态 |
 |---|---|---|---|
-| 26.3 | `modern/26.3` | `carpet-Neko-Addition-mc26.3-1.0.4.jar` | ✅ 编译 + 自检（29 项全过） |
-| 26.2 | `modern/26.2` | `carpet-Neko-Addition-mc26.2-1.0.4.jar` | ✅ 编译 + 自检（29 项全过） |
-| 26.1.1 | `modern/26.1.1` | `carpet-Neko-Addition-mc26.1.1-1.0.4.jar` | ✅ 编译 + 自检（29 项全过） |
-| 26.1.2 | `modern/26.1.2` | `carpet-Neko-Addition-mc26.1.2-1.0.4.jar` | ✅ 编译 + 自检（29 项全过） |
-| 1.21.11 | `versions/1.21.11` | `carpet-Neko-Addition-mc1.21.11-1.0.4.jar` | ✅ 编译 + 自检（55 项全过） |
+| 26.3 | `modern/26.3` | `carpet-Neko-Addition-mc26.3-1.0.5.jar` | ✅ 编译 + 自检（29 项全过）+ 1.0.5 启动冒烟 |
+| 26.2 | `modern/26.2` | `carpet-Neko-Addition-mc26.2-1.0.5.jar` | ✅ 编译 + 自检（29 项全过） |
+| 26.1.1 | `modern/26.1.1` | `carpet-Neko-Addition-mc26.1.1-1.0.5.jar` | ✅ 编译 + 自检（29 项全过） |
+| 26.1.2 | `modern/26.1.2` | `carpet-Neko-Addition-mc26.1.2-1.0.5.jar` | ✅ 编译 + 自检（29 项全过） |
+| 1.21.11 | `versions/1.21.11` | `carpet-Neko-Addition-mc1.21.11-1.0.5.jar` | ✅ 编译 + 自检（55 项全过） |
 
+> **1.0.5 新增「虚空仓库只读查询通道」**（`carpet_neko_addition:printer_query` /
+> `printer_query_result`），供 `litematica-printer` 把仓库库存显示在投影材料列表的「已有数量」上。
+> 五版本编译通过；26.3 另跑了真实 `runServer` 启动冒烟（`carpet_neko_addition 1.0.5` 加载 →
+> `Done (0.897s)` → 无异常），确认两条通道在模组初始化阶段注册成功。
+> 设计与客户端接线见 [`docs/投影材料列表显示虚空仓库库存.md`](docs/投影材料列表显示虚空仓库库存.md)。
+>
 > **第三条规则（混凝土粉末 → 染色玻璃）**另有一套 `ConcretePowderToGlassSelfCheck`，
 > **五个版本各跑一次真实 `runServer` 全绿（`checks=25 failures=0`）**，且带反证组。
 > 版本差异与踩坑记录见 `docs/混凝土粉末烧制染色玻璃规则移植.md`。

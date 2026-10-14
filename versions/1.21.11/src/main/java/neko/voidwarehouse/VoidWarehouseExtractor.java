@@ -11,6 +11,8 @@ import net.minecraft.world.level.block.HopperBlock;
 import net.minecraft.world.level.block.entity.HopperBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 
+import java.math.BigInteger;
+
 /**
  * 虚空仓库 → 漏斗 的<b>出料</b>（与 {@link VoidWarehouseHopper} 的入库正好相反）。
  *
@@ -143,10 +145,15 @@ public final class VoidWarehouseExtractor {
             if (room <= 0) {
                 continue;
             }
-            int taken = data.takeExact(sample, room);
-            if (taken <= 0) {
+            // 走统一的「取出」入口：成品有货就直接扣成品，成品一件都没有且规则允许时
+            // 改用 9 合 1 兑换（例如分类物是铁块、仓库里只剩铁粒）。
+            // 兑换的账由 withdraw 内部一次性提交，这里的 setItem 一定能成功，所以不需要回滚路径。
+            VoidWarehouseData.Withdrawal withdrawal =
+                    data.withdraw(sample, BigInteger.valueOf(room));
+            if (withdrawal.isEmpty()) {
                 continue;
             }
+            int taken = withdrawal.taken();
             // 只加数量：分类物那件东西本身（含数据组件）原样不动，
             // 而且用 copyWithCount 造新实例，绝不把同一个 ItemStack 挂在两处（防复制）
             hopper.setItem(i, sample.copyWithCount(sample.getCount() + taken));

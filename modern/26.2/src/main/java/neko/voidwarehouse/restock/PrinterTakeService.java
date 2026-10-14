@@ -109,12 +109,15 @@ public final class PrinterTakeService {
                 continue;
             }
             ItemStack sample = new ItemStack(item);
-            BigInteger stock = data.amountOf(item);
-            if (stock.signum() <= 0) {
-                // 这件没有 → 换下一个候选，不算失败
+            // 「有货就直接扣成品、成品一件都没有时（规则允许）改用 9 合 1 兑换」这条判断
+            // 封装在 VoidWarehouseData#withdraw 里，这里不需要自己先查一遍库存。
+            VoidWarehouseData.Withdrawal withdrawal =
+                    data.withdraw(sample, BigInteger.valueOf(Integer.MAX_VALUE));
+            if (withdrawal.isEmpty()) {
+                // 这件既没货、也兑不出来 → 换下一个候选，不算失败
                 continue;
             }
-            return giveOrRollback(data, player, sample, stock);
+            return giveOrRollback(data, player, sample, withdrawal);
         }
         return TakeOutcome.of(PrinterTakeResultPayload.EMPTY);
     }
@@ -164,28 +167,29 @@ public final class PrinterTakeService {
     /**
      * 真的取并且真的放；放不下就把扣掉的还回去。
      *
-     * @param sample 样板（数量无所谓，内部只看 Item + 数据组件）
+     * <p>撤销走 {@link VoidWarehouseData.Withdrawal#returnUnplaced(int)} ——
+     * 它同时覆盖两条路：直接扣成品那条「原样退回同一种物品」，
+     * 以及 9 合 1 兑换那条「整笔账反向执行、再按实际用掉的量重做」。</p>
+     *
+     * @param sample     样板（数量无所谓，内部只看 Item + 数据组件）
+     * @param withdrawal 已经扣好账的取货结果（还没放进背包）
      */
     private static TakeOutcome giveOrRollback(VoidWarehouseData data, ServerPlayer player,
-                                              ItemStack sample, BigInteger stock) {
-        int wanted = stock.min(BigInteger.valueOf(Integer.MAX_VALUE)).intValue();
-        ItemStack taken = data.takeStack(sample, wanted);
-        if (taken.isEmpty()) {
-            return TakeOutcome.of(PrinterTakeResultPayload.EMPTY);
-        }
+                                              ItemStack sample, VoidWarehouseData.Withdrawal withdrawal) {
+        ItemStack taken = withdrawal.stack();
         Inventory inventory = player.getInventory();
         int remaining = tryGive(inventory, taken);
         int placed = taken.getCount() - remaining;
 
         if (placed <= 0) {
-            // 一件都没放进去 → 原样退还，仓库零消耗
-            data.insert(taken);
+            // 一件都没放进去 → 整笔撤销，仓库零消耗
+            withdrawal.returnUnplaced(0);
             return new TakeOutcome(PrinterTakeResultPayload.INVENTORY_FULL, 0,
                     data.amountExact(sample), sample);
         }
         if (remaining > 0) {
             // 放了一部分 → 只退还没放下的那部分
-            data.insert(taken.copyWithCount(remaining));
+            withdrawal.returnUnplaced(placed);
         }
         // 与 /give 一致：改动了服务端背包就必须推一次差分，否则客户端看不到货
         player.containerMenu.broadcastChanges();

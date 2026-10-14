@@ -28,17 +28,21 @@ import java.util.List;
  * <p>页码仍然在这里做「按实际页数夹取」——存在 {@code View} 里的原始页码可能超出范围
  * （仓库被取空之后页数会变小），读的时候夹一下即可，不回写。</p>
  *
- * <h2>容器下标 → 仓库格号</h2>
+ * <h2>容器下标 → 展示序号 →（真实格 / 可兑条目）</h2>
  * <ul>
- *   <li>0..44：本页内容，映射到仓库格号 {@code 页码 × 45 + 下标}；
- *       开了「数量排序」时，还要再经一层 {@link VoidWarehouseData#amountOrder()}
- *       的<b>视图映射</b>（视图第 n 位 → 仓库第几格），所以映射结果可能是 {@code -1}（该位置没有东西）；</li>
+ *   <li>0..44：本页内容。先经 {@link #displayIndexOf(int)} 算出<b>展示序号</b>
+ *       （默认排序时就是「页码 × 45 + 下标」；开了「数量排序」还要过一层
+ *       {@link VoidWarehouseData#displayAmountOrder() 数量降序视图}），
+ *       所以结果可能是 {@code -1}（该位置没有东西）；</li>
+ *   <li>再把展示序号交给 {@link #slotAt(int)}，得到这一格到底是
+ *       <b>真实库存格</b>、<b>9 合 1 可兑虚拟条目</b>还是<b>空</b>；</li>
  *   <li>45..53：导航行，由 {@link VoidWarehouseNav} 实时生成，<b>不可写、不入存档</b>。</li>
  * </ul>
  * {@link #getContainerSize()} 恒为 54，这样原版客户端才会套用大箱子界面（GUI 尺寸不变）。
  *
- * <p>{@link #slotIndexOf(int)} 是本类里唯一一处「视图 → 数据」的换算，
- * 菜单里所有取物品的路径都经过它，所以数量排序不会出现「点到 A 却取出 B」。</p>
+ * <p>{@link #slotAt(int)} 是本类里唯一一处「这一格是谁」的换算，
+ * 菜单里所有取物品的路径都经过它，所以数量排序也不会点错格，
+ * 更不会出现「渲染时是可兑条目、点击时却按真实格处理」这种错位。</p>
  *
  * <h2>为什么这里几乎全是「只读」的</h2>
  * <p>仓库的写操作只有一种正确姿势：{@link VoidWarehouseData#insert(ItemStack)}（数量累加）和
@@ -123,23 +127,46 @@ final class VoidWarehousePageContainer implements Container {
     }
 
     /**
-     * 本页第 {@code slot} 格对应仓库里的<b>第几格</b>（会随页码与「数量排序」变化）。
+     * 本页第 {@code slot} 格对应<b>展示序里的第几格</b>（会随页码与「数量排序」变化）。
      *
      * <p>默认排序时就是 {@code 页码 × 45 + slot}；开了数量排序则还要翻译一层
-     * {@link VoidWarehouseData#amountOrder() 数量降序视图}。该位置没有东西时返回 {@code -1} ——
-     * {@link VoidWarehouseData#entryAt(int)} 与 {@link VoidWarehouseData#take(int, int)} 都认这个值
-     * （直接当「空格」处理），所以调用方不需要额外判空。</p>
+     * {@link VoidWarehouseData#displayAmountOrder() 数量降序视图}。该位置没有东西时返回 {@code -1} ——
+     * {@link VoidWarehouseData#displaySlotAt(int)} 认这个值（直接当「空格」处理），
+     * 所以调用方不需要额外判空。</p>
+     *
+     * <h2>为什么返回的是「展示序号」而不是「仓库格号」</h2>
+     * <p>加上 9 合 1 兑换之后，「这一页第 3 格是谁」有三种可能：<b>真实库存格</b>、
+     * <b>可兑虚拟条目</b>、空。三者混在一条序列里（见 {@link VoidWarehouseData#unifiedOrder()}），
+     * 所以这一层给出的必须是<b>那条序列的下标</b>，再由
+     * {@link #slotAt(int)} 翻译成「真实格还是可兑条目」。
+     * 如果这里仍旧返回 {@code entries} 的格号，虚拟条目就没有任何一格能指向它 ——
+     * 那正是「明明说能兑、界面里却找不到」的来源。</p>
      */
-    int slotIndexOf(int slot) {
+    int displayIndexOf(int slot) {
         if (slot < 0 || slot >= VoidWarehouseData.PAGE_SIZE) {
             return -1;
         }
         int view = this.page() * VoidWarehouseData.PAGE_SIZE + slot;
         if (!this.view.amountSort()) {
-            return view;
+            return view < this.data.displayCount() ? view : -1;
         }
-        int[] order = this.data.amountOrder();
+        int[] order = this.data.displayAmountOrder();
         return view < order.length ? order[view] : -1;
+    }
+
+    /**
+     * 第 {@code slot} 格背后到底是什么（真实库存格 / 可兑条目 / 空）。
+     *
+     * <p><b>界面层唯一一处「这一格是谁」的答案</b>：渲染它、点击它、Shift 点它，
+     * 全都先问这里一次、把结果存进局部变量，绝不允许「先解析一次渲染、再解析一次扣账」——
+     * 数量排序与「库存变了之后可兑条目会消失」都会让两次解析给出不同结果。</p>
+     */
+    VoidWarehouseData.DisplaySlot slotAt(int slot) {
+        int index = this.displayIndexOf(slot);
+        if (index < 0) {
+            return VoidWarehouseData.DisplaySlot.empty();
+        }
+        return this.data.displaySlotAt(index);
     }
 
     @Override
@@ -164,32 +191,21 @@ final class VoidWarehousePageContainer implements Container {
                     this.data.pageCount(),
                     this.data.entryCount(),
                     this.data.totalAmount(),
+                    this.data.exchangeOfferCount(),
                     this.view.shulkerMode(),
                     this.view.amountSort());
         }
-        int index = this.slotIndexOf(slot);
-        if (this.view.shulkerMode()) {
-            return shulkerDisplay(index);
-        }
-        ItemStack shown = this.data.displayAt(index);
-        // 空格子用屏障方块作临时占位图标：纯展示、不可交互，物品入库后由本方法换成真物品
-        return shown.isEmpty() ? PLACEHOLDER : shown;
-    }
-
-    /**
-     * 潜影盒模式下物品格的展示内容。
-     *
-     * <p>这里<b>不是</b>在普通说明后面追加几行，而是直接取
-     * {@link VoidWarehouseData.Entry#displayInBoxMode()} 那一套：盒模式下
-     * 「左键取出 1 个 / 右键取出一组」是不成立的说明，追加只会既长又误导。</p>
-     */
-    private ItemStack shulkerDisplay(int index) {
-        VoidWarehouseData.Entry entry = this.data.entryAt(index);
-        if (entry == null) {
-            // 空位同样用屏障占位（潜影盒模式只是给「有物品」的格子换说明，空位仍是占位符）
+        VoidWarehouseData.DisplaySlot target = this.slotAt(slot);
+        if (target.isEmpty()) {
+            // 空格子用屏障方块作临时占位图标：纯展示、不可交互，有东西之后由本方法换成真物品
             return PLACEHOLDER;
         }
-        return entry.displayInBoxMode();
+        if (target.isExchange()) {
+            // 「可兑」虚拟条目：仓库里没有这种物品，但能靠 9 合 1 兑换拿出来。
+            // 两种模式各给一套说明，与真实格的显示口径保持一致。
+            return VoidWarehouseData.buildExchangeDisplay(target.offer(), this.view.shulkerMode());
+        }
+        return this.view.shulkerMode() ? target.entry().displayInBoxMode() : target.entry().display();
     }
 
     /** 取出若干（真正扣减仓库数量）；返回的是一份崭新的堆叠，与仓库里的样板无关 */
@@ -198,15 +214,7 @@ final class VoidWarehousePageContainer implements Container {
         if (slot < 0 || slot >= VoidWarehouseData.NAV_START || amount <= 0) {
             return ItemStack.EMPTY;
         }
-        int index = this.slotIndexOf(slot);
-        VoidWarehouseData.Entry entry = this.data.entryAt(index);
-        if (entry == null) {
-            return ItemStack.EMPTY;
-        }
-        // 必须在 take 之前记住样板：整格取空时那一格会被移除
-        ItemStack template = entry.template();
-        int actual = this.data.take(index, amount);
-        return actual <= 0 ? ItemStack.EMPTY : template.copyWithCount(actual);
+        return this.takeDisplayed(slot, amount);
     }
 
     /**
@@ -218,13 +226,39 @@ final class VoidWarehousePageContainer implements Container {
         if (slot < 0 || slot >= VoidWarehouseData.NAV_START) {
             return ItemStack.EMPTY;
         }
-        int index = this.slotIndexOf(slot);
-        VoidWarehouseData.Entry entry = this.data.entryAt(index);
-        if (entry == null) {
+        VoidWarehouseData.DisplaySlot target = this.slotAt(slot);
+        if (target.isEmpty()) {
             return ItemStack.EMPTY;
         }
-        ItemStack template = entry.template();
-        int actual = this.data.take(index, entry.maxStack());
+        return this.takeDisplayed(slot, target.entry() == null
+                ? Math.max(1, target.offer().template().getMaxStackSize())
+                : target.entry().maxStack());
+    }
+
+    /**
+     * 真实格才按真实数量扣减；<b>可兑虚拟条目一律返回空</b>。
+     *
+     * <h2>为什么虚拟条目在这里什么都不做</h2>
+     * <p>{@code removeItem} / {@code removeItemNoUpdate} 是原版<b>绕过菜单</b>直接往容器里取东西的
+     * 两条小路（拖拽、Shift、双击取物的收尾都会走到）。真实格走它们没问题 ——
+     * 扣的就是这一格里存的那件东西，口径唯一。</p>
+     *
+     * <p>而虚拟条目背后<b>根本没有一格</b>：它的「取出」是一笔可能跨好几种物品的兑换
+     * （扣 9 个铁粒、还可能退回 8 个铁锭）。从这里放行等于把一笔复杂的账塞进一个
+     * 「取出 n 个」的接口里，一旦半途失败就没有任何地方能补偿。
+     * 所以虚拟条目的取出<b>只认 {@link VoidWarehouseMenu#clicked} 这一条路</b> ——
+     * 那条路有完整的规划、提交、回滚三步。这里返回空，客户端那次预测会被
+     * {@code sendAllDataToRemote()} 全量覆盖掉，玩家看到的只是这一格没反应（与空格子一致）。</p>
+     */
+    private ItemStack takeDisplayed(int slot, int amount) {
+        VoidWarehouseData.DisplaySlot target = this.slotAt(slot);
+        if (target.entry() == null) {
+            return ItemStack.EMPTY;
+        }
+        int index = target.realIndex();
+        // 必须在 take 之前记住样板：整格取空时那一格会被移除
+        ItemStack template = target.entry().template();
+        int actual = this.data.take(index, amount);
         return actual <= 0 ? ItemStack.EMPTY : template.copyWithCount(actual);
     }
 

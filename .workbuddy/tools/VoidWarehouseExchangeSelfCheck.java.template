@@ -1,0 +1,1036 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.Connection;
+import net.minecraft.network.PacketListener;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.network.protocol.game.ServerboundUseItemPacket;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemLore;
+import net.minecraft.world.item.crafting.CraftingInput;
+import net.minecraft.world.item.crafting.RecipeType;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.UUID;
+
+import neko.voidwarehouse.restock.PrinterTakeService;
+import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
+
+/**
+ * 【临时自检】「虚空仓库 9 合 1 兑换」这一整条新链路。验证完删掉。
+ *
+ * <h2>要证的东西（每组都配反证）</h2>
+ * <ol>
+ *   <li><b>A 静态表</b>：29 条边 / 53 个物品 / 双向 20 + 只能向上 8 + 只能向下 1，层级自洽；</li>
+ *   <li><b>B 启动复核</b>：拿真实 {@code RecipeManager} 复核后一条都没被砍（说明表与 26.3 的现实一致）；</li>
+ *   <li><b>C 反向核对</b>：把表里每条边<b>还原成 9 个（或 1 个）真实物品</b>，交给真实配方系统去匹配，
+ *       产出的东西必须正好是边的另一端 —— 这是「模式本身对不对」的独立第二意见，
+ *       不依赖采集脚本没写错；</li>
+ *   <li><b>D 守恒不变量</b>（纯逻辑）：{@code Σ(每条 delta × 9^层级) == −need × 9^目标层级}。
+ *       这是「不可能刷物」的形式化判据；</li>
+ *   <li><b>E 随机 fuzz</b>：随机库存 × 随机目标跑 150 次，凡是成功的规划全部必须守恒；</li>
+ *   <li><b>F 数据层</b>：可兑条目入选条件、「统一展示序」与可兑条目数一致、数量次序是排列、虚拟格文案；</li>
+ *   <li><b>G 回滚精确性</b>：取货失败时整个仓库逐项还原（含一条与兑换无关的干扰项）；</li>
+ *   <li><b>H 四条入口一致</b>：API 直调 / 界面点格 / 打印机补货 / 聊天按量取货，扣的必须是同一笔账；</li>
+ *   <li><b>I 规则关闭</b>：关掉规则后「可兑」格必须<b>立刻</b>消失（这条会咬住缓存没作废的 bug）；</li>
+ *   <li><b>J 漏斗出料</b>：分类物是铁锭、仓库里只有铁粒时，漏斗真的被补上。</li>
+ * </ol>
+ *
+ * <h2>反证组（区分「改对了」与「断言是空转」）</h2>
+ * <ul>
+ *   <li>有货时绝不兑换：仓里同时有 9 铁粒 + 1 铁锭，取 1 铁锭的账目必须<b>只有</b>铁锭 −1；</li>
+ *   <li>单向不可逆：9 铜锭合不出 1 涂蜡铜块（断言返回 null）；浮冰拆不回冰；</li>
+ *   <li>凑不够就整次失败：8 铁粒取 1 铁锭 = null，且仓库一个字节都没动；</li>
+ *   <li>fuzz 成功次数 ≥ 30（否则「全部守恒」是空转）。</li>
+ * </ul>
+ */
+public final class VoidWarehouseExchangeSelfCheck {
+
+    private static final BigInteger ONE = BigInteger.ONE;
+    private static final BigInteger NINE = BigInteger.valueOf(9);
+
+    /** 前几个 tick 先等配方表读好（配方跟着数据包重载，构造完成的那一刻不一定就绪） */
+    private static final int WAIT_TICKS = 5;
+
+    private static final int HOPPER_X = 612;
+    private static final int HOPPER_Y = 133;
+    private static final int HOPPER_Z = 617;
+
+    private static boolean done = false;
+    private static int stage = 0;
+    private static int tickIndex = 0;
+    private static int waitHopper = 0;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private static BlockPos hopperPos;
+    private static HopperBlockEntity hopper;
+
+    private VoidWarehouseExchangeSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        // 规则必须先开着，否则 exchangeEnabled() 恒为假，整组断言都在空转
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        switch (stage) {
+            case 0:
+                if (++tickIndex < WAIT_TICKS) {
+                    return;
+                }
+                tickIndex = 0;
+                break;
+            case 1:
+                tableChecks();
+                break;
+            case 2:
+                bootstrapChecks(server);
+                break;
+            case 3:
+                recipeMatchChecks(server);
+                break;
+            case 4:
+                conservationChecks();
+                break;
+            case 5:
+                fuzzChecks();
+                break;
+            case 6:
+                dataLayerChecks(server);
+                break;
+            case 7:
+                rollbackChecks(server);
+                break;
+            case 8:
+                entryPointChecks(server);
+                break;
+            case 9:
+                ruleOffChecks(server);
+                break;
+            case 10:
+                placeHopper(server);
+                break;
+            case 11:
+                hopper = asHopper(server.overworld().getBlockEntity(hopperPos));
+                if (hopper == null && ++waitHopper < 300) {
+                    return;
+                }
+                break;
+            case 12:
+                hopperChecks(server);
+                break;
+            case 13:
+                cleanup(server);
+                break;
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    // ================================================================ A 静态表
+
+    private static void tableChecks() {
+        System.out.println("=== A 静态表 ===");
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
+
+        check("A1 声明 29 条边", VoidWarehouseExchange.EDGES.size() == 29);
+        check("A2 建表后生效 29 条边", table.edges().size() == 29);
+        check("A3 层级自相矛盾被丢掉的边 = 0", table.dropped().isEmpty());
+        check("A4 表里共 53 个物品", table.items().size() == 53);
+
+        int both = 0;
+        int combineOnly = 0;
+        int splitOnly = 0;
+        for (VoidWarehouseExchange.Edge edge : table.edges()) {
+            if (edge.canCombine() && edge.canSplit()) {
+                both++;
+            } else if (edge.canCombine()) {
+                combineOnly++;
+            } else {
+                splitOnly++;
+            }
+        }
+        check("A5 双向边 20 条（实际 " + both + "）", both == 20);
+        check("A6 只能向上合成 8 条（实际 " + combineOnly + "）", combineOnly == 8);
+        check("A7 只能向下拆分 1 条（实际 " + splitOnly + "）", splitOnly == 1);
+
+        check("A8 铁粒层级 +1 == 铁锭层级", table.levelOf("iron_nugget") + 1 == table.levelOf("iron_ingot"));
+        check("A9 铁锭层级 +1 == 铁块层级", table.levelOf("iron_ingot") + 1 == table.levelOf("iron_block"));
+        check("A10 浮冰层级 +1 == 蓝冰层级", table.levelOf("packed_ice") + 1 == table.levelOf("blue_ice"));
+        check("A11 冰层级 +2 == 蓝冰层级（三级链）", table.levelOf("ice") + 2 == table.levelOf("blue_ice"));
+
+        check("A12 makersOf(铁锭) 含铁粒", table.makersOf("iron_ingot").contains("iron_nugget"));
+        check("A13 splittersOf(铁锭) 含铁块", table.splittersOf("iron_ingot").contains("iron_block"));
+        check("A14 反证：makersOf(涂蜡铜块) 为空（9 铜锭合不出涂蜡铜块）",
+                table.makersOf("waxed_copper_block").isEmpty());
+        check("A15 反证：splittersOf(涂蜡铜块) 为空（涂蜡铜块不可再拆）",
+                table.splittersOf("waxed_copper_block").isEmpty());
+        check("A16 反证：splittersOf(冰) 为空（浮冰拆不回冰）", table.splittersOf("ice").isEmpty());
+        check("A17 反证：圆石不在表里", !table.contains("cobblestone"));
+        check("A18 反证：泥土不在表里", !table.contains("dirt"));
+    }
+
+    // ================================================================ B 启动复核
+
+    private static void bootstrapChecks(MinecraftServer server) {
+        System.out.println("=== B 启动复核（真实 RecipeManager）===");
+        System.out.println("   [B] 本服务器的配方总数 = " + server.getRecipeManager().getRecipes().size());
+        VoidWarehouseExchangeBootstrap.Summary summary = VoidWarehouseExchangeBootstrap.bootstrap(server);
+        System.out.println("   [B] " + summary);
+
+        // 基准不能死写成 29：旧版本里没有硫磺 / 浓缩硫（26.2 才加的），那一条边<b>应该</b>被砍掉。
+        // 正确口径是「本版本里两边物品都存在的边有几条」，跟 Summary 对得上才叫按事实收紧。
+        int declared = VoidWarehouseExchange.EDGES.size();
+        int unavailable = 0;
+        for (VoidWarehouseExchange.Edge edge : VoidWarehouseExchange.EDGES) {
+            if (VoidWarehouseExchangeBootstrap.itemOf(edge.small()) == null
+                    || VoidWarehouseExchangeBootstrap.itemOf(edge.big()) == null) {
+                unavailable++;
+            }
+        }
+        System.out.println("   [B] 声明 " + declared + " 条边，其中 " + unavailable
+                + " 条的物品在本版本不存在（26.2 起才有硫磺 / 浓缩硫）");
+
+        check("B1 声明 29 条边（表本身不随版本变）", declared == 29);
+        check("B2 作废条数 == 「物品在本版本不存在」的条数（" + unavailable + "，实际 "
+                + summary.dropped() + "）", summary.dropped() == unavailable);
+        check("B3 kept + dropped == declared", summary.kept() + summary.dropped() == declared);
+        check("B4 没有被降级成单向的（版本差异只会整条没有，不会只剩半个方向）",
+                summary.downgraded() == 0);
+        check("B5 诊断信息条数 == 作废条数", summary.notes().size() == summary.dropped());
+        check("B6 生效表建图层级自洽（没有边被丢掉）", VoidWarehouseExchange.active().dropped().isEmpty());
+        check("B7 生效表条数 == Summary.kept()",
+                VoidWarehouseExchange.active().edges().size() == summary.kept());
+        check("B8 反证：itemOf(不存在的物品) 返回 null（复核的判据有牙）",
+                VoidWarehouseExchangeBootstrap.itemOf("definitely_not_an_item_xyz") == null);
+        check("B9 反证：idOf(空气) 返回 null（空物品不算任何一件东西）",
+                VoidWarehouseExchangeBootstrap.idOf(Items.AIR) == null);
+    }
+
+    // ================================================================ C 反向核对（真实配方系统）
+
+    private static void recipeMatchChecks(MinecraftServer server) {
+        System.out.println("=== C 反向核对：把每条边还原成真实物品，交给真实配方系统匹配 ===");
+        ServerLevel level = server.overworld();
+        int combineOk = 0;
+        int combineTotal = 0;
+        int splitOk = 0;
+        int splitTotal = 0;
+        int skipped = 0;
+
+        for (VoidWarehouseExchange.Edge edge : VoidWarehouseExchange.EDGES) {
+            Item small = VoidWarehouseExchangeBootstrap.itemOf(edge.small());
+            Item big = VoidWarehouseExchangeBootstrap.itemOf(edge.big());
+            if (small == null || big == null) {
+                // 这个版本里没有这件物品 —— 启动复核已经把整条边砍掉了，这里跳过
+                skipped++;
+                continue;
+            }
+            if (edge.canCombine()) {
+                combineTotal++;
+                // 3×3 全填满同一种物品（每个格子 1 个，共 9 个）
+                if (matches(server, level, 3, 3, small, big, 1)) {
+                    combineOk++;
+                } else {
+                    check("C 9×" + edge.small() + " 能合成 1×" + edge.big(), false);
+                }
+            }
+            if (edge.canSplit()) {
+                splitTotal++;
+                // 1×1 只放 1 个
+                if (matches(server, level, 1, 1, big, small, 9)) {
+                    splitOk++;
+                } else {
+                    check("C 1×" + edge.big() + " 能拆成 9×" + edge.small(), false);
+                }
+            }
+        }
+        System.out.println("   [C] 9 合 1 匹配 " + combineOk + "/" + combineTotal
+                + "，1 拆 9 匹配 " + splitOk + "/" + splitTotal + "，跳过（物品缺失）" + skipped);
+        check("C1 全部 " + combineTotal + " 条可用的「9 合 1」都在真实配方系统里匹配成功",
+                combineOk == combineTotal);
+        check("C2 全部 " + splitTotal + " 条可用的「1 拆 9」都在真实配方系统里匹配成功",
+                splitOk == splitTotal);
+        check("C3 因物品缺失而跳过的条数 == 启动复核作废的条数（" + skipped + "）",
+                skipped == VoidWarehouseExchangeBootstrap.summary().dropped());
+        check("C4 反证：随便放 9 个圆石匹配不到铁锭（匹配方法有牙）",
+                !matches(server, level, 3, 3, Items.COBBLESTONE, Items.IRON_INGOT, 1));
+    }
+
+    /** 把 {@code w×h} 个格子的输入喂给真实配方系统，看产出的东西是不是 {@code out × outCount} */
+    private static boolean matches(MinecraftServer server, ServerLevel level, int w, int h,
+                                   Item in, Item out, int outCount) {
+        if (in == null || out == null) {
+            return false;
+        }
+        List<ItemStack> items = new ArrayList<>(w * h);
+        for (int i = 0; i < w * h; i++) {
+            items.add(new ItemStack(in, 1));
+        }
+        CraftingInput input = CraftingInput.of(w, h, items);
+        var found = server.getRecipeManager().getRecipeFor(RecipeType.CRAFTING, input, level);
+        if (found.isEmpty()) {
+            return false;
+        }
+        ItemStack result = found.get().value().assemble(input);
+        return result.getCount() == outCount && result.getItem() == out;
+    }
+
+    // ================================================================ D 守恒 + 反证（纯逻辑）
+
+    private static void conservationChecks() {
+        System.out.println("=== D 纯逻辑：守恒不变量 + 反证组 ===");
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
+
+        check("D1 空库存取铁锭 -> 无解", plan(table, "iron_ingot", 1, Map.of("cobblestone", 9999)) == null);
+
+        // ---- 反证：有货时绝不兑换 ----
+        VoidWarehouseExchange.Plan p = plan(table, "iron_ingot", 1,
+                Map.of("iron_nugget", 9, "iron_ingot", 1));
+        System.out.println("   [D] 有 9 铁粒 + 1 铁锭，取 1 铁锭 -> " + ledger(p));
+        check("D2 有货时取到 1 铁锭", p != null);
+        check("D3 有货时账目里只有铁锭 −1（一个铁粒都没动）",
+                p != null && p.asMap().size() == 1 && change(p, "iron_ingot").equals(ONE.negate()));
+
+        p = plan(table, "iron_ingot", 5, Map.of("iron_block", 1, "iron_ingot", 5));
+        System.out.println("   [D] 铁锭刚好够 5 个（另有 1 铁块），取 5 铁锭 -> " + ledger(p));
+        check("D4 成品够时也不会去拆铁块", p != null && p.asMap().size() == 1
+                && change(p, "iron_ingot").equals(BigInteger.valueOf(-5)));
+
+        // ---- 下级合成 ----
+        p = plan(table, "iron_ingot", 1, Map.of("iron_nugget", 9));
+        System.out.println("   [D] 9 铁粒 -> 1 铁锭：" + ledger(p));
+        check("D5 9 铁粒能兑 1 铁锭，且只扣 9 铁粒",
+                p != null && p.asMap().size() == 1 && change(p, "iron_nugget").equals(NINE.negate()));
+        checkConserved(table, "D5 9 铁粒 -> 1 铁锭", p);
+        check("D6 反证：8 铁粒取 1 铁锭 无解", plan(table, "iron_ingot", 1, Map.of("iron_nugget", 8)) == null);
+        check("D7 反证：90 铁粒取 11 铁锭 无解（不够 99）",
+                plan(table, "iron_ingot", 11, Map.of("iron_nugget", 90)) == null);
+
+        // ---- 拆上级找零 ----
+        p = plan(table, "iron_ingot", 1, Map.of("iron_block", 1));
+        System.out.println("   [D] 拆 1 铁块取 1 铁锭：" + ledger(p));
+        check("D8 拆 1 铁块取 1 铁锭：铁块 −1 且找回 8 铁锭",
+                p != null && change(p, "iron_block").equals(ONE.negate())
+                        && change(p, "iron_ingot").equals(NINE.subtract(ONE)));
+        checkConserved(table, "D8 拆铁块取铁锭", p);
+
+        // ---- 三级链 ----
+        p = plan(table, "blue_ice", 1, Map.of("ice", 81));
+        System.out.println("   [D] 81 冰 -> 1 蓝冰：" + ledger(p));
+        check("D9 81 冰 -> 1 蓝冰（跨两级）", p != null && change(p, "ice").equals(NINE.multiply(NINE).negate()));
+        checkConserved(table, "D9 81 冰 -> 1 蓝冰", p);
+        check("D10 反证：80 冰 -> 1 蓝冰 无解", plan(table, "blue_ice", 1, Map.of("ice", 80)) == null);
+
+        // ---- 单向：只能向上 ----
+        check("D11 反证：只有 1 浮冰时取冰 无解（浮冰拆不回冰）",
+                plan(table, "ice", 1, Map.of("packed_ice", 1)) == null);
+        p = plan(table, "packed_ice", 1, Map.of("ice", 9));
+        check("D12 9 冰 -> 1 浮冰 可行", p != null);
+        checkConserved(table, "D12 9 冰 -> 1 浮冰", p);
+
+        // ---- 单向：只能向下 ----
+        p = plan(table, "copper_ingot", 1, Map.of("waxed_copper_block", 1));
+        System.out.println("   [D] 拆 1 涂蜡铜块取 1 铜锭：" + ledger(p));
+        check("D13 拆 1 涂蜡铜块取 1 铜锭：涂蜡铜块 −1 且找回 8 铜锭",
+                p != null && change(p, "waxed_copper_block").equals(ONE.negate())
+                        && change(p, "copper_ingot").equals(NINE.subtract(ONE)));
+        checkConserved(table, "D13 拆涂蜡铜块取铜锭", p);
+        check("D14 反证：9 铜锭合不出 1 涂蜡铜块 无解",
+                plan(table, "waxed_copper_block", 1, Map.of("copper_ingot", 9)) == null);
+
+        // ---- 大数：跨两级只用原料 ----
+        p = plan(table, "iron_block", 1, Map.of("iron_nugget", 81));
+        System.out.println("   [D] 81 铁粒 -> 1 铁块：" + ledger(p));
+        check("D15 81 铁粒 -> 1 铁块（铁粒→铁锭→铁块，跨两级只用原料）",
+                p != null && p.asMap().size() == 1 && change(p, "iron_nugget").equals(BigInteger.valueOf(-81)));
+        checkConserved(table, "D15 81 铁粒 -> 1 铁块", p);
+        p = VoidWarehouseExchange.planMax(table, "iron_block", BigInteger.valueOf(100),
+                stock(Map.of("iron_nugget", 729)));
+        System.out.println("   [D] 729 铁粒最多能拿铁块：" + ledger(p));
+        check("D15b 729 铁粒最多能拿 9 个铁块（729 = 9 × 81）",
+                p != null && p.amount().equals(NINE));
+        checkConserved(table, "D15b 729 铁粒尽力取铁块", p);
+
+        // ---- planMax 尽力而为 ----
+        p = VoidWarehouseExchange.planMax(table, "iron_ingot", BigInteger.valueOf(64),
+                stock(Map.of("iron_nugget", 10)));
+        check("D16 只有 10 铁粒时「最多能拿」= 1 个（不是整次失败）",
+                p != null && p.amount().equals(ONE));
+        checkConserved(table, "D16 尽力取", p);
+        check("D17 反证：只有 8 铁粒时「最多能拿」= 无解",
+                VoidWarehouseExchange.planMax(table, "iron_ingot", BigInteger.valueOf(64),
+                        stock(Map.of("iron_nugget", 8))) == null);
+
+        // ---- 计划本身是只读的 ----
+        Map<String, Integer> frozen = new LinkedHashMap<>();
+        frozen.put("iron_nugget", 90);
+        VoidWarehouseExchange.Plan readOnly = plan(table, "iron_ingot", 3, frozen);
+        check("D18 规划是只读的（调用方给的快照没被改）",
+                readOnly != null && frozen.size() == 1 && frozen.get("iron_nugget") == 90);
+        VoidWarehouseExchange.Plan negated = readOnly == null ? null : readOnly.negate();
+        check("D19 Plan.negate() 把每一笔都反号",
+                negated != null && change(negated, "iron_nugget").equals(change(readOnly, "iron_nugget").negate()));
+    }
+
+    // ================================================================ E fuzz
+
+    private static void fuzzChecks() {
+        System.out.println("=== E 随机库存 fuzz：任何成功规划都必须守恒 ===");
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
+        List<String> items = new ArrayList<>(table.items());
+        Random rng = new Random(20261014L);
+
+        int tried = 0;
+        int succeeded = 0;
+        int broken = 0;
+        for (int iter = 0; iter < 150; iter++) {
+            VoidWarehouseExchange.Edge edge = VoidWarehouseExchange.EDGES.get(
+                    rng.nextInt(VoidWarehouseExchange.EDGES.size()));
+            boolean upward = rng.nextBoolean();
+            String target = upward ? edge.big() : edge.small();
+            String source = upward ? edge.small() : edge.big();
+
+            Map<String, Integer> snap = new LinkedHashMap<>();
+            snap.put(source, rng.nextInt(400));
+            int noise = rng.nextInt(3);
+            for (int k = 0; k < noise; k++) {
+                snap.merge(items.get(rng.nextInt(items.size())), rng.nextInt(50), Integer::sum);
+            }
+
+            BigInteger limit = BigInteger.valueOf(1 + rng.nextInt(64));
+            tried++;
+            VoidWarehouseExchange.Plan p = VoidWarehouseExchange.planMax(table, target, limit, stock(snap));
+            if (p == null) {
+                continue;
+            }
+            succeeded++;
+            if (!conserved(table, p)) {
+                broken++;
+                System.out.println("   !! 不守恒: target=" + target + " limit=" + limit
+                        + " stock=" + snap + " plan=" + ledger(p));
+            }
+        }
+        System.out.println("   [E] 试了 " + tried + " 次，成功 " + succeeded + " 次，不守恒 " + broken + " 次");
+        check("E1 fuzz 全部守恒（成功 " + succeeded + " / 不守恒 " + broken + "）", broken == 0);
+        check("E2 反证：fuzz 至少成功 30 次（否则上一条是空转）", succeeded >= 30);
+    }
+
+    // ================================================================ F 数据层
+
+    private static void dataLayerChecks(MinecraftServer server) {
+        System.out.println("=== F 数据层：可兑条目 / 统一展示序 / 虚拟格 ===");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_NUGGET, 90));
+        check("F1 仓库里只有 90 个铁粒、0 个铁锭",
+                data.amountOf(Items.IRON_NUGGET).equals(BigInteger.valueOf(90))
+                        && data.amountOf(Items.IRON_INGOT).signum() == 0);
+
+        List<VoidWarehouseData.ExchangeOffer> offers = data.exchangeOffers();
+        System.out.println("   [F] 可兑条目 = " + describeOffers(offers));
+        check("F2 可兑条目里有铁锭（仓库里没有它，但能兑出来）", hasOffer(offers, "iron_ingot"));
+        check("F3 反证：可兑条目里没有铁粒（仓库里有货的绝不列成可兑）", !hasOffer(offers, "iron_nugget"));
+        check("F4 反证：可兑条目里没有金锭（仓库里一点金料都没有）", !hasOffer(offers, "gold_ingot"));
+
+        VoidWarehouseData.ExchangeOffer ingot = offerOf(offers, "iron_ingot");
+        check("F5 铁锭可兑数量 = 10（90 ÷ 9）",
+                ingot != null && ingot.obtainable().equals(BigInteger.valueOf(10)));
+        check("F6 铁锭的单位账目 = 只扣 9 个铁粒",
+                ingot != null && ingot.unitCost().size() == 1
+                        && "iron_nugget".equals(ingot.unitCost().get(0).itemId())
+                        && ingot.unitCost().get(0).change().equals(NINE.negate()));
+
+        // ---- 统一展示序 ----
+        int display = data.displayCount();
+        int entries = data.entryCount();
+        int offerCount = data.exchangeOfferCount();
+        check("F7 展示格数 " + display + " = 真实格 " + entries + " + 可兑 " + offerCount,
+                display == entries + offerCount);
+        check("F8 反证：这里确实多出了虚拟格（可兑数 > 0）", offerCount > 0);
+
+        int exchangeSlots = 0;
+        boolean allNonEmpty = true;
+        for (int i = 0; i < display; i++) {
+            VoidWarehouseData.DisplaySlot slot = data.displaySlotAt(i);
+            if (slot.isEmpty()) {
+                allNonEmpty = false;
+            }
+            if (slot.isExchange()) {
+                exchangeSlots++;
+            }
+        }
+        check("F9 展示序里每一格都非空", allNonEmpty);
+        check("F10 展示序里的可兑格数 == exchangeOfferCount()", exchangeSlots == offerCount);
+        check("F11 越界取展示格返回空", data.displaySlotAt(-1).isEmpty() && data.displaySlotAt(display).isEmpty());
+
+        int[] amountOrder = data.displayAmountOrder();
+        check("F12 数量次序长度 == 展示格数", amountOrder.length == display);
+        boolean[] seen = new boolean[display];
+        boolean permutation = true;
+        for (int idx : amountOrder) {
+            if (idx < 0 || idx >= display || seen[idx]) {
+                permutation = false;
+            } else {
+                seen[idx] = true;
+            }
+        }
+        check("F13 数量次序是一个排列（不重不漏）", permutation);
+        boolean descending = true;
+        for (int i = 1; i < amountOrder.length; i++) {
+            if (amountAt(data, amountOrder[i - 1]).compareTo(amountAt(data, amountOrder[i])) < 0) {
+                descending = false;
+            }
+        }
+        check("F14 数量次序确实从大到小", descending);
+
+        // ---- 虚拟格渲染 ----
+        ItemStack shown = VoidWarehouseData.buildExchangeDisplay(ingot, false);
+        check("F15 虚拟格图标 = 铁锭", shown.getItem() == Items.IRON_INGOT);
+        check("F16 虚拟格名字带「（可兑）」", shown.getHoverName().getString().contains("（可兑）"));
+        List<Component> lore = loreOf(shown);
+        dumpLore("exchange", lore);
+        check("F17 虚拟格有「可兑：」那一行", contains(lore, "可兑："));
+        check("F18 虚拟格有「消耗：」那一行", contains(lore, "消耗："));
+        check("F19 反证：9 铁粒正好换 1 铁锭，不该有「找回：」",
+                !contains(lore, "找回："));
+        check("F20 虚拟格说明「仓库里没有这种物品」", contains(lore, "仓库里没有这种物品"));
+
+        // ---- 拆零场景：必须出现「找回」行 ----
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_BLOCK, 1));
+        List<VoidWarehouseData.ExchangeOffer> blockOffers = data.exchangeOffers();
+        System.out.println("   [F] 只有 1 个铁块时的可兑条目 = " + describeOffers(blockOffers));
+        VoidWarehouseData.ExchangeOffer fromBlock = offerOf(blockOffers, "iron_ingot");
+        check("F21 只有 1 个铁块时，铁锭也可兑（拆块找零）", fromBlock != null);
+        check("F22 1 个铁块能兑 9 个铁锭", fromBlock != null && fromBlock.obtainable().equals(NINE));
+        if (fromBlock != null) {
+            ItemStack shown2 = VoidWarehouseData.buildExchangeDisplay(fromBlock, false);
+            List<Component> lore2 = loreOf(shown2);
+            dumpLore("exchange-split", lore2);
+            check("F23 拆零场景下出现「找回：」行（否则玩家会以为亏了）", contains(lore2, "找回："));
+            check("F24 拆零场景下「消耗：」行写的是被扣走的铁块", contains(lore2, "消耗："));
+        }
+    }
+
+    // ================================================================ G 回滚精确性
+
+    private static void rollbackChecks(MinecraftServer server) {
+        System.out.println("=== G 回滚精确性（取货失败必须一个字节都不动）===");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_NUGGET, 100));
+        data.insert(new ItemStack(Items.DIRT, 7));
+
+        Map<String, BigInteger> before = snapshot(data);
+        check("G0 起点仓库 = " + before, before.size() == 2);
+
+        VoidWarehouseData.Withdrawal first = data.withdraw(new ItemStack(Items.IRON_INGOT), NINE.multiply(BigInteger.valueOf(64)));
+        System.out.println("   [G] 100 铁粒取一组铁锭 -> 取到 " + (first.isEmpty() ? 0 : first.taken())
+                + "，viaExchange=" + first.viaExchange());
+        check("G1 100 铁粒能兑出 11 个铁锭（99 个铁粒，余 1 个不够再换）",
+                !first.isEmpty() && first.taken() == 11);
+        check("G2 走的确实是兑换那条路", first.viaExchange());
+        check("G3 扣掉 99 铁粒后仓库剩 1（余数绝对不许被吃掉）",
+                data.amountOf(Items.IRON_NUGGET).equals(ONE));
+        check("G4 仓库里铁锭仍然是 0（那 11 个在 Withdrawal 手里，还没入包）",
+                data.amountOf(Items.IRON_INGOT).signum() == 0);
+
+        first.returnUnplaced(0);
+        System.out.println("   [G] 整笔撤销后仓库 = " + snapshot(data));
+        check("G5 整笔撤销后库存逐项还原（" + snapshot(data) + "）", snapshot(data).equals(before));
+        check("G6 铁粒回到 100", data.amountOf(Items.IRON_NUGGET).equals(BigInteger.valueOf(100)));
+        check("G7 铁锭仍然是 0", data.amountOf(Items.IRON_INGOT).signum() == 0);
+        check("G8 反证：与兑换无关的干扰项（泥土 7 个）一个字没动",
+                data.amountOf(Items.DIRT).equals(BigInteger.valueOf(7)));
+
+        // 部分撤销：取 11 个，只留下 3 个
+        VoidWarehouseData.Withdrawal second = data.withdraw(new ItemStack(Items.IRON_INGOT), NINE.multiply(BigInteger.valueOf(64)));
+        check("G9 再取一次仍然是 11 个", !second.isEmpty() && second.taken() == 11);
+        second.returnUnplaced(3);
+        System.out.println("   [G] 只留 3 个之后：铁粒=" + data.amountOf(Items.IRON_NUGGET)
+                + "，铁锭=" + data.amountOf(Items.IRON_INGOT));
+        check("G10 只留 3 个时铁粒消耗 = 27（剩 73）",
+                data.amountOf(Items.IRON_NUGGET).equals(BigInteger.valueOf(73)));
+        check("G11 那 3 个在玩家手里，仓库里铁锭仍是 0",
+                data.amountOf(Items.IRON_INGOT).signum() == 0);
+        check("G12 干扰项仍然没动", data.amountOf(Items.DIRT).equals(BigInteger.valueOf(7)));
+    }
+
+    // ================================================================ H 四条入口一致
+
+    private static void entryPointChecks(MinecraftServer server) {
+        System.out.println("=== H 四条入口一致（API 直调 / 界面 / 打印机 / 聊天）===");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        check("H0 假玩家可构造", player != null);
+        if (player == null) {
+            return;
+        }
+        player.getInventory().clearContent();
+        player.containerMenu = player.inventoryMenu;
+
+        // ---- H1 API 直调：取 1 个 ----
+        reset(data, 90);
+        player.getInventory().clearContent();
+        VoidWarehouseData.Withdrawal direct = data.withdraw(new ItemStack(Items.IRON_INGOT), ONE);
+        check("H1 API：取到 1 个铁锭，铁粒 90 -> 81",
+                !direct.isEmpty() && direct.taken() == 1
+                        && data.amountOf(Items.IRON_NUGGET).equals(BigInteger.valueOf(81)));
+
+        // ---- H2 打印机补货：取一组（10 个）----
+        // 补货规则自己还有一个开关（voidWarehouseRestock），不开的话 take() 直接回 RULE_OFF
+        boolean restockWasOn = VoidWarehouseRestockSettings.voidWarehouseRestock;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = true;
+        reset(data, 90);
+        player.getInventory().clearContent();
+        PrinterTakeService.TakeOutcome outcome =
+                PrinterTakeService.take(server, player, List.of("minecraft:iron_ingot"));
+        System.out.println("   [H] 打印机: status=" + outcome.status() + " taken=" + outcome.takenCount()
+                + " remaining=" + outcome.remaining());
+        check("H2 打印机取货成功", outcome.delivered());
+        check("H3 打印机取走 10 个（一组 90 铁粒恰好），铁粒归零",
+                outcome.takenCount() == 10 && data.amountOf(Items.IRON_NUGGET).signum() == 0);
+        check("H4 背包里真的有 10 个铁锭", countInInventory(player, Items.IRON_INGOT) == 10);
+        check("H5 反证：仓库里铁锭仍是 0（那 10 个在背包里，不在仓库）",
+                data.amountOf(Items.IRON_INGOT).signum() == 0);
+        VoidWarehouseRestockSettings.voidWarehouseRestock = restockWasOn;
+
+        // ---- H3 界面点格 ----
+        reset(data, 90);
+        player.getInventory().clearContent();
+        VoidWarehouseMenu menu = openMenu(player);
+        check("H6 能打开虚空仓库界面", menu != null);
+        if (menu != null) {
+            VoidWarehousePageContainer container = (VoidWarehousePageContainer) menu.getContainer();
+            int slot = findExchangeSlot(container, "iron_ingot");
+            check("H7 界面里找得到「可兑」的铁锭格（容器下标 " + slot + "）", slot >= 0);
+            if (slot >= 0) {
+                check("H8 那一格的图标确实带「（可兑）」",
+                        container.getItem(slot).getHoverName().getString().contains("（可兑）"));
+                // 左键：取 1 个
+                menu.clicked(slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                check("H9 左键取 1 个：铁粒 90 -> 81",
+                        data.amountOf(Items.IRON_NUGGET).equals(BigInteger.valueOf(81)));
+                check("H10 左键取到的 1 个铁锭进了背包",
+                        countInInventory(player, Items.IRON_INGOT) == 1);
+                // 右键：取一组（10 个，但只剩 9 个可兑了）
+                int slot2 = findExchangeSlot(container, "iron_ingot");
+                check("H11 取了一个之后那一格还在（还能再兑）", slot2 >= 0);
+                if (slot2 >= 0) {
+                    menu.clicked(slot2, 1, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                    check("H12 右键取一组：剩下 81 铁粒全用完（仓库铁粒归零）",
+                            data.amountOf(Items.IRON_NUGGET).signum() == 0);
+                    check("H13 背包里一共 10 个铁锭",
+                            countInInventory(player, Items.IRON_INGOT) == 10);
+                    check("H14 反证：仓库里铁锭仍是 0",
+                            data.amountOf(Items.IRON_INGOT).signum() == 0);
+                }
+            }
+        }
+
+        // ---- H4 聊天按数量取货 ----
+        reset(data, 90);
+        player.getInventory().clearContent();
+        boolean invoked = invokeWithdrawChat(player, new ItemStack(Items.IRON_INGOT), 3L);
+        check("H15 聊天取货链路可调用", invoked);
+        if (invoked) {
+            check("H16 聊天取 3 个：铁粒 90 -> 63",
+                    data.amountOf(Items.IRON_NUGGET).equals(BigInteger.valueOf(63)));
+            check("H17 聊天取到的 3 个进了背包", countInInventory(player, Items.IRON_INGOT) == 3);
+            check("H18 反证：仓库里铁锭仍是 0", data.amountOf(Items.IRON_INGOT).signum() == 0);
+        }
+
+        // ---- H5 四条入口的账目必须一模一样 ----
+        check("H19 四条入口扣的都是「9 铁粒换 1 铁锭」这一笔账（剩 63 = 90 − 3×9）",
+                data.amountOf(Items.IRON_NUGGET).equals(BigInteger.valueOf(63)));
+    }
+
+    // ================================================================ I 规则关闭
+
+    private static void ruleOffChecks(MinecraftServer server) {
+        System.out.println("=== I 规则关闭：可兑格必须立刻消失（会咬住缓存没作废）===");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        reset(data, 90);
+
+        // 先让缓存被热起来（这一步是关键：没热过的缓存测不出「关规则后没作废」）
+        int warmOffers = data.exchangeOfferCount();
+        int warmDisplay = data.displayCount();
+        check("I1 规则开着时可兑条目 > 0（缓存被热起来）", warmOffers > 0);
+        check("I2 规则开着时展示格数 > 真实格数", warmDisplay > data.entryCount());
+
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+        try {
+            check("I3 关规则后 exchangeEnabled() 为 false", !VoidWarehouseData.exchangeEnabled());
+            check("I4 关规则后可兑条目立刻为空（缓存作废了）", data.exchangeOffers().isEmpty());
+            check("I5 关规则后展示格数 == 真实格数（幽灵格没了）",
+                    data.displayCount() == data.entryCount());
+            check("I6 关规则后规划返回 null",
+                    data.planExchange(new ItemStack(Items.IRON_INGOT), ONE) == null);
+            check("I7 关规则后 withdraw 不会再兑换（只扣成品）",
+                    data.withdraw(new ItemStack(Items.IRON_INGOT), ONE).isEmpty());
+            check("I8 关规则后仓库一个字节都没动",
+                    data.amountOf(Items.IRON_NUGGET).equals(BigInteger.valueOf(90)));
+        } finally {
+            VoidWarehouseSettings.voidWarehouseExchange = true;
+        }
+
+        check("I9 反证：规则开回来后可兑条目又回来了", data.exchangeOfferCount() > 0);
+        VoidWarehouseSettings.voidWarehouse = false;
+        try {
+            check("I10 主开关关掉时 exchangeEnabled() 为 false", !VoidWarehouseData.exchangeEnabled());
+            check("I11 主开关关掉时可兑条目为空", data.exchangeOffers().isEmpty());
+        } finally {
+            VoidWarehouseSettings.voidWarehouse = true;
+        }
+        check("I12 规则全部开回来", VoidWarehouseData.exchangeEnabled());
+    }
+
+    // ================================================================ J 漏斗出料
+
+    private static void placeHopper(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        hopperPos = new BlockPos(HOPPER_X, HOPPER_Y, HOPPER_Z);
+        level.setChunkForced(HOPPER_X >> 4, HOPPER_Z >> 4, true);
+        // 注意：上方【不】放工作台 —— 那样 voidWarehouse 的 tick 会自己调 pull，
+        // 和我手动调的那一次抢料，测量就不可复现了。直接手动调 pull 即可。
+        level.setBlock(hopperPos, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+        System.out.println("[VWX] 漏斗已放置 " + hopperPos);
+    }
+
+    private static void hopperChecks(MinecraftServer server) {
+        System.out.println("=== J 漏斗出料入口 ===");
+        if (hopper == null) {
+            check("J0 漏斗方块实体就位", false);
+            return;
+        }
+        check("J0 漏斗方块实体就位", true);
+
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_NUGGET, 90));
+
+        // 分类物：漏斗第 0 格放 1 个铁锭（仓库里 0 个铁锭，只有铁粒）
+        hopper.setItem(0, new ItemStack(Items.IRON_INGOT, 1));
+        hopper.setChanged();
+
+        int moved = VoidWarehouseExtractor.pull(server.overworld(), hopper);
+        int slot0 = hopper.getItem(0).getCount();
+        BigInteger left = data.amountOf(Items.IRON_NUGGET);
+        System.out.println("   [J] pull 补入 " + moved + " 个，漏斗第 0 格 = " + slot0
+                + "，仓库剩余铁粒 = " + left);
+
+        check("J1 pull 补入 10 个（90 铁粒 ÷ 9）", moved == 10);
+        check("J2 漏斗第 0 格从 1 变成 11", slot0 == 11);
+        check("J3 仓库铁粒归零", left.signum() == 0);
+        check("J4 反证：漏斗里补的就是铁锭，没混进别的东西",
+                hopper.getItem(0).getItem() == Items.IRON_INGOT);
+    }
+
+    private static void cleanup(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        if (hopperPos != null) {
+            level.setBlock(hopperPos, Blocks.AIR.defaultBlockState(), 3);
+            level.setChunkForced(HOPPER_X >> 4, HOPPER_Z >> 4, false);
+        }
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        data.insert(new ItemStack(Items.DIRT, 5678));
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        System.out.println("SMOKE RESULT vw-exchange/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ================================================================ 工具：兑换
+
+    /** 把「物品 id → 个数」的简写快照转成引擎要的 {@link VoidWarehouseExchange.Stock} */
+    private static VoidWarehouseExchange.Stock stock(Map<String, Integer> snapshot) {
+        Map<String, BigInteger> converted = new LinkedHashMap<>();
+        for (Map.Entry<String, Integer> e : snapshot.entrySet()) {
+            converted.put(e.getKey(), BigInteger.valueOf(e.getValue()));
+        }
+        return VoidWarehouseExchange.Stock.of(converted);
+    }
+
+    private static VoidWarehouseExchange.Plan plan(VoidWarehouseExchange.Table table, String itemId, long want,
+                                                   Map<String, Integer> snapshot) {
+        return VoidWarehouseExchange.plan(table, itemId, BigInteger.valueOf(want), stock(snapshot));
+    }
+
+    /** 账目里某个物品的净变化（没有该物品时为 0） */
+    private static BigInteger change(VoidWarehouseExchange.Plan plan, String itemId) {
+        return plan == null ? BigInteger.ZERO : plan.asMap().getOrDefault(itemId, BigInteger.ZERO);
+    }
+
+    /** 守恒判据：{@code Σ(delta × 9^(层级 − 最低层级)) == −amount × 9^(目标层级 − 最低层级)} */
+    private static boolean conserved(VoidWarehouseExchange.Table table, VoidWarehouseExchange.Plan plan) {
+        if (plan == null) {
+            return false;
+        }
+        int min = Integer.MAX_VALUE;
+        for (String itemId : table.items()) {
+            min = Math.min(min, table.levelOf(itemId));
+        }
+        if (min == Integer.MAX_VALUE) {
+            return false;
+        }
+        BigInteger left = BigInteger.ZERO;
+        for (VoidWarehouseExchange.Delta delta : plan.deltas()) {
+            left = left.add(delta.change().multiply(weight(table, delta.itemId(), min)));
+        }
+        BigInteger right = plan.amount().negate().multiply(weight(table, plan.itemId(), min));
+        return left.equals(right);
+    }
+
+    private static BigInteger weight(VoidWarehouseExchange.Table table, String itemId, int minLevel) {
+        return NINE.pow(table.levelOf(itemId) - minLevel);
+    }
+
+    private static void checkConserved(VoidWarehouseExchange.Table table, String label,
+                                       VoidWarehouseExchange.Plan plan) {
+        check(label + " 守恒（Σ 数量×9^层级 == −需求×9^目标层级）", conserved(table, plan));
+    }
+
+    private static String ledger(VoidWarehouseExchange.Plan plan) {
+        if (plan == null) {
+            return "null";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append(plan.itemId()).append(" ×").append(plan.amount()).append(" [");
+        boolean first = true;
+        for (Map.Entry<String, BigInteger> e : plan.asMap().entrySet()) {
+            if (!first) {
+                sb.append(", ");
+            }
+            sb.append(e.getKey()).append(' ').append(e.getValue().signum() > 0 ? "+" : "").append(e.getValue());
+            first = false;
+        }
+        return sb.append(']').toString();
+    }
+
+    // ================================================================ 工具：数据层
+
+    private static void reset(VoidWarehouseData data, int nuggets) {
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_NUGGET, nuggets));
+    }
+
+    private static Map<String, BigInteger> snapshot(VoidWarehouseData data) {
+        Map<String, BigInteger> map = new LinkedHashMap<>();
+        for (int i = 0; i < data.entryCount(); i++) {
+            VoidWarehouseData.Entry entry = data.entryAt(i);
+            if (entry == null) {
+                continue;
+            }
+            String id = VoidWarehouseExchangeBootstrap.idOf(entry.template().getItem());
+            map.put(id == null ? ("?" + i) : id, entry.amount());
+        }
+        return map;
+    }
+
+    private static boolean hasOffer(List<VoidWarehouseData.ExchangeOffer> offers, String itemId) {
+        return offerOf(offers, itemId) != null;
+    }
+
+    private static VoidWarehouseData.ExchangeOffer offerOf(List<VoidWarehouseData.ExchangeOffer> offers,
+                                                           String itemId) {
+        for (VoidWarehouseData.ExchangeOffer offer : offers) {
+            if (offer.itemId().equals(itemId)) {
+                return offer;
+            }
+        }
+        return null;
+    }
+
+    private static String describeOffers(List<VoidWarehouseData.ExchangeOffer> offers) {
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        for (VoidWarehouseData.ExchangeOffer offer : offers) {
+            if (!first) {
+                sb.append(", ");
+            }
+            sb.append(offer.itemId()).append(" ×").append(offer.obtainable());
+            first = false;
+        }
+        return sb.append(']').toString();
+    }
+
+    private static BigInteger amountAt(VoidWarehouseData data, int displayIndex) {
+        VoidWarehouseData.DisplaySlot slot = data.displaySlotAt(displayIndex);
+        if (slot.entry() != null) {
+            return slot.entry().amount();
+        }
+        return slot.offer() == null ? BigInteger.ZERO : slot.offer().obtainable();
+    }
+
+    private static int findExchangeSlot(VoidWarehousePageContainer container, String itemId) {
+        for (int slot = 0; slot < VoidWarehouseData.PAGE_SIZE; slot++) {
+            VoidWarehouseData.DisplaySlot target = container.slotAt(slot);
+            if (target.isExchange() && itemId.equals(target.offer().itemId())) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    // ================================================================ 工具：玩家 / 界面 / 聊天
+
+    private static ServerPlayer player(MinecraftServer server, ServerLevel level) {
+        try {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "NekoExchangeCheck");
+            ClientInformation info = ClientInformation.createDefault();
+            ServerPlayer p = new ServerPlayer(server, level, profile, info);
+            PacketListener listener = new ServerGamePacketListenerImpl(
+                    server, new Connection(PacketFlow.SERVERBOUND), p,
+                    CommonListenerCookie.createInitial(profile, false));
+            p.connection = (ServerGamePacketListenerImpl) listener;
+            forceClientLoaded(p.connection);
+            return p;
+        } catch (Throwable t) {
+            System.out.println("   假玩家构造失败: " + t);
+            return null;
+        }
+    }
+
+    /** 手工造的连接没走完握手，不摁成已加载的话 handleUseItem 首行就 return */
+    private static void forceClientLoaded(ServerGamePacketListenerImpl conn) {
+        for (String name : new String[]{"waitingForRespawn", "clientLoadedTimeoutTimer"}) {
+            try {
+                Field f = ServerGamePacketListenerImpl.class.getDeclaredField(name);
+                f.setAccessible(true);
+                if (f.getType() == boolean.class) {
+                    f.setBoolean(conn, false);
+                } else {
+                    f.setInt(conn, 0);
+                }
+            } catch (Throwable t) {
+                System.out.println("   [diag] 强制已加载失败(" + name + "): " + t);
+            }
+        }
+    }
+
+    /** 走真实包链路开一次界面（与玩家右键工作台完全同一条路），失败返回 null */
+    private static VoidWarehouseMenu openMenu(ServerPlayer player) {
+        player.containerMenu = player.inventoryMenu;
+        ItemStack trigger = new ItemStack(Items.CRAFTING_TABLE);
+        trigger.set(DataComponents.CUSTOM_NAME, Component.literal(VoidWarehouseTrigger.ITEM_NAME));
+        player.setItemInHand(InteractionHand.MAIN_HAND, trigger);
+        try {
+            player.connection.handleUseItem(new ServerboundUseItemPacket(
+                    InteractionHand.MAIN_HAND, 0, player.getYRot(), player.getXRot()));
+        } catch (Throwable t) {
+            System.out.println("   [diag] 包路径抛异常: " + t);
+        }
+        return player.containerMenu instanceof VoidWarehouseMenu
+                ? (VoidWarehouseMenu) player.containerMenu : null;
+    }
+
+    /** 反射调 {@code VoidWarehouseWithdraw.execute}（聊天按量取货的真正执行体） */
+    private static boolean invokeWithdrawChat(ServerPlayer player, ItemStack sample, long amount) {
+        try {
+            Method m = VoidWarehouseWithdraw.class.getDeclaredMethod(
+                    "execute", ServerPlayer.class, ItemStack.class, long.class);
+            m.setAccessible(true);
+            m.invoke(null, player, sample, amount);
+            return true;
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 反射调用 VoidWarehouseWithdraw.execute 失败: " + t);
+            t.printStackTrace(System.out);
+            return false;
+        }
+    }
+
+    private static int countInInventory(ServerPlayer player, Item item) {
+        int total = 0;
+        var inventory = player.getInventory();
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (!stack.isEmpty() && stack.getItem() == item) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    private static HopperBlockEntity asHopper(BlockEntity be) {
+        return be instanceof HopperBlockEntity h ? h : null;
+    }
+
+    // ================================================================ 工具：组件
+
+    private static List<Component> loreOf(ItemStack stack) {
+        ItemLore lore = stack.get(DataComponents.LORE);
+        return lore == null ? List.of() : lore.lines();
+    }
+
+    private static boolean contains(List<Component> lines, String needle) {
+        for (Component line : lines) {
+            if (line.getString().contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void dumpLore(String tag, List<Component> lore) {
+        for (int i = 0; i < lore.size(); i++) {
+            System.out.println("   [" + tag + " " + i + "] '" + lore.get(i).getString() + "'");
+        }
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+        }
+        System.out.println("   " + (ok ? "ok  " : "FAIL") + " " + label);
+    }
+}

@@ -6,6 +6,8 @@
   "carpet.rule.voidWarehouse.desc": "把铁砧改名的工作台变成全服共享仓库",
   "carpet.rule.voidWarehouseRestock.name": "虚空仓库补货",
   "carpet.rule.voidWarehouseRestock.desc": "允许建造时缺少材料的打印机直接从虚空仓库领取物品（每次一组）。注意：开启后任何装了对应打印机的玩家都能动用全服共享的库存",
+  "carpet.rule.voidWarehouseExchange.name": "虚空仓库 9 合 1 兑换",
+  "carpet.rule.voidWarehouseExchange.desc": "允许在成品缺货时改用 9 合 1 配方的原料顶替：没有铁锭就用 9 个铁粒换 1 个；也可以拆上级找零，比如拆 1 个铁块取出 1 个铁锭、剩下的退回仓库。只在成品本身没货时才会兑换，且只走原版真实存在的配方（26.3 共 29 条边 / 53 个物品）。依赖「虚空仓库」规则",
   "carpet.rule.concretePowderToGlass.name": "混凝土粉末烧制染色玻璃",
   "carpet.rule.concretePowderToGlass.desc": "允许在普通熔炉里把 16 种混凝土粉末烧成对应颜色的染色玻璃（0.1 经验 / 200 tick，与「沙子 → 玻璃」一致）。只影响普通熔炉，高炉与烟熏炉仍不受理混凝土粉末"
 }

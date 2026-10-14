@@ -137,6 +137,37 @@ public final class VoidWarehouseText {
     }
 
     /**
+     * 按语义起一个<b>还能继续 {@code append}</b> 的开头（颜色按语义、去斜体）。
+     *
+     * <p>{@link #line(String, ChatFormatting)} 返回的是 {@code Component}，
+     * 类型上拼得了，但 {@code append} 会返回 {@code MutableComponent}，
+     * 一路拼下去类型会绕。这里直接给出可变的，是为了写「消耗：铁粒 ×9 + 铁块 ×1」
+     * 这种一段一段拼起来的行时不用来回转换。</p>
+     */
+    static MutableComponent label(String text, ChatFormatting style) {
+        return Component.literal(text).withStyle(style)
+                .withStyle(Style.EMPTY.withItalic(false));
+    }
+
+    /**
+     * 给一个<b>已经造好的组件</b>套上颜色（同样去斜体）。
+     *
+     * <p>专门用来处理<b>可翻译组件</b>—— 目前只有物品名（{@code ItemStack#getHoverName()}
+     * 给的是 {@code {"translate":"...","fallback":"..."}}）。<b>绝不能先 {@code getString()} 再拼字符串</b>：
+     * 那会在服务端用服务端的语言表当场解析，专用服务器上永远是英文，
+     * 中文客户端也只能看到英文（详细原因见 {@link #body(Component)} 的说明）。
+     * 只覆盖样式、内容原样保留，本地化就发生在客户端。</p>
+     */
+    static MutableComponent tinted(Component text, ChatFormatting style) {
+        return text.copy().withStyle(style).withStyle(Style.EMPTY.withItalic(false));
+    }
+
+    /** {@link #tinted(Component, ChatFormatting)} 的 RGB 版 */
+    static MutableComponent tinted(Component text, int rgb) {
+        return text.copy().withStyle(Style.EMPTY.withColor(rgb).withItalic(false));
+    }
+
+    /**
      * 物品名 / 图标名：{@code on} 决定用「开」还是「关」的颜色（null = 中性青色）。
      *
      * <p>去斜体在这里尤其重要：这些文本会被设成 {@code CUSTOM_NAME} 组件，而原版

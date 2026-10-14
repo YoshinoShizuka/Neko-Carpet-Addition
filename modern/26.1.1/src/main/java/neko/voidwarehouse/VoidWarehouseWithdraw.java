@@ -200,11 +200,17 @@ public final class VoidWarehouseWithdraw {
         boolean packLoose = loose > (long) LOOSE_PACK_STACKS * max;
         long totalBoxes = packLoose ? fullBoxes + 1 : fullBoxes;
 
-        // ① 校验物品库存（精确口径：同物品 + 同数据组件，与 takeExact 一致）
-        BigInteger stock = data.amountExact(sample);
-        if (stock.compareTo(BigInteger.valueOf(requested)) < 0) {
-            player.sendSystemMessage(MSG_NO_STOCK);
-            return;
+        // ① 校验物品库存（精确口径：同物品 + 同数据组件，与 takeExact 一致）。
+        //    成品不够时，规则允许就用 9 合 1 兑换补齐 —— 规划是「先扣成品、再动别的」，
+        //    所以有成品一定先用成品，玩家不会遇到「明明有铁锭却被扣了铁粒」。
+        BigInteger want = BigInteger.valueOf(requested);
+        VoidWarehouseExchange.Plan exchange = null;
+        if (data.amountExact(sample).compareTo(want) < 0) {
+            exchange = data.planExchange(sample, want);
+            if (exchange == null) {
+                player.sendSystemMessage(MSG_NO_STOCK);
+                return;
+            }
         }
 
         // ② 校验盒子材料：优先空盒，不够的用壳 + 箱（按 totalBoxes 算，含散货装出来的那个）。
@@ -241,8 +247,13 @@ public final class VoidWarehouseWithdraw {
             moveIntoInventory(player, out);
         }
 
-        // ⑥ 扣账：物品 + 盒子材料（空盒优先，不够的才用壳 + 箱；材料在 ② 里验过）
-        data.takeExact(sample, (int) requested);
+        // ⑥ 扣账：物品 + 盒子材料（空盒优先，不够的才用壳 + 箱；材料在 ② 里验过）。
+        //    物品那一步在 ① 里已经定好了走哪条路：兑换计划一次性提交（原子），否则直接按量扣。
+        if (exchange != null) {
+            data.applyExchange(exchange);
+        } else {
+            data.takeExact(sample, (int) requested);
+        }
         data.consumeBoxMaterials(plan);
         player.sendSystemMessage(successMessage(sample, requested, fullBoxes, loose, packLoose));
     }

@@ -164,6 +164,9 @@ public final class VoidWarehouseExchangeSelfCheck {
                 boxModeChecks(server);
                 break;
             case 14:
+                splitRemainderChecks(server);
+                break;
+            case 15:
                 cleanup(server);
                 break;
             default:
@@ -561,7 +564,8 @@ public final class VoidWarehouseExchangeSelfCheck {
 
         // 可兑数量够一组时，仍然是「右键取一组」的老口径
         VoidWarehouseData.ExchangeOffer plenty = new VoidWarehouseData.ExchangeOffer(
-                "emerald_block", new ItemStack(Items.EMERALD_BLOCK), BigInteger.valueOf(666), List.of());
+                "emerald_block", new ItemStack(Items.EMERALD_BLOCK), BigInteger.valueOf(666),
+                BigInteger.valueOf(64), BigInteger.valueOf(666), List.of());
         String plentyLine = lineContaining(
                 loreOf(VoidWarehouseData.buildExchangeDisplay(plenty, false)), "右键：");
         check("F38 可兑 666 个（≥ 一组）时右键仍是「兑换 64 个」，且不出现括注",
@@ -569,7 +573,8 @@ public final class VoidWarehouseExchangeSelfCheck {
 
         // 只能兑 1 个：左右键一个说法，不能一边写 1 一边写 64
         VoidWarehouseData.ExchangeOffer single = new VoidWarehouseData.ExchangeOffer(
-                "iron_ingot", new ItemStack(Items.IRON_INGOT), BigInteger.ONE, List.of());
+                "iron_ingot", new ItemStack(Items.IRON_INGOT), BigInteger.ONE,
+                BigInteger.ONE, BigInteger.ONE, List.of());
         check("F39 只能兑出 1 个时写「左键 / 右键：兑换 1 个」",
                 contains(loreOf(VoidWarehouseData.buildExchangeDisplay(single, false)),
                         "左键 / 右键：兑换 1 个"));
@@ -1082,6 +1087,211 @@ public final class VoidWarehouseExchangeSelfCheck {
             }
         }
         return total;
+    }
+
+    // ================================================================ P 拆零不留零头
+    //
+    // 玩家原话：「假设仓库没有铜锭但拥有铜块，当铜锭显示可兑后，在普通模式下，
+    // 右键一次取出 8 个，再次右键取出一组，这明显是有问题的。」
+    //
+    // 查出来的真相有两层：
+    //   ① 老实现拆上级用的是 ceilDiv —— 为了凑满「一组 64」，它会拆 ceil(64/9) = 8 个铜块
+    //      （= 72 个铜锭）→ 给 64 → <b>把 8 个零头写回仓库</b>。于是「一次取出」把仓库的
+    //      <b>构成形态</b>改了（铜块少 8 个、凭空多出 8 个铜锭），下一次取货命中「成品有货」
+    //      那条路，取货量就变成那个零头 8 —— 玩家看到的「右键一次 8 个」。
+    //   ② 改成「只拆整块」之后又暴露出第二层：planMax 原本用<b>二分</b>，前提「能拿 5 个就
+    //      一定能拿 4 个」在本规则里不成立（1~9 可行、10~17 不行、18 又可行），二分会落进
+    //      洞里收敛，于是「一次取一组」给出 9 或 17 这种明显做不对的数。
+    //      现在 planMax 换成「由价值上界往下逐个试」，不依赖任何单调性。
+    // 现在拆上级只拆「用得完的整块」（floor，不够就逐块往下退），零头根本不产生。
+    //
+    // 玩家拍板的口径：右键「取一组」按整块拆、不留零头（9 个铜块 → 63，仓库剩 2 块）；
+    // 左键「取 1 个」保持「拆 1 块 + 找零」（那是上一轮明确要的功能，不能砍）。
+
+    private static void splitRemainderChecks(MinecraftServer server) {
+        System.out.println("=== P 拆零不留零头：仓库只有上级时，取货不该改变仓库的构成 ===");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        check("P0 假玩家可构造", player != null);
+        if (player == null) {
+            return;
+        }
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
+        // 物品一律走引擎自己的 id→item 解析器：26.x 的 Items.COPPER_BLOCK 是
+        // WeatheringCopperCollection（铜氧化四态集合）而不是 Item，直接构造 ItemStack 编译不过；
+        // 用 id 解析还对五个版本一致。
+        Item copperBlock = VoidWarehouseExchangeBootstrap.itemOf("copper_block");
+        Item copperIngot = VoidWarehouseExchangeBootstrap.itemOf("copper_ingot");
+        check("P1 铜粒 / 铜锭 / 铜块连成同一族（" + table.familyOf("copper_ingot") + "）",
+                copperBlock != null && copperIngot != null
+                        && table.familyOf("copper_ingot").containsAll(
+                        java.util.List.of("copper_nugget", "copper_ingot", "copper_block")));
+        if (copperBlock == null || copperIngot == null) {
+            return;
+        }
+
+        // ---- P2~P6 纯算法：拆上级只拆整块 ----
+        check("P2 9 个铜块取 64 个铜锭 —— <b>凑不出来</b>（64 不是整块量，凑满就得留 8 个零头）",
+                plan(table, "copper_ingot", 64L, Map.of("copper_block", 9)) == null);
+        VoidWarehouseExchange.Plan p63 = plan(table, "copper_ingot", 63L, Map.of("copper_block", 9));
+        System.out.println("   [P] 9 铜块取 63 -> " + ledger(p63));
+        check("P3 9 个铜块取 63 —— 可行，账目只有「铜块 −7」，零头为 0",
+                p63 != null && p63.asMap().size() == 1
+                        && change(p63, "copper_block").equals(BigInteger.valueOf(-7)));
+        checkConserved(table, "P3b 整块拆", p63);
+
+        VoidWarehouseExchange.Plan p1 = plan(table, "copper_ingot", 1L, Map.of("copper_block", 1));
+        System.out.println("   [P] 1 铜块取 1 -> " + ledger(p1));
+        check("P4 反证：左键取 1 个仍保留「拆 1 块 + 找零 8」（上一轮要的功能不能被砍掉）",
+                p1 != null && change(p1, "copper_block").equals(ONE.negate())
+                        && change(p1, "copper_ingot").equals(BigInteger.valueOf(8)));
+        checkConserved(table, "P4b 找零", p1);
+
+        // 整块拆完还差一点点时，用下级补 —— 老实现（ceil）做不到这一条
+        Map<String, Integer> mixed = new LinkedHashMap<>();
+        mixed.put("copper_block", 7);
+        mixed.put("copper_nugget", 90);
+        VoidWarehouseExchange.Plan p64 = plan(table, "copper_ingot", 64L, mixed);
+        System.out.println("   [P] 7 铜块 + 90 铜粒取 64 -> " + ledger(p64));
+        check("P5 混合库存能取满 64：7 块 = 63 差 1，用 9 个铜粒补齐，零头仍为 0",
+                p64 != null && change(p64, "copper_block").equals(BigInteger.valueOf(-7))
+                        && change(p64, "copper_nugget").equals(BigInteger.valueOf(-9)));
+        checkConserved(table, "P5b 混合补零", p64);
+        check("P6 1 铜块 + 90 铜粒取 11 —— 老实现要 2 块直接判无解，现在能凑出来",
+                plan(table, "copper_ingot", 11L,
+                        Map.of("copper_block", 1, "copper_nugget", 90)) != null);
+
+        // 上级不够时要「少拆一块、把更多零头交给下级」—— 只试 floor(need / 9) 会漏掉这条路，
+        // 于是「1 块 + 100 粒」被算成 17（9 + 8）而不是 20（9 + 11）：100 粒明明够 11 个铜锭，
+        // 却被「必须拆 2 块」卡掉。这正是 P9 那个 9 的同源毛病在另一处的表现。
+        VoidWarehouseExchange.Plan pNugMax = VoidWarehouseExchange.planMax(table, "copper_ingot",
+                BigInteger.valueOf(64), stock(Map.of("copper_block", 1, "copper_nugget", 100)));
+        System.out.println("   [P] 1 铜块 + 100 铜粒最多能取 " + ledger(pNugMax));
+        check("P6b 1 铜块 + 100 铜粒「最多能取」= 20（9 + 11），不是 17",
+                pNugMax != null && pNugMax.amount().equals(BigInteger.valueOf(20)));
+        check("P6c 账目 = 铜块 −1、铜粒 −99（11 × 9），零头为 0",
+                change(pNugMax, "copper_block").equals(ONE.negate())
+                        && change(pNugMax, "copper_nugget").equals(BigInteger.valueOf(-99)));
+        checkConserved(table, "P6d 少拆一块", pNugMax);
+        check("P6e 反证：只有 1 铜块 + 8 铜粒时取 10 个凑不出来（零头 1 个铜锭要 9 粒）",
+                plan(table, "copper_ingot", 10L,
+                        Map.of("copper_block", 1, "copper_nugget", 8)) == null);
+
+        // ---- P7~P11 真实界面：可兑数量 81 与「一次取货 63」都要显示对 ----
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(copperBlock, 9));
+        VoidWarehouseData.ExchangeOffer offer = offerOf(data.exchangeOffers(), "copper_ingot");
+        check("P7 9 个铜块时铜锭出现在可兑条目里", offer != null);
+        if (offer != null) {
+            System.out.println("   [P] 9 铜块：可兑 " + offer.obtainable() + "，一次取货 " + offer.bulk()
+                    + "，一盒 " + offer.boxed());
+            check("P8 可兑数量 = 81（9 个铜块能换的全部铜锭）",
+                    offer.obtainable().equals(BigInteger.valueOf(81)));
+            check("P9 一次「取一组」= <b>63</b> 而不是 64（64 要拆 8 块、会留下 8 个零头）",
+                    offer.bulk().equals(BigInteger.valueOf(63)));
+            List<Component> lore = loreOf(VoidWarehouseData.buildExchangeDisplay(offer, false));
+            dumpLore("P-offer", lore);
+            String bulkLine = lineContaining(lore, "右键：");
+            check("P10 tooltip 的右键行写 63 并说明原因（按整块拆、不留零头）",
+                    bulkLine != null && bulkLine.contains("63 个") && bulkLine.contains("不留零头"));
+        }
+
+        // ---- P11~P14 右键两次：63、18，全程不留零头 ----
+        for (int round = 1; round <= 2; round++) {
+            VoidWarehouseMenu menu = openMenu(player);
+            check("P11." + round + " 界面可打开", menu != null);
+            if (menu == null) {
+                break;
+            }
+            VoidWarehousePageContainer container = (VoidWarehousePageContainer) menu.getContainer();
+            int slot = findExchangeSlot(container, "copper_ingot");
+            check("P11." + round + "b 找得到可兑槽", slot >= 0);
+            if (slot < 0) {
+                break;
+            }
+            int before = countInInventory(player, copperIngot);
+            menu.clicked(slot, 1, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+            int got = countInInventory(player, copperIngot) - before;
+            if (round == 1) {
+                check("P11 右键第 1 次给 63 个", got == 63);
+                check("P12 仓库只剩 2 个铜块、<b>没有任何零头铜锭</b>（" + snapshot(data) + "）",
+                        snapshot(data).equals(Map.of("copper_block", BigInteger.valueOf(2))));
+            } else {
+                check("P13 右键第 2 次给 18 个（剩下那 2 块）", got == 18);
+                check("P14 仓库清空（" + snapshot(data) + "）", snapshot(data).isEmpty());
+            }
+        }
+
+        // ---- P15~P16 左键取 1 个：保持「找零」口径 ----
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(copperBlock, 9));
+        VoidWarehouseMenu menu = openMenu(player);
+        if (menu != null) {
+            VoidWarehousePageContainer container = (VoidWarehousePageContainer) menu.getContainer();
+            int slot = findExchangeSlot(container, "copper_ingot");
+            check("P15 左键前找得到可兑槽", slot >= 0);
+            if (slot >= 0) {
+                int before = countInInventory(player, copperIngot);
+                menu.clicked(slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                check("P16 左键取到 1 个铜锭",
+                        countInInventory(player, copperIngot) - before == 1);
+            }
+        }
+        check("P17 左键之后仓库 = {铜块 8, 铜锭 8}（拆 1 块、找零 8，这是玩家要保留的口径）",
+                snapshot(data).equals(Map.of("copper_block", BigInteger.valueOf(8),
+                        "copper_ingot", BigInteger.valueOf(8))));
+
+        // ---- P18~P19 潜影盒模式：一盒的上限（27 组）是 9 的倍数，整块拆刚好除尽 ----
+        prepare(data, player);
+        data.insert(new ItemStack(copperBlock, 9));
+        data.insert(new ItemStack(Items.SHULKER_SHELL, VoidWarehouseShulker.SHELL_COST));
+        data.insert(new ItemStack(Items.CHEST, VoidWarehouseShulker.CHEST_COST));
+        VoidWarehouseData.ExchangeOffer boxOffer = offerOf(data.exchangeOffers(), "copper_ingot");
+        check("P18 盒模式：一盒能装 81 个（9 块全拆正好 81，零头为 0，与工具提示同源）",
+                boxOffer != null && boxOffer.boxed().equals(BigInteger.valueOf(81)));
+        VoidWarehouseMenu boxMenu = openMenu(player);
+        if (boxMenu != null) {
+            VoidWarehousePageContainer boxContainer = (VoidWarehousePageContainer) boxMenu.getContainer();
+            int boxSlot = findExchangeSlot(boxContainer, "copper_ingot");
+            check("P19 盒模式下找得到可兑槽", boxSlot >= 0);
+            if (boxSlot >= 0) {
+                boxMenu.clicked(boxSlot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                long packed = countInside(findInInventory(player, Items.SHULKER_BOX), copperIngot);
+                System.out.println("   [P] 盒里装了 " + packed + " 个铜锭");
+                check("P19b 盒里正好 81 个（与 P18 的数字一致，不留零头）", packed == 81);
+                check("P19c 仓库清空（" + snapshot(data) + "）", snapshot(data).isEmpty());
+            }
+        }
+
+        // ---- P20~P23 上级不够的真实界面：一次「取一组」= 20（少拆一块、零头交给下级）----
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        Item copperNugget = VoidWarehouseExchangeBootstrap.itemOf("copper_nugget");
+        data.insert(new ItemStack(copperBlock, 1));
+        data.insert(new ItemStack(copperNugget, 100));
+        VoidWarehouseData.ExchangeOffer thin = offerOf(data.exchangeOffers(), "copper_ingot");
+        check("P20 1 铜块 + 100 铜粒：可兑 20 且一次取货 20（老实现只有 17）",
+                thin != null && thin.obtainable().equals(BigInteger.valueOf(20))
+                        && thin.bulk().equals(BigInteger.valueOf(20)));
+        VoidWarehouseMenu thinMenu = openMenu(player);
+        if (thinMenu != null) {
+            VoidWarehousePageContainer thinContainer = (VoidWarehousePageContainer) thinMenu.getContainer();
+            int thinSlot = findExchangeSlot(thinContainer, "copper_ingot");
+            check("P21 找得到可兑槽", thinSlot >= 0);
+            if (thinSlot >= 0) {
+                int before = countInInventory(player, copperIngot);
+                thinMenu.clicked(thinSlot, 1, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                check("P22 右键一次给 20 个（老实现只给 17）",
+                        countInInventory(player, copperIngot) - before == 20);
+                check("P23 仓库只剩 1 个铜粒（" + snapshot(data) + "）",
+                        snapshot(data).equals(Map.of("copper_nugget", BigInteger.ONE)));
+            }
+        }
+
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
     }
 
     private static void cleanup(MinecraftServer server) {

@@ -36,8 +36,10 @@ import java.util.TreeSet;
  *   <li><b>直接扣库存</b> —— <b>只要成品本身有货就永远走这条路</b>，
  *       所以「有货时绝不做任何兑换」是结构上保证的，不是靠判断；</li>
  *   <li><b>用下级合成</b>：需要 {@code 9 × need} 个上级原料，递归取；</li>
- *   <li><b>拆上级找零</b>：拆 {@code ceil(need / 9)} 个更大的物品，用掉 {@code need} 个，
- *       剩下的<b>作为成品退回仓库</b>（这就是「拆零」）。</li>
+ *   <li><b>拆上级</b>：拆「用得完的整块」—— {@code floor(need / 9)} 个更大的物品，
+ *       上级不够就逐块往下退；差的零头交给前两条路补。
+ *       只有 {@code need < 9} 时才多拆一块、把用不完的<b>作为成品退回仓库</b>
+ *       （这就是玩家要的「拆零找零」）。</li>
  * </ol>
  * <p>递归里用 {@link State#visiting} 破环：{@code 铁锭 → 需要铁粒 → 只能拆铁锭} 这种
  * 自我指涉的分支必须直接判失败，否则会无限递归。</p>
@@ -308,41 +310,38 @@ public final class VoidWarehouseExchange {
         return new Plan(itemId, want, deltas);
     }
 
-    /**
-     * 规划「最多能拿到多少个」，上限 {@code limit}。
-     *
-     * <p>可行性对数量单调（能拿 5 个就一定能拿 4 个：只要少用 1 个），所以这里用二分。
-     * 二分出来之后<b>再验一次</b>，防止单调性在某些刁钻库存上被破坏 ——
-     * 真的验失败就线性往下退几步，宁可少给也绝不给出一个执行不了的量。</p>
-     *
-     * @return 可行的计划（数量可能小于 {@code limit}）；一个都拿不到时返回 {@code null}
-     */
     public static Plan planMax(String itemId, BigInteger limit, Stock stock) {
         return planMax(active(), itemId, limit, stock);
     }
 
-    /** 同 {@link #planMax(String, BigInteger, Stock)}，但用指定的表 */
+    /**
+     * 规划「最多能拿到多少个」，上限 {@code limit}。
+     *
+     * <h2>为什么这里<b>不能</b>二分</h2>
+     * <p>早先的实现是二分，前提是「能拿 5 个就一定能拿 4 个」。这个前提在本规则里
+     * <b>根本不成立</b>：一次取货要么拆整块上级、要么拿下级补零头，可行性是<b>跳档</b>的。
+     * 仓库里只有 9 个铜块时，1~9 个都给得出来（9 是拆整块，1~8 是拆一块找零），
+     * 而 10~17 一个都给不出，18 又给得出 —— 中间是一串洞。
+     * 二分一旦落进洞里就会在洞边收敛，实测对「上限 64」给出 <b>9</b>：
+     * 这就是玩家报的「铜锭显示可兑后，右键第一下给 8/9 个、第二下才给一组」。
+     *
+     * <h2>现在怎么做</h2>
+     * <p>先由价值守恒算出「再怎么折腾也超不过去」的上界（{@link #maxObtainable}），
+     * 与 {@code limit} 取小，然后<b>从上往下逐个试</b>；第一个规划得出来的就是答案，
+     * 所以返回值必定是「真做得到的最大量」，不依赖任何单调性假设。</p>
+     *
+     * <p>代价可接受，因为这个上界很紧（仓库里有多少料，它就只给出对应那么多），
+     * 而「9 的倍数」这一档永远可行，实际往下退的步数是个位数；
+     * {@code limit} 本身也只是「堆叠上限 64」或「一盒容量」这个量级。</p>
+     *
+     * @return 可行的计划（数量可能小于 {@code limit}）；一个都拿不到时返回 {@code null}
+     */
     public static Plan planMax(Table table, String itemId, BigInteger limit, Stock stock) {
         if (limit == null || limit.signum() <= 0 || !table.items().contains(itemId)) {
             return null;
         }
-        Plan atLimit = plan(table, itemId, limit, stock);
-        if (atLimit != null) {
-            return atLimit;
-        }
-        BigInteger low = ZERO;
-        BigInteger high = limit;
-        while (high.subtract(low).compareTo(ONE) > 0) {
-            BigInteger mid = low.add(high).shiftRight(1);
-            if (plan(table, itemId, mid, stock) != null) {
-                low = mid;
-            } else {
-                high = mid;
-            }
-        }
-        // 二分结果复验 + 线性回退：单调性万一不成立（例如某些库存下 3 可行而 2 不行），
-        // 二分可能高估，这里往下找第一个真正可行的值。
-        for (BigInteger probe = low; probe.signum() > 0; probe = probe.subtract(ONE)) {
+        BigInteger upper = limit.min(maxObtainable(table, itemId, stock));
+        for (BigInteger probe = upper; probe.signum() > 0; probe = probe.subtract(ONE)) {
             Plan plan = plan(table, itemId, probe, stock);
             if (plan != null) {
                 return plan;
@@ -357,8 +356,8 @@ public final class VoidWarehouseExchange {
      * 「现在最多能兑出多少个 {@code itemId}」的<b>安全上界</b>，只由<b>本族现有库存</b>推出来。
      *
      * <h2>为什么需要它</h2>
-     * <p>{@link #planMax} 要一个 {@code limit}（二分得有上界）。这个上限<b>不能拍一个固定值</b>：
-     * 早先写过「一组（堆叠上限）」，后来又写成「一盒容量 1728」，两次都被玩家指出不合理 ——
+     * <p>「可兑数量」这个数<b>不能拍一个固定值</b>：早先写过「一组（堆叠上限）」，
+     * 后来又写成「一盒容量 1728」，两次都被玩家指出不合理 ——
      * 仓库里只有 81 个铁锭时，铁块那格显示 1728 是<b>凭空的一个数</b>，跟仓库里有什么毫无关系。</p>
      * <p>正确做法是由库存自身推上界：<b>每一步兑换都守恒价值</b>（9 个下级 = 1 个上级），
      * 所以价值只会减少、不会增加，拿「本族库存的总价值」除以「一个目标物品的价值」，
@@ -371,8 +370,9 @@ public final class VoidWarehouseExchange {
      *       所以「只有 9 个浮冰」时取冰的上界是 81、真值是 0；</li>
      *   <li><b>剩下不够再换的零头</b>：整除法本来就是向下取整，零头算不进任何一整件。</li>
      * </ul>
-     * <p>所以这个数只用来给二分定范围，真正的答案由 {@link #planMax} 收敛到
-     * 「确实执行得出来」的最大值。上界偏大是安全的（最多多跑一次注定失败的规划），
+     * <p>所以这个数有两个用途：给界面显示「这一格现在能兑多少个」，以及给
+     * {@link #planMax} 当<b>往下试探的起点</b> —— 真正的答案由 {@code planMax} 收敛到
+     * 「确实执行得出来」的最大值。上界偏大是安全的（最多多跑几次注定失败的规划），
      * 偏小才是 bug —— 而价值守恒保证了它不会偏小。</p>
      *
      * <h2>拿来当限制还有个副作用是好事</h2>
@@ -404,6 +404,43 @@ public final class VoidWarehouseExchange {
         return value.divide(NINE.pow(table.levelOf(itemId) - floor));
     }
 
+    /**
+     * 「<b>不拆上级</b>的话最多能补出多少个 {@code item}」的<b>安全上界</b>。
+     *
+     * <p>用途只有一个：给 {@link #drain} 第 ③ 条路的「往下少拆一块」循环一个停下来的理由 ——
+     * 少拆一块，零头就多 9 个；零头一旦超过这个上界就再也补不上，剩下的块数不必再试，
+     * 否则「9 个铜块取 64」这种明摆着做不通的请求会白试 7 次。</p>
+     *
+     * <p>口径：只数<b>层级不高于 {@code item}</b> 的族内库存。拆零只会沿「层级 + 1」的方向发生，
+     * 所以下级递归里可能被拆到的物品，层级都不会超过目标自己（这正是
+     * {@link #drainWithoutSplitting} 里那句「不许再拆上级」的另一种表述）。</p>
+     *
+     * <p>和 {@link #maxObtainable} 一样是<b>上界而不是精确值</b>（不同分支的料未必凑得到一起），
+     * 但方向相反：这里<b>偏大安全</b> —— 最多多试几次注定失败的规划，绝不会把一条可行的路掐掉。</p>
+     */
+    private static BigInteger coverBound(Table table, String itemId, State state) {
+        Set<String> family = table.familyOf(itemId);
+        if (family.isEmpty()) {
+            return ZERO;
+        }
+        int floor = Integer.MAX_VALUE;
+        for (String id : family) {
+            floor = Math.min(floor, table.levelOf(id));
+        }
+        int level = table.levelOf(itemId);
+        BigInteger value = ZERO;
+        for (String id : family) {
+            if (table.levelOf(id) > level) {
+                continue;
+            }
+            BigInteger have = orZero(state.stock.get(id));
+            if (have.signum() > 0) {
+                value = value.add(have.multiply(NINE.pow(table.levelOf(id) - floor)));
+            }
+        }
+        return value.divide(NINE.pow(level - floor));
+    }
+
     // ------------------------------------------------------------------ 递归取数
 
     /**
@@ -411,6 +448,12 @@ public final class VoidWarehouseExchange {
      *
      * <p>三条路按「目标本身 → 下级合成 → 上级拆零」的优先级依次试；
      * ②③ 都在状态副本上试，失败整支丢弃（{@link State#copy()}）。</p>
+     *
+     * <p><b>第 ③ 条路只拆「用得完的整块」</b>：拆的上级个数从 {@code floor(need / 9)}
+     * <b>逐块往下试</b>（上级不够就少拆一块、把更多零头留给下级），差的零头交给
+     * {@link #drainWithoutSplitting} 用下级补。这样做是为了让
+     * <b>一次取货不改变仓库的构成形态</b> —— 细节与踩坑见该分支里的注释。
+     * 唯一的例外是 {@code need < 9}（左键「取 1 个」），那时退回「拆 1 块 + 找零」。</p>
      *
      * @return 是否成功；失败时 {@code state} <b>一个字节都没动</b>
      */
@@ -445,18 +488,53 @@ public final class VoidWarehouseExchange {
                 }
             }
 
-            // ③ 拆上级找零：拆 1 个 Z 得到 9 个 item，用掉 need 个，剩下的作为 item 退回仓库
+            // ③ 拆上级：<b>只按「整块」拆</b>，而且<b>从能拆的最多块数往下逐块试</b>。
+            //
+            // 这里曾经用 ceilDiv：要取 64 个铜锭、仓库里只有铜块（一块 = 9 个）时，
+            // 它会拆 ceil(64/9) = 8 块 → 得 72 个 → 给 64 → <b>8 个零头退回仓库</b>。
+            // 玩家看到的后果：一次「取出」把仓库里的铜块拆掉一整批，仓库里还凭空多出 8 个铜锭，
+            // 下一次取货量就变成 8 —— 取出动作不该改变仓库的<b>构成形态</b>。
+            //
+            // 现在的规则：拆的块数是 floor(need / 9)，<b>只拆用得完的整块</b>；
+            // 剩下不足 9 的那一点点交给「目标库存 + 下级合成」去补
+            // （仓库 9 个铜块 → 右键「取一组」给 63 = 拆 7 块，仓库剩 2 块，零头为 0）。
+            // 补不上就让这一支失败，由 {@link #planMax} 从真上界往下收敛。
+            //
+            // 为什么块数要<b>往下枚举</b>，而不是只试 floor(need / 9) 这一个：
+            // 上级不一定够。仓库里 1 个铜块 + 100 个铜粒，要 20 个铜锭 ——
+            // floor(20/9) = 2 块（只有 1 块，这一支判失败），可正确答案是
+            // 「拆 1 块（9 个）+ 铜粒合 11 个」，零头仍然为 0。
+            // 少拆一块、把更多零头交给下级，是一条完全合法的路，必须被枚举到。
+            //
+            // 唯一例外是 need < 9（左键「取 1 个」）：floor 是 0，一块都取不出来，
+            // 那时退回「拆 1 块 + 找零」—— 这正是玩家要的「拆上级找零」，必须保留。
+            BigInteger maxUnits = need.divide(NINE);
+            BigInteger cover = coverBound(table, item, state);
             for (String higher : table.splittersOf(item)) {
-                State branch = state.copy();
-                BigInteger units = ceilDiv(need, NINE);
-                if (drain(table, higher, units, branch, depth + 1)) {
-                    BigInteger change = units.multiply(NINE).subtract(need);
-                    if (change.signum() > 0) {
-                        branch.stock.merge(item, change, BigInteger::add);
-                        bump(branch.delta, item, change);
+                for (BigInteger units = maxUnits.signum() <= 0 ? ONE : maxUnits;
+                        units.signum() > 0;
+                        units = units.subtract(ONE)) {
+                    BigInteger rest = need.subtract(units.multiply(NINE));
+                    if (rest.signum() > 0 && rest.compareTo(cover) > 0) {
+                        // 少拆一块，零头就多 9 个，只会更补不上 —— 这条支路整体作废
+                        break;
                     }
-                    state.adopt(branch);
-                    return true;
+                    State branch = state.copy();
+                    if (!drain(table, higher, units, branch, depth + 1)) {
+                        continue;
+                    }
+                    if (rest.signum() < 0) {
+                        // need < 9：拆多了，把用不完的作为「找零」退回仓库（玩家明确要的能力）
+                        branch.stock.merge(item, rest.negate(), BigInteger::add);
+                        bump(branch.delta, item, rest.negate());
+                        state.adopt(branch);
+                        return true;
+                    }
+                    // 差的这一点点只许用下级补，绝不再拆一个上级（那就是「留零头」的老毛病）
+                    if (rest.signum() == 0 || drainWithoutSplitting(table, item, rest, branch, depth)) {
+                        state.adopt(branch);
+                        return true;
+                    }
                 }
             }
 
@@ -464,6 +542,48 @@ public final class VoidWarehouseExchange {
         } finally {
             state.visiting.remove(item);
         }
+    }
+
+    /**
+     * 只走「目标库存 + 下级合成」两条路，<b>绝不拆上级</b>。
+     *
+     * <p>用途单一：{@link #drain} 的第 ③ 条路按「整块」拆完之后，还差不足 9 的一点点
+     * （例如 <b>7 个铜块 + 90 个铜粒</b> 要取 64 个：7 块 = 63，还差 1 个）。
+     * 这 1 个必须用铜粒补 —— <b>不能靠再拆一块铜块</b>，那正是「为了凑满一组而留下 8 个零头」
+     * 的老毛病（见 {@link #drain} 第 ③ 条路的注释）。补不上就老实返回 {@code false}，
+     * 让 {@link #planMax} 从真上界往下收敛出一个做得到的量。</p>
+     *
+     * <p>{@code item} 此刻已经在 {@link State#visiting} 里（调用点就在 {@code drain(item)} 内部），
+     * 所以下级递归里若想回头再拆到 {@code item} 会被自动挡住 —— 正是我们要的「不许再拆上级」。</p>
+     */
+    private static boolean drainWithoutSplitting(Table table, String item, BigInteger need,
+                                                 State state, int depth) {
+        if (need.signum() <= 0) {
+            return true;
+        }
+        if (depth > MAX_DEPTH) {
+            return false;
+        }
+        // ① 目标库存
+        BigInteger have = orZero(state.stock.get(item));
+        if (have.signum() > 0) {
+            BigInteger taken = have.min(need);
+            state.stock.put(item, have.subtract(taken));
+            bump(state.delta, item, taken.negate());
+            need = need.subtract(taken);
+            if (need.signum() <= 0) {
+                return true;
+            }
+        }
+        // ② 下级合成
+        for (String lower : table.makersOf(item)) {
+            State branch = state.copy();
+            if (drain(table, lower, need.multiply(NINE), branch, depth + 1)) {
+                state.adopt(branch);
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 递归的工作状态：库存快照 + 累计增减 + 当前递归栈（破环用） */
@@ -495,10 +615,6 @@ public final class VoidWarehouseExchange {
 
     private static BigInteger orZero(BigInteger value) {
         return value == null ? ZERO : value;
-    }
-
-    private static BigInteger ceilDiv(BigInteger value, BigInteger divisor) {
-        return value.add(divisor.subtract(ONE)).divide(divisor);
     }
 
     // ------------------------------------------------------------------ 图

@@ -1087,6 +1087,11 @@ public final class VoidWarehouseData extends SavedData {
      * @param itemId     物品 id（如 {@code "iron_ingot"}）
      * @param template   这一件物品的样板（数量恒 1，无数据组件）
      * @param obtainable 现在最多能兑出多少个
+     * @param bulk       普通模式右键「取一组」实际能取到的量。<b>不等于
+     *                   {@code min(堆叠上限, obtainable)}</b> —— 仓库里只有铜块时那个算式给 64，
+     *                   而真值是 63（7 块 = 63；要 64 就得拆 8 块、在仓库里留下 8 个零头）。
+     *                   tooltip 必须写这个数，否则又变成「数字对不上」
+     * @param boxed      潜影盒模式左键「交出 1 盒」实际能装进去的量，同理必须问规划器
      * @param totalCost  把这 {@code obtainable} 个<b>一次性全兑出来</b>的账目：
      *                   负数 = 要从仓库扣走的，正数 = 找零退回仓库的
      *
@@ -1096,8 +1101,8 @@ public final class VoidWarehouseData extends SavedData {
      * 而单价是「铁块 −1、铁锭 +8」，乘 9 会得到「铁块 −9」这种明显荒谬的消耗 ——
      * 拿它去显示，玩家一眼就看出数字对不上。所以这里直接存规划器给出的那一份真账。</p>
      */
-    public record ExchangeOffer(String itemId, ItemStack template, BigInteger obtainable,
-                                List<VoidWarehouseExchange.Delta> totalCost) {
+    public record ExchangeOffer(String itemId, ItemStack template, BigInteger obtainable, BigInteger bulk,
+                                BigInteger boxed, List<VoidWarehouseExchange.Delta> totalCost) {
         public ExchangeOffer {
             totalCost = List.copyOf(totalCost);
         }
@@ -1420,11 +1425,39 @@ public final class VoidWarehouseData extends SavedData {
             if (plan == null || plan.amount().signum() <= 0) {
                 continue;
             }
-            built.add(new ExchangeOffer(itemId, new ItemStack(item), plan.amount(), plan.deltas()));
+            // 「一次取货实际能拿到多少」一律交给规划器收敛，**不许自己算**：
+            // min(堆叠上限, obtainable) 会给出 64，而真值是 63（按整块拆、不留零头，
+            // 见 VoidWarehouseExchange#drain 第 ③ 条路）。这两个数写反就是「tooltip 说 64、
+            // 实际给 63」—— 跟玩家连着报两次的「凭空常数」是同一类毛病。
+            ItemStack sample = new ItemStack(item);
+            BigInteger bulk = takeAmount(table, itemId, plan.amount(),
+                    Math.max(1, sample.getMaxStackSize()), stock);
+            BigInteger boxed = takeAmount(table, itemId, plan.amount(),
+                    VoidWarehouseShulker.capacity(sample), stock);
+            built.add(new ExchangeOffer(itemId, sample, plan.amount(), bulk, boxed, plan.deltas()));
         }
         built.sort(Comparator.comparingInt(offer -> VoidWarehouseSort.rankOf(offer.template())));
         this.offers = List.copyOf(built);
         return this.offers;
+    }
+
+    /**
+     * 一次取货动作（左键一盒 / 右键一组）<b>实际能拿到多少</b>：把上限交给规划器收敛，取回真值。
+     *
+     * <p>为什么不直接写 {@code min(上限, obtainable)}：那个算式在「仓库里只有上级」时会高估 ——
+     * 9 个铜块、一组 64，算式给 64，而实际只能给 63（拆 7 块 = 63；要 64 就得拆 8 块、
+     * 把 8 个零头留在仓库里，而这个动作已经被否掉了）。
+     * 所以 tooltip 上的每一个数字都要走这里，宁可多跑一次规划，也不让界面写出一个做不到的数。</p>
+     */
+    private static BigInteger takeAmount(VoidWarehouseExchange.Table table, String itemId,
+                                         BigInteger obtainable, long cap,
+                                         VoidWarehouseExchange.Stock stock) {
+        BigInteger limit = obtainable.min(BigInteger.valueOf(Math.max(1, cap)));
+        if (limit.signum() <= 0) {
+            return BigInteger.ZERO;
+        }
+        VoidWarehouseExchange.Plan plan = VoidWarehouseExchange.planMax(table, itemId, limit, stock);
+        return plan == null ? BigInteger.ZERO : plan.amount();
     }
 
     // ------------------------------------------------------------------ 统一展示序
@@ -1572,10 +1605,11 @@ public final class VoidWarehouseData extends SavedData {
      * <p>物品名一律走 {@code getHoverName()} 保持成组件，<b>不 {@code getString()}</b> ——
      * 否则专用服务器上会解析成英文名（说明见 {@link VoidWarehouseText#tinted(Component, ChatFormatting)}）。</p>
      *
-     * <p><b>操作行里的数量同样不许写死</b>：「右键：兑换 64 个」里的 64 是堆叠上限，
-     * 这一格只能兑出 9 个时它照样写 64 —— 跟可兑数量本身写死一样是「凭空常数」。
-     * 所以一次实际能拿走多少 = {@code min(堆叠上限, 可兑数量)}，不足一组时改写实际值、
-     * 并加一个短括注说明为什么不满一组（否则玩家会以为以后每次也只能拿这么多）。</p>
+     * <p><b>操作行里的数量同样不许自己算</b>：无论是「右键：兑换 64 个」还是「交出 1 盒（N 个）」，
+     * 数字都必须来自规划器的真值（{@link ExchangeOffer#bulk()} / {@link ExchangeOffer#boxed()}），
+     * 而不是 {@code min(堆叠上限, 可兑数量)} 之类的算式 —— 后者在「仓库里只有上级」时会高估：
+     * 9 个铜块时它给 64，而实际只能给 63（拆 7 块 = 63；要 64 就得拆 8 块、把 8 个零头留在仓库里）。
+     * 界面写出一个做不到的数，跟可兑数量本身写死一样，都属于「凭空常数」。</p>
      *
      * @param boxMode 潜影盒模式（操作行换成「交出盒子」那一套，与普通格的口径保持一致）
      */
@@ -1591,29 +1625,34 @@ public final class VoidWarehouseData extends SavedData {
         // 操作行：与普通格一样的说法，口径统一（盒模式下就换成盒模式那一套）
         int max = Math.max(1, offer.template().getMaxStackSize());
         if (boxMode) {
-            // 盒里实际能装多少：不超过一盒容量。可兑数量可能远超一盒（上限由库存推出来，
-            // 不再是固定值），所以这里必须写「实际装进去的个数」，不能照抄容量。
-            long packed = offer.obtainable()
-                    .min(BigInteger.valueOf(VoidWarehouseShulker.capacity(offer.template()))).longValue();
+            // 盒里实际能装多少：同样来自规划器（offer.boxed），不是「容量」也不是
+            // 「min(可兑数量, 容量)」。可兑数量可能远超一盒（上限由库存推出来，不是固定值），
+            // 所以这里必须写「实际装进去的个数」。
+            long packed = offer.boxed().longValue();
             lore.add(VoidWarehouseText.line("左键：交出 1 盒（"
                     + VoidWarehouseText.count(packed) + " 个）", VoidWarehouseText.ACTION_RGB));
             lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION_RGB));
         } else {
-            // 右键一次「取一组」，但一次实际能拿走多少 = min(一组, 这一格能兑出的量)。
-            // 照抄堆叠上限（64）就是在数量后面又写一个跟仓库无关的常数 ——
-            // 这一格只能兑 9 个时它还写着「兑换 64 个」，跟玩家连着报两次的毛病
-            // （1728 / 64 这种凭空的上限）是同一类。所以超不过可兑数量时就改写实际值，
-            // 并用一个短括注说明为什么不足一组。
-            long bulk = offer.obtainable().min(BigInteger.valueOf(max)).longValue();
+            // 右键一次「取一组」，但一次实际能拿走多少必须问规划器（offer.bulk），
+            // 不能写 min(一组, 可兑数量)：仓库里只有铜块时那个算式给 64，
+            // 而真值是 63（拆 7 块 = 63；要 64 就得拆 8 块、仓库里留下 8 个零头）。
+            // 照抄那个算式就是在数量后面又写一个跟仓库无关的常数。
+            long bulk = offer.bulk().longValue();
             if (bulk <= 1) {
                 lore.add(VoidWarehouseText.line("左键 / 右键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
             } else if (bulk >= max) {
                 lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
                 lore.add(VoidWarehouseText.line("右键：兑换 " + max + " 个", VoidWarehouseText.ACTION_RGB));
-            } else {
+            } else if (bulk >= offer.obtainable().longValue()) {
+                // 仓库里一共就这么多可兑 —— 一次就能全拿走
                 lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
                 lore.add(VoidWarehouseText.line("右键：兑换 " + VoidWarehouseText.count(bulk)
                         + " 个（最多兑出这么多）", VoidWarehouseText.ACTION_RGB));
+            } else {
+                // 仓库里能兑更多，但一次取不到一组 —— 因为上级只能按整块拆
+                lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：兑换 " + VoidWarehouseText.count(bulk)
+                        + " 个（按整块拆，不留零头）", VoidWarehouseText.ACTION_RGB));
             }
         }
         lore.add(VoidWarehouseText.line("仓库里没有这种物品，靠 9 合 1 兑换取出", VoidWarehouseText.NOTE));

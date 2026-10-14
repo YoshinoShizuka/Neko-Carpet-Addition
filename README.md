@@ -58,6 +58,8 @@
 - **潜影盒**：导航行**槽位 47** 有「潜影盒模式」开关 —— 开启后取出会交出**装满的潜影盒**；
   而存入潜影盒时会被**拆开**（盒内物品照常入库，盒子本身变成 2 潜影壳 + 1 箱子）
 - **数量排序**：导航行**槽位 51** 有一个罗盘图标 —— 点开后显示顺序改成**数量从大到小**（只改显示）
+- **9 合 1 兑换**：**另一条独立规则** `voidWarehouseExchange`（默认 `false`）—— 成品缺货时可以
+  改用 9 合 1 配方的**原料**顶替，也能**拆上级找零**；见下文「虚空仓库 9 合 1 兑换」一节
 
 ### 放置终端：潜行 + 右键方块
 
@@ -71,6 +73,83 @@
 想把它摆下去必须**潜行 + 右键**，普通右键不会放置。
 
 这个功能**不需要注册任何新物品**，触发物就是原版工作台本身。
+
+---
+
+### 虚空仓库 9 合 1 兑换 (voidWarehouseExchange)
+
+**成品没货时，允许改用「9 合 1」配方的原料顶替**。最典型的例子：仓库里一个铁锭都没有，
+但有 9 个（或更多）铁粒 —— 这时取 1 个铁锭会**直接扣掉 9 个铁粒**，跳过合成这一步。
+反向也成立：仓库里没有铁锭、只有 1 个铁块时，取 1 个铁锭会**把那 1 个铁块拆开**，
+扣掉 1 个铁块、把用不完的 **8 个铁锭退回仓库**（俗称「拆上级找零」）。
+
+- 类型：`boolean`
+- 默认值：`false`
+- 分类：`neko`、`survival`
+- 用法：`/carpet voidWarehouseExchange true`
+- **依赖「虚空仓库」规则**：`voidWarehouse` 关掉时这条规则不起作用（虚拟条目一起消失）
+- **只在成品本身没货时才兑换**：仓库里有铁锭就老老实实扣铁锭，**一个原料都不会动**。
+  这不是「先兑换再判断」，而是算法的结构决定的 —— 扣减第一步就是「先吃目标物品自己」
+- **扣减优先级**（自上而下依次尝试，前一级有货就不会走到下一级）：
+  1. **目标物品本身**
+  2. **族内更小的单位**（用「下级合成」，如铁锭 ← 铁粒）
+  3. **族内更大的单位**（**拆开找零**，如铁块 → 铁锭）
+  4. **单向边的上游**（如冰 → 浮冰 → 蓝冰；涂蜡铜块 → 铜锭）
+- **绝不刷物**：每次成功兑换都满足同一条守恒式
+  `Σ(数量 × 9^(层级−族内最低层级)) == 需要数 × 9^(目标层级−族内最低层级)`，
+  自检（含 150 次随机 fuzz，成功 122 次）逐笔校验
+
+#### 界面上的「可兑」虚拟行
+
+开启后，**只有「当前仓库一个都没有、但靠兑换能凑出来」的成品**会额外出现在列表里，
+格子上标着**「可兑」**，鼠标指着它会告诉你**一次要消耗多少什么**（如 `消耗：铁粒 ×9`），
+拆上级找零时还会多一行**「找回：铁锭 ×8」**。导航行（槽位 49 附近）也会补一句
+「其中 N 种可用 9 合 1 兑换取出」。
+
+这些格子**只用来取料**：左键取 1 个、右键取一组都照常，但**不能往里存**（它们背后没有真的格子）。
+**规则一关掉，虚拟行立刻消失**，不会留下点不动的幽灵格。
+
+#### 配方覆盖范围（26.3 实测，脚本扫全量 `data/minecraft/recipe/*.json`，共 2042 个文件）
+
+**29 条边 / 53 个物品**，其中双向 20 条、**只能合成**（有 9→1 没 1→9）8 条、**只能拆解** 1 条：
+
+| 类别 | 边 |
+| --- | --- |
+| 双向（20） | 铁粒↔铁锭、铁锭↔铁块、金粒↔金锭、金锭↔金块、铜粒↔铜锭、铜锭↔铜块、钻石↔钻石块、绿宝石↔绿宝石块、青金石↔青金石块、红石↔红石块、煤↔煤炭块、下界合金锭↔下界合金块、下界疣↔下界疣块、骨粉↔骨块、干海带↔干海带块、树脂团↔树脂块、黏液球↔黏液块、小麦↔干草块、粗铁↔粗铁块、粗金↔粗金块 |
+| **只能合成**（8） | 竹子→竹块、唱片碎片→唱片 5、冰→浮冰、**浮冰→蓝冰**、西瓜片→西瓜、硫磺→浓缩硫磺 |
+| **只能拆解**（1） | **涂蜡铜块→铜锭**（反向 9 铜锭合不出涂蜡铜块） |
+
+- **三级链**：`冰 → 浮冰 → 蓝冰` —— 所以 **81 个冰 = 1 个蓝冰**，自检里专门验过
+- 表里**有环**（双向边本身就是环），所以层级不能用传递闭包算，
+  而是「无向邻接 + BFS 传播」把每一族标定成 **9 的幂**（铁粒 = 1 / 铁锭 = 9 / 铁块 = 81），
+  递归时用 `visiting` 集合破环
+- **26.1.1 / 26.1.2 没有 `sulfur` / `potent_sulfur`** ⇒ 那两版上「硫磺→浓缩硫磺」这条边
+  **在启动复核时会被正确砍掉**（`kept=28 / dropped=1`），不是 bug
+
+#### 只走原版真实存在的配方
+
+静态表放在 `common/`（纯字符串 + 整数，五版本共享），**启动时用真实的 `RecipeManager` 反查一遍**：
+
+- 两个物品都必须在这个版本的注册表里存在，否则**整条边丢弃**；
+- `combine` / `split` 两个配方 id 各自独立复核，**只剩一个就降级成单向边**，
+  两个都没了才丢边 —— 全部结果汇总成一行 `Summary`（`declared / kept / dropped / downgraded`）；
+- 服务器 `/reload` 时作废重算。
+
+跑服务器时控制台只在**有变化**时逐条打印被砍/被降级的边，**全绿不刷屏**。
+
+#### 四条取料入口都会兑换
+
+| 入口 | 行为 |
+| --- | --- |
+| 界面点格 / Shift 批量 | 成品不够自动兑换；可兑格子走同一条路 |
+| 打印机补货 | 缺铁锭时用铁粒补（`printer_query` 报的「已有数量」**不含**兑换，是真实库存） |
+| 聊天按量取货 | 只要成品不够就先规划兑换，再去掉「取多少」 |
+| 漏斗出料 | 漏斗 5 格里的分类物缺货时同样兑换 |
+
+四条路都走同一个 `withdraw` / `planExchange`，**扣的是同一笔账**。
+取货后如果背包 / 目标容器塞不下，**余数原路退回**（余数绝对不许被吃掉，自检 G 组逐项验过）。
+
+> 完整实现说明与踩坑记录：`docs/虚空仓库 9 合 1 兑换.md`
 
 ---
 
@@ -817,22 +896,28 @@ public static View viewFor(Player player) { ... }   // 关掉界面再打开 -> 
 ### 代码结构（虚空仓库）
 
 ```
+common/src/main/java/neko/voidwarehouse/        （五版本共享，不引用任何 MC 类型）
+  VoidWarehouseExchange.java      9 合 1 兑换引擎：29 条边的静态表 + BFS 层级标定 + 递归 drain + plan / planMax / Plan.negate / 守恒
+  VoidWarehouseSettings.java      Carpet 规则 voidWarehouse / voidWarehouseExchange
+
 src/main/java/neko/voidwarehouse/
   VoidWarehouse.java              门面：先把排列顺序准备好，再取数据 / openMenu
-  VoidWarehouseData.java          SavedData：一格一种物品 + 无上限数量、合并、编解码、老存档迁移、入库筛选、潜影盒拆解、恒定排序 + 数量降序视图、**O(1) 物品索引**、按分类物精确扣减的 takeExact
+  VoidWarehouseData.java          SavedData：一格一种物品 + 无上限数量、合并、编解码、老存档迁移、入库筛选、潜影盒拆解、恒定排序 + 数量降序视图、**O(1) 物品索引**、按分类物精确扣减的 takeExact、**withdraw / applyExchange / DisplaySlot（真实格 + 可兑虚拟格统一编排）**
   VoidWarehouseViews.java         SavedData：**每个玩家各自的视图状态**（页码 / 潜影盒模式 / 数量排序），按 UUID 存、关界面和重启都保留
   VoidWarehouseSort.java          排列顺序：创造模式物品栏序号（注册表 ID 兜底），全局只构建一次
-  VoidWarehousePageContainer.java 某一页的容器视图（每个菜单一份，持有一份 VoidWarehouseViews.View；导航行在这里生成；视图→数据只在这一处换算）
-  VoidWarehouseNav.java           导航行 9 格：箭头按钮 / 潜影盒开关 / 数量排序开关 / 页码 / 红玻璃占位
+  VoidWarehousePageContainer.java 某一页的容器视图（每个菜单一份，持有一份 VoidWarehouseViews.View；导航行在这里生成；**展示序号 →（真实格 / 可兑条目）只在这一处换算**）
+  VoidWarehouseNav.java           导航行 9 格：箭头按钮 / 潜影盒开关 / 数量排序开关 / 页码 / 红玻璃占位（**+ 可兑种类提示行**）
   VoidWarehouseMenu.java          ChestMenu 子类：NavSlot 替换、clicked / quickMoveStack / removed / stillValid、潜影盒取出、syncAllViewers（全量重发）
   VoidWarehouseProvider.java      MenuProvider，标题「虚空仓库」
   VoidWarehouseTrigger.java       触发判定（精确名称匹配）
-  VoidWarehouseSettings.java      Carpet 规则 voidWarehouse
+  VoidWarehouseWithdraw.java      聊天按量取货（成品不够先规划兑换）
+  VoidWarehouseExchangeBootstrap.java 启动复核：用真实 RecipeManager + BuiltInRegistries 反查静态表，砍掉/降级不存在的边，/reload 作废重算
   VoidWarehouseTerminals.java     SavedData：仓库终端的坐标登记表（GlobalPos，带维度）
   VoidWarehouseHopper.java        漏斗 → 仓库的搬运（1 tick 搬空，与界面同一套筛选）
   VoidWarehouseExtractor.java     仓库 → 漏斗的出料（终端压在漏斗正上方；按分类物补料；每格最后 1 个永不被搬走）
   VoidWarehouseShulker.java       潜影盒的识别 / 容量 / 读内容 / 打包（全部规则集中在这一个类）
-  VoidWarehouseExtension.java     Carpet 扩展（规则注册 + 规则关闭时安全关界面）
+  VoidWarehouseText.java          文案工具（配色、可翻译组件套色）
+  VoidWarehouseExtension.java     Carpet 扩展（规则注册 + 规则关闭时安全关界面 + 兑换表 tick 绑定 / /reload 作废）
   VoidWarehouseClassifier.java    两端共用的「分类物」规则：余量常量 KEEP、有没有分类物、是不是分类物
   VoidWarehouseHopperFilter.java  鸭子接口：给漏斗方块实体挂「玩家声明过分类物」这个布尔开关
   mixin/                          8 个 Mixin：4 个交互入口 + 登记 / 注销 / 漏斗（入库 + 出料 + 分类物保护 + 白名单）/ Slot（只认玩家的手）
@@ -850,8 +935,9 @@ neko/cooking/
 resources/carpet_neko_addition.cooking.mixins.json   新的 Mixin 配置，与原有一份并列
 ```
 
-> 三条规则各自一个 `CarpetExtension`、各自一个规则类，**互相之间没有耦合** ——
-> 摘掉任何一条都不影响另外两条。
+> 每条规则各自一个 `CarpetExtension`、各自一个规则类，**互相之间没有耦合** ——
+> 摘掉任何一条都不影响其余各条。（`voidWarehouseExchange` 是唯一的例外：它**依赖** `voidWarehouse`，
+> 因为兑换取的是虚空仓库里的料。）
 
 ### 性能：O(1) 的物品索引
 

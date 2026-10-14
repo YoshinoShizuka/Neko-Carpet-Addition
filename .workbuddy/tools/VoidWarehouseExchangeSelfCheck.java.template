@@ -57,7 +57,10 @@ import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
  *   <li><b>G 回滚精确性</b>：取货失败时整个仓库逐项还原（含一条与兑换无关的干扰项）；</li>
  *   <li><b>H 四条入口一致</b>：API 直调 / 界面点格 / 打印机补货 / 聊天按量取货，扣的必须是同一笔账；</li>
  *   <li><b>I 规则关闭</b>：关掉规则后「可兑」格必须<b>立刻</b>消失（这条会咬住缓存没作废的 bug）；</li>
- *   <li><b>J 漏斗出料</b>：分类物是铁锭、仓库里只有铁粒时，漏斗真的被补上。</li>
+ *   <li><b>J 漏斗出料</b>：分类物是铁锭、仓库里只有铁粒时，漏斗真的被补上；</li>
+ *   <li><b>K 潜影盒模式</b>：可兑条目在盒模式下也要「尽量装满一盒」（与真实库存格同口径），
+ *       料不够时绝不多给 —— 这一组是玩家报「只给一组 64」之后补的，
+ *       补它的理由就是 A~J 组一条盒模式用例都没有。</li>
  * </ol>
  *
  * <h2>反证组（区分「改对了」与「断言是空转」）</h2>
@@ -158,6 +161,9 @@ public final class VoidWarehouseExchangeSelfCheck {
                 hopperChecks(server);
                 break;
             case 13:
+                boxModeChecks(server);
+                break;
+            case 14:
                 cleanup(server);
                 break;
             default:
@@ -476,10 +482,10 @@ public final class VoidWarehouseExchangeSelfCheck {
         VoidWarehouseData.ExchangeOffer ingot = offerOf(offers, "iron_ingot");
         check("F5 铁锭可兑数量 = 10（90 ÷ 9）",
                 ingot != null && ingot.obtainable().equals(BigInteger.valueOf(10)));
-        check("F6 铁锭的单位账目 = 只扣 9 个铁粒",
-                ingot != null && ingot.unitCost().size() == 1
-                        && "iron_nugget".equals(ingot.unitCost().get(0).itemId())
-                        && ingot.unitCost().get(0).change().equals(NINE.negate()));
+        check("F6 铁锭的账目 = 一次性兑 10 个要扣 90 个铁粒（存的是总量，不是单价）",
+                ingot != null && ingot.totalCost().size() == 1
+                        && "iron_nugget".equals(ingot.totalCost().get(0).itemId())
+                        && ingot.totalCost().get(0).change().equals(BigInteger.valueOf(90).negate()));
 
         // ---- 统一展示序 ----
         int display = data.displayCount();
@@ -530,13 +536,17 @@ public final class VoidWarehouseExchangeSelfCheck {
         check("F16 虚拟格名字带「（可兑）」", shown.getHoverName().getString().contains("（可兑）"));
         List<Component> lore = loreOf(shown);
         dumpLore("exchange", lore);
-        check("F17 虚拟格有「可兑：」那一行", contains(lore, "可兑："));
-        check("F18 虚拟格有「消耗：」那一行", contains(lore, "消耗："));
+        check("F17 虚拟格有「可合成：」那一行（被扣的是更小的东西 = 向上合成）",
+                contains(lore, "可合成："));
+        String costLine = lineContaining(lore, "用：");
+        check("F18 虚拟格有「用：」那一行", costLine != null);
+        check("F18b 那一行写的是总量（铁粒 ×90），不是单价 ×9 —— 玩家报的就是这条",
+                costLine != null && costLine.contains("×90"));
         check("F19 反证：9 铁粒正好换 1 铁锭，不该有「找回：」",
                 !contains(lore, "找回："));
         check("F20 虚拟格说明「仓库里没有这种物品」", contains(lore, "仓库里没有这种物品"));
 
-        // ---- 拆零场景：必须出现「找回」行 ----
+        // ---- 拆零场景：说法必须换成「可拆出 / 拆」 ----
         data.clearContent();
         data.insert(new ItemStack(Items.IRON_BLOCK, 1));
         List<VoidWarehouseData.ExchangeOffer> blockOffers = data.exchangeOffers();
@@ -545,11 +555,41 @@ public final class VoidWarehouseExchangeSelfCheck {
         check("F21 只有 1 个铁块时，铁锭也可兑（拆块找零）", fromBlock != null);
         check("F22 1 个铁块能兑 9 个铁锭", fromBlock != null && fromBlock.obtainable().equals(NINE));
         if (fromBlock != null) {
+            check("F23 拆零账目 = 只扣 1 个铁块（9 个正好用完，一个找回都没有）",
+                    fromBlock.totalCost().size() == 1
+                            && "iron_block".equals(fromBlock.totalCost().get(0).itemId())
+                            && fromBlock.totalCost().get(0).change().equals(BigInteger.ONE.negate()));
             ItemStack shown2 = VoidWarehouseData.buildExchangeDisplay(fromBlock, false);
             List<Component> lore2 = loreOf(shown2);
             dumpLore("exchange-split", lore2);
-            check("F23 拆零场景下出现「找回：」行（否则玩家会以为亏了）", contains(lore2, "找回："));
-            check("F24 拆零场景下「消耗：」行写的是被扣走的铁块", contains(lore2, "消耗："));
+            check("F24 拆零场景改用「可拆出：」（不能写「可合成」，那是反的）",
+                    contains(lore2, "可拆出：") && !contains(lore2, "可合成："));
+            // 只咬数字不咬物品英文名：「Block of Iron」这种译名随语言包变，而这里要证的是
+            // 「写的是<b>总量</b> ×1 个铁块」——物品身份由 F23 的账目断言负责。
+            String splitLine = lineContaining(lore2, "拆：");
+            check("F24b 拆零场景的消耗行写「拆：」+ 那个大件 ×1（总量，不是单价 ×9）",
+                    splitLine != null && splitLine.contains("×1") && !splitLine.contains("×9"));
+            check("F24c 反证：9 个正好用完，不该凭空多一行「找回：」",
+                    !contains(lore2, "找回："));
+        }
+
+        // ---- 判据有牙：光看「有没有找零」会把「1 个铁块兑 9 个铁锭」判成合成 ----
+        check("F25 拆 / 合 的判据是「被扣的层级」而不是「有没有找零」"
+                        + "（只有 1 个铁块时兑换铁锭没有找零，但确实是拆零）",
+                fromBlock != null && contains(loreOf(VoidWarehouseData.buildExchangeDisplay(fromBlock, false)),
+                        "可拆出："));
+
+        // ---- 2 个铁块：同样是拆零，能兑 18 个 ----
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_BLOCK, 2));
+        VoidWarehouseData.ExchangeOffer twoBlocks = offerOf(data.exchangeOffers(), "iron_ingot");
+        check("F26 2 个铁块能兑 18 个铁锭，账目 = 铁块 −2",
+                twoBlocks != null && twoBlocks.obtainable().equals(BigInteger.valueOf(18))
+                        && twoBlocks.totalCost().size() == 1
+                        && twoBlocks.totalCost().get(0).change().equals(BigInteger.valueOf(-2)));
+        if (twoBlocks != null) {
+            check("F27 2 个铁块仍是「可拆出：」",
+                    contains(loreOf(VoidWarehouseData.buildExchangeDisplay(twoBlocks, false)), "可拆出："));
         }
     }
 
@@ -768,6 +808,174 @@ public final class VoidWarehouseExchangeSelfCheck {
         check("J3 仓库铁粒归零", left.signum() == 0);
         check("J4 反证：漏斗里补的就是铁锭，没混进别的东西",
                 hopper.getItem(0).getItem() == Items.IRON_INGOT);
+    }
+
+    // ================================================================ K 潜影盒模式
+    //
+    // 玩家报的 bug：盒模式下左键点「可兑」的绿宝石块，只给出一个装着「一组（64）」的盒子。
+    // 根因是 offer.obtainable 当时按「一组」封顶，而一盒容量是 27 组 —— 于是可兑条目
+    // 永远只能装 1/27 盒，而 tooltip 却写着「左键：兑换 1 盒（1728 个）」。
+    // A~J 组一条盒模式用例都没有，所以这个 bug 从自检里整个漏了过去 —— 这就是补 K 组的理由。
+
+    private static void boxModeChecks(MinecraftServer server) {
+        System.out.println("=== K 潜影盒模式：可兑条目也要「尽量装满一盒」 ===");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        check("K0 假玩家可构造", player != null);
+        if (player == null) {
+            return;
+        }
+
+        // ---- K1 玩家报的场景：仓库里一大堆绿宝石、0 个绿宝石块 ----
+        prepare(data, player);
+        data.insert(new ItemStack(Items.EMERALD, 6000));
+        VoidWarehouseData.ExchangeOffer emeraldBlock = offerOf(data.exchangeOffers(), "emerald_block");
+        check("K1 仓库里 0 个绿宝石块时，绿宝石块出现在可兑条目里", emeraldBlock != null);
+        long obtainable = emeraldBlock == null ? 0L : emeraldBlock.obtainable().longValue();
+        long boxCapacity = VoidWarehouseShulker.capacity(new ItemStack(Items.EMERALD_BLOCK));
+        System.out.println("   [K] 绿宝石块可兑数量 = " + obtainable + "，一盒容量 = " + boxCapacity
+                + "，一组 = " + new ItemStack(Items.EMERALD_BLOCK).getMaxStackSize());
+        check("K2 可兑上限已经抬到一盒容量（6000 ÷ 9 = 666，远超一组 64）",
+                obtainable == 666 && boxCapacity == 1728);
+
+        // ---- K3 盒模式下左键点这一格 ----
+        data.insert(new ItemStack(Items.SHULKER_SHELL, VoidWarehouseShulker.SHELL_COST));
+        data.insert(new ItemStack(Items.CHEST, VoidWarehouseShulker.CHEST_COST));
+        VoidWarehouseMenu menu = openMenu(player);
+        check("K3 能打开虚空仓库界面", menu != null);
+        if (menu != null) {
+            VoidWarehousePageContainer container = (VoidWarehousePageContainer) menu.getContainer();
+            check("K4 这一页确实是盒模式", container.shulkerMode());
+            int slot = findExchangeSlot(container, "emerald_block");
+            check("K5 界面里找得到「可兑」的绿宝石块格（容器下标 " + slot + "）", slot >= 0);
+            if (slot >= 0) {
+                menu.clicked(slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                ItemStack box = findInInventory(player, Items.SHULKER_BOX);
+                long packed = countInside(box, Items.EMERALD_BLOCK);
+                System.out.println("   [K] 盒里装了 " + packed + " 个绿宝石块，仓库剩 "
+                        + data.amountOf(Items.EMERALD) + " 个绿宝石");
+                check("K6 背包里确实拿到 1 个潜影盒", !box.isEmpty());
+                check("K7 盒里装的绿宝石块数 == 可兑数量（" + obtainable + "）", packed == obtainable);
+                check("K8 反证：不是只给一组 64 —— 盒里远超 64 个（这就是玩家报的 bug）",
+                        packed > 64);
+                check("K9 账目对得上：6000 个绿宝石 − 666×9 = 6",
+                        data.amountOf(Items.EMERALD).equals(BigInteger.valueOf(6)));
+                check("K9b 反证：盒里是绿宝石块，不是绿宝石", countInside(box, Items.EMERALD) == 0);
+                check("K10 装盒材料被扣掉了（潜影壳 0 / 箱子 0）",
+                        data.amountOf(Items.SHULKER_SHELL).signum() == 0
+                                && data.amountOf(Items.CHEST).signum() == 0);
+            }
+        }
+
+        // ---- K11 反方向：料只够一点点时，绝不能多给 ----
+        prepare(data, player);
+        data.insert(new ItemStack(Items.EMERALD, 18));
+        data.insert(new ItemStack(Items.SHULKER_SHELL, VoidWarehouseShulker.SHELL_COST));
+        data.insert(new ItemStack(Items.CHEST, VoidWarehouseShulker.CHEST_COST));
+        VoidWarehouseData.ExchangeOffer small = offerOf(data.exchangeOffers(), "emerald_block");
+        check("K11 18 个绿宝石 → 可兑 2 个绿宝石块",
+                small != null && small.obtainable().equals(BigInteger.valueOf(2)));
+        VoidWarehouseMenu menu2 = openMenu(player);
+        if (menu2 != null) {
+            VoidWarehousePageContainer container2 = (VoidWarehousePageContainer) menu2.getContainer();
+            int slot = findExchangeSlot(container2, "emerald_block");
+            if (slot >= 0) {
+                menu2.clicked(slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                ItemStack box = findInInventory(player, Items.SHULKER_BOX);
+                long packed = countInside(box, Items.EMERALD_BLOCK);
+                System.out.println("   [K] 18 个绿宝石时盒里装了 " + packed + " 个绿宝石块");
+                check("K12 盒里只有 2 个（料不够就装多少算多少，绝不多给一组）", packed == 2);
+                check("K13 绿宝石归零（18 − 2×9 = 0）", data.amountOf(Items.EMERALD).signum() == 0);
+            } else {
+                check("K12 找得到 18 个绿宝石时的可兑格", false);
+            }
+        }
+
+        // ---- K14 拆零场景也要能装盒 ----
+        prepare(data, player);
+        data.insert(new ItemStack(Items.IRON_BLOCK, 1));
+        data.insert(new ItemStack(Items.SHULKER_SHELL, VoidWarehouseShulker.SHELL_COST));
+        data.insert(new ItemStack(Items.CHEST, VoidWarehouseShulker.CHEST_COST));
+        VoidWarehouseMenu menu3 = openMenu(player);
+        if (menu3 != null) {
+            VoidWarehousePageContainer container3 = (VoidWarehousePageContainer) menu3.getContainer();
+            int slot = findExchangeSlot(container3, "iron_ingot");
+            check("K14 拆零场景下也能在盒模式里找到可兑格", slot >= 0);
+            if (slot >= 0) {
+                menu3.clicked(slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                ItemStack box = findInInventory(player, Items.SHULKER_BOX);
+                long packed = countInside(box, Items.IRON_INGOT);
+                check("K15 1 个铁块 → 盒里 9 个铁锭", packed == 9);
+                check("K16 铁块被扣光", data.amountOf(Items.IRON_BLOCK).signum() == 0);
+            }
+        }
+
+        // ---- K17 真实库存格的口径不能被带歪（本来就该装满一盒）----
+        prepare(data, player);
+        data.insert(new ItemStack(Items.EMERALD_BLOCK, 2000));
+        data.insert(new ItemStack(Items.SHULKER_SHELL, VoidWarehouseShulker.SHELL_COST));
+        data.insert(new ItemStack(Items.CHEST, VoidWarehouseShulker.CHEST_COST));
+        VoidWarehouseMenu menu4 = openMenu(player);
+        if (menu4 != null) {
+            VoidWarehousePageContainer container4 = (VoidWarehousePageContainer) menu4.getContainer();
+            int slot = findRealSlot(container4, Items.EMERALD_BLOCK);
+            check("K17 真实库存格在盒模式里也能找到", slot >= 0);
+            if (slot >= 0) {
+                menu4.clicked(slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                long packed = countInside(findInInventory(player, Items.SHULKER_BOX), Items.EMERALD_BLOCK);
+                check("K18 真实格 2000 个 → 盒里 1728 个（一盒容量，与可兑条目同一口径）",
+                        packed == boxCapacity);
+                check("K19 仓库剩 272 个", data.amountOf(Items.EMERALD_BLOCK).equals(BigInteger.valueOf(272)));
+            }
+        }
+
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+    }
+
+    /** K 组每个场景的起手式：清仓库 / 清背包 / 关界面 / 开盒模式 */
+    private static void prepare(VoidWarehouseData data, ServerPlayer player) {
+        data.clearContent();
+        player.getInventory().clearContent();
+        if (player.containerMenu != player.inventoryMenu) {
+            player.closeContainer();
+        }
+        player.containerMenu = player.inventoryMenu;
+        VoidWarehouseViews.viewFor(player).setShulkerMode(true);
+    }
+
+    private static int findRealSlot(VoidWarehousePageContainer container, Item item) {
+        for (int slot = 0; slot < VoidWarehouseData.PAGE_SIZE; slot++) {
+            VoidWarehouseData.DisplaySlot target = container.slotAt(slot);
+            if (target.entry() != null && target.entry().template().getItem() == item) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    private static ItemStack findInInventory(ServerPlayer player, Item item) {
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (!stack.isEmpty() && stack.getItem() == item) {
+                return stack;
+            }
+        }
+        return ItemStack.EMPTY;
+    }
+
+    /** 数一个潜影盒里某种物品一共有多少个（空盒子返回 0） */
+    private static long countInside(ItemStack box, Item item) {
+        if (box.isEmpty()) {
+            return 0L;
+        }
+        long total = 0L;
+        for (ItemStack inside : VoidWarehouseShulker.contentsOf(box)) {
+            if (inside.getItem() == item) {
+                total += inside.getCount();
+            }
+        }
+        return total;
     }
 
     private static void cleanup(MinecraftServer server) {
@@ -1012,12 +1220,18 @@ public final class VoidWarehouseExchangeSelfCheck {
     }
 
     private static boolean contains(List<Component> lines, String needle) {
+        return lineContaining(lines, needle) != null;
+    }
+
+    /** 返回第一条含 {@code needle} 的 lore 行原文（没有则 null）—— 用来咬「某一<em>行</em>」写的是什么 */
+    private static String lineContaining(List<Component> lines, String needle) {
         for (Component line : lines) {
-            if (line.getString().contains(needle)) {
-                return true;
+            String text = line.getString();
+            if (text.contains(needle)) {
+                return text;
             }
         }
-        return false;
+        return null;
     }
 
     private static void dumpLore(String tag, List<Component> lore) {

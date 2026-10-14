@@ -1572,6 +1572,11 @@ public final class VoidWarehouseData extends SavedData {
      * <p>物品名一律走 {@code getHoverName()} 保持成组件，<b>不 {@code getString()}</b> ——
      * 否则专用服务器上会解析成英文名（说明见 {@link VoidWarehouseText#tinted(Component, ChatFormatting)}）。</p>
      *
+     * <p><b>操作行里的数量同样不许写死</b>：「右键：兑换 64 个」里的 64 是堆叠上限，
+     * 这一格只能兑出 9 个时它照样写 64 —— 跟可兑数量本身写死一样是「凭空常数」。
+     * 所以一次实际能拿走多少 = {@code min(堆叠上限, 可兑数量)}，不足一组时改写实际值、
+     * 并加一个短括注说明为什么不满一组（否则玩家会以为以后每次也只能拿这么多）。</p>
+     *
      * @param boxMode 潜影盒模式（操作行换成「交出盒子」那一套，与普通格的口径保持一致）
      */
     public static ItemStack buildExchangeDisplay(ExchangeOffer offer, boolean boxMode) {
@@ -1593,11 +1598,23 @@ public final class VoidWarehouseData extends SavedData {
             lore.add(VoidWarehouseText.line("左键：交出 1 盒（"
                     + VoidWarehouseText.count(packed) + " 个）", VoidWarehouseText.ACTION_RGB));
             lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION_RGB));
-        } else if (max > 1) {
-            lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
-            lore.add(VoidWarehouseText.line("右键：兑换 " + max + " 个", VoidWarehouseText.ACTION_RGB));
         } else {
-            lore.add(VoidWarehouseText.line("左键 / 右键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
+            // 右键一次「取一组」，但一次实际能拿走多少 = min(一组, 这一格能兑出的量)。
+            // 照抄堆叠上限（64）就是在数量后面又写一个跟仓库无关的常数 ——
+            // 这一格只能兑 9 个时它还写着「兑换 64 个」，跟玩家连着报两次的毛病
+            // （1728 / 64 这种凭空的上限）是同一类。所以超不过可兑数量时就改写实际值，
+            // 并用一个短括注说明为什么不足一组。
+            long bulk = offer.obtainable().min(BigInteger.valueOf(max)).longValue();
+            if (bulk <= 1) {
+                lore.add(VoidWarehouseText.line("左键 / 右键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
+            } else if (bulk >= max) {
+                lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：兑换 " + max + " 个", VoidWarehouseText.ACTION_RGB));
+            } else {
+                lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：兑换 " + VoidWarehouseText.count(bulk)
+                        + " 个（最多兑出这么多）", VoidWarehouseText.ACTION_RGB));
+            }
         }
         lore.add(VoidWarehouseText.line("仓库里没有这种物品，靠 9 合 1 兑换取出", VoidWarehouseText.NOTE));
 

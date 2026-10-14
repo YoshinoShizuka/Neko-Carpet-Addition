@@ -550,6 +550,30 @@ public final class VoidWarehouseExchangeSelfCheck {
                 !contains(lore, "找回 "));
         check("F20 虚拟格说明「仓库里没有这种物品」", contains(lore, "仓库里没有这种物品"));
 
+        // ---- 操作行里的数量也得来自库存，不能是写死的堆叠上限 ----
+        // 「右键：兑换 64 个」跟玩家连着报两次的 1728 / 64 是同一类毛病：
+        // 这一格只能兑 10 个时它照样写着 64。所以不足一组时改写实际值 + 短括注。
+        String bulkLine = lineContaining(lore, "右键：");
+        check("F36 右键行写这一格实际能兑的 10 个，不是凭空写死的 64",
+                bulkLine != null && bulkLine.contains("10 个") && !bulkLine.contains("64 个"));
+        check("F37 不足一组时括注说明原因（否则玩家会以为以后也只能拿 10 个）",
+                bulkLine != null && bulkLine.contains("（最多兑出这么多）"));
+
+        // 可兑数量够一组时，仍然是「右键取一组」的老口径
+        VoidWarehouseData.ExchangeOffer plenty = new VoidWarehouseData.ExchangeOffer(
+                "emerald_block", new ItemStack(Items.EMERALD_BLOCK), BigInteger.valueOf(666), List.of());
+        String plentyLine = lineContaining(
+                loreOf(VoidWarehouseData.buildExchangeDisplay(plenty, false)), "右键：");
+        check("F38 可兑 666 个（≥ 一组）时右键仍是「兑换 64 个」，且不出现括注",
+                plentyLine != null && plentyLine.contains("64 个") && !plentyLine.contains("最多兑出"));
+
+        // 只能兑 1 个：左右键一个说法，不能一边写 1 一边写 64
+        VoidWarehouseData.ExchangeOffer single = new VoidWarehouseData.ExchangeOffer(
+                "iron_ingot", new ItemStack(Items.IRON_INGOT), BigInteger.ONE, List.of());
+        check("F39 只能兑出 1 个时写「左键 / 右键：兑换 1 个」",
+                contains(loreOf(VoidWarehouseData.buildExchangeDisplay(single, false)),
+                        "左键 / 右键：兑换 1 个"));
+
         // ---- 拆零场景：说法必须换成「可拆出 / 拆」 ----
         data.clearContent();
         data.insert(new ItemStack(Items.IRON_BLOCK, 1));

@@ -335,8 +335,11 @@ public class VoidWarehouseMenu extends ChestMenu {
         }
 
         // ---- 第 1..5 行：本页仓库内容 ----
-        // 空格子（屏障占位符）：任何输入都无响应，纯占位，直接返回、不做任何重发
-        if (this.entryAt(slotId) == null) {
+        // 「这一格是谁」只解析这一次，后面渲染 / 取出 / 存入全都用这一个值 ——
+        // 数量排序、以及「可兑条目会随库存出现 / 消失」，都会让两次解析给出不同结果。
+        VoidWarehouseData.DisplaySlot target = this.slotAt(slotId);
+        if (target.isEmpty()) {
+            // 空格子（屏障占位符）：任何输入都无响应，纯占位，直接返回、不做任何重发
             return;
         }
         // 潜影盒模式下，所有「取出」动作都换成交出 1 个装满的潜影盒；
@@ -347,9 +350,9 @@ public class VoidWarehouseMenu extends ChestMenu {
             case PICKUP -> {
                 if (button == 0) {
                     if (boxMode) {
-                        this.withdrawShulkerBox(slotId, player);
+                        this.withdrawShulkerBox(target, player);
                     } else {
-                        this.withdrawToInventory(slotId, 1, player);
+                        this.withdrawFrom(target, 1, player);
                     }
                 } else if (button == 1) {
                     if (boxMode) {
@@ -360,13 +363,13 @@ public class VoidWarehouseMenu extends ChestMenu {
                         // 所以这里必须直接 return：菜单此刻已经不存在了，再往下走
                         // syncAllViewers 就是对着一个已关闭的菜单发包。
                         // 取完货由 VoidWarehouseWithdraw 自己把界面开回来（页码/开关都还在）。
-                        VoidWarehouseData.Entry entry = this.entryAt(slotId);
-                        if (entry != null && player instanceof ServerPlayer serverPlayer) {
-                            VoidWarehouseWithdraw.request(serverPlayer, entry.template());
+                        // 「可兑」虚拟条目走的是同一条路 —— 区别只在 execute 里改用兑换扣账。
+                        if (player instanceof ServerPlayer serverPlayer) {
+                            VoidWarehouseWithdraw.request(serverPlayer, target.template());
                         }
                         return;
                     } else {
-                        this.withdrawOrStore(slotId, player);
+                        this.withdrawOrStore(target, player);
                     }
                 } else {
                     return;
@@ -379,16 +382,16 @@ public class VoidWarehouseMenu extends ChestMenu {
                 // 玩家想连点取几个「1 个」时会莫名其妙被掏走一整组。想取一组用右键或 Shift。
                 // 潜影盒模式交出一盒。
                 if (boxMode) {
-                    this.withdrawShulkerBox(slotId, player);
+                    this.withdrawShulkerBox(target, player);
                 } else {
-                    this.withdrawToInventory(slotId, 1, player);
+                    this.withdrawFrom(target, 1, player);
                 }
                 this.syncAllViewers(player);
             }
             case QUICK_MOVE -> {
                 // Shift 点击仓库格：潜影盒模式交出一盒，普通模式取一组
                 if (boxMode) {
-                    this.withdrawShulkerBox(slotId, player);
+                    this.withdrawShulkerBox(target, player);
                 } else {
                     this.quickMoveStack(player, slotId);
                 }
@@ -491,22 +494,23 @@ public class VoidWarehouseMenu extends ChestMenu {
      * 潜影盒的 {@code maxStackSize} 恒为 1，放进背包这件事天然只有「整个放进去」和
      * 「一个都没放进去」两种结果，所以「放完不为空」就等于「一点都没放进去」。</p>
      */
-    private void withdrawShulkerBox(int slotId, Player player) {
-        // 索引只解析这一次，后面扣账用同一个值（数量排序下视图↔数据是动态映射）
-        int index = this.slotIndexOf(slotId);
-        VoidWarehouseData.Entry entry = this.data.entryAt(index);
-        if (entry == null) {
+    private void withdrawShulkerBox(VoidWarehouseData.DisplaySlot target, Player player) {
+        if (target.isEmpty()) {
             return;
         }
-        ItemStack template = entry.template();
+        ItemStack template = target.template();
         long capacity = VoidWarehouseShulker.capacity(template);
-        // 库存是 BigInteger（无上限），但一盒最多 1728 个，所以这里一定在 int 范围内
-        int fill = entry.amount().min(BigInteger.valueOf(capacity)).intValue();
-        if (fill <= 0) {
+
+        // ① 这一格现在能拿出多少个：真实格看库存，可兑条目看「现在能兑出多少」。
+        //    库存是 BigInteger（无上限），但一盒最多 1728 个，所以这里一定在 long 范围内。
+        long available = (target.entry() != null
+                ? target.entry().amount()
+                : target.offer().obtainable()).min(BigInteger.valueOf(capacity)).longValue();
+        if (available <= 0) {
             return;
         }
 
-        // ① 盒子材料够不够？—— 优先消耗仓库里现成的空潜影盒，不够的那些才动用潜影壳 + 箱子。
+        // ② 盒子材料够不够？—— 优先消耗仓库里现成的空潜影盒，不够的那些才动用潜影壳 + 箱子。
         //    必须与「聊天按数量取货」用同一份算法（VoidWarehouseData.planBoxMaterials），
         //    否则玩家会遇到「库里有空盒，却在界面里被要求补潜影壳」的分裂行为。
         VoidWarehouseData.BoxMaterials plan = this.data.planBoxMaterials(1);
@@ -515,19 +519,34 @@ public class VoidWarehouseMenu extends ChestMenu {
             return;
         }
 
-        // ② 真的把盒子放进背包。放不下（背包满）时 box 会原封不动剩在手上 ——
+        // ③ 「可兑」虚拟条目：兑换计划必须<b>在把盒子放进背包之前</b>算好。
+        //    反过来做的话，万一规划失败，盒子已经进了玩家背包、仓库却一个字节都没扣 ——
+        //    那就是凭空造物。这一条是这条路唯一的凭空造物入口，所以单独盯住。
+        VoidWarehouseExchange.Plan exchange = null;
+        if (target.entry() == null) {
+            exchange = this.data.planExchange(template, BigInteger.valueOf(available));
+            if (exchange == null) {
+                return;
+            }
+        }
+
+        // ④ 真的把盒子放进背包。放不下（背包满）时 box 会原封不动剩在手上 ——
         //    此时仓库还一个字节都没动，直接放弃即可。
-        ItemStack box = VoidWarehouseShulker.pack(template, fill);
+        ItemStack box = VoidWarehouseShulker.pack(template, (int) available);
         this.moveItemStackTo(box, VoidWarehouseData.TOTAL_SLOTS, this.slots.size(), true);
         if (!box.isEmpty()) {
             this.message(player, MSG_BOX_INV_FULL);
             return;
         }
 
-        // ③ 盒子已经进背包了，这才扣账。三步都不能失败（① 已验过库存），但顺序有讲究：
-        //    take(index) 必须排在最前 —— 扣空盒 / 壳 / 箱移除了别的格子会让 entries 前移，
-        //    若先扣材料再按 index 取物，index 就可能已经指向别的物品了。
-        this.data.take(index, fill);
+        // ⑤ 盒子已经进背包了，这才扣账。三步都不能失败（① ② ③ 已验过），但顺序有讲究：
+        //    取出物品必须排在最前 —— 扣空盒 / 壳 / 箱会移除别的格子、让 entries 前移，
+        //    若先扣材料再按 realIndex 取物，那个下标就可能已经指向别的物品了。
+        if (exchange != null) {
+            this.data.applyExchange(exchange);
+        } else {
+            this.data.take(target.realIndex(), (int) available);
+        }
         this.data.consumeBoxMaterials(plan);
     }
 
@@ -535,47 +554,53 @@ public class VoidWarehouseMenu extends ChestMenu {
      * 右键：光标空 → 取一组进背包；光标上拿着同一种物品 → 存进仓库；拿着别的物品 → 什么都不做。
      *
      * <p>「存入」走 {@link VoidWarehouseData#insert(ItemStack)}：同一种物品只会占一格，
-     * 数量直接累加，所以在第 5 页放东西也会合并到第 1 页那一格上。</p>
+     * 数量直接累加，所以在第 5 页放东西也会合并到第 1 页那一格上。
+     * <b>「可兑」虚拟条目不支持存入</b>：它背后根本没有一格，把东西「存进去」
+     * 没有任何现实含义（真要存就直接存那件物品本身，物品列表里自然会多出它的一格）。</p>
      */
-    private void withdrawOrStore(int slotId, Player player) {
-        ItemStack carried = this.getCarried();
-        if (!carried.isEmpty()) {
-            VoidWarehouseData.Entry entry = this.entryAt(slotId);
-            if (entry != null && ItemStack.isSameItemSameComponents(carried, entry.template())) {
-                // 光标上就是同一种物品：直接存进仓库（数量累加到同一格）
-                this.insert(carried, player);
-                return;
-            }
+    private void withdrawOrStore(VoidWarehouseData.DisplaySlot target, Player player) {
+        if (target.isEmpty()) {
+            return;
         }
-        this.withdrawToInventory(slotId, this.batchSize(slotId), player);
+        ItemStack carried = this.getCarried();
+        if (!carried.isEmpty() && target.entry() != null
+                && ItemStack.isSameItemSameComponents(carried, target.template())) {
+            // 光标上就是同一种物品：直接存进仓库（数量累加到同一格）
+            this.insert(carried, player);
+            return;
+        }
+        this.withdrawFrom(target, target.entry() != null ? target.entry().maxStack() : 0, player);
     }
 
     /**
      * 取出到<b>玩家背包</b>（不经过光标，物品不会悬浮在鼠标上）。
      *
-     * <p>先用 {@link VoidWarehouseData#take} 扣账，再造一份全新的堆叠
-     * {@code copyWithCount(actual)} 塞进背包（{@code moveItemStackTo} 会优先并进已有的同类格，
-     * 再找空格）。背包塞不下的部分<b>原样退回仓库</b>，绝不丢、也不会凭空产生。</p>
+     * <p>走 {@link VoidWarehouseData#withdraw}：成品有货就直接扣成品，
+     * 成品一件都没有且规则允许时改用 9 合 1 兑换。<b>背包塞不下的部分原样退回仓库</b>，
+     * 绝不丢、也不会凭空产生 —— 兑换那条路的退回是「整笔账反向执行 + 按实际用量重做」，
+     * 精确到个位数，不是靠猜该退回哪个物品。</p>
+     *
+     * @param wanted 想要几个（{@code <= 0} 时按「该物品一组」算）
      */
-    private void withdrawToInventory(int slotId, int wanted, Player player) {
-        int index = this.slotIndexOf(slotId);
-        VoidWarehouseData.Entry entry = this.data.entryAt(index);
-        if (entry == null || wanted <= 0) {
+    private void withdrawFrom(VoidWarehouseData.DisplaySlot target, int wanted, Player player) {
+        if (target.isEmpty() || player == null) {
             return;
         }
-        ItemStack template = entry.template();
-        int actual = this.data.take(index, wanted);
-        if (actual <= 0) {
+        ItemStack template = target.template();
+        int ask = wanted > 0 ? wanted : Math.max(1, template.getMaxStackSize());
+        VoidWarehouseData.Withdrawal withdrawal = this.data.withdraw(template, BigInteger.valueOf(ask));
+        if (withdrawal.isEmpty()) {
             return;
         }
-        ItemStack moved = template.copyWithCount(actual);
+        ItemStack moved = withdrawal.stack();
         this.moveItemStackTo(moved, VoidWarehouseData.TOTAL_SLOTS, this.slots.size(), true);
-        if (!moved.isEmpty()) {
-            // 背包塞不下：原样退回仓库（走 restore，不受筛选规则影响，绝不丢东西）
-            this.data.restore(moved);
-            if (player instanceof ServerPlayer serverPlayer) {
-                serverPlayer.sendSystemMessage(MSG_INV_FULL);
-            }
+        if (moved.isEmpty()) {
+            return;
+        }
+        // 背包塞不下：把没放下的那部分还回仓库（走 returnUnplaced，不受筛选规则影响，绝不丢东西）
+        withdrawal.returnUnplaced(withdrawal.taken() - moved.getCount());
+        if (player instanceof ServerPlayer serverPlayer) {
+            serverPlayer.sendSystemMessage(MSG_INV_FULL);
         }
     }
 
@@ -639,30 +664,19 @@ public class VoidWarehouseMenu extends ChestMenu {
         }
 
         if (index < VoidWarehouseData.NAV_START) {
+            VoidWarehouseData.DisplaySlot target = this.slotAt(index);
+            if (target.isEmpty()) {
+                return ItemStack.EMPTY;
+            }
             // 潜影盒模式：Shift 点击同样是「交出 1 个满潜影盒」
             if (this.pageContainer.shulkerMode()) {
-                this.withdrawShulkerBox(index, player);
+                this.withdrawShulkerBox(target, player);
                 this.syncAllViewers(player);
                 return ItemStack.EMPTY;
             }
             // ---- 仓库 → 玩家背包：取出一组 ----
-            // 索引只解析这一次（数量排序下视图↔数据是动态映射）
-            int dataIndex = this.slotIndexOf(index);
-            VoidWarehouseData.Entry entry = this.data.entryAt(dataIndex);
-            if (entry == null) {
-                return ItemStack.EMPTY;
-            }
-            ItemStack template = entry.template();
-            int actual = this.data.take(dataIndex, entry.maxStack());
-            if (actual <= 0) {
-                return ItemStack.EMPTY;
-            }
-            ItemStack moved = template.copyWithCount(actual);
-            this.moveItemStackTo(moved, VoidWarehouseData.TOTAL_SLOTS, this.slots.size(), true);
-            if (!moved.isEmpty()) {
-                // 背包塞不下：原样退回仓库（走 restore，不受筛选规则影响，绝不丢东西）
-                this.data.restore(moved);
-            }
+            // 这一格是谁只解析这一次（数量排序 + 可兑条目都让视图↔数据是动态映射）
+            this.withdrawFrom(target, 0, player);
             this.syncAllViewers(player);
             return ItemStack.EMPTY;
         }
@@ -741,27 +755,17 @@ public class VoidWarehouseMenu extends ChestMenu {
         return null;
     }
 
-    /** 本页第 {@code slotId} 格对应的仓库格；该位置是空的（或越界）时返回 null */
-    private VoidWarehouseData.Entry entryAt(int slotId) {
-        return this.data.entryAt(this.slotIndexOf(slotId));
-    }
-
     /**
-     * 本页第 {@code slotId} 格对应的<b>仓库格号</b>。
+     * 本页第 {@code slotId} 格背后到底是什么：真实库存格、9 合 1「可兑」虚拟条目、或空。
      *
-     * <p>开了「数量排序」时这里会经过一层视图映射，所以结果可能是 {@code -1}（该位置没有东西）。
-     * 菜单里所有取物品的路径都<b>先解析一次索引、把结果存进局部变量</b>，
-     * 之后 {@code entryAt} 与 {@code take} 用同一个值 ——
-     * 避免「解析两次、中间顺序变了导致点到 A 却取走 B」。</p>
+     * <p>唯一的一处「这一格是谁」的换算（{@link VoidWarehousePageContainer#slotAt(int)}）。
+     * 菜单里所有取物品的路径都<b>先调它一次、把结果存进局部变量</b>，
+     * 之后渲染、扣账、判定都用同一个值 ——
+     * 避免「解析两次、中间顺序变了导致点到 A 却取走 B」，
+     * 也避免「渲染时是可兑条目、点击时却按真实格处理」。</p>
      */
-    private int slotIndexOf(int slotId) {
-        return this.pageContainer.slotIndexOf(slotId);
-    }
-
-    /** 一次能取多少 = 该物品的一组 */
-    private int batchSize(int slotId) {
-        VoidWarehouseData.Entry entry = this.entryAt(slotId);
-        return entry == null ? 0 : entry.maxStack();
+    private VoidWarehouseData.DisplaySlot slotAt(int slotId) {
+        return this.pageContainer.slotAt(slotId);
     }
 
     /**

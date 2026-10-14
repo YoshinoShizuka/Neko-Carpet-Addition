@@ -87,16 +87,17 @@ final class VoidWarehouseNav {
      * @param pageCount   总页数（至少 1）
      * @param entryCount  仓库里有多少种物品（占了多少格）
      * @param totalAmount 仓库里一共有多少个物品
+     * @param offerCount  当前有几个「可兑」条目（0 = 没开规则 / 没得兑）
      * @param shulkerMode 潜影盒模式是否开启（每个玩家各自的状态）
      * @param amountSort  数量排序是否开启（每个玩家各自的状态）
      */
     static ItemStack build(int rowIndex, int page, int pageCount, int entryCount, BigInteger totalAmount,
-                           boolean shulkerMode, boolean amountSort) {
+                           int offerCount, boolean shulkerMode, boolean amountSort) {
         return switch (rowIndex) {
             case SLOT_SHULKER -> shulkerToggle(shulkerMode);
             case SLOT_PREV -> button(Items.ARROW, "◀  上一页", "往前翻一页",
                     page > 0, "已经在第一页");
-            case SLOT_INDICATOR -> indicator(page, pageCount, entryCount, totalAmount, amountSort);
+            case SLOT_INDICATOR -> indicator(page, pageCount, entryCount, totalAmount, offerCount, amountSort);
             case SLOT_NEXT -> button(Items.ARROW, "下一页  ▶", "往后翻一页",
                     page < pageCount - 1, "已经在最后一页");
             case SLOT_SORT -> amountSortToggle(amountSort);
@@ -183,18 +184,24 @@ final class VoidWarehouseNav {
     }
 
     private static ItemStack indicator(int page, int pageCount, int entryCount, BigInteger totalAmount,
-                                       boolean amountSort) {
+                                       int offerCount, boolean amountSort) {
         ItemStack stack = new ItemStack(Items.PAPER);
         stack.set(DataComponents.CUSTOM_NAME,
                 VoidWarehouseText.name("第 " + (page + 1) + " / " + pageCount + " 页", null));
-        stack.set(DataComponents.LORE, new ItemLore(List.of(
-                // 最关心的两个数字合并成一行：多少种 + 多少个
-                VoidWarehouseText.line("已存 " + entryCount + " 种 · 合计 "
-                        + VoidWarehouseText.count(totalAmount) + " 个", VoidWarehouseText.VALUE),
-                VoidWarehouseText.line("每种物品一格，数量无上限", VoidWarehouseText.NOTE),
-                // 当前排列，与排序开关呼应
-                VoidWarehouseText.line("排列：" + (amountSort ? "数量从大到小" : "创造模式物品栏顺序"),
-                        VoidWarehouseText.FACT))));
+        List<Component> lore = new ArrayList<>(4);
+        // 最关心的两个数字合并成一行：多少种 + 多少个
+        lore.add(VoidWarehouseText.line("已存 " + entryCount + " 种 · 合计 "
+                + VoidWarehouseText.count(totalAmount) + " 个", VoidWarehouseText.VALUE));
+        // 有「可兑」条目时补一行：不写的话玩家会以为那些灰格子是仓库里真有的东西
+        if (offerCount > 0) {
+            lore.add(VoidWarehouseText.line("其中 " + offerCount + " 种可用 9 合 1 兑换取出"
+                    + "（格子上标着「可兑」）", VoidWarehouseText.FACT));
+        }
+        lore.add(VoidWarehouseText.line("每种物品一格，数量无上限", VoidWarehouseText.NOTE));
+        // 当前排列，与排序开关呼应
+        lore.add(VoidWarehouseText.line("排列：" + (amountSort ? "数量从大到小" : "创造模式物品栏顺序"),
+                VoidWarehouseText.FACT));
+        stack.set(DataComponents.LORE, new ItemLore(lore));
         return stack;
     }
 }

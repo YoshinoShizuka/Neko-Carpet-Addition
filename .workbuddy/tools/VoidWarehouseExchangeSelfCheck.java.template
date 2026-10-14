@@ -536,14 +536,18 @@ public final class VoidWarehouseExchangeSelfCheck {
         check("F16 虚拟格名字带「（可兑）」", shown.getHoverName().getString().contains("（可兑）"));
         List<Component> lore = loreOf(shown);
         dumpLore("exchange", lore);
-        check("F17 虚拟格有「可合成：」那一行（被扣的是更小的东西 = 向上合成）",
-                contains(lore, "可合成："));
-        String costLine = lineContaining(lore, "用：");
-        check("F18 虚拟格有「用：」那一行", costLine != null);
-        check("F18b 那一行写的是总量（铁粒 ×90），不是单价 ×9 —— 玩家报的就是这条",
-                costLine != null && costLine.contains("×90"));
-        check("F19 反证：9 铁粒正好换 1 铁锭，不该有「找回：」",
-                !contains(lore, "找回："));
+        check("F17 虚拟格写「可合成 N 个」（被扣的是更小的东西 = 向上合成）",
+                contains(lore, "可合成 "));
+        String costLine = lineContaining(lore, "可合成 ");
+        check("F18 数据行是<b>一行</b>（玩家嫌「可合成 xN」+「用 xN」两排冗余）",
+                costLine != null && costLine.contains(" 个，用 "));
+        check("F18b 那一行里的消耗写的是<b>总量</b>（铁粒 90 个），不是单价 9 个 —— 玩家报的就是这条",
+                segmentAfter(costLine, "，用 ").contains("90 个")
+                        && !segmentAfter(costLine, "，用 ").contains(" 9 个"));
+        check("F18c 反证：文案里不再有旧版的冒号和 × 号（旧版是「可合成：×2」「用：绿宝石 ×9」）",
+                costLine != null && !costLine.contains("：") && !costLine.contains("×"));
+        check("F19 反证：9 铁粒正好换 1 铁锭，不该有「找回 」那一段",
+                !contains(lore, "找回 "));
         check("F20 虚拟格说明「仓库里没有这种物品」", contains(lore, "仓库里没有这种物品"));
 
         // ---- 拆零场景：说法必须换成「可拆出 / 拆」 ----
@@ -562,22 +566,25 @@ public final class VoidWarehouseExchangeSelfCheck {
             ItemStack shown2 = VoidWarehouseData.buildExchangeDisplay(fromBlock, false);
             List<Component> lore2 = loreOf(shown2);
             dumpLore("exchange-split", lore2);
-            check("F24 拆零场景改用「可拆出：」（不能写「可合成」，那是反的）",
-                    contains(lore2, "可拆出：") && !contains(lore2, "可合成："));
+            check("F24 拆零场景改用「可拆出 」（不能写「可合成」，那是反的）",
+                    contains(lore2, "可拆出 ") && !contains(lore2, "可合成 "));
             // 只咬数字不咬物品英文名：「Block of Iron」这种译名随语言包变，而这里要证的是
-            // 「写的是<b>总量</b> ×1 个铁块」——物品身份由 F23 的账目断言负责。
-            String splitLine = lineContaining(lore2, "拆：");
-            check("F24b 拆零场景的消耗行写「拆：」+ 那个大件 ×1（总量，不是单价 ×9）",
-                    splitLine != null && splitLine.contains("×1") && !splitLine.contains("×9"));
-            check("F24c 反证：9 个正好用完，不该凭空多一行「找回：」",
-                    !contains(lore2, "找回："));
+            // 「写的是<b>总量</b> 1 个铁块」——物品身份由 F23 的账目断言负责。
+            // 注意「，拆 」这一段必须单独切出来看：整行里必然有「可拆出 9 个」的 9，
+            // 直接对整行找「 9 个」会永远命中。
+            String splitLine = lineContaining(lore2, "可拆出 ");
+            String splitCost = segmentAfter(splitLine, "，拆 ");
+            check("F24b 拆零场景的消耗段写「，拆 」+ 那个大件 1 个（总量，不是单价 9 个）",
+                    splitCost.contains(" 1 个") && !splitCost.contains(" 9 个"));
+            check("F24c 反证：9 个正好用完，不该凭空多一段「找回 」",
+                    !contains(lore2, "找回 "));
         }
 
         // ---- 判据有牙：光看「有没有找零」会把「1 个铁块兑 9 个铁锭」判成合成 ----
         check("F25 拆 / 合 的判据是「被扣的层级」而不是「有没有找零」"
                         + "（只有 1 个铁块时兑换铁锭没有找零，但确实是拆零）",
                 fromBlock != null && contains(loreOf(VoidWarehouseData.buildExchangeDisplay(fromBlock, false)),
-                        "可拆出："));
+                        "可拆出 "));
 
         // ---- 2 个铁块：同样是拆零，能兑 18 个 ----
         data.clearContent();
@@ -588,9 +595,61 @@ public final class VoidWarehouseExchangeSelfCheck {
                         && twoBlocks.totalCost().size() == 1
                         && twoBlocks.totalCost().get(0).change().equals(BigInteger.valueOf(-2)));
         if (twoBlocks != null) {
-            check("F27 2 个铁块仍是「可拆出：」",
-                    contains(loreOf(VoidWarehouseData.buildExchangeDisplay(twoBlocks, false)), "可拆出："));
+            check("F27 2 个铁块仍是「可拆出 」",
+                    contains(loreOf(VoidWarehouseData.buildExchangeDisplay(twoBlocks, false)), "可拆出 "));
         }
+
+        // ---- 🔴 玩家这次报的核心：可兑数量必须由本族库存推出来，不能是固定值 ----
+        // 原话：「铁锭剩余81个，那么在金块那里，可兑换数量应显示为9，而不是给出一个固定的上限」。
+        // 之前两次都写死了固定上限（先是一组 64，后是一盒容量 1728），两次都被指不合理 ——
+        // 有 A~K 组一条都没测过这个，所以这两次都是装到真机上才被发现的。
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_INGOT, 81));
+        List<VoidWarehouseData.ExchangeOffer> ingotOffers = data.exchangeOffers();
+        System.out.println("   [F] 只有 81 个铁锭时的可兑条目 = " + describeOffers(ingotOffers));
+        VoidWarehouseData.ExchangeOffer blockOffer = offerOf(ingotOffers, "iron_block");
+        check("F28 81 个铁锭 → 铁块那格可兑 9 个（玩家原话；不是 1728，也不是 64）",
+                blockOffer != null && blockOffer.obtainable().equals(BigInteger.valueOf(9)));
+        if (blockOffer != null) {
+            check("F29 账目 = 一次性扣 81 个铁锭（9 个铁块 × 9）",
+                    blockOffer.totalCost().size() == 1
+                            && "iron_ingot".equals(blockOffer.totalCost().get(0).itemId())
+                            && blockOffer.totalCost().get(0).change().equals(BigInteger.valueOf(-81)));
+            List<Component> lore3 = loreOf(VoidWarehouseData.buildExchangeDisplay(blockOffer, false));
+            dumpLore("exchange-from-ingots", lore3);
+            String plainLine = lineContaining(lore3, "可合成 ");
+            check("F30 普通模式 tooltip 也写 9（不是固定上限）",
+                    plainLine != null && plainLine.contains("可合成 9 个"));
+
+            List<Component> boxLore = loreOf(VoidWarehouseData.buildExchangeDisplay(blockOffer, true));
+            dumpLore("exchange-from-ingots-box", boxLore);
+            String boxLine = lineContaining(boxLore, "左键：交出 1 盒");
+            check("F31 盒模式操作行写的是<b>实际装进去的 9 个</b>，不是容量 1728",
+                    boxLine != null && boxLine.contains("9 个") && !boxLine.contains("1728"));
+        }
+
+        // ---- F32~F35：上界算法本身的直接单测（不走界面，只喂快照）----
+        VoidWarehouseExchange.Table familyTable = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
+        check("F32 maxObtainable：族外物品的库存一件都不算"
+                        + "（仓库里 9999 个圆石，对铁族可兑数量毫无帮助）",
+                VoidWarehouseExchange.maxObtainable(familyTable, "iron_block",
+                        stock(Map.of("cobblestone", 9999, "iron_ingot", 81)))
+                        .equals(BigInteger.valueOf(9)));
+        check("F33 maxObtainable：不在表里的物品返回 0",
+                VoidWarehouseExchange.maxObtainable(familyTable, "cobblestone",
+                        stock(Map.of("cobblestone", 9999))).signum() == 0);
+        check("F34 maxObtainable：整个铁族一点料都没有时返回 0"
+                        + "（调用方据此直接跳过，省掉一次注定失败的规划）",
+                VoidWarehouseExchange.maxObtainable(familyTable, "iron_block",
+                        stock(Map.of("cobblestone", 64))).signum() == 0);
+
+        // ---- F35：上界<b>偏大</b>是被允许的（价值守恒只保证不被突破，不保证够得着）----
+        // 9 个浮冰在价值上等于 81 个冰，但浮冰拆不回冰 ⇒ 取冰的上界 81、真值 0。
+        // 这条同时证明「上界当限制用是安全的」：偏大只是白跑一次规划，绝不会少给。
+        check("F35 上界可以偏大：9 个浮冰时取冰的上界是 81，但真值 0（被单向边卡住）",
+                VoidWarehouseExchange.maxObtainable(familyTable, "ice", stock(Map.of("packed_ice", 9)))
+                        .equals(BigInteger.valueOf(81))
+                        && plan(familyTable, "ice", 81L, Map.of("packed_ice", 9)) == null);
     }
 
     // ================================================================ G 回滚精确性
@@ -836,7 +895,7 @@ public final class VoidWarehouseExchangeSelfCheck {
         long boxCapacity = VoidWarehouseShulker.capacity(new ItemStack(Items.EMERALD_BLOCK));
         System.out.println("   [K] 绿宝石块可兑数量 = " + obtainable + "，一盒容量 = " + boxCapacity
                 + "，一组 = " + new ItemStack(Items.EMERALD_BLOCK).getMaxStackSize());
-        check("K2 可兑上限已经抬到一盒容量（6000 ÷ 9 = 666，远超一组 64）",
+        check("K2 可兑数量由库存推出来（6000 ÷ 9 = 666），不是固定上限（一盒容量仍是 1728）",
                 obtainable == 666 && boxCapacity == 1728);
 
         // ---- K3 盒模式下左键点这一格 ----
@@ -927,6 +986,29 @@ public final class VoidWarehouseExchangeSelfCheck {
                 check("K18 真实格 2000 个 → 盒里 1728 个（一盒容量，与可兑条目同一口径）",
                         packed == boxCapacity);
                 check("K19 仓库剩 272 个", data.amountOf(Items.EMERALD_BLOCK).equals(BigInteger.valueOf(272)));
+            }
+        }
+
+        // ---- K20 玩家第三次报的场景：盒模式也必须按库存算，不是一盒容量 ----
+        // 原话：「在处于潜影盒模式和普通模式情况下，可兑换的数量不应该以 1728 这种固定的数量来显示，
+        // 而是根据仓库里面下一级的物品数量进行显示，例如 铁锭剩余 81 个，那么在金块那里，
+        // 可兑换数量应显示为 9」。K 组之前只测了「料够多时装满一盒」，没测过「料不够时必须小」。
+        prepare(data, player);
+        data.insert(new ItemStack(Items.IRON_INGOT, 81));
+        data.insert(new ItemStack(Items.SHULKER_SHELL, VoidWarehouseShulker.SHELL_COST));
+        data.insert(new ItemStack(Items.CHEST, VoidWarehouseShulker.CHEST_COST));
+        VoidWarehouseMenu menu5 = openMenu(player);
+        if (menu5 != null) {
+            VoidWarehousePageContainer container5 = (VoidWarehousePageContainer) menu5.getContainer();
+            int slot = findExchangeSlot(container5, "iron_block");
+            check("K20 盒模式下也找得到「可兑」的铁块格", slot >= 0);
+            if (slot >= 0) {
+                menu5.clicked(slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                long packed = countInside(findInInventory(player, Items.SHULKER_BOX), Items.IRON_BLOCK);
+                System.out.println("   [K] 81 个铁锭时盒里装了 " + packed + " 个铁块"
+                        + "（一盒容量 " + boxCapacity + "）");
+                check("K21 盒里 9 个铁块 —— 按库存算，不是 1728、也不是一组 64", packed == 9);
+                check("K22 铁锭归零（81 − 9×9 = 0）", data.amountOf(Items.IRON_INGOT).signum() == 0);
             }
         }
 
@@ -1232,6 +1314,21 @@ public final class VoidWarehouseExchangeSelfCheck {
             }
         }
         return null;
+    }
+
+    /**
+     * 取一行里 {@code marker} <b>之后</b>的那一段（找不到就返回空串，行本身为 null 也是空串）。
+     *
+     * <p>为什么必须切段：单行文案里「可拆出 9 个，拆 铁块 1 个」前后各有一个数字，
+     * 直接对整行找「 9 个」会永远命中前面那个「可拆出 9 个」，断言就成了空转。
+     * 只有把「，拆 」之后那一段单独拿出来，才能证明消耗段写的是 1 不是 9。</p>
+     */
+    private static String segmentAfter(String line, String marker) {
+        if (line == null) {
+            return "";
+        }
+        int at = line.indexOf(marker);
+        return at < 0 ? "" : line.substring(at + marker.length());
     }
 
     private static void dumpLore(String tag, List<Component> lore) {

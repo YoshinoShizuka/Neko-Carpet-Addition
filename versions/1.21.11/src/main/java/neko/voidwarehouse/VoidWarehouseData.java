@@ -1406,12 +1406,15 @@ public final class VoidWarehouseData extends SavedData {
             if (item == null || this.amountOf(item).signum() > 0) {
                 continue;
             }
-            // 上限取「一盒容量」（27 组）而不是「一组」：这表示「一次手势最多能交出的量」。
-            // 普通模式右键一次一组，盒模式左键一次一盒；拿 maxStackSize 当上限的话，
-            // 盒模式下就永远只能装 1/27 盒，而真实库存格不会这样（它能装满一整盒）——
-            // 玩家报的就是这一条：有海量绿宝石，点「可兑」的绿宝石块却只给了一个装了
-            // 一组的盒子。容量口径与 VoidWarehouseShulker 完全一致。
-            BigInteger cap = BigInteger.valueOf(VoidWarehouseShulker.capacity(new ItemStack(item)));
+            // 可兑数量的上限<b>由本族库存推出来</b>，不是一个固定值。
+            // 曾经写死过「一组 64」（盒模式下永远只装 1/27 盒），又改成「一盒容量 1728」
+            // （仓库里只有 81 个铁锭时，铁块那格显示 1728 —— 跟仓库里有什么毫无关系）。
+            // 两次都被玩家指出不合理。见 VoidWarehouseExchange#maxObtainable。
+            // 顺带的好事：本族没料时上界是 0，直接跳过，省掉一次注定失败的规划。
+            BigInteger cap = VoidWarehouseExchange.maxObtainable(table, itemId, stock);
+            if (cap.signum() <= 0) {
+                continue;
+            }
             VoidWarehouseExchange.Plan plan = VoidWarehouseExchange.planMax(table, itemId, cap, stock);
             if (plan == null || plan.amount().signum() <= 0) {
                 continue;
@@ -1541,18 +1544,24 @@ public final class VoidWarehouseData extends SavedData {
     /**
      * 「可兑」虚拟条目的展示堆叠。
      *
-     * <p>三件事必须一眼看清，各占一行：</p>
+     * <p>数据只有<b>一行</b>，口径与聊天里的补货提示完全一致（灰底文字 + 亮绿数字），
+     * 所以直接复用 {@link VoidWarehouseText#body}/{@link VoidWarehouseText#key}：</p>
      * <ul>
-     *   <li><b>能拿几个</b>（金）：这一格现在最多能兑出多少个；</li>
-     *   <li><b>靠什么拿</b>（红）：向上合成写「用：铁粒 ×18」，拆上级找零写「拆：铁块 ×1」；</li>
-     *   <li><b>找回什么</b>（绿，只在有找零时出现）：
-     *       拆一个铁块取 1 个铁锭会找回 8 个铁锭，不说清楚玩家会以为亏了。</li>
+     *   <li>向上合成：{@code 可合成 2 个，用 绿宝石 18 个}；</li>
+     *   <li>拆上级找零：{@code 可拆出 9 个，拆 铁块 1 个}，有找零时接 {@code ，找回 铁锭 8 个}。</li>
      * </ul>
      *
-     * <p><b>写的是这几个的总量，不是单价</b>：账目直接取 {@link ExchangeOffer#totalCost()}，
+     * <p><b>为什么合成一行</b>：原先拆成「能兑多少」「消耗什么」两行，玩家反馈
+     * <b>双排冗余</b> —— 两行说的是同一件事（这一格现在能拿走什么、要付什么），
+     * 分成两行反而要来回对数字。合成一行后，「能拿几个」和「要付什么」挨着读，
+     * 像补货提示那样一句读完。</p>
+     *
+     * <p><b>数量写的是总量，不是单价</b>：账目直接取 {@link ExchangeOffer#totalCost()}，
      * 那是规划器为「正好兑出 {@link ExchangeOffer#obtainable()} 个」算出来的真账。
      * 早先写的是单价（「消耗：铁粒 ×9」），玩家一眼看成「点一下就要 9 个」，
-     * 而仓库里有 18 个铁粒时真账是 18 —— 数字对不上，所以改成总量。</p>
+     * 而仓库里有 18 个铁粒时真账是 18 —— 数字对不上，所以改成总量。
+     * 而且<b>单价根本算不出真账</b>：手上只有 1 个铁块时兑 9 个铁锭，
+     * 单价是「铁块 −1、铁锭 +8」，乘 9 会得到「铁块 −9」这种仓库里不存在的消耗。</p>
      *
      * <p><b>「可合成」还是「可拆出」不是拍脑袋定的</b>：看被扣走的那几样
      * 在兑换表里的<b>层级</b> —— 比目标小 = 向上合成，比目标大 = 拆上级找零。
@@ -1570,26 +1579,18 @@ public final class VoidWarehouseData extends SavedData {
                 VoidWarehouseText.tinted(offer.template().getHoverName(), VoidWarehouseText.FACT)
                         .append(VoidWarehouseText.line("（可兑）", VoidWarehouseText.FACT)));
 
-        List<Component> lore = new ArrayList<>(5);
-        boolean split = splitsFromAbove(offer);
-        lore.add(VoidWarehouseText.pair(split ? "可拆出：" : "可合成：", VoidWarehouseText.LABEL_RGB,
-                "×" + VoidWarehouseText.count(offer.obtainable()), VoidWarehouseText.VALUE_RGB));
-
-        Component cost = ledgerLine(split ? "拆：" : "用：", true, VoidWarehouseText.COST, offer);
-        if (cost != null) {
-            lore.add(cost);
-        }
-        Component change = ledgerLine("找回：", false, VoidWarehouseText.ACTION, offer);
-        if (change != null) {
-            lore.add(change);
-        }
+        List<Component> lore = new ArrayList<>(4);
+        lore.add(exchangeSummary(offer));
 
         // 操作行：与普通格一样的说法，口径统一（盒模式下就换成盒模式那一套）
         int max = Math.max(1, offer.template().getMaxStackSize());
         if (boxMode) {
-            lore.add(VoidWarehouseText.line("左键：兑换 1 盒（"
-                    + VoidWarehouseText.count(VoidWarehouseShulker.capacity(offer.template())) + " 个）",
-                    VoidWarehouseText.ACTION_RGB));
+            // 盒里实际能装多少：不超过一盒容量。可兑数量可能远超一盒（上限由库存推出来，
+            // 不再是固定值），所以这里必须写「实际装进去的个数」，不能照抄容量。
+            long packed = offer.obtainable()
+                    .min(BigInteger.valueOf(VoidWarehouseShulker.capacity(offer.template()))).longValue();
+            lore.add(VoidWarehouseText.line("左键：交出 1 盒（"
+                    + VoidWarehouseText.count(packed) + " 个）", VoidWarehouseText.ACTION_RGB));
             lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION_RGB));
         } else if (max > 1) {
             lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
@@ -1601,6 +1602,49 @@ public final class VoidWarehouseData extends SavedData {
 
         stack.set(DataComponents.LORE, new ItemLore(lore));
         return stack;
+    }
+
+    /**
+     * 数据行本体：{@code 可合成 2 个，用 绿宝石 18 个} / {@code 可拆出 9 个，拆 铁块 1 个}。
+     *
+     * <p>配色与聊天提示同一套：<b>无关紧要的文字灰、关键数字亮绿</b>。
+     * 整行只有两个数字，所以「哪个是要拿的量、哪个是要付的量」靠紧挨着的词就能读出来。</p>
+     */
+    private static Component exchangeSummary(ExchangeOffer offer) {
+        boolean split = splitsFromAbove(offer);
+        MutableComponent line = VoidWarehouseText.body(split ? "可拆出 " : "可合成 ");
+        line.append(VoidWarehouseText.key(VoidWarehouseText.count(offer.obtainable())));
+        line.append(VoidWarehouseText.body(" 个"));
+        line.append(ledgerSegment(offer, true, split ? "，拆 " : "，用 "));
+        line.append(ledgerSegment(offer, false, "，找回 "));
+        return line;
+    }
+
+    /**
+     * 拼一段账目：{@code prefix} + 若干「物品 数字 个」。
+     *
+     * <p>一段里一个物品都解析不出来时返回<b>空组件</b>（那一小段就整体不出现）——
+     * 免得只留下一个孤零零的「，找回 」。</p>
+     */
+    private static MutableComponent ledgerSegment(ExchangeOffer offer, boolean negatives, String prefix) {
+        MutableComponent segment = Component.empty();
+        boolean first = true;
+        for (VoidWarehouseExchange.Delta delta : offer.totalCost()) {
+            if (negatives != (delta.change().signum() < 0)) {
+                continue;
+            }
+            Item item = VoidWarehouseExchangeBootstrap.itemOf(delta.itemId());
+            if (item == null) {
+                continue;
+            }
+            segment.append(VoidWarehouseText.body(first ? prefix : " ＋ "));
+            segment.append(VoidWarehouseText.body(new ItemStack(item).getHoverName()));
+            segment.append(VoidWarehouseText.body(" "));
+            segment.append(VoidWarehouseText.key(VoidWarehouseText.count(delta.change().abs())));
+            segment.append(VoidWarehouseText.body(" 个"));
+            first = false;
+        }
+        return segment;
     }
 
     /**
@@ -1623,43 +1667,6 @@ public final class VoidWarehouseData extends SavedData {
             }
         }
         return false;
-    }
-
-    /**
-     * 把一份兑换账目里「被扣走的」或「被退回的」那些物品拼成一行。
-     *
-     * <p>数量是 {@link ExchangeOffer#totalCost()} 里的<b>总量</b>（为 {@code obtainable} 个
-     * 物品一次性兑完的那笔账），不是单价 —— 单价在拆零场景下算不出真账，理由见那个 record。</p>
-     *
-     * @param negatives {@code true} = 取负数那部分（消耗），{@code false} = 取正数那部分（找回）
-     * @return 没有任何符合条件的条目时返回 {@code null}（那一行就不显示）
-     */
-    private static Component ledgerLine(String prefix, boolean negatives, ChatFormatting style,
-                                        ExchangeOffer offer) {
-        List<VoidWarehouseExchange.Delta> picked = new ArrayList<>(2);
-        for (VoidWarehouseExchange.Delta delta : offer.totalCost()) {
-            if (negatives == (delta.change().signum() < 0)) {
-                picked.add(delta);
-            }
-        }
-        if (picked.isEmpty()) {
-            return null;
-        }
-        MutableComponent line = VoidWarehouseText.label(prefix, style);
-        boolean first = true;
-        for (VoidWarehouseExchange.Delta delta : picked) {
-            Item item = VoidWarehouseExchangeBootstrap.itemOf(delta.itemId());
-            if (item == null) {
-                continue;
-            }
-            if (!first) {
-                line.append(VoidWarehouseText.label(" + ", style));
-            }
-            line.append(VoidWarehouseText.tinted(new ItemStack(item).getHoverName(), style));
-            line.append(VoidWarehouseText.label(" ×" + VoidWarehouseText.count(delta.change().abs()), style));
-            first = false;
-        }
-        return first ? null : line;
     }
 
     /**

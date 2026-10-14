@@ -351,6 +351,59 @@ public final class VoidWarehouseExchange {
         return null;
     }
 
+    // ------------------------------------------------------------------ 可兑数量的上界
+
+    /**
+     * 「现在最多能兑出多少个 {@code itemId}」的<b>安全上界</b>，只由<b>本族现有库存</b>推出来。
+     *
+     * <h2>为什么需要它</h2>
+     * <p>{@link #planMax} 要一个 {@code limit}（二分得有上界）。这个上限<b>不能拍一个固定值</b>：
+     * 早先写过「一组（堆叠上限）」，后来又写成「一盒容量 1728」，两次都被玩家指出不合理 ——
+     * 仓库里只有 81 个铁锭时，铁块那格显示 1728 是<b>凭空的一个数</b>，跟仓库里有什么毫无关系。</p>
+     * <p>正确做法是由库存自身推上界：<b>每一步兑换都守恒价值</b>（9 个下级 = 1 个上级），
+     * 所以价值只会减少、不会增加，拿「本族库存的总价值」除以「一个目标物品的价值」，
+     * 就是再怎么折腾也超不过去的数量。</p>
+     *
+     * <h2>为什么是「上界」而不是精确值</h2>
+     * <p>价值守恒只说明上界<b>不会被突破</b>，不说明<b>够得着</b>。两种情况会让上界偏大：</p>
+     * <ul>
+     *   <li><b>被单向边卡住</b>：9 个浮冰在价值上等于 81 个冰，但浮冰拆不回冰，
+     *       所以「只有 9 个浮冰」时取冰的上界是 81、真值是 0；</li>
+     *   <li><b>剩下不够再换的零头</b>：整除法本来就是向下取整，零头算不进任何一整件。</li>
+     * </ul>
+     * <p>所以这个数只用来给二分定范围，真正的答案由 {@link #planMax} 收敛到
+     * 「确实执行得出来」的最大值。上界偏大是安全的（最多多跑一次注定失败的规划），
+     * 偏小才是 bug —— 而价值守恒保证了它不会偏小。</p>
+     *
+     * <h2>拿来当限制还有个副作用是好事</h2>
+     * <p>本族一点料都没有时上界是 0，调用方可以<b>直接跳过</b>，不用跑一次注定失败的规划 ——
+     * 界面每次刷可兑条目要问 53 个物品，这一下省掉的是绝大多数。</p>
+     *
+     * @return 上界（本族无料时为 {@code 0}）；{@code itemId} 不在表里也返回 {@code 0}
+     */
+    public static BigInteger maxObtainable(Table table, String itemId, Stock stock) {
+        if (table == null || itemId == null || !table.contains(itemId)) {
+            return ZERO;
+        }
+        Set<String> family = table.familyOf(itemId);
+        if (family.isEmpty()) {
+            return ZERO;
+        }
+        // 族内最低层级当基准，把所有库存折算成「最小单位的价值」
+        int floor = Integer.MAX_VALUE;
+        for (String id : family) {
+            floor = Math.min(floor, table.levelOf(id));
+        }
+        BigInteger value = ZERO;
+        for (String id : family) {
+            BigInteger have = orZero(stock.amountOf(id));
+            if (have.signum() > 0) {
+                value = value.add(have.multiply(NINE.pow(table.levelOf(id) - floor)));
+            }
+        }
+        return value.divide(NINE.pow(table.levelOf(itemId) - floor));
+    }
+
     // ------------------------------------------------------------------ 递归取数
 
     /**
@@ -465,16 +518,18 @@ public final class VoidWarehouseExchange {
         private final Map<String, List<String>> makers;
         private final Map<String, List<String>> splitters;
         private final Map<String, Integer> levels;
+        private final Map<String, Set<String>> families;
         private final List<Edge> dropped;
 
         private Table(List<Edge> edges, Set<String> items, Map<String, List<String>> makers,
                       Map<String, List<String>> splitters, Map<String, Integer> levels,
-                      List<Edge> dropped) {
+                      Map<String, Set<String>> families, List<Edge> dropped) {
             this.edges = List.copyOf(edges);
             this.items = Set.copyOf(items);
             this.makers = makers;
             this.splitters = splitters;
             this.levels = levels;
+            this.families = families;
             this.dropped = List.copyOf(dropped);
         }
 
@@ -503,6 +558,7 @@ public final class VoidWarehouseExchange {
             }
 
             Map<String, Integer> levels = new HashMap<>();
+            Map<String, Set<String>> families = new HashMap<>();
             Deque<String> queue = new ArrayDeque<>();
             // 根节点的选取顺序用字典序固定下来，保证同一张表每次建出来的层级完全一致
             for (String root : new TreeSet<>(adjacency.keySet())) {
@@ -510,16 +566,26 @@ public final class VoidWarehouseExchange {
                     continue;
                 }
                 levels.put(root, 0);
+                // 顺手把这一族（连通分量）的成员收集起来 —— 层级是「族内相对值」，
+                // 而「现在最多能兑出多少个」这类问题必须先知道<b>哪些库存跟目标是一族的</b>
+                // （别的族的料一件都用不上），见 maxObtainable。
+                Set<String> members = new TreeSet<>();
+                members.add(root);
                 queue.add(root);
                 while (!queue.isEmpty()) {
                     String node = queue.poll();
                     int base = levels.get(node);
                     for (Link link : adjacency.get(node)) {
+                        members.add(link.peer());
                         if (!levels.containsKey(link.peer())) {
                             levels.put(link.peer(), base + link.delta());
                             queue.add(link.peer());
                         }
                     }
+                }
+                Set<String> frozen = Set.copyOf(members);
+                for (String member : members) {
+                    families.put(member, frozen);
                 }
             }
 
@@ -561,7 +627,7 @@ public final class VoidWarehouseExchange {
                     return byLevel != 0 ? byLevel : a.compareTo(b);
                 });
             }
-            return new Table(kept, items, makers, splitters, levels, dropped);
+            return new Table(kept, items, makers, splitters, levels, families, dropped);
         }
 
         /** 表里的全部物品 id（已排序，方便快照与展示） */
@@ -582,6 +648,16 @@ public final class VoidWarehouseExchange {
         /** 层级（同一张连通图内才有比较意义） */
         public int levelOf(String itemId) {
             return this.levels.getOrDefault(itemId, 0);
+        }
+
+        /**
+         * 与 {@code itemId} <b>同族</b>（同一个连通分量）的全部物品 id；不在表里返回空集。
+         *
+         * <p>「族」是价值换算的作用域：只有族内的库存才可能被兑换用到，
+         * 别的族的料一件都用不上（族与族之间没有边）。见 {@link #maxObtainable}。</p>
+         */
+        public Set<String> familyOf(String itemId) {
+            return this.families.getOrDefault(itemId, Set.of());
         }
 
         /** 能「9 个合一」成 {@code itemId} 的下级原料（按「离目标最近」优先） */

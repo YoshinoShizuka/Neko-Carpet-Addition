@@ -1085,13 +1085,20 @@ public final class VoidWarehouseData extends SavedData {
      *
      * @param itemId     物品 id（如 {@code "iron_ingot"}）
      * @param template   这一件物品的样板（数量恒 1，无数据组件）
-     * @param obtainable 现在最多能兑出多少个（已按该物品的堆叠上限封顶）
-     * @param unitCost   兑 <b>1 个</b>的账目：负数 = 要从仓库扣走的，正数 = 找零退回仓库的
+     * @param obtainable 现在最多能兑出多少个
+     * @param totalCost  把这 {@code obtainable} 个<b>一次性全兑出来</b>的账目：
+     *                   负数 = 要从仓库扣走的，正数 = 找零退回仓库的
+     *
+     * <p><b>为什么是总量而不是单价</b>：拆零场景下每一步的边际成本都不一样，
+     * 「单价 × 个数」会算出仓库里根本不存在的账。手上只有 1 个铁块时兑 9 个铁锭，
+     * 真账是「铁块 −1」（第一步拆出 9 个铁锭，后面几个直接用退回的那些）；
+     * 而单价是「铁块 −1、铁锭 +8」，乘 9 会得到「铁块 −9」这种明显荒谬的消耗 ——
+     * 拿它去显示，玩家一眼就看出数字对不上。所以这里直接存规划器给出的那一份真账。</p>
      */
     public record ExchangeOffer(String itemId, ItemStack template, BigInteger obtainable,
-                                List<VoidWarehouseExchange.Delta> unitCost) {
+                                List<VoidWarehouseExchange.Delta> totalCost) {
         public ExchangeOffer {
-            unitCost = List.copyOf(unitCost);
+            totalCost = List.copyOf(totalCost);
         }
     }
 
@@ -1399,14 +1406,17 @@ public final class VoidWarehouseData extends SavedData {
             if (item == null || this.amountOf(item).signum() > 0) {
                 continue;
             }
-            BigInteger cap = BigInteger.valueOf(Math.max(1, new ItemStack(item).getMaxStackSize()));
+            // 上限取「一盒容量」（27 组）而不是「一组」：这表示「一次手势最多能交出的量」。
+            // 普通模式右键一次一组，盒模式左键一次一盒；拿 maxStackSize 当上限的话，
+            // 盒模式下就永远只能装 1/27 盒，而真实库存格不会这样（它能装满一整盒）——
+            // 玩家报的就是这一条：有海量绿宝石，点「可兑」的绿宝石块却只给了一个装了
+            // 一组的盒子。容量口径与 VoidWarehouseShulker 完全一致。
+            BigInteger cap = BigInteger.valueOf(VoidWarehouseShulker.capacity(new ItemStack(item)));
             VoidWarehouseExchange.Plan plan = VoidWarehouseExchange.planMax(table, itemId, cap, stock);
             if (plan == null || plan.amount().signum() <= 0) {
                 continue;
             }
-            VoidWarehouseExchange.Plan unit = VoidWarehouseExchange.plan(table, itemId, BigInteger.ONE, stock);
-            built.add(new ExchangeOffer(itemId, new ItemStack(item), plan.amount(),
-                    unit == null ? List.of() : unit.deltas()));
+            built.add(new ExchangeOffer(itemId, new ItemStack(item), plan.amount(), plan.deltas()));
         }
         built.sort(Comparator.comparingInt(offer -> VoidWarehouseSort.rankOf(offer.template())));
         this.offers = List.copyOf(built);
@@ -1533,13 +1543,21 @@ public final class VoidWarehouseData extends SavedData {
      *
      * <p>三件事必须一眼看清，各占一行：</p>
      * <ul>
-     *   <li><b>能兑多少</b>（金）：这一格现在能给出几个；</li>
-     *   <li><b>消耗什么</b>（红）：实际要扣仓库里的哪几样、各扣多少 ——
-     *       这是玩家最需要确认的，写「需 9 个铁粒」而不是「铁锭倒推」，
-     *       因为拆零场景下真正被扣的是那个<b>大件</b>；</li>
+     *   <li><b>能拿几个</b>（金）：这一格现在最多能兑出多少个；</li>
+     *   <li><b>靠什么拿</b>（红）：向上合成写「用：铁粒 ×18」，拆上级找零写「拆：铁块 ×1」；</li>
      *   <li><b>找回什么</b>（绿，只在有找零时出现）：
      *       拆一个铁块取 1 个铁锭会找回 8 个铁锭，不说清楚玩家会以为亏了。</li>
      * </ul>
+     *
+     * <p><b>写的是这几个的总量，不是单价</b>：账目直接取 {@link ExchangeOffer#totalCost()}，
+     * 那是规划器为「正好兑出 {@link ExchangeOffer#obtainable()} 个」算出来的真账。
+     * 早先写的是单价（「消耗：铁粒 ×9」），玩家一眼看成「点一下就要 9 个」，
+     * 而仓库里有 18 个铁粒时真账是 18 —— 数字对不上，所以改成总量。</p>
+     *
+     * <p><b>「可合成」还是「可拆出」不是拍脑袋定的</b>：看被扣走的那几样
+     * 在兑换表里的<b>层级</b> —— 比目标小 = 向上合成，比目标大 = 拆上级找零。
+     * 光看「有没有找零」会判错：手里只有 1 个铁块时兑 9 个铁锭，
+     * 真账是「铁块 −1」而<b>一个找回都没有</b>（9 个正好用完），那明明是拆零。</p>
      *
      * <p>物品名一律走 {@code getHoverName()} 保持成组件，<b>不 {@code getString()}</b> ——
      * 否则专用服务器上会解析成英文名（说明见 {@link VoidWarehouseText#tinted(Component, ChatFormatting)}）。</p>
@@ -1553,10 +1571,11 @@ public final class VoidWarehouseData extends SavedData {
                         .append(VoidWarehouseText.line("（可兑）", VoidWarehouseText.FACT)));
 
         List<Component> lore = new ArrayList<>(5);
-        lore.add(VoidWarehouseText.pair("可兑：", VoidWarehouseText.LABEL_RGB,
-                VoidWarehouseText.count(offer.obtainable()) + " 个", VoidWarehouseText.VALUE_RGB));
+        boolean split = splitsFromAbove(offer);
+        lore.add(VoidWarehouseText.pair(split ? "可拆出：" : "可合成：", VoidWarehouseText.LABEL_RGB,
+                "×" + VoidWarehouseText.count(offer.obtainable()), VoidWarehouseText.VALUE_RGB));
 
-        Component cost = ledgerLine("消耗：", true, VoidWarehouseText.COST, offer);
+        Component cost = ledgerLine(split ? "拆：" : "用：", true, VoidWarehouseText.COST, offer);
         if (cost != null) {
             lore.add(cost);
         }
@@ -1585,7 +1604,32 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
+     * 这份账目是「拆上级找零」还是「向上合成」？
+     *
+     * <p>判据是<b>被扣走的物品在兑换表里的层级</b>：比目标物品大 = 拆零，比目标小 = 合成。
+     * 只要被扣的里面有一个比目标大，就按拆零说 —— 这是能让玩家一眼看懂的口径，
+     * 因为「拆」和「用」指向的是完全不同的仓库格子。</p>
+     */
+    private static boolean splitsFromAbove(ExchangeOffer offer) {
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
+        if (!table.contains(offer.itemId())) {
+            return false;
+        }
+        int target = table.levelOf(offer.itemId());
+        for (VoidWarehouseExchange.Delta delta : offer.totalCost()) {
+            if (delta.change().signum() < 0 && table.contains(delta.itemId())
+                    && table.levelOf(delta.itemId()) > target) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * 把一份兑换账目里「被扣走的」或「被退回的」那些物品拼成一行。
+     *
+     * <p>数量是 {@link ExchangeOffer#totalCost()} 里的<b>总量</b>（为 {@code obtainable} 个
+     * 物品一次性兑完的那笔账），不是单价 —— 单价在拆零场景下算不出真账，理由见那个 record。</p>
      *
      * @param negatives {@code true} = 取负数那部分（消耗），{@code false} = 取正数那部分（找回）
      * @return 没有任何符合条件的条目时返回 {@code null}（那一行就不显示）
@@ -1593,7 +1637,7 @@ public final class VoidWarehouseData extends SavedData {
     private static Component ledgerLine(String prefix, boolean negatives, ChatFormatting style,
                                         ExchangeOffer offer) {
         List<VoidWarehouseExchange.Delta> picked = new ArrayList<>(2);
-        for (VoidWarehouseExchange.Delta delta : offer.unitCost()) {
+        for (VoidWarehouseExchange.Delta delta : offer.totalCost()) {
             if (negatives == (delta.change().signum() < 0)) {
                 picked.add(delta);
             }

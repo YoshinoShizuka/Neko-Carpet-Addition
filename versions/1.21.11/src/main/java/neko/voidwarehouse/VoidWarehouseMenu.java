@@ -490,6 +490,10 @@ public class VoidWarehouseMenu extends ChestMenu {
      * <b>all-or-nothing</b>：任何一步不满足就整次放弃，仓库不会被扣掉一个物品。
      * 这样绝不会出现「扣了 2 个潜影壳却因为背包满而没拿到盒子」这种账目错乱。</p>
      *
+     * <p><b>盒子里装多少个</b>：真实格与「可兑」虚拟条目都按<b>一盒容量</b>封顶
+     * （27 组），也就是说「尽量装满」。料 / 库存不够装满时给出一个装了实际数量的盒子，
+     * 两种格子的口径完全一致 —— 虚拟条目<b>不会</b>退化成「只给一组」。</p>
+     *
      * <p><b>为什么不能先「试放」再真放</b>：{@code moveItemStackTo} 不是演练，
      * 它真的会往槽位里写。拿一份副本去试放，等于把盒子放进背包一次、再放一次 ——
      * 直接复制出一个盒子（这个坑是被自检抓出来的）。所以这里的做法是
@@ -504,11 +508,23 @@ public class VoidWarehouseMenu extends ChestMenu {
         ItemStack template = target.template();
         long capacity = VoidWarehouseShulker.capacity(template);
 
-        // ① 这一格现在能拿出多少个：真实格看库存，可兑条目看「现在能兑出多少」。
-        //    库存是 BigInteger（无上限），但一盒最多 1728 个，所以这里一定在 long 范围内。
-        long available = (target.entry() != null
-                ? target.entry().amount()
-                : target.offer().obtainable()).min(BigInteger.valueOf(capacity)).longValue();
+        // ① 这一格现在能拿出多少个 + （可兑条目）这一笔账怎么扣。
+        //    真实格看库存、可兑条目看「现在能兑出多少」，两者都按<b>一盒容量</b>封顶。
+        //
+        //    ⚠️ 可兑条目这里的上限必须是「容量」而不是 offer.obtainable() 直接取 min：
+        //    obtainable 是按「一盒容量」规划出来的（见 VoidWarehouseData#exchangeOffers），
+        //    这里重新按容量规划一次，兼作「库存从缓存算出来到现在有没有变」的新鲜度校验 ——
+        //    规划是只读的，所以放在最前面也不会动到任何账。
+        long available;
+        VoidWarehouseExchange.Plan exchange = null;
+        if (target.entry() != null) {
+            available = target.entry().amount().min(BigInteger.valueOf(capacity)).longValue();
+        } else {
+            exchange = this.data.planExchangeMax(target.template(), BigInteger.valueOf(capacity));
+            available = exchange == null
+                    ? 0L
+                    : exchange.amount().min(BigInteger.valueOf(capacity)).longValue();
+        }
         if (available <= 0) {
             return;
         }
@@ -522,16 +538,11 @@ public class VoidWarehouseMenu extends ChestMenu {
             return;
         }
 
-        // ③ 「可兑」虚拟条目：兑换计划必须<b>在把盒子放进背包之前</b>算好。
+        // ③ 盒子里的东西必须在<b>把盒子放进背包之前</b>就规划好（就是上面的 exchange）。
         //    反过来做的话，万一规划失败，盒子已经进了玩家背包、仓库却一个字节都没扣 ——
         //    那就是凭空造物。这一条是这条路唯一的凭空造物入口，所以单独盯住。
-        VoidWarehouseExchange.Plan exchange = null;
-        if (target.entry() == null) {
-            exchange = this.data.planExchange(template, BigInteger.valueOf(available));
-            if (exchange == null) {
-                return;
-            }
-        }
+        //    盒子装的就是 available 个，而 exchange 正是「凑够 available 个」的那份账，
+        //    两者同源，不会出现「盒子里有 64 个、账上只扣了 2 个」这种错位。
 
         // ④ 真的把盒子放进背包。放不下（背包满）时 box 会原封不动剩在手上 ——
         //    此时仓库还一个字节都没动，直接放弃即可。

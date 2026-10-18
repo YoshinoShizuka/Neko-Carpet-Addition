@@ -19,7 +19,7 @@ import java.util.Set;
  * 把 {@link VoidWarehouseExchange} 里那张<b>纯字符串的静态表</b>绑到当前版本真实的物品与配方上。
  *
  * <h2>为什么需要这一层</h2>
- * <p>静态表是在 Minecraft 26.3 的全量配方上采集的（30 条边 / 54 个物品），
+ * <p>静态表是在 Minecraft 26.3 的全量配方上采集的（30 条单原料边 + 1 条多原料配方 / 56 个物品），
  * 是<b>26.x 的超集</b>。但本模组还编译到 1.21.x：那些版本里既可能没有某些物品
  * （硫磺、树脂是后来才加的），也可能没有某些配方。如果不复核就照单执行，
  * 结果就是「点一下说换了，实际什么也没发生」，甚至更糟 —— 凭空变出物品。</p>
@@ -29,7 +29,8 @@ import java.util.Set;
  *   <li><b>物品存在性</b>：{@link BuiltInRegistries#ITEM} 里查不到这个 id，这条边作废；</li>
  *   <li><b>配方存在性</b>：拿表里记着的<b>配方 id</b>去 {@code RecipeManager} 里查。
  *       两个方向各自独立判定 —— 某个版本只剩「向上合成」而丢了「向下拆分」时，
- *       只把那半个方向砍掉，另一条路照常可用。</li>
+ *       只把那半个方向砍掉，另一条路照常可用。多原料配方（{@link VoidWarehouseExchange.MultiRecipe}）
+ *       只有合成方向，物品与配方 id 都在才留下。</li>
  * </ol>
  *
  * <h2>为什么用「配方 id 是否存在」而不是「重新解析配方内容」</h2>
@@ -59,7 +60,7 @@ public final class VoidWarehouseExchangeBootstrap {
     private static volatile MinecraftServer boundServer;
 
     /** 最近一次绑定的结果（自检断言用） */
-    private static volatile Summary summary = new Summary(0, 0, 0, 0, List.of());
+    private static volatile Summary summary = new Summary(0, 0, 0, 0, 0, 0, List.of());
 
     /**
      * 一次绑定的结果。
@@ -68,9 +69,12 @@ public final class VoidWarehouseExchangeBootstrap {
      * @param kept        这个版本真正生效了多少条
      * @param dropped     整条作废了几条（物品不存在，或两个方向的配方都不存在）
      * @param downgraded  保留但砍掉了半个方向的条数
+     * @param recipesDeclared 多原料配方声明了几条（26.3 是 1 条：海晶灯）
+     * @param recipesKept     这个版本真正生效了几条多原料配方
      * @param notes       诊断信息（每条作废 / 降级一行），只有真丢了东西时才非空
      */
-    public record Summary(int declared, int kept, int dropped, int downgraded, List<String> notes) {
+    public record Summary(int declared, int kept, int dropped, int downgraded,
+                          int recipesDeclared, int recipesKept, List<String> notes) {
         public Summary {
             notes = List.copyOf(notes);
         }
@@ -180,15 +184,35 @@ public final class VoidWarehouseExchangeBootstrap {
                     edge.small(), edge.big(), edge.count(), combine, split));
         }
 
-        VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(keptEdges);
-        VoidWarehouseExchange.setActive(table);
-
-        if (!table.dropped().isEmpty()) {
-            notes.add("价值自相矛盾被丢弃：" + table.dropped().size() + " 条（这是表写错了，请检查）");
+        // 多原料配方同样按事实收紧：物品都在、配方 id 也在，才留下
+        List<VoidWarehouseExchange.MultiRecipe> keptRecipes = new ArrayList<>();
+        for (VoidWarehouseExchange.MultiRecipe recipe : VoidWarehouseExchange.MULTI_RECIPES) {
+            boolean itemsOk = itemOf(recipe.output()) != null;
+            for (VoidWarehouseExchange.Part part : recipe.inputs()) {
+                itemsOk &= itemOf(part.itemId()) != null;
+            }
+            if (!itemsOk) {
+                notes.add("作废多原料配方（物品不存在）：" + recipe.output());
+                continue;
+            }
+            if (!exists(recipeIds, recipe.recipeId())) {
+                notes.add("作废多原料配方（配方不存在）：" + recipe.output());
+                continue;
+            }
+            keptRecipes.add(recipe);
         }
 
-        Summary built = new Summary(
-                VoidWarehouseExchange.EDGES.size(), table.edges().size(), dropped, downgraded, notes);
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(keptEdges, keptRecipes);
+        VoidWarehouseExchange.setActive(table);
+
+        if (!table.dropped().isEmpty() || !table.droppedRecipes().isEmpty()) {
+            notes.add("价值自相矛盾被丢弃：" + table.dropped().size() + " 条边 / "
+                    + table.droppedRecipes().size() + " 条多原料配方（这是表写错了，请检查）");
+        }
+
+        Summary built = new Summary(VoidWarehouseExchange.EDGES.size(), table.edges().size(),
+                dropped, downgraded, VoidWarehouseExchange.MULTI_RECIPES.size(),
+                table.recipes().size(), notes);
         boundServer = server;
         summary = built;
         log(built);
@@ -214,6 +238,8 @@ public final class VoidWarehouseExchangeBootstrap {
     private static void log(Summary summary) {
         StringBuilder line = new StringBuilder("[虚空仓库] 兑换表：");
         line.append("生效 ").append(summary.kept()).append(" 条 / 声明 ").append(summary.declared()).append(" 条");
+        line.append("；多原料配方 ").append(summary.recipesKept())
+                .append(" / ").append(summary.recipesDeclared()).append(" 条");
         if (summary.downgraded() > 0) {
             line.append("，降级 ").append(summary.downgraded()).append(" 条");
         }

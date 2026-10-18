@@ -45,7 +45,7 @@ import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
  *
  * <h2>要证的东西（每组都配反证）</h2>
  * <ol>
- *   <li><b>A 静态表</b>：30 条边 / 54 个物品 / 双向 20 + 只能向上 9 + 只能向下 1，价值自洽
+ *   <li><b>A 静态表</b>：30 条边 + 1 条多原料配方 / 56 个物品 / 双向 20 + 只能向上 9 + 只能向下 1，价值自洽
  *       （{@code value(big) == count × value(small)}）；</li>
  *   <li><b>B 启动复核</b>：拿真实 {@code RecipeManager} 复核后一条都没被砍（说明表与 26.3 的现实一致）；</li>
  *   <li><b>C 反向核对</b>：把表里每条边<b>按它自己的比例还原成真实物品</b>（9 个摆 3×3、4 个摆 2×2），
@@ -64,7 +64,9 @@ import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
  *       补它的理由就是 A~J 组一条盒模式用例都没有；</li>
  *   <li><b>Q 非 9 比例</b>：{@code 4 海晶碎片 → 1 海晶石} 端到端跑一遍（含界面右键、盒模式、反证）。
  *       A~P 全部建立在「一块 = 9 个」上，引擎里任何一处把 9 写死，用 9:1 的物品测都是绿的 ——
- *       只有 4:1 能咬住这种 bug。</li>
+ *       只有 4:1 能咬住这种 bug；</li>
+ *   <li><b>R 多原料配方</b>：海晶灯（5 碎片 + 4 晶体）端到端跑一遍 —— 玩家要求「只能使用原料兑换」，
+ *       所以要同时证「两种原料都真扣」和「同族成品一个都不许折算」。</li>
  * </ol>
  *
  * <h2>反证组（区分「改对了」与「断言是空转」）</h2>
@@ -73,7 +75,7 @@ import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
  *   <li>单向不可逆：9 铜锭合不出 1 涂蜡铜块（断言返回 null）；浮冰拆不回冰；
  *       1 个海晶石拆不出碎片（4:1 那条边只有合成方向）；</li>
  *   <li>凑不够就整次失败：8 铁粒取 1 铁锭 = null，3 个碎片取 1 海晶石 = null；</li>
- *   <li>多原料不做：海晶灯（5 碎片 + 4 晶体）永远兑不出来；</li>
+ *   <li>多原料不许折算：海晶石 / 海晶石砖再多也换不出海晶灯，只有「5 碎片 + 4 晶体」才行；</li>
  *   <li>fuzz 成功次数 ≥ 30（否则「全部守恒」是空转）。</li>
  * </ul>
  */
@@ -177,6 +179,9 @@ public final class VoidWarehouseExchangeSelfCheck {
                 countChecks(server);
                 break;
             case 16:
+                seaLanternChecks(server);
+                break;
+            case 17:
                 cleanup(server);
                 break;
             default:
@@ -195,7 +200,7 @@ public final class VoidWarehouseExchangeSelfCheck {
         check("A1 声明 30 条边", VoidWarehouseExchange.EDGES.size() == 30);
         check("A2 建表后生效 30 条边", table.edges().size() == 30);
         check("A3 价值自相矛盾被丢掉的边 = 0", table.dropped().isEmpty());
-        check("A4 表里共 54 个物品", table.items().size() == 54);
+        check("A4 表里共 56 个物品（54 个来自单原料边 + 海晶棱镜 / 海晶灯）", table.items().size() == 56);
 
         int both = 0;
         int combineOnly = 0;
@@ -244,8 +249,19 @@ public final class VoidWarehouseExchangeSelfCheck {
                 && table.makersOf("prismarine").size() == 1);
         check("A23 反证：splittersOf(海晶石) 为空（原版没有「1 海晶石 → 4 碎片」）",
                 table.splittersOf("prismarine").isEmpty());
-        check("A24 反证：海晶灯不在表里（5 碎片 + 4 晶体 = 多原料，本规则不做）",
-                !table.contains("sea_lantern"));
+        // ---- 多原料配方（海晶灯）----
+        check("A24 海晶灯在表里（5 碎片 + 4 晶体 的多原料配方）", table.contains("sea_lantern"));
+        check("A25 多原料配方 1 条，且没有被丢弃（" + table.droppedRecipes() + "）",
+                table.recipes().size() == 1 && table.droppedRecipes().isEmpty());
+        check("A26 海晶灯价值 = 5 × 碎片 + 4 × 晶体（" + table.valueOf("sea_lantern") + "）",
+                table.valueOf("sea_lantern").equals(
+                        table.valueOf("prismarine_shard").multiply(BigInteger.valueOf(5))
+                                .add(table.valueOf("prismarine_crystals").multiply(FOUR))));
+        check("A27 海晶灯与碎片同族（原料和成品算一伙的）",
+                table.familyOf("sea_lantern").contains("prismarine_shard")
+                        && table.familyOf("sea_lantern").contains("prismarine_crystals"));
+        check("A28 反证：暗海晶石不在表里（8 碎片 + 1 黑色染料，带染色的配方不收）",
+                !table.contains("dark_prismarine"));
     }
 
     /** {@code item} 有没有「用 {@code small} 合成」这条边 */
@@ -256,6 +272,11 @@ public final class VoidWarehouseExchangeSelfCheck {
             }
         }
         return false;
+    }
+
+    /** 生效表里有没有「做出 {@code output}」的多原料配方 */
+    private static boolean hasRecipe(VoidWarehouseExchange.Table table, String output) {
+        return !table.recipesOf(output).isEmpty();
     }
 
     /** {@code item} 有没有「从 {@code big} 拆出来」这条边 */
@@ -303,6 +324,10 @@ public final class VoidWarehouseExchangeSelfCheck {
                 VoidWarehouseExchangeBootstrap.itemOf("definitely_not_an_item_xyz") == null);
         check("B9 反证：idOf(空气) 返回 null（空物品不算任何一件东西）",
                 VoidWarehouseExchangeBootstrap.idOf(Items.AIR) == null);
+        check("B10 多原料配方 1 条全部生效（" + summary.recipesKept() + " / "
+                + summary.recipesDeclared() + "）",
+                summary.recipesKept() == 1 && summary.recipesDeclared() == 1);
+        check("B11 生效表里确实有海晶灯这条配方", hasRecipe(VoidWarehouseExchange.active(), "sea_lantern"));
     }
 
     // ================================================================ C 反向核对（真实配方系统）
@@ -744,6 +769,18 @@ public final class VoidWarehouseExchangeSelfCheck {
                 VoidWarehouseExchange.maxObtainable(familyTable, "ice", stock(Map.of("packed_ice", 9)))
                         .equals(BigInteger.valueOf(81))
                         && plan(familyTable, "ice", 81L, Map.of("packed_ice", 9)) == null);
+
+        // ---- F36~F37：多原料配方带来的那条「纯原料快路」的口径 ----
+        // 海晶棱镜只在「5 碎片 + 4 晶体 → 1 海晶灯」里当过原料，既不能合成也不能拆，
+        // 所以它在这套价值图里只是「料」：仓库里没有就一件也拿不到，
+        // 上界必须是 0，而不是「另一种原料的库存数」（那会让 planMax 白试上百次）。
+        check("F36 纯原料（海晶棱镜）仓库里没有时上界 = 0"
+                        + "（拿 64 个碎片也变不出一个晶体）",
+                VoidWarehouseExchange.maxObtainable(familyTable, "prismarine_crystals",
+                        stock(Map.of("prismarine_shard", 64))).signum() == 0);
+        check("F37 但仓库里有现货时照常算：3 个晶体的上界就是 3",
+                VoidWarehouseExchange.maxObtainable(familyTable, "prismarine_crystals",
+                        stock(Map.of("prismarine_crystals", 3))).equals(BigInteger.valueOf(3)));
     }
 
     // ================================================================ G 回滚精确性
@@ -1401,9 +1438,14 @@ public final class VoidWarehouseExchangeSelfCheck {
                 p != null && p.amount().equals(BigInteger.TWO));
         checkConserved(table, "Q5 18 碎片尽力取海晶石砖", p);
 
-        check("Q6 反证：海晶灯兑不出来（5 碎片 + 4 晶体 是多原料配方，本规则不管）",
-                plan(table, "sea_lantern", 1,
-                        Map.of("prismarine_shard", 64, "prismarine_crystals", 64)) == null);
+        // ⚠️ 这条以前是反证（「海晶灯兑不出来」）。1.0.11 起海晶灯改走多原料配方，
+        // 反证作废 —— 但也不能就这么删掉：Q 组是「表结构」的哨兵，
+        // 这里改成确认「海晶灯确实进了表、确实有一条配方、确实和海晶碎片同族」，
+        // 行为本身（能不能兑、能兑几个）由 R 组专测，不在这里重复。
+        check("Q6 海晶灯已进表：1 条多原料配方，且与海晶碎片同族（行为见 R 组）",
+                table.recipesOf("sea_lantern").size() == 1
+                        && table.familyOf("sea_lantern").contains("prismarine_shard")
+                        && table.familyOf("sea_lantern").contains("prismarine_crystals"));
 
         // ---- 数据层 / 界面：玩家真的右键一次会拿到几个 ----
         VoidWarehouseData data = VoidWarehouse.data(server);
@@ -1461,6 +1503,112 @@ public final class VoidWarehouseExchangeSelfCheck {
         VoidWarehouseData.ExchangeOffer mixed = offerOf(data.exchangeOffers(), "prismarine_bricks");
         check("Q13 1 海晶石 + 9 碎片：海晶石砖可兑 1（4 + 9 = 13 价值，一个砖要 9）",
                 mixed != null && mixed.obtainable().equals(ONE) && mixed.bulk().equals(ONE));
+
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+    }
+
+    // ================================================================ R 多原料配方（海晶灯）
+
+    /**
+     * 玩家要求：「海晶灯设置为<b>只能使用原料兑换</b>」。
+     *
+     * <p>原版配方是 {@code SCS/CCC/SCS} —— <b>5 海晶碎片 + 4 海晶棱镜</b>。
+     * 所以这一组要证两件事，缺一不可：</p>
+     * <ol>
+     *   <li><b>两种原料都真的被扣</b>：少一个碎片、少一个晶体都必须整次失败；</li>
+     *   <li><b>不许拿同族成品折算</b>：海晶石（价值 4）、海晶石砖（价值 9）摆一堆也换不出海晶灯 ——
+     *       哪怕价值上刚好够。这是「只能使用原料」这句话的实际含义，
+     *       也是这套价值模型最容易犯的错（价值等价 ≠ 配方存在）。</li>
+     * </ol>
+     */
+    private static void seaLanternChecks(MinecraftServer server) {
+        System.out.println("=== R 多原料配方：海晶灯只能用原料兑换 ===");
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
+
+        VoidWarehouseExchange.Plan p = plan(table, "sea_lantern", 1,
+                Map.of("prismarine_shard", 5, "prismarine_crystals", 4));
+        System.out.println("   [R] 5 碎片 + 4 晶体 -> 海晶灯：" + ledger(p));
+        check("R1 5 碎片 + 4 晶体 → 1 海晶灯，两种原料都扣",
+                p != null && p.asMap().size() == 2
+                        && change(p, "prismarine_shard").equals(BigInteger.valueOf(-5))
+                        && change(p, "prismarine_crystals").equals(FOUR.negate()));
+        checkConserved(table, "R1 原料换海晶灯", p);
+
+        check("R2 反证：4 碎片 + 4 晶体（差一个碎片）→ 无解",
+                plan(table, "sea_lantern", 1,
+                        Map.of("prismarine_shard", 4, "prismarine_crystals", 4)) == null);
+        check("R3 反证：5 碎片 + 3 晶体（差一个晶体）→ 无解",
+                plan(table, "sea_lantern", 1,
+                        Map.of("prismarine_shard", 5, "prismarine_crystals", 3)) == null);
+
+        // ---- 「只能使用原料」：同族成品一件都不许折算过去 ----
+        check("R4 反证：3 个海晶石（价值 12 ≥ 9）也换不出海晶灯",
+                plan(table, "sea_lantern", 1, Map.of("prismarine", 3)) == null);
+        check("R5 反证：1 个海晶石砖（价值正好 9）也换不出海晶灯",
+                plan(table, "sea_lantern", 1, Map.of("prismarine_bricks", 1)) == null);
+        check("R6 反证：1 个海晶灯拆不出碎片（原版没有拆解配方）",
+                plan(table, "prismarine_shard", 1, Map.of("sea_lantern", 1)) == null);
+
+        p = VoidWarehouseExchange.planMax(table, "sea_lantern", BigInteger.valueOf(64),
+                stock(Map.of("prismarine_shard", 10, "prismarine_crystals", 8)));
+        System.out.println("   [R] 10 碎片 + 8 晶体最多能拿：" + ledger(p));
+        check("R7 10 碎片 + 8 晶体最多兑 2 个海晶灯",
+                p != null && p.amount().equals(BigInteger.TWO));
+        checkConserved(table, "R7 原料尽力换海晶灯", p);
+        VoidWarehouseExchange.Plan nearly = VoidWarehouseExchange.planMax(table, "sea_lantern",
+                BigInteger.valueOf(64), stock(Map.of("prismarine_shard", 9, "prismarine_crystals", 4)));
+        check("R8 9 碎片 + 4 晶体只够 1 个（碎片不够第二个，不许凑）",
+                nearly != null && nearly.amount().equals(ONE));
+
+        // ---- 数据层 / 界面：玩家真的点一下会怎样 ----
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        check("R9 假玩家可构造", player != null);
+        if (player == null) {
+            return;
+        }
+        Item shard = VoidWarehouseExchangeBootstrap.itemOf("prismarine_shard");
+        Item crystal = VoidWarehouseExchangeBootstrap.itemOf("prismarine_crystals");
+        Item lantern = VoidWarehouseExchangeBootstrap.itemOf("sea_lantern");
+        Item bricks = VoidWarehouseExchangeBootstrap.itemOf("prismarine_bricks");
+        if (shard == null || crystal == null || lantern == null || bricks == null) {
+            check("R10 本版本缺海晶灯 / 海晶棱镜（不该发生）", false);
+            return;
+        }
+
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(shard, 5));
+        data.insert(new ItemStack(crystal, 4));
+        VoidWarehouseData.ExchangeOffer offer = offerOf(data.exchangeOffers(), "sea_lantern");
+        check("R10 仓库 5 碎片 + 4 晶体 → 海晶灯那格「可兑 1」",
+                offer != null && offer.obtainable().equals(ONE));
+        VoidWarehouseMenu menu = openMenu(player);
+        if (menu != null) {
+            VoidWarehousePageContainer container = (VoidWarehousePageContainer) menu.getContainer();
+            int slot = findExchangeSlot(container, "sea_lantern");
+            check("R11 界面上找得到海晶灯的可兑槽", slot >= 0);
+            if (slot >= 0) {
+                int before = countInInventory(player, lantern);
+                menu.clicked(slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                check("R12 左键真的拿到 1 个海晶灯", countInInventory(player, lantern) - before == 1);
+                check("R13 仓库被清空（" + snapshot(data) + "）", snapshot(data).isEmpty());
+            }
+        }
+
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(shard, 4));
+        data.insert(new ItemStack(crystal, 4));
+        check("R14 反证：差一个碎片时，海晶灯不在可兑列表",
+                offerOf(data.exchangeOffers(), "sea_lantern") == null);
+
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(bricks, 3));
+        check("R15 反证：仓库只有海晶石砖时，海晶灯也不在可兑列表（不许折算）",
+                offerOf(data.exchangeOffers(), "sea_lantern") == null);
 
         VoidWarehouseViews.viewFor(player).setShulkerMode(false);
     }

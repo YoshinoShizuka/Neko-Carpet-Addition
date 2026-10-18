@@ -80,6 +80,14 @@ def install():
                 if old not in text:
                     raise SystemExit("!! 1.21.11 的重命名找不到：%s" % old)
                 text = text.replace(old, new)
+        # 版本标签也必须跟着换：模板里写死了 "SMOKE RESULT vw-exchange/26.3"，
+        # 不改的话五个版本跑出来**全是 26.3**，看日志时根本分不清跑的是哪个版本
+        # （踩过：以为 26.2 没跑，实际是标签没换）。
+        label_old = "SMOKE RESULT vw-exchange/26.3 "
+        label_new = "SMOKE RESULT vw-exchange/%s " % target.split("/")[-1]
+        if label_old not in text:
+            raise SystemExit("!! %s 的自检里找不到 SMOKE RESULT 标签" % target)
+        text = text.replace(label_old, label_new)
         write_back(os.path.join(ROOT, target, PKG, NAME), text, True)
 
         ext = extension_path(target)

@@ -20,6 +20,12 @@ import java.util.TreeSet;
  * 但 2×2 的配方是 <b>4 合 1</b>（{@code 4 个海晶碎片 → 1 个海晶石}）。
  * 引擎里所有乘除都走边上的 {@link Edge#count()}，任何地方都不写死 9。</p>
  *
+ * <p><b>还有第二类关系：多原料配方</b>（{@link MultiRecipe}）—— 一种原料凑不出来的时候，
+ * 原版还有「几种不同原料 → 1 个成品」的配方，例如
+ * {@code 5 海晶碎片 + 4 海晶棱镜 → 1 海晶灯}。这类<b>不能</b>拆成若干个单边再叠加
+ * （拆出来的中间物在原版里根本不存在），所以它是一等公民：有自己的价值公式
+ * （{@code value(成品) = Σ 原料价值}）和自己的取料分支（每种原料一样都不能少）。</p>
+ *
  * <h2>它解决什么问题</h2>
  * <p>虚空仓库里只有 9 个铁粒、没有铁锭时，玩家点「铁锭」这一格应该能拿到 1 个铁锭
  * （仓库里那 9 个铁粒被扣掉），等价于「替玩家把合成步骤做掉」。反过来也成立：
@@ -129,6 +135,8 @@ public final class VoidWarehouseExchange {
 
     /**
      * 全部兑换边（<b>30 条 / 54 个物品</b>），按 (small, big) 字典序。
+     * 另有 <b>1 条多原料配方</b>（海晶灯，2 种原料），见 {@link #MULTI_RECIPES} ——
+     * 算上它表里一共 56 个物品。
      *
      * <p>采集口径（对 Minecraft 26.3 的原版配方全集做过一次全量扫描，2042 个配方文件）：</p>
      * <ul>
@@ -217,6 +225,81 @@ public final class VoidWarehouseExchange {
             // ---- 只能向下拆分（9 合 1 在原版里不存在） ----
             // 9 x copper_ingot -> 1 x waxed_copper_block
             new Edge("copper_ingot", "waxed_copper_block", 9, null, "copper_ingot_from_waxed_copper_block"));
+
+    // ------------------------------------------------------------------ 多原料配方
+
+    /**
+     * 一个多原料配方里的一项：{@code count} 个 {@code itemId}。
+     *
+     * <p>和 {@link Edge} 的区别是：一条边只描述「一种原料 N 个 → 1 个成品」，
+     * 而多原料配方可以有几种不同的原料（例如海晶灯要 5 个碎片 + 4 个晶体）。
+     * 这类配方<b>不能</b>折成若干个单边再叠加 —— 折出来的中间物在原版里并不存在，
+     * 那样算等于凭空造物。</p>
+     */
+    public record Part(String itemId, int count) {
+        public Part {
+            if (itemId == null || itemId.isEmpty()) {
+                throw new IllegalArgumentException("配方原料的物品 id 不能为空");
+            }
+            if (count < 1) {
+                throw new IllegalArgumentException("配方原料 " + itemId + " 的数量至少是 1，收到 " + count);
+            }
+        }
+    }
+
+    /**
+     * 一个多原料配方：{@code Σ part.count 个 part.item → 1 个 output}。
+     *
+     * <p><b>只有合成方向</b>：原版对这类配方没有「拆回去」的配方（海晶灯拆不回碎片和晶体），
+     * 所以这里没有 {@code splitRecipe} 这个字段 —— 少一个字段就少一处「以为能拆」的误解。</p>
+     *
+     * <p>配方 id 同样只用于启动复核与文档追溯，运行期算法不看它。</p>
+     */
+    public record MultiRecipe(String output, List<Part> inputs, String recipeId) {
+        public MultiRecipe {
+            if (output == null || output.isEmpty()) {
+                throw new IllegalArgumentException("配方成品 id 不能为空");
+            }
+            if (inputs == null || inputs.size() < 2) {
+                throw new IllegalArgumentException(
+                        "多原料配方 " + output + " 至少要两种原料；只有一种请用 Edge");
+            }
+            if (recipeId == null || recipeId.isEmpty()) {
+                throw new IllegalArgumentException("多原料配方 " + output + " 必须有配方 id");
+            }
+            Set<String> seen = new HashSet<>();
+            for (Part part : inputs) {
+                if (part.itemId().equals(output)) {
+                    throw new IllegalArgumentException(
+                            "多原料配方 " + output + " 的原料里不能有它自己");
+                }
+                if (!seen.add(part.itemId())) {
+                    throw new IllegalArgumentException(
+                            "多原料配方 " + output + " 的同一种原料出现了两次：" + part.itemId());
+                }
+            }
+            inputs = List.copyOf(inputs);
+        }
+    }
+
+    /**
+     * 全部多原料配方（目前<b>只有 1 条</b>：海晶灯）。
+     *
+     * <p>为什么单独立一张表而不是硬编码进 {@link #drain}：硬编码等于给这件物品开后门，
+     * 而「它凭什么特殊」写不进数据里 —— 下一条多原料配方又得再改一遍算法。
+     * 现在引擎只认「一组原料 → 1 个成品」这个形状，表里加一条就能用。</p>
+     *
+     * <p><b>为什么收海晶灯</b>：它是玩家点名要的，而且原料都是<b>不可合成</b>的原始材料
+     * （海晶碎片、海晶棱镜），不存在「用别的物品折算出来」的空间。
+     * 表里其它多原料配方（例如 8 碎片 + 1 黑色染料 → 暗海晶石）都带染料或带工具，
+     * 换算成价值毫无意义，所以仍然不收。</p>
+     */
+    public static final List<MultiRecipe> MULTI_RECIPES = List.of(
+            // 5 x prismarine_shard + 4 x prismarine_crystals -> 1 x sea_lantern
+            // 原版 3×3 的 SCS/CCC/SCS；没有拆解配方，所以只能合成
+            new MultiRecipe("sea_lantern",
+                    List.of(new Part("prismarine_shard", 5), new Part("prismarine_crystals", 4)),
+                    "sea_lantern"));
 
     // ------------------------------------------------------------------ 运行期生效的那一张图
 
@@ -404,7 +487,7 @@ public final class VoidWarehouseExchange {
      *
      * <h2>拿来当限制还有个副作用是好事</h2>
      * <p>本族一点料都没有时上界是 0，调用方可以<b>直接跳过</b>，不用跑一次注定失败的规划 ——
-     * 界面每次刷可兑条目要问 54 个物品，这一下省掉的是绝大多数。</p>
+     * 界面每次刷可兑条目要问 56 个物品，这一下省掉的是绝大多数。</p>
      *
      * @return 上界（本族无料时为 {@code 0}）；{@code itemId} 不在表里也返回 {@code 0}
      */
@@ -415,6 +498,16 @@ public final class VoidWarehouseExchange {
         Set<String> family = table.familyOf(itemId);
         BigInteger unit = table.valueOf(itemId);
         if (family.isEmpty() || unit.signum() <= 0) {
+            return ZERO;
+        }
+        // 仓库里一件都没有、而它<b>压根不是「货」</b> ⇒ 真值就是 0，不必先按价值算一个虚高的
+        // 上界再逐个往下试。见 {@link Table#isMaterialOnly}。
+        //
+        // ⚠️ 这里<b>只能</b>判「纯原料」，不能判「能不能做出来」：价值图里有一批物品是
+        // 只能从<b>上级拆</b>下来的（例如浮冰、海晶石砖），它们自己没有任何合成路径，
+        // 按「做不出来」判会把一个本来能拿的答案掐成 0（F35 就是拿这个当哨兵）。
+        // 快路的目的只是省掉「拿一块海晶碎片」这类注定失败的规划，不是收紧任何合法结论。
+        if (orZero(stock.amountOf(itemId)).signum() <= 0 && table.isMaterialOnly(itemId)) {
             return ZERO;
         }
         // 同一族里所有物品的价值都基于同一个尺度（Table 建表时已放大成整数），
@@ -517,6 +610,25 @@ public final class VoidWarehouseExchange {
                 }
             }
 
+            // ②b 多原料配方：<b>几种原料一样都不能少</b>（例如 5 海晶碎片 + 4 海晶棱镜 → 1 海晶灯）。
+            // 这正是玩家对海晶灯的要求「只能使用原料兑换」：不能拿海晶石 / 海晶石砖去折算，
+            // 哪怕它们在价值上刚好等价 —— 原版里根本没有「3 个海晶石 → 1 个海晶灯」这种配方。
+            // 每种原料各自递归取，任何一项凑不出来就整支作废（分支副本保证仓库没被改）。
+            for (MultiRecipe recipe : table.recipesOf(item)) {
+                State branch = state.copy();
+                boolean all = true;
+                for (Part part : recipe.inputs()) {
+                    if (!drain(table, part.itemId(), need.multiply(countOf(part)), branch, depth + 1)) {
+                        all = false;
+                        break;
+                    }
+                }
+                if (all) {
+                    state.adopt(branch);
+                    return true;
+                }
+            }
+
             // ③ 拆上级：<b>只按「整块」拆</b>，而且<b>从能拆的最多块数往下逐块试</b>。
             //
             // 这里曾经用 ceilDiv：要取 64 个铜锭、仓库里只有铜块（一块 = 9 个）时，
@@ -613,6 +725,21 @@ public final class VoidWarehouseExchange {
                 return true;
             }
         }
+        // ②b 多原料配方（口径同 {@link #drain}：几种原料一样都不能少）
+        for (MultiRecipe recipe : table.recipesOf(item)) {
+            State branch = state.copy();
+            boolean all = true;
+            for (Part part : recipe.inputs()) {
+                if (!drain(table, part.itemId(), need.multiply(countOf(part)), branch, depth + 1)) {
+                    all = false;
+                    break;
+                }
+            }
+            if (all) {
+                state.adopt(branch);
+                return true;
+            }
+        }
         return false;
     }
 
@@ -652,18 +779,24 @@ public final class VoidWarehouseExchange {
         return BigInteger.valueOf(edge.count());
     }
 
+    /** 多原料配方里某一项的数量转成 BigInteger */
+    private static BigInteger countOf(Part part) {
+        return BigInteger.valueOf(part.count());
+    }
+
     // ------------------------------------------------------------------ 图
 
     /**
-     * 复核过的一张「N 合 1」图。
+     * 复核过的一张兑换图（单原料边 + 多原料配方）。
      *
-     * <p>除了原始的边，还会算出每个物品的<b>价值</b>（{@link #valueOf}）：
-     * 沿边传播「{@code count 个 small = 1 个 big}」，所以 {@code value(big) = count × value(small)}。
-     * 价值只有<b>同一族内</b>才有比较意义（不同族之间没有边，比值无意义）。</p>
+     * <p>除了原始的表，还会算出每个物品的<b>价值</b>（{@link #valueOf}）：
+     * 沿边传播「{@code count 个 small = 1 个 big}」，所以 {@code value(big) = count × value(small)}；
+     * 多原料配方则是 {@code value(output) = Σ count × value(原料)}。
+     * 价值只有<b>同一族内</b>才有比较意义（不同族之间没有关系，比值无意义）。</p>
      *
      * <p>价值是<b>校验过的</b>：如果绕着某个环回到同一件物品却算不出同一个价值，
      * 说明表里有矛盾（比如某条边的方向和其它边打架），那条边会被丢掉并在
-     * {@link #dropped()} 里留痕 —— 自检会把「丢了几条」断言成 0。</p>
+     * {@link #dropped()} / {@link #droppedRecipes()} 里留痕 —— 自检会把「丢了几条」断言成 0。</p>
      *
      * <p><b>为什么不再是「层级」（{@code 9^level}）</b>：一旦表里同时有 9:1 与 4:1 两条边，
      * 「层级」就分不出价值了 —— 海晶石与海晶石砖同属「离碎片一条边」，但一个是 4 个碎片、
@@ -671,23 +804,35 @@ public final class VoidWarehouseExchange {
      */
     public static final class Table {
         private final List<Edge> edges;
+        private final List<MultiRecipe> recipes;
         private final Set<String> items;
+        /** 在<b>单原料边</b>里出现过的物品（不管方向、也不管那条边实际开没开单向锁） */
+        private final Set<String> edgeItems;
         private final Map<String, List<Edge>> makers;
         private final Map<String, List<Edge>> splitters;
+        private final Map<String, List<MultiRecipe>> recipeMakers;
         private final Map<String, BigInteger> values;
         private final Map<String, Set<String>> families;
         private final List<Edge> dropped;
+        private final List<MultiRecipe> droppedRecipes;
 
-        private Table(List<Edge> edges, Set<String> items, Map<String, List<Edge>> makers,
-                      Map<String, List<Edge>> splitters, Map<String, BigInteger> values,
-                      Map<String, Set<String>> families, List<Edge> dropped) {
+        private Table(List<Edge> edges, List<MultiRecipe> recipes, Set<String> items,
+                      Set<String> edgeItems, Map<String, List<Edge>> makers,
+                      Map<String, List<Edge>> splitters,
+                      Map<String, List<MultiRecipe>> recipeMakers, Map<String, BigInteger> values,
+                      Map<String, Set<String>> families, List<Edge> dropped,
+                      List<MultiRecipe> droppedRecipes) {
             this.edges = List.copyOf(edges);
+            this.recipes = List.copyOf(recipes);
             this.items = Set.copyOf(items);
+            this.edgeItems = Set.copyOf(edgeItems);
             this.makers = makers;
             this.splitters = splitters;
+            this.recipeMakers = recipeMakers;
             this.values = values;
             this.families = families;
             this.dropped = List.copyOf(dropped);
+            this.droppedRecipes = List.copyOf(droppedRecipes);
         }
 
         /**
@@ -725,22 +870,50 @@ public final class VoidWarehouseExchange {
         }
 
         /**
-         * 从一组边建表。
-         *
-         * <p>价值用 BFS 传播：把每条边看成「{@code value(big) = count × value(small)}」，
-         * 从每个连通块里挑一个节点当 1，沿边推下去（走向 big 乘 count、走向 small 除 count，
-         * 除法在传播期用 {@link Frac} 兜着）。若某条边推出来的价值和已有值打架，
-         * 说明表里自相矛盾，这条边<b>直接丢掉</b>（不参与建图），并在 {@link #dropped()} 留痕。</p>
-         *
-         * <p>正常情况（本表已实测过）丢掉 0 条 —— 因为表里任何环上「向上乘的比例」
-         * 与「向下除的比例」正好抵消。丢边只是「万一以后有人手改表改错了」的兜底：
-         * <b>宁可少一条兑换路径，也绝不允许一条自相矛盾的边被执行</b>。</p>
+         * 从一组边建表（多原料配方默认取 {@link #MULTI_RECIPES}）。
          */
         public static Table of(Iterable<Edge> source) {
+            return of(source, MULTI_RECIPES);
+        }
+
+        /**
+         * 从一组边 + 一组多原料配方建表。
+         *
+         * <h2>价值怎么标定（两步，顺序不能反）</h2>
+         * <ol>
+         *   <li><b>先按单原料边各自归一</b>：把每条边看成「{@code value(big) = count × value(small)}」，
+         *       从每个连通块里挑一个节点当 1，沿边推下去（走向 big 乘 count、走向 small 除 count，
+         *       除法在传播期用 {@link Frac} 兜着），整块再乘上公共分母变成整数。
+         *       这一步和上一版<b>一字不差</b>，所以老物品的价值一个都没变；</li>
+         *   <li><b>再算多原料配方</b>：{@code value(output) = Σ count × value(原料)}。
+         *       原料的价值来自第 1 步（或更早算出来的另一个多原料配方），所以这里要迭代到不动点。</li>
+         * </ol>
+         * <p>为什么不能一步到位：多原料配方是<b>加法</b>约束，单原料边是<b>乘法</b>约束，
+         * 混在一个 BFS 里会互相污染。分开做还有一个好处 —— 每块单边的尺度只由它自己决定
+         * （族内最小值 = 1），于是「一块原始原料算 1 个价值」这条口径天然成立：
+         * 海晶碎片在海晶族里是 1，海晶棱镜自己一块也是 1，海晶灯 = 5 + 4 = 9。</p>
+         *
+         * <p>若某条边推出来的价值和已有值打架，说明表里自相矛盾，这条边<b>直接丢掉</b>
+         * （不参与建图），并在 {@link #dropped()} 留痕；多原料配方同理进 {@link #droppedRecipes()}。
+         * 正常情况（本表已实测过）两者都是 0 条 —— 丢东西只是「万一以后有人手改表改错了」的兜底：
+         * <b>宁可少一条兑换路径，也绝不允许一条自相矛盾的关系被执行</b>。</p>
+         */
+        public static Table of(Iterable<Edge> source, Iterable<MultiRecipe> recipes) {
             List<Edge> all = new ArrayList<>();
             for (Edge edge : source) {
                 all.add(edge);
             }
+            all.sort((a, b) -> {
+                int bySmall = a.small().compareTo(b.small());
+                return bySmall != 0 ? bySmall : a.big().compareTo(b.big());
+            });
+            List<MultiRecipe> allRecipes = new ArrayList<>();
+            for (MultiRecipe recipe : recipes) {
+                allRecipes.add(recipe);
+            }
+            allRecipes.sort((a, b) -> a.recipeId().compareTo(b.recipeId()));
+
+            // ---- 第 1 步：单原料边按连通块归一 ----
             Map<String, List<Link>> adjacency = new HashMap<>();
             for (Edge edge : all) {
                 BigInteger count = countOf(edge);
@@ -752,7 +925,6 @@ public final class VoidWarehouseExchange {
 
             Map<String, Frac> frac = new HashMap<>();
             Map<String, BigInteger> values = new HashMap<>();
-            Map<String, Set<String>> families = new HashMap<>();
             Deque<String> queue = new ArrayDeque<>();
             // 根节点的选取顺序用字典序固定下来，保证同一张表每次建出来的价值完全一致
             for (String root : new TreeSet<>(adjacency.keySet())) {
@@ -760,9 +932,6 @@ public final class VoidWarehouseExchange {
                     continue;
                 }
                 frac.put(root, Frac.ONE);
-                // 顺手把这一族（连通分量）的成员收集起来 —— 价值是「族内相对值」，
-                // 而「现在最多能兑出多少个」这类问题必须先知道<b>哪些库存跟目标是一族的</b>
-                // （别的族的料一件都用不上），见 maxObtainable。
                 Set<String> members = new TreeSet<>();
                 members.add(root);
                 queue.add(root);
@@ -777,7 +946,7 @@ public final class VoidWarehouseExchange {
                         }
                     }
                 }
-                // 整族乘上公共分母 → 全整数，且族内比值一个不变
+                // 整块乘上公共分母 → 全整数，且块内比值一个不变
                 BigInteger scale = BigInteger.ONE;
                 for (String member : members) {
                     scale = lcm(scale, frac.get(member).den());
@@ -786,12 +955,81 @@ public final class VoidWarehouseExchange {
                     Frac f = frac.get(member);
                     values.put(member, f.num().multiply(scale.divide(f.den())));
                 }
+            }
+
+            // ---- 第 2 步：多原料配方的价值 = 原料价值之和（迭代到不动点）----
+            //
+            // 先给「只出现在多原料配方里的原料」定个基准：它们没有任何单原料边
+            // （海晶棱镜只能靠打怪 / 挖矿拿到，原版没有任何配方能做它），
+            // 所以第 1 步压根没碰过它们。这类物品按<b>一块算 1 个价值</b> ——
+            // 这和「海晶碎片在它自己那族里价值是 1」是同一条口径，
+            // 于是海晶灯 = 5 × 1 + 4 × 1 = 9 个原始原料，正是配方本身的样子。
+            Set<String> produced = new HashSet<>();
+            for (Edge edge : all) {
+                produced.add(edge.big());
+            }
+            for (MultiRecipe recipe : allRecipes) {
+                produced.add(recipe.output());
+            }
+            for (MultiRecipe recipe : allRecipes) {
+                for (Part part : recipe.inputs()) {
+                    if (!values.containsKey(part.itemId()) && !produced.contains(part.itemId())) {
+                        values.put(part.itemId(), BigInteger.ONE);
+                    }
+                }
+            }
+            for (boolean progress = true; progress; ) {
+                progress = false;
+                for (MultiRecipe recipe : allRecipes) {
+                    if (values.containsKey(recipe.output())) {
+                        continue;
+                    }
+                    BigInteger sum = ZERO;
+                    boolean complete = true;
+                    for (Part part : recipe.inputs()) {
+                        BigInteger input = values.get(part.itemId());
+                        if (input == null) {
+                            complete = false;
+                            break;
+                        }
+                        sum = sum.add(input.multiply(countOf(part)));
+                    }
+                    if (complete) {
+                        values.put(recipe.output(), sum);
+                        progress = true;
+                    }
+                }
+            }
+
+            // ---- 族：单原料边 + 多原料配方都算「连在一起」----
+            // 族是价值换算的作用域：只有同族的库存才可能被兑换用到，见 maxObtainable。
+            // 多原料配方必须把原料和成品并进同一族，否则「5 碎片 + 4 晶体」的库存会被算漏。
+            Map<String, String> parent = new HashMap<>();
+            for (String item : adjacency.keySet()) {
+                parent.put(item, item);
+            }
+            for (Edge edge : all) {
+                union(parent, edge.small(), edge.big());
+            }
+            for (MultiRecipe recipe : allRecipes) {
+                parent.putIfAbsent(recipe.output(), recipe.output());
+                for (Part part : recipe.inputs()) {
+                    union(parent, recipe.output(), part.itemId());
+                }
+            }
+            Map<String, Set<String>> families = new HashMap<>();
+            Map<String, Set<String>> byRoot = new HashMap<>();
+            for (String item : new TreeSet<>(parent.keySet())) {
+                byRoot.computeIfAbsent(find(parent, item), key -> new TreeSet<>()).add(item);
+            }
+            for (Set<String> members : byRoot.values()) {
                 Set<String> frozen = Set.copyOf(members);
                 for (String member : members) {
                     families.put(member, frozen);
                 }
             }
 
+            // ---- 校验：矛盾的关系一律丢掉（宁可少一条路，也不允许它被执行）----
             List<Edge> kept = new ArrayList<>();
             List<Edge> dropped = new ArrayList<>();
             for (Edge edge : all) {
@@ -803,19 +1041,44 @@ public final class VoidWarehouseExchange {
                     dropped.add(edge);
                 }
             }
+            List<MultiRecipe> keptRecipes = new ArrayList<>();
+            List<MultiRecipe> droppedRecipes = new ArrayList<>();
+            for (MultiRecipe recipe : allRecipes) {
+                BigInteger sum = ZERO;
+                for (Part part : recipe.inputs()) {
+                    sum = sum.add(values.getOrDefault(part.itemId(), ZERO).multiply(countOf(part)));
+                }
+                // sum 为 0 说明有原料根本没算过价值（表里缺东西），这种配方绝不能留
+                if (sum.signum() > 0 && values.getOrDefault(recipe.output(), ZERO).equals(sum)) {
+                    keptRecipes.add(recipe);
+                } else {
+                    droppedRecipes.add(recipe);
+                }
+            }
 
             Map<String, List<Edge>> makers = new HashMap<>();
             Map<String, List<Edge>> splitters = new HashMap<>();
+            Map<String, List<MultiRecipe>> recipeMakers = new HashMap<>();
             Set<String> items = new LinkedHashSet<>();
+            Set<String> edgeItems = new LinkedHashSet<>();
             for (Edge edge : kept) {
                 items.add(edge.small());
                 items.add(edge.big());
+                edgeItems.add(edge.small());
+                edgeItems.add(edge.big());
                 if (edge.canCombine()) {
                     makers.computeIfAbsent(edge.big(), key -> new ArrayList<>(2)).add(edge);
                 }
                 if (edge.canSplit()) {
                     splitters.computeIfAbsent(edge.small(), key -> new ArrayList<>(2)).add(edge);
                 }
+            }
+            for (MultiRecipe recipe : keptRecipes) {
+                items.add(recipe.output());
+                for (Part part : recipe.inputs()) {
+                    items.add(part.itemId());
+                }
+                recipeMakers.computeIfAbsent(recipe.output(), key -> new ArrayList<>(2)).add(recipe);
             }
             // 下级原料按「价值从高到低」（离目标最近的最先用）；拆零来源按「价值从低到高」
             // （拆最小的那个够用就行）。都补一层字典序当第二关键字，保证结果可复现。
@@ -833,7 +1096,34 @@ public final class VoidWarehouseExchange {
                     return byValue != 0 ? byValue : a.big().compareTo(b.big());
                 });
             }
-            return new Table(kept, items, makers, splitters, values, families, dropped);
+            return new Table(kept, keptRecipes, items, edgeItems, makers, splitters, recipeMakers,
+                    values, families, dropped, droppedRecipes);
+        }
+
+        /** 并查集：把两个物品并进同一族（用于「原料和成品算不算一伙的」） */
+        private static String find(Map<String, String> parent, String item) {
+            String root = item;
+            while (!parent.get(root).equals(root)) {
+                root = parent.get(root);
+            }
+            // 路径压缩：这一族的链最多两三跳，压缩一次就够
+            String cursor = item;
+            while (!parent.get(cursor).equals(root)) {
+                String next = parent.get(cursor);
+                parent.put(cursor, root);
+                cursor = next;
+            }
+            return root;
+        }
+
+        private static void union(Map<String, String> parent, String a, String b) {
+            parent.putIfAbsent(a, a);
+            parent.putIfAbsent(b, b);
+            String rootA = find(parent, a);
+            String rootB = find(parent, b);
+            if (!rootA.equals(rootB)) {
+                parent.put(rootB, rootA);
+            }
         }
 
         /** 表里的全部物品 id（已排序，方便快照与展示） */
@@ -846,9 +1136,19 @@ public final class VoidWarehouseExchange {
             return this.edges;
         }
 
+        /** 生效的多原料配方 */
+        public List<MultiRecipe> recipes() {
+            return this.recipes;
+        }
+
         /** 因自相矛盾被丢掉的边（正常永远是空） */
         public List<Edge> dropped() {
             return this.dropped;
+        }
+
+        /** 因自相矛盾被丢掉的多原料配方（正常永远是空） */
+        public List<MultiRecipe> droppedRecipes() {
+            return this.droppedRecipes;
         }
 
         /** 价值（同一族内才有比较意义；不在表里返回 0） */
@@ -874,6 +1174,31 @@ public final class VoidWarehouseExchange {
         /** 拆开能给出 {@code itemId} 的那些边（{@code edge.small() == itemId}，按「价值最低」优先） */
         public List<Edge> splittersOf(String itemId) {
             return this.splitters.getOrDefault(itemId, List.of());
+        }
+
+        /** 能做出 {@code itemId} 的那些多原料配方（{@code recipe.output() == itemId}） */
+        public List<MultiRecipe> recipesOf(String itemId) {
+            return this.recipeMakers.getOrDefault(itemId, List.of());
+        }
+
+        /**
+         * 这件物品是不是<b>只能靠仓库现货</b>的「纯原料」：它没出现在任何一条单原料边里，
+         * 也没有任何多原料配方做得出来。
+         *
+         * <p>谁会落到这一类：多原料配方把原料带进了表（海晶棱镜只在
+         * {@code 5 海晶碎片 + 4 海晶棱镜 → 1 海晶灯} 里出现过，既不能合成也不能拆），
+         * 它在这套价值图里的地位就是「料」而不是「货」。</p>
+         *
+         * <p>用途：{@link #maxObtainable} 的快路 —— 这种物品仓库里一件没有时真值必然是 0，
+         * 不必先按价值算一个虚高的上界（那会等于「另一种原料的库存数」，让 {@link #planMax}
+         * 白试几十上百次注定失败的规划）。</p>
+         *
+         * <p>⚠️ <b>判据必须是「在不在边上」，不能是「做不做得出来」</b>：只能从上级拆下来的
+         * 物品（浮冰、海晶石砖）一样没有合成路径，但它们是能拿到的 ——
+         * 拿「做不出来」当快路会把这些答案掐成 0。</p>
+         */
+        public boolean isMaterialOnly(String itemId) {
+            return !this.edgeItems.contains(itemId) && !this.recipeMakers.containsKey(itemId);
         }
 
         /** 这个物品在不在表里（不在表里的物品永远不能兑换） */

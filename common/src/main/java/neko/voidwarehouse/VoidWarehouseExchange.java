@@ -474,52 +474,80 @@ public final class VoidWarehouseExchange {
      * 就是再怎么折腾也超不过去的数量。</p>
      *
      * <h2>为什么是「上界」而不是精确值</h2>
-     * <p>价值守恒只说明上界<b>不会被突破</b>，不说明<b>够得着</b>。两种情况会让上界偏大：</p>
-     * <ul>
-     *   <li><b>被单向边卡住</b>：9 个浮冰在价值上等于 81 个冰，但浮冰拆不回冰，
-     *       所以「只有 9 个浮冰」时取冰的上界是 81、真值是 0；</li>
-     *   <li><b>剩下不够再换的零头</b>：整除法本来就是向下取整，零头算不进任何一整件。</li>
-     * </ul>
+     * <p>价值守恒只说明上界<b>不会被突破</b>，不说明<b>够得着</b>。剩下这一种情况会让上界偏大：
+     * <b>不够再换的零头</b>（整除法向下取整，零头算不进任何一整件）。</p>
      * <p>所以这个数有两个用途：给界面显示「这一格现在能兑多少个」，以及给
      * {@link #planMax} 当<b>往下试探的起点</b> —— 真正的答案由 {@code planMax} 收敛到
      * 「确实执行得出来」的最大值。上界偏大是安全的（最多多跑几次注定失败的规划），
-     * 偏小才是 bug —— 而价值守恒保证了它不会偏小。</p>
+     * 偏小才是 bug。</p>
+     *
+     * <h2>⚠️ 上界必须紧，否则会把 TPS 吃掉（1.0.11 玩家实测）</h2>
+     * <p>早先的写法把<b>整个族</b>的库存都算进来，于是上界经常离谱地大，而 {@code planMax}
+     * 是「从上界往下逐个试」—— 白试的次数就等于「上界 − 真值」。玩家仓库里有点规模之后，
+     * 一次重算要几百毫秒，界面上又每次改动都重算，TPS 直接塌。</p>
+     * <p>现在只数<b>真能变成目标</b>的那部分库存（见 {@link Table#suppliersOf}）：</p>
+     * <ul>
+     *   <li>单向边反方向的东西不算 —— 9 个浮冰拆不回冰，那 81 点价值对「取冰」毫无帮助；</li>
+     *   <li>多原料配方的<b>每种原料各自是个硬顶</b> —— 没有海晶棱镜时，碎片再多也兑不出海晶灯，
+     *       不必从上界一路试到 1 才发现。要 1 个成品就得凑齐 {@code count} 个该原料，
+     *       所以「该原料自己的上界 ÷ count」是铁上界。</li>
+     * </ul>
+     * <p>这两条都只是<b>把上界往下压</b>，压的依据仍然只有「价值守恒 + 边有没有这个方向」，
+     * 所以不会把一个本来拿得到的数量压掉。</p>
      *
      * <h2>拿来当限制还有个副作用是好事</h2>
-     * <p>本族一点料都没有时上界是 0，调用方可以<b>直接跳过</b>，不用跑一次注定失败的规划 ——
+     * <p>一点相关料都没有时上界是 0，调用方可以<b>直接跳过</b>，不用跑一次注定失败的规划 ——
      * 界面每次刷可兑条目要问 56 个物品，这一下省掉的是绝大多数。</p>
      *
-     * @return 上界（本族无料时为 {@code 0}）；{@code itemId} 不在表里也返回 {@code 0}
+     * @return 上界（没有任何能变成它的库存时为 {@code 0}）；{@code itemId} 不在表里也返回 {@code 0}
      */
     public static BigInteger maxObtainable(Table table, String itemId, Stock stock) {
+        return maxObtainable(table, itemId, stock, 0);
+    }
+
+    /** 递归深度上限：多原料配方目前只有一层，留 4 层足够并且能防止将来手滑写出环 */
+    private static final int MAX_RECIPE_DEPTH = 4;
+
+    private static BigInteger maxObtainable(Table table, String itemId, Stock stock, int depth) {
         if (table == null || itemId == null || !table.contains(itemId)) {
             return ZERO;
         }
-        Set<String> family = table.familyOf(itemId);
+        Set<String> suppliers = table.suppliersOf(itemId);
         BigInteger unit = table.valueOf(itemId);
-        if (family.isEmpty() || unit.signum() <= 0) {
+        if (suppliers.isEmpty() || unit.signum() <= 0) {
             return ZERO;
         }
-        // 仓库里一件都没有、而它<b>压根不是「货」</b> ⇒ 真值就是 0，不必先按价值算一个虚高的
-        // 上界再逐个往下试。见 {@link Table#isMaterialOnly}。
-        //
-        // ⚠️ 这里<b>只能</b>判「纯原料」，不能判「能不能做出来」：价值图里有一批物品是
-        // 只能从<b>上级拆</b>下来的（例如浮冰、海晶石砖），它们自己没有任何合成路径，
-        // 按「做不出来」判会把一个本来能拿的答案掐成 0（F35 就是拿这个当哨兵）。
-        // 快路的目的只是省掉「拿一块海晶碎片」这类注定失败的规划，不是收紧任何合法结论。
-        if (orZero(stock.amountOf(itemId)).signum() <= 0 && table.isMaterialOnly(itemId)) {
-            return ZERO;
-        }
+        // 只有「真能变成它」的库存才算数（同族但方向上不可达的不算，见方法注释）。
         // 同一族里所有物品的价值都基于同一个尺度（Table 建表时已放大成整数），
         // 所以直接 Σ(库存 × 价值) 再除「一个目标的那个值」，不需要再折什么基准层。
         BigInteger value = ZERO;
-        for (String id : family) {
+        for (String id : suppliers) {
             BigInteger have = orZero(stock.amountOf(id));
             if (have.signum() > 0) {
                 value = value.add(have.multiply(table.valueOf(id)));
             }
         }
-        return value.divide(unit);
+        BigInteger bound = value.divide(unit);
+
+        // 多原料配方：每种原料各自是硬顶。多条配方时取「最好的那条」（max），
+        // 单条配方时就是「最缺的那种原料」（min）—— 把上界压到真实可及的量级。
+        List<MultiRecipe> recipes = table.recipesOf(itemId);
+        if (!recipes.isEmpty() && depth < MAX_RECIPE_DEPTH) {
+            BigInteger best = ZERO;
+            for (MultiRecipe recipe : recipes) {
+                BigInteger tightest = null;
+                for (Part part : recipe.inputs()) {
+                    BigInteger partBound = maxObtainable(table, part.itemId(), stock, depth + 1)
+                            .divide(countOf(part));
+                    tightest = tightest == null ? partBound : tightest.min(partBound);
+                }
+                if (tightest != null && tightest.compareTo(best) > 0) {
+                    best = tightest;
+                }
+            }
+            bound = bound.min(best);
+        }
+        return bound;
     }
 
     /**
@@ -806,8 +834,14 @@ public final class VoidWarehouseExchange {
         private final List<Edge> edges;
         private final List<MultiRecipe> recipes;
         private final Set<String> items;
-        /** 在<b>单原料边</b>里出现过的物品（不管方向、也不管那条边实际开没开单向锁） */
-        private final Set<String> edgeItems;
+        /**
+         * 「能变成它」的物品集合（含自己），按生产方向算的反向闭包。
+         *
+         * <p>用途只有一个：{@link #maxObtainable} 只能数<b>这部分</b>库存。
+         * 少算就会把上界压到真值以下（少给东西），所以它必须覆盖所有<b>可能的</b>来路，
+         * 哪怕那条来路此刻凑不齐 —— 覆盖多了只是上界偏大，覆盖少了才是 bug。</p>
+         */
+        private final Map<String, Set<String>> suppliers;
         private final Map<String, List<Edge>> makers;
         private final Map<String, List<Edge>> splitters;
         private final Map<String, List<MultiRecipe>> recipeMakers;
@@ -817,7 +851,7 @@ public final class VoidWarehouseExchange {
         private final List<MultiRecipe> droppedRecipes;
 
         private Table(List<Edge> edges, List<MultiRecipe> recipes, Set<String> items,
-                      Set<String> edgeItems, Map<String, List<Edge>> makers,
+                      Map<String, Set<String>> suppliers, Map<String, List<Edge>> makers,
                       Map<String, List<Edge>> splitters,
                       Map<String, List<MultiRecipe>> recipeMakers, Map<String, BigInteger> values,
                       Map<String, Set<String>> families, List<Edge> dropped,
@@ -825,7 +859,7 @@ public final class VoidWarehouseExchange {
             this.edges = List.copyOf(edges);
             this.recipes = List.copyOf(recipes);
             this.items = Set.copyOf(items);
-            this.edgeItems = Set.copyOf(edgeItems);
+            this.suppliers = suppliers;
             this.makers = makers;
             this.splitters = splitters;
             this.recipeMakers = recipeMakers;
@@ -1060,12 +1094,9 @@ public final class VoidWarehouseExchange {
             Map<String, List<Edge>> splitters = new HashMap<>();
             Map<String, List<MultiRecipe>> recipeMakers = new HashMap<>();
             Set<String> items = new LinkedHashSet<>();
-            Set<String> edgeItems = new LinkedHashSet<>();
             for (Edge edge : kept) {
                 items.add(edge.small());
                 items.add(edge.big());
-                edgeItems.add(edge.small());
-                edgeItems.add(edge.big());
                 if (edge.canCombine()) {
                     makers.computeIfAbsent(edge.big(), key -> new ArrayList<>(2)).add(edge);
                 }
@@ -1079,6 +1110,46 @@ public final class VoidWarehouseExchange {
                     items.add(part.itemId());
                 }
                 recipeMakers.computeIfAbsent(recipe.output(), key -> new ArrayList<>(2)).add(recipe);
+            }
+
+            // ---- 「谁能变成它」的反向闭包（上界只许数这部分库存，见 maxObtainable）----
+            // 直接关系按<b>生产方向</b>算：原料 → 成品。
+            //   合成边：small → big；拆解边：big → small（只有这条边允许拆时才算）；
+            //   多原料配方：每种原料 → 成品（多原料要齐，但闭包只关心「能不能算进价值」，
+            //   凑不齐的情况由上界偏大来兜，不影响安全性）。
+            Map<String, Set<String>> directInputs = new HashMap<>();
+            for (Edge edge : kept) {
+                if (edge.canCombine()) {
+                    directInputs.computeIfAbsent(edge.big(), key -> new LinkedHashSet<>(2))
+                            .add(edge.small());
+                }
+                if (edge.canSplit()) {
+                    directInputs.computeIfAbsent(edge.small(), key -> new LinkedHashSet<>(2))
+                            .add(edge.big());
+                }
+            }
+            for (MultiRecipe recipe : keptRecipes) {
+                Set<String> inputs = directInputs.computeIfAbsent(recipe.output(),
+                        key -> new LinkedHashSet<>(4));
+                for (Part part : recipe.inputs()) {
+                    inputs.add(part.itemId());
+                }
+            }
+            Map<String, Set<String>> suppliers = new HashMap<>();
+            for (String item : items) {
+                Set<String> reachable = new LinkedHashSet<>();
+                Deque<String> pending = new ArrayDeque<>();
+                reachable.add(item);
+                pending.add(item);
+                while (!pending.isEmpty()) {
+                    String cursor = pending.poll();
+                    for (String input : directInputs.getOrDefault(cursor, Set.of())) {
+                        if (reachable.add(input)) {
+                            pending.add(input);
+                        }
+                    }
+                }
+                suppliers.put(item, Set.copyOf(reachable));
             }
             // 下级原料按「价值从高到低」（离目标最近的最先用）；拆零来源按「价值从低到高」
             // （拆最小的那个够用就行）。都补一层字典序当第二关键字，保证结果可复现。
@@ -1096,7 +1167,7 @@ public final class VoidWarehouseExchange {
                     return byValue != 0 ? byValue : a.big().compareTo(b.big());
                 });
             }
-            return new Table(kept, keptRecipes, items, edgeItems, makers, splitters, recipeMakers,
+            return new Table(kept, keptRecipes, items, suppliers, makers, splitters, recipeMakers,
                     values, families, dropped, droppedRecipes);
         }
 
@@ -1182,23 +1253,25 @@ public final class VoidWarehouseExchange {
         }
 
         /**
-         * 这件物品是不是<b>只能靠仓库现货</b>的「纯原料」：它没出现在任何一条单原料边里，
-         * 也没有任何多原料配方做得出来。
+         * 能变成 {@code itemId} 的物品集合（含自己），按<b>生产方向</b>算的反向闭包。
          *
-         * <p>谁会落到这一类：多原料配方把原料带进了表（海晶棱镜只在
-         * {@code 5 海晶碎片 + 4 海晶棱镜 → 1 海晶灯} 里出现过，既不能合成也不能拆），
-         * 它在这套价值图里的地位就是「料」而不是「货」。</p>
+         * <p>例：</p>
+         * <ul>
+         *   <li>{@code prismarine_shard}（碎片）：只有它自己 —— 海晶石 / 海晶石砖都拆不回碎片
+         *       （原版没有那条配方），所以它们那点价值对「取碎片」一点用都没有；</li>
+         *   <li>{@code sea_lantern}（海晶灯）：自己 + 碎片 + 晶体（多原料配方把三种连在一起）。</li>
+         * </ul>
          *
-         * <p>用途：{@link #maxObtainable} 的快路 —— 这种物品仓库里一件没有时真值必然是 0，
-         * 不必先按价值算一个虚高的上界（那会等于「另一种原料的库存数」，让 {@link #planMax}
-         * 白试几十上百次注定失败的规划）。</p>
+         * <p>用途：{@link #maxObtainable} 只数这部分库存。这是<b>把上界压紧</b>的关键 ——
+         * 早先按「整个族」数，玩家仓库一大，上界就离谱地大，而 {@link #planMax} 是从上界
+         * <b>往下逐个试</b>，白试次数等于「上界 − 真值」，一次界面重算要几百毫秒（1.0.11 实测）。</p>
          *
-         * <p>⚠️ <b>判据必须是「在不在边上」，不能是「做不做得出来」</b>：只能从上级拆下来的
-         * 物品（浮冰、海晶石砖）一样没有合成路径，但它们是能拿到的 ——
-         * 拿「做不出来」当快路会把这些答案掐成 0。</p>
+         * <p>⚠️ 覆盖范围只许多、不许少：多算一样东西只是上界偏大（安全），
+         * 少算一样就会把能拿到的数量压掉（少给东西）。所以多原料配方里<b>每种原料都算进来</b>，
+         * 哪怕它们此刻凑不齐。</p>
          */
-        public boolean isMaterialOnly(String itemId) {
-            return !this.edgeItems.contains(itemId) && !this.recipeMakers.containsKey(itemId);
+        public Set<String> suppliersOf(String itemId) {
+            return this.suppliers.getOrDefault(itemId, Set.of());
         }
 
         /** 这个物品在不在表里（不在表里的物品永远不能兑换） */

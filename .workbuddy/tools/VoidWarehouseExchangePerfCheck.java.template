@@ -1,0 +1,167 @@
+package neko.voidwarehouse;
+
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * 【临时性能探针】回答玩家报的「打开虚空仓库后 TPS 下降」。
+ *
+ * <p>怀疑对象只有一处：{@link VoidWarehouseData#exchangeOffers()} 对整个表
+ * 逐个物品跑一次 {@code maxObtainable} + {@code planMax}，而它在
+ * {@link VoidWarehouseData#markChanged()} 之后必然重算 —— 仓库里有东西在动
+ * （漏斗输入、玩家存取）时，只要 GUI 开着，这条路径就会反复执行。</p>
+ *
+ * <p>要测三件事：</p>
+ * <ol>
+ *   <li><b>一次完整重算要多久</b>（冷缓存，模拟仓库刚被改过）—— 分库存规模；</li>
+ *   <li><b>钱花在哪个物品上</b> —— 逐物品计时，按耗时排序；</li>
+ *   <li><b>是否随库存量线性增长</b> —— 这是「TPS 掉到个位数」的关键判据。</li>
+ * </ol>
+ */
+public final class VoidWarehouseExchangePerfCheck {
+
+    private static boolean done = false;
+
+    /** 同一形态重复几轮，取<b>最小值</b>（最小值比平均值更能排除 GC/JIT 抖动） */
+    private static final int ROUNDS = 5;
+
+    private static long sink;
+
+    private VoidWarehouseExchangePerfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        System.out.println("=== PERF 虚空仓库「可兑」重算开销 ===");
+
+        // 探针必须自己把规则打开：exchangeOffers() 在规则关着时直接返回空表，
+        // 上一版探针忘了这一句，量出来全是 0.000 ms（白测一轮）。
+        boolean oldWarehouse = VoidWarehouseSettings.voidWarehouse;
+        boolean oldExchange = VoidWarehouseSettings.voidWarehouseExchange;
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+
+        try {
+            VoidWarehouseData data = VoidWarehouse.data(server);
+            if (data == null) {
+                System.out.println("   !! 拿不到 VoidWarehouseData，放弃");
+                return;
+            }
+
+            // ---- 规模梯度：同一个族，库存翻 10 倍、100 倍 ----
+            timeOffers("空仓库", data, Map.of());
+            timeOffers("海晶碎片 1k", data, Map.of("prismarine_shard", 1000));
+            timeOffers("海晶碎片 10k", data, Map.of("prismarine_shard", 10000));
+            timeOffers("海晶碎片 100k", data, Map.of("prismarine_shard", 100000));
+            timeOffers("10k 碎片 + 1k 棱镜", data,
+                    Map.of("prismarine_shard", 10000, "prismarine_crystals", 1000));
+
+            // ---- 玩家真实仓库的样子：一堆农场产物 ----
+            Map<String, Integer> mixed = new LinkedHashMap<>();
+            mixed.put("cobblestone", 5000);
+            mixed.put("iron_ingot", 2000);
+            mixed.put("gold_nugget", 3000);
+            mixed.put("copper_ingot", 1500);
+            mixed.put("prismarine_shard", 2000);
+            mixed.put("prismarine_bricks", 200);
+            mixed.put("emerald", 800);
+            mixed.put("ice", 1000);
+            mixed.put("snowball", 2000);
+            mixed.put("bone_meal", 1500);
+            mixed.put("wheat", 1200);
+            timeOffers("混合大库存", data, mixed);
+
+            // ---- 逐物品明细（用混合大库存的形态）----
+            perItem(data);
+        } finally {
+            VoidWarehouseSettings.voidWarehouse = oldWarehouse;
+            VoidWarehouseSettings.voidWarehouseExchange = oldExchange;
+        }
+        System.out.println("=== PERF 结束 ===");
+        server.halt(false);
+    }
+
+    private static void fill(VoidWarehouseData data, Map<String, Integer> stock) {
+        data.clearContent();
+        for (Map.Entry<String, Integer> e : stock.entrySet()) {
+            Item item = VoidWarehouseExchangeBootstrap.itemOf(e.getKey());
+            if (item == null) {
+                System.out.println("   (跳过不存在的物品 " + e.getKey() + ")");
+                continue;
+            }
+            // 按 64 一摞塞进去：ItemStack 本身装不下几万个
+            int left = e.getValue();
+            while (left > 0) {
+                int n = Math.min(64, left);
+                data.insert(new ItemStack(item, n));
+                left -= n;
+            }
+        }
+        // 造一个「库存刚被动过」的状态，保证 offers 缓存被作废
+        data.insert(new ItemStack(Items.DIRT, 64));
+    }
+
+    /** 一次冷缓存重算的耗时（{@code exchangeOffers()} 的缓存由 insert/withdraw 作废） */
+    private static void timeOffers(String label, VoidWarehouseData data, Map<String, Integer> stock) {
+        fill(data, stock);
+        long best = Long.MAX_VALUE;
+        int offers = -1;
+        for (int round = 0; round < ROUNDS; round++) {
+            // 每轮都把缓存打掉：插一格再取走一格，走的是 markChanged 那条路
+            data.insert(new ItemStack(Items.DIRT, 1));
+            data.withdraw(new ItemStack(Items.DIRT), BigInteger.ONE);
+            long t0 = System.nanoTime();
+            List<VoidWarehouseData.ExchangeOffer> built = data.exchangeOffers();
+            long cost = System.nanoTime() - t0;
+            sink += built.size();
+            offers = built.size();
+            best = Math.min(best, cost);
+        }
+        System.out.printf("   [%-20s] 可兑 %2d 条，一次重算 %8.3f ms%n",
+                label, offers, best / 1_000_000.0);
+    }
+
+    /** 逐个物品计时：哪个物品把钱吃掉了 */
+    private static void perItem(VoidWarehouseData data) {
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
+        VoidWarehouseExchange.Stock stock = VoidWarehouseExchange.Stock.of(data.exchangeStock());
+        record Row(String itemId, BigInteger cap, VoidWarehouseExchange.Plan plan, long nanos) {
+        }
+        List<Row> rows = new ArrayList<>();
+        long total = 0;
+        for (String itemId : table.items()) {
+            BigInteger cap = VoidWarehouseExchange.maxObtainable(table, itemId, stock);
+            if (cap.signum() <= 0) {
+                continue;
+            }
+            long t0 = System.nanoTime();
+            VoidWarehouseExchange.Plan plan =
+                    VoidWarehouseExchange.planMax(table, itemId, cap, stock);
+            long cost = System.nanoTime() - t0;
+            total += cost;
+            sink += plan == null ? 1 : plan.amount().longValue();
+            rows.add(new Row(itemId, cap, plan, cost));
+        }
+        rows.sort(Comparator.comparingLong(Row::nanos).reversed());
+        System.out.printf("   逐物品合计 %.3f ms（按耗时降序前 10）：%n", total / 1_000_000.0);
+        for (int i = 0; i < Math.min(10, rows.size()); i++) {
+            Row row = rows.get(i);
+            System.out.printf("     %-22s 上界 %-8s 结果 %-8s %8.3f ms%n",
+                    row.itemId(), row.cap(),
+                    row.plan() == null ? "兑不出" : row.plan().amount(),
+                    row.nanos() / 1_000_000.0);
+        }
+    }
+}

@@ -35,6 +35,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.UUID;
 
 import neko.voidwarehouse.restock.PrinterTakeService;
@@ -262,6 +263,16 @@ public final class VoidWarehouseExchangeSelfCheck {
                         && table.familyOf("sea_lantern").contains("prismarine_crystals"));
         check("A28 反证：暗海晶石不在表里（8 碎片 + 1 黑色染料，带染色的配方不收）",
                 !table.contains("dark_prismarine"));
+        // ---- 「谁能变成它」（1.0.11 修 TPS 时的上界依据，见 Table#suppliersOf）----
+        check("A29 suppliersOf(碎片) 只有它自己：海晶石 / 海晶石砖都拆不回碎片，"
+                        + "它们那点价值对「取碎片」不算数（" + table.suppliersOf("prismarine_shard") + "）",
+                table.suppliersOf("prismarine_shard").equals(Set.of("prismarine_shard")));
+        check("A30 suppliersOf(海晶灯) 含碎片与晶体（多原料配方把三种连在一起）",
+                table.suppliersOf("sea_lantern").containsAll(
+                        Set.of("sea_lantern", "prismarine_shard", "prismarine_crystals")));
+        check("A31 suppliersOf(浮冰) 含冰，suppliersOf(冰) 不含浮冰（单向边只通一个方向）",
+                table.suppliersOf("packed_ice").contains("ice")
+                        && !table.suppliersOf("ice").contains("packed_ice"));
     }
 
     /** {@code item} 有没有「用 {@code small} 合成」这条边 */
@@ -762,18 +773,21 @@ public final class VoidWarehouseExchangeSelfCheck {
                 VoidWarehouseExchange.maxObtainable(familyTable, "iron_block",
                         stock(Map.of("cobblestone", 64))).signum() == 0);
 
-        // ---- F35：上界<b>偏大</b>是被允许的（价值守恒只保证不被突破，不保证够得着）----
-        // 9 个浮冰在价值上等于 81 个冰，但浮冰拆不回冰 ⇒ 取冰的上界 81、真值 0。
-        // 这条同时证明「上界当限制用是安全的」：偏大只是白跑一次规划，绝不会少给。
-        check("F35 上界可以偏大：9 个浮冰时取冰的上界是 81，但真值 0（被单向边卡住）",
+        // ---- F35：上界收窄的方向性 —— 单向边反方向的东西，一点都不能算 ----
+        // 9 个浮冰在价值上等于 81 个冰，但「浮冰 → 冰」这条配方原版不存在（只有冰 → 浮冰）。
+        // 1.0.11 修 TPS 时把上界从「整族」收紧成「真能变成它的库存」，
+        // 于是这里从 81 变成 0 —— 这才是真值（一件冰都拿不到），顺带省掉 81 次白试。
+        check("F35 单向边反方向不计入：9 个浮冰时取冰的上界 = 0（拆不回来就是拆不回来）",
                 VoidWarehouseExchange.maxObtainable(familyTable, "ice", stock(Map.of("packed_ice", 9)))
-                        .equals(BigInteger.valueOf(81))
+                        .signum() == 0
                         && plan(familyTable, "ice", 81L, Map.of("packed_ice", 9)) == null);
+        check("F35b 但「冰 → 浮冰」这个方向是通的：81 个冰时浮冰的上界 = 9",
+                VoidWarehouseExchange.maxObtainable(familyTable, "packed_ice",
+                        stock(Map.of("ice", 81))).equals(BigInteger.valueOf(9)));
 
-        // ---- F36~F37：多原料配方带来的那条「纯原料快路」的口径 ----
-        // 海晶棱镜只在「5 碎片 + 4 晶体 → 1 海晶灯」里当过原料，既不能合成也不能拆，
-        // 所以它在这套价值图里只是「料」：仓库里没有就一件也拿不到，
-        // 上界必须是 0，而不是「另一种原料的库存数」（那会让 planMax 白试上百次）。
+        // ---- F36~F39：上界收窄的两条依据（1.0.11 修 TPS 时加）----
+        // 依据一：只数「真能变成它」的库存。海晶棱镜只在「5 碎片 + 4 晶体 → 1 海晶灯」里
+        // 当过原料，既不能合成也不能拆 ⇒ 仓库里没有就一件也拿不到。
         check("F36 纯原料（海晶棱镜）仓库里没有时上界 = 0"
                         + "（拿 64 个碎片也变不出一个晶体）",
                 VoidWarehouseExchange.maxObtainable(familyTable, "prismarine_crystals",
@@ -781,6 +795,55 @@ public final class VoidWarehouseExchangeSelfCheck {
         check("F37 但仓库里有现货时照常算：3 个晶体的上界就是 3",
                 VoidWarehouseExchange.maxObtainable(familyTable, "prismarine_crystals",
                         stock(Map.of("prismarine_crystals", 3))).equals(BigInteger.valueOf(3)));
+
+        // 依据二：多原料配方里每种原料都是硬顶。没有棱镜时，2000 个碎片的上界必须是 0
+        // （按价值算会给出 222，那 222 次白试就是玩家报的 TPS 问题的来源）。
+        check("F38 多原料硬顶：2000 碎片但一个棱镜都没有 ⇒ 海晶灯上界 = 0（不是 222）",
+                VoidWarehouseExchange.maxObtainable(familyTable, "sea_lantern",
+                        stock(Map.of("prismarine_shard", 2000))).signum() == 0);
+        check("F39 料都够时上界由「最缺的那种」定：2000 碎片 + 8 棱镜 ⇒ 上界 = 2（8/4，不是 222）",
+                VoidWarehouseExchange.maxObtainable(familyTable, "sea_lantern",
+                        stock(Map.of("prismarine_shard", 2000, "prismarine_crystals", 8)))
+                        .equals(BigInteger.TWO));
+
+        // ---- F40：收窄只能往下压，绝不能压到真值以下（这条是 1.0.11 的性能改动唯一的风险）----
+        // 四个场景交叉验证「上界 ≥ 真正规划得出来的数量」。
+        Object[][] boundCases = {
+                {"iron_ingot", Map.of("iron_nugget", 100)},
+                {"iron_block", Map.of("iron_ingot", 81)},
+                {"ice", Map.of("packed_ice", 9, "ice", 5)},
+                {"sea_lantern", Map.of("prismarine_shard", 50, "prismarine_crystals", 40)},
+                {"prismarine", Map.of("prismarine_shard", 9)},
+        };
+        boolean boundSafe = true;
+        StringBuilder boundDetail = new StringBuilder();
+        for (Object[] item : boundCases) {
+            @SuppressWarnings("unchecked")
+            Map<String, Integer> snapshot = (Map<String, Integer>) item[1];
+            String id = (String) item[0];
+            BigInteger bound = VoidWarehouseExchange.maxObtainable(familyTable, id, stock(snapshot));
+            VoidWarehouseExchange.Plan real = VoidWarehouseExchange.planMax(familyTable, id, bound,
+                    stock(snapshot));
+            BigInteger truth = real == null ? BigInteger.ZERO : real.amount();
+            if (bound.compareTo(truth) < 0) {
+                boundSafe = false;
+                boundDetail.append(' ').append(id).append(":上界").append(bound)
+                        .append("<真值").append(truth);
+            }
+        }
+        check("F40 上界永远不小于真值（收窄只能往下压到「没料」，不能压掉拿得到的量）"
+                + boundDetail, boundSafe);
+
+        // ---- F41：把「上界虚高」这件事本身钉死（1.0.11 玩家报的 TPS 问题就出在这）----
+        // 2000 碎片 + 200 海晶石砖：砖拆不回碎片，所以对「取碎片」有用的只有那 2000 个。
+        // 老实现按整族价值算出 3800 ⇒ planMax 从 3800 往下试 1800 次注定失败的规划。
+        // 这里不测时间（会被机器性能带偏），而是直接咬「上界 = 真值」——
+        // 相等就意味着第一次试探就命中，白试 0 次。
+        check("F41 上界 = 真值（2000 碎片 + 200 砖 ⇒ 上界 2000 而不是 3800，"
+                        + "否则每次重算白试 1800 次）",
+                VoidWarehouseExchange.maxObtainable(familyTable, "prismarine_shard",
+                        stock(Map.of("prismarine_shard", 2000, "prismarine_bricks", 200)))
+                        .equals(BigInteger.valueOf(2000)));
     }
 
     // ================================================================ G 回滚精确性

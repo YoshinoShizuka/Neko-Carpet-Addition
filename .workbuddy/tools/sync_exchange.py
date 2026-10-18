@@ -82,7 +82,7 @@ IDENTICAL_FILES = [
 VERSION_SPECIFIC = {
     "VoidWarehouseNav.java": {
         "required": ["int offerCount, boolean shulkerMode, boolean amountSort",
-                     "其中 \" + offerCount + \" 种可用 9 合 1 兑换取出"],
+                     "其中 \" + offerCount + \" 种可用合成兑换取出"],
         "per_version": {
             "modern/26.2": ["Items.STAINED_GLASS_PANE.red()"],
             "modern/26.1.1": ["Items.RED_STAINED_GLASS_PANE"],

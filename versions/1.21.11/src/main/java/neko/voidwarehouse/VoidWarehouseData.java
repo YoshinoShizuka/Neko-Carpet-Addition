@@ -1391,7 +1391,7 @@ public final class VoidWarehouseData extends SavedData {
      *   <li>这件物品<b>仓库里一件都没有</b> —— 有货就不该出现「可兑」格，
      *       否则玩家会看到一个假的库存量，而且点下去会意外消耗别的东西；</li>
      *   <li>现有库存<b>真的能兑出至少 1 个</b> —— 只列「理论上能兑」会把
-     *       9 合 1 表里 53 个物品全列出来，其中绝大多数当前兑不动，纯属噪音。</li>
+     *       兑换表里 54 个物品全列出来，其中绝大多数当前兑不动，纯属噪音。</li>
      * </ol>
      */
     public List<ExchangeOffer> exchangeOffers() {
@@ -1654,7 +1654,7 @@ public final class VoidWarehouseData extends SavedData {
                         + " 个（按整块拆，不留零头）", VoidWarehouseText.ACTION_RGB));
             }
         }
-        lore.add(VoidWarehouseText.line("仓库里没有这种物品，靠 9 合 1 兑换取出", VoidWarehouseText.NOTE));
+        lore.add(VoidWarehouseText.line("仓库里没有这种物品，靠合成兑换取出", VoidWarehouseText.NOTE));
 
         stack.set(DataComponents.LORE, new ItemLore(lore));
         return stack;
@@ -1706,19 +1706,24 @@ public final class VoidWarehouseData extends SavedData {
     /**
      * 这份账目是「拆上级找零」还是「向上合成」？
      *
-     * <p>判据是<b>被扣走的物品在兑换表里的层级</b>：比目标物品大 = 拆零，比目标小 = 合成。
-     * 只要被扣的里面有一个比目标大，就按拆零说 —— 这是能让玩家一眼看懂的口径，
+     * <p>判据是<b>被扣走的物品在兑换表里的价值</b>（{@code 9 个下级 = 1 个上级} 那个价值）：
+     * 比目标物品值钱 = 拆零，比目标便宜 = 合成。只要被扣的里面有一个比目标值钱，
+     * 就按拆零说 —— 这是能让玩家一眼看懂的口径，
      * 因为「拆」和「用」指向的是完全不同的仓库格子。</p>
+     *
+     * <p>为什么不用「层级」：表里现在同时有 9:1 与 4:1 两种比例，
+     * 海晶石和海晶石砖离海晶碎片都只有一跳，但一个值 4、一个值 9 ——
+     * 层级分不出谁大谁小，价值才分得出。</p>
      */
     private static boolean splitsFromAbove(ExchangeOffer offer) {
         VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
         if (!table.contains(offer.itemId())) {
             return false;
         }
-        int target = table.levelOf(offer.itemId());
+        BigInteger target = table.valueOf(offer.itemId());
         for (VoidWarehouseExchange.Delta delta : offer.totalCost()) {
             if (delta.change().signum() < 0 && table.contains(delta.itemId())
-                    && table.levelOf(delta.itemId()) > target) {
+                    && table.valueOf(delta.itemId()).compareTo(target) > 0) {
                 return true;
             }
         }

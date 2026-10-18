@@ -41,16 +41,17 @@ import neko.voidwarehouse.restock.PrinterTakeService;
 import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
 
 /**
- * 【临时自检】「虚空仓库 9 合 1 兑换」这一整条新链路。验证完删掉。
+ * 【临时自检】「虚空仓库 N 合 1 兑换」这一整条新链路。验证完删掉。
  *
  * <h2>要证的东西（每组都配反证）</h2>
  * <ol>
- *   <li><b>A 静态表</b>：29 条边 / 53 个物品 / 双向 20 + 只能向上 8 + 只能向下 1，层级自洽；</li>
+ *   <li><b>A 静态表</b>：30 条边 / 54 个物品 / 双向 20 + 只能向上 9 + 只能向下 1，价值自洽
+ *       （{@code value(big) == count × value(small)}）；</li>
  *   <li><b>B 启动复核</b>：拿真实 {@code RecipeManager} 复核后一条都没被砍（说明表与 26.3 的现实一致）；</li>
- *   <li><b>C 反向核对</b>：把表里每条边<b>还原成 9 个（或 1 个）真实物品</b>，交给真实配方系统去匹配，
- *       产出的东西必须正好是边的另一端 —— 这是「模式本身对不对」的独立第二意见，
+ *   <li><b>C 反向核对</b>：把表里每条边<b>按它自己的比例还原成真实物品</b>（9 个摆 3×3、4 个摆 2×2），
+ *       交给真实配方系统去匹配，产出的东西必须正好是边的另一端 —— 这是「模式本身对不对」的独立第二意见，
  *       不依赖采集脚本没写错；</li>
- *   <li><b>D 守恒不变量</b>（纯逻辑）：{@code Σ(每条 delta × 9^层级) == −need × 9^目标层级}。
+ *   <li><b>D 守恒不变量</b>（纯逻辑）：{@code Σ(每条 delta × 该物品价值) == −need × 目标物品价值}。
  *       这是「不可能刷物」的形式化判据；</li>
  *   <li><b>E 随机 fuzz</b>：随机库存 × 随机目标跑 150 次，凡是成功的规划全部必须守恒；</li>
  *   <li><b>F 数据层</b>：可兑条目入选条件、「统一展示序」与可兑条目数一致、数量次序是排列、虚拟格文案；</li>
@@ -60,20 +61,26 @@ import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
  *   <li><b>J 漏斗出料</b>：分类物是铁锭、仓库里只有铁粒时，漏斗真的被补上；</li>
  *   <li><b>K 潜影盒模式</b>：可兑条目在盒模式下也要「尽量装满一盒」（与真实库存格同口径），
  *       料不够时绝不多给 —— 这一组是玩家报「只给一组 64」之后补的，
- *       补它的理由就是 A~J 组一条盒模式用例都没有。</li>
+ *       补它的理由就是 A~J 组一条盒模式用例都没有；</li>
+ *   <li><b>Q 非 9 比例</b>：{@code 4 海晶碎片 → 1 海晶石} 端到端跑一遍（含界面右键、盒模式、反证）。
+ *       A~P 全部建立在「一块 = 9 个」上，引擎里任何一处把 9 写死，用 9:1 的物品测都是绿的 ——
+ *       只有 4:1 能咬住这种 bug。</li>
  * </ol>
  *
  * <h2>反证组（区分「改对了」与「断言是空转」）</h2>
  * <ul>
  *   <li>有货时绝不兑换：仓里同时有 9 铁粒 + 1 铁锭，取 1 铁锭的账目必须<b>只有</b>铁锭 −1；</li>
- *   <li>单向不可逆：9 铜锭合不出 1 涂蜡铜块（断言返回 null）；浮冰拆不回冰；</li>
- *   <li>凑不够就整次失败：8 铁粒取 1 铁锭 = null，且仓库一个字节都没动；</li>
+ *   <li>单向不可逆：9 铜锭合不出 1 涂蜡铜块（断言返回 null）；浮冰拆不回冰；
+ *       1 个海晶石拆不出碎片（4:1 那条边只有合成方向）；</li>
+ *   <li>凑不够就整次失败：8 铁粒取 1 铁锭 = null，3 个碎片取 1 海晶石 = null；</li>
+ *   <li>多原料不做：海晶灯（5 碎片 + 4 晶体）永远兑不出来；</li>
  *   <li>fuzz 成功次数 ≥ 30（否则「全部守恒」是空转）。</li>
  * </ul>
  */
 public final class VoidWarehouseExchangeSelfCheck {
 
     private static final BigInteger ONE = BigInteger.ONE;
+    private static final BigInteger FOUR = BigInteger.valueOf(4);
     private static final BigInteger NINE = BigInteger.valueOf(9);
 
     /** 前几个 tick 先等配方表读好（配方跟着数据包重载，构造完成的那一刻不一定就绪） */
@@ -167,6 +174,9 @@ public final class VoidWarehouseExchangeSelfCheck {
                 splitRemainderChecks(server);
                 break;
             case 15:
+                countChecks(server);
+                break;
+            case 16:
                 cleanup(server);
                 break;
             default:
@@ -182,10 +192,10 @@ public final class VoidWarehouseExchangeSelfCheck {
         System.out.println("=== A 静态表 ===");
         VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
 
-        check("A1 声明 29 条边", VoidWarehouseExchange.EDGES.size() == 29);
-        check("A2 建表后生效 29 条边", table.edges().size() == 29);
-        check("A3 层级自相矛盾被丢掉的边 = 0", table.dropped().isEmpty());
-        check("A4 表里共 53 个物品", table.items().size() == 53);
+        check("A1 声明 30 条边", VoidWarehouseExchange.EDGES.size() == 30);
+        check("A2 建表后生效 30 条边", table.edges().size() == 30);
+        check("A3 价值自相矛盾被丢掉的边 = 0", table.dropped().isEmpty());
+        check("A4 表里共 54 个物品", table.items().size() == 54);
 
         int both = 0;
         int combineOnly = 0;
@@ -200,16 +210,21 @@ public final class VoidWarehouseExchangeSelfCheck {
             }
         }
         check("A5 双向边 20 条（实际 " + both + "）", both == 20);
-        check("A6 只能向上合成 8 条（实际 " + combineOnly + "）", combineOnly == 8);
+        check("A6 只能向上合成 9 条（实际 " + combineOnly + "）", combineOnly == 9);
         check("A7 只能向下拆分 1 条（实际 " + splitOnly + "）", splitOnly == 1);
 
-        check("A8 铁粒层级 +1 == 铁锭层级", table.levelOf("iron_nugget") + 1 == table.levelOf("iron_ingot"));
-        check("A9 铁锭层级 +1 == 铁块层级", table.levelOf("iron_ingot") + 1 == table.levelOf("iron_block"));
-        check("A10 浮冰层级 +1 == 蓝冰层级", table.levelOf("packed_ice") + 1 == table.levelOf("blue_ice"));
-        check("A11 冰层级 +2 == 蓝冰层级（三级链）", table.levelOf("ice") + 2 == table.levelOf("blue_ice"));
+        // 价值（不是「层级」）：value(big) == count × value(small)
+        check("A8 铁锭价值 = 9 × 铁粒价值",
+                table.valueOf("iron_ingot").equals(table.valueOf("iron_nugget").multiply(NINE)));
+        check("A9 铁块价值 = 9 × 铁锭价值",
+                table.valueOf("iron_block").equals(table.valueOf("iron_ingot").multiply(NINE)));
+        check("A10 蓝冰价值 = 9 × 浮冰价值",
+                table.valueOf("blue_ice").equals(table.valueOf("packed_ice").multiply(NINE)));
+        check("A11 蓝冰价值 = 81 × 冰价值（三级链）",
+                table.valueOf("blue_ice").equals(table.valueOf("ice").multiply(NINE).multiply(NINE)));
 
-        check("A12 makersOf(铁锭) 含铁粒", table.makersOf("iron_ingot").contains("iron_nugget"));
-        check("A13 splittersOf(铁锭) 含铁块", table.splittersOf("iron_ingot").contains("iron_block"));
+        check("A12 makersOf(铁锭) 含铁粒", hasMaker(table, "iron_ingot", "iron_nugget"));
+        check("A13 splittersOf(铁锭) 含铁块", hasSplitter(table, "iron_ingot", "iron_block"));
         check("A14 反证：makersOf(涂蜡铜块) 为空（9 铜锭合不出涂蜡铜块）",
                 table.makersOf("waxed_copper_block").isEmpty());
         check("A15 反证：splittersOf(涂蜡铜块) 为空（涂蜡铜块不可再拆）",
@@ -217,6 +232,40 @@ public final class VoidWarehouseExchangeSelfCheck {
         check("A16 反证：splittersOf(冰) 为空（浮冰拆不回冰）", table.splittersOf("ice").isEmpty());
         check("A17 反证：圆石不在表里", !table.contains("cobblestone"));
         check("A18 反证：泥土不在表里", !table.contains("dirt"));
+
+        // ---- 4:1 的那一条（全表唯一的非 9 比例）----
+        check("A19 海晶石价值 = 4 × 海晶碎片价值（不是 9）",
+                table.valueOf("prismarine").equals(table.valueOf("prismarine_shard").multiply(FOUR)));
+        check("A20 海晶石砖价值 = 9 × 海晶碎片价值",
+                table.valueOf("prismarine_bricks").equals(table.valueOf("prismarine_shard").multiply(NINE)));
+        check("A21 海晶石与海晶石砖同族（碎片能往两边走）",
+                table.familyOf("prismarine").contains("prismarine_bricks"));
+        check("A22 makersOf(海晶石) 就是碎片这一条", hasMaker(table, "prismarine", "prismarine_shard")
+                && table.makersOf("prismarine").size() == 1);
+        check("A23 反证：splittersOf(海晶石) 为空（原版没有「1 海晶石 → 4 碎片」）",
+                table.splittersOf("prismarine").isEmpty());
+        check("A24 反证：海晶灯不在表里（5 碎片 + 4 晶体 = 多原料，本规则不做）",
+                !table.contains("sea_lantern"));
+    }
+
+    /** {@code item} 有没有「用 {@code small} 合成」这条边 */
+    private static boolean hasMaker(VoidWarehouseExchange.Table table, String item, String small) {
+        for (VoidWarehouseExchange.Edge edge : table.makersOf(item)) {
+            if (edge.small().equals(small)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** {@code item} 有没有「从 {@code big} 拆出来」这条边 */
+    private static boolean hasSplitter(VoidWarehouseExchange.Table table, String item, String big) {
+        for (VoidWarehouseExchange.Edge edge : table.splittersOf(item)) {
+            if (edge.big().equals(big)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ================================================================ B 启动复核
@@ -240,7 +289,7 @@ public final class VoidWarehouseExchangeSelfCheck {
         System.out.println("   [B] 声明 " + declared + " 条边，其中 " + unavailable
                 + " 条的物品在本版本不存在（26.2 起才有硫磺 / 浓缩硫）");
 
-        check("B1 声明 29 条边（表本身不随版本变）", declared == 29);
+        check("B1 声明 30 条边（表本身不随版本变）", declared == 30);
         check("B2 作废条数 == 「物品在本版本不存在」的条数（" + unavailable + "，实际 "
                 + summary.dropped() + "）", summary.dropped() == unavailable);
         check("B3 kept + dropped == declared", summary.kept() + summary.dropped() == declared);
@@ -277,33 +326,49 @@ public final class VoidWarehouseExchangeSelfCheck {
             }
             if (edge.canCombine()) {
                 combineTotal++;
-                // 3×3 全填满同一种物品（每个格子 1 个，共 9 个）
-                if (matches(server, level, 3, 3, small, big, 1)) {
+                // 按<b>这条边自己的比例</b>铺网格：9 个 → 3×3，4 个 → 2×2，其余一行平铺
+                int[] grid = gridFor(edge.count());
+                if (matches(server, level, grid[0], grid[1], small, big, 1)) {
                     combineOk++;
                 } else {
-                    check("C 9×" + edge.small() + " 能合成 1×" + edge.big(), false);
+                    check("C " + edge.count() + "×" + edge.small() + " 能合成 1×" + edge.big(), false);
                 }
             }
             if (edge.canSplit()) {
                 splitTotal++;
-                // 1×1 只放 1 个
-                if (matches(server, level, 1, 1, big, small, 9)) {
+                // 1×1 只放 1 个，产出的个数必须是这条边的比例
+                if (matches(server, level, 1, 1, big, small, edge.count())) {
                     splitOk++;
                 } else {
-                    check("C 1×" + edge.big() + " 能拆成 9×" + edge.small(), false);
+                    check("C 1×" + edge.big() + " 能拆成 " + edge.count() + "×" + edge.small(), false);
                 }
             }
         }
-        System.out.println("   [C] 9 合 1 匹配 " + combineOk + "/" + combineTotal
-                + "，1 拆 9 匹配 " + splitOk + "/" + splitTotal + "，跳过（物品缺失）" + skipped);
-        check("C1 全部 " + combineTotal + " 条可用的「9 合 1」都在真实配方系统里匹配成功",
+        System.out.println("   [C] N 合 1 匹配 " + combineOk + "/" + combineTotal
+                + "，1 拆 N 匹配 " + splitOk + "/" + splitTotal + "，跳过（物品缺失）" + skipped);
+        check("C1 全部 " + combineTotal + " 条可用的「N 合 1」都在真实配方系统里匹配成功",
                 combineOk == combineTotal);
-        check("C2 全部 " + splitTotal + " 条可用的「1 拆 9」都在真实配方系统里匹配成功",
+        check("C2 全部 " + splitTotal + " 条可用的「1 拆 N」都在真实配方系统里匹配成功",
                 splitOk == splitTotal);
         check("C3 因物品缺失而跳过的条数 == 启动复核作废的条数（" + skipped + "）",
                 skipped == VoidWarehouseExchangeBootstrap.summary().dropped());
         check("C4 反证：随便放 9 个圆石匹配不到铁锭（匹配方法有牙）",
                 !matches(server, level, 3, 3, Items.COBBLESTONE, Items.IRON_INGOT, 1));
+    }
+
+    /**
+     * 「{@code count} 个同种物品」在合成网格里怎么摆：9 → 3×3、4 → 2×2，
+     * 其余（2 / 3）平铺成一行。原版只有 shapeless 的 9 项、shaped 的 3×3 与 2×2 三种形态，
+     * 这几个分支够用；真出现摆不下的比例，匹配会失败并报出具体是哪条边。
+     */
+    private static int[] gridFor(int count) {
+        if (count == 9) {
+            return new int[]{3, 3};
+        }
+        if (count == 4) {
+            return new int[]{2, 2};
+        }
+        return new int[]{count, 1};
     }
 
     /** 把 {@code w×h} 个格子的输入喂给真实配方系统，看产出的东西是不是 {@code out × outCount} */
@@ -1294,6 +1359,112 @@ public final class VoidWarehouseExchangeSelfCheck {
         VoidWarehouseViews.viewFor(player).setShulkerMode(false);
     }
 
+    // ================================================================ Q 非 9 比例（4:1 海晶石）
+
+    /**
+     * 这一组专测「比例不是 9」的那条边（{@code 4 海晶碎片 → 1 海晶石}）。
+     *
+     * <p>为什么非要有这一组：A~P 全部断言都建立在「一块 = 9 个」上，
+     * 引擎里任何一处把 9 写死的地方，用 9:1 的物品测都是绿的 ——
+     * 只有拿 4:1 的物品跑一遍，才会暴露「乘 9 而不是乘边上的比例」。</p>
+     *
+     * <p>同时咬住两条反证：<b>海晶石拆不回碎片</b>（原版没有那个配方）、
+     * <b>海晶灯兑不出</b>（5 碎片 + 4 晶体，多原料，本规则不做）。</p>
+     */
+    private static void countChecks(MinecraftServer server) {
+        System.out.println("=== Q 非 9 比例：4 海晶碎片 → 1 海晶石 ===");
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
+
+        // ---- 纯逻辑：4 个换 1 个，多一个少一个都不行 ----
+        VoidWarehouseExchange.Plan p = plan(table, "prismarine", 1, Map.of("prismarine_shard", 4));
+        System.out.println("   [Q] 4 碎片 -> 1 海晶石：" + ledger(p));
+        check("Q1 4 碎片能兑 1 个海晶石，且只扣 4 碎片",
+                p != null && p.asMap().size() == 1 && change(p, "prismarine_shard").equals(FOUR.negate()));
+        checkConserved(table, "Q1 4 碎片 -> 1 海晶石", p);
+        check("Q2 反证：3 碎片取 1 海晶石 无解（差一个就是差一个）",
+                plan(table, "prismarine", 1, Map.of("prismarine_shard", 3)) == null);
+
+        check("Q3 反证：1 个海晶石取 1 个碎片 无解（原版没有拆分配方，不能逆用 4:1）",
+                plan(table, "prismarine_shard", 1, Map.of("prismarine", 1)) == null);
+
+        p = VoidWarehouseExchange.planMax(table, "prismarine", BigInteger.valueOf(64),
+                stock(Map.of("prismarine_shard", 9)));
+        System.out.println("   [Q] 9 碎片最多能拿几个海晶石：" + ledger(p));
+        check("Q4 9 碎片最多兑 2 个海晶石（9/4 = 2，剩 1 个碎片当零头）",
+                p != null && p.amount().equals(BigInteger.TWO));
+        checkConserved(table, "Q4 9 碎片尽力取海晶石", p);
+
+        p = VoidWarehouseExchange.planMax(table, "prismarine_bricks", BigInteger.valueOf(64),
+                stock(Map.of("prismarine_shard", 18)));
+        System.out.println("   [Q] 18 碎片最多能拿几个海晶石砖：" + ledger(p));
+        check("Q5 18 碎片最多兑 2 个海晶石砖（那条边还是 9:1）",
+                p != null && p.amount().equals(BigInteger.TWO));
+        checkConserved(table, "Q5 18 碎片尽力取海晶石砖", p);
+
+        check("Q6 反证：海晶灯兑不出来（5 碎片 + 4 晶体 是多原料配方，本规则不管）",
+                plan(table, "sea_lantern", 1,
+                        Map.of("prismarine_shard", 64, "prismarine_crystals", 64)) == null);
+
+        // ---- 数据层 / 界面：玩家真的右键一次会拿到几个 ----
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        check("Q6b 假玩家可构造", player != null);
+        if (player == null) {
+            return;
+        }
+        Item shard = VoidWarehouseExchangeBootstrap.itemOf("prismarine_shard");
+        Item prismarine = VoidWarehouseExchangeBootstrap.itemOf("prismarine");
+        if (shard == null || prismarine == null) {
+            check("Q7 本版本里没有海晶碎片 / 海晶石（不该发生）", false);
+            return;
+        }
+
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(shard, 18));
+        VoidWarehouseData.ExchangeOffer offer = offerOf(data.exchangeOffers(), "prismarine");
+        check("Q7 仓库 18 碎片时，海晶石那格「可兑 4」（18/4，不是 18/9 = 2）",
+                offer != null && offer.obtainable().equals(FOUR));
+        check("Q8 一次取货量也是 4（与可兑数量同源，都来自规划器）",
+                offer != null && offer.bulk().equals(FOUR));
+
+        VoidWarehouseMenu menu = openMenu(player);
+        if (menu != null) {
+            VoidWarehousePageContainer container = (VoidWarehousePageContainer) menu.getContainer();
+            int slot = findExchangeSlot(container, "prismarine");
+            check("Q9 界面上找得到海晶石的可兑槽", slot >= 0);
+            if (slot >= 0) {
+                int before = countInInventory(player, prismarine);
+                menu.clicked(slot, 1, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                check("Q10 右键一次真的拿到 4 个海晶石（不是 9 个）",
+                        countInInventory(player, prismarine) - before == 4);
+                check("Q11 仓库只剩 2 个碎片（" + snapshot(data) + "）",
+                        snapshot(data).equals(Map.of("prismarine_shard", BigInteger.TWO)));
+            }
+        }
+
+        // ---- 盒模式：一盒装得下就按料给，料不够绝不多给 ----
+        prepare(data, player);
+        data.insert(new ItemStack(shard, 18));
+        data.insert(new ItemStack(Items.SHULKER_SHELL, VoidWarehouseShulker.SHELL_COST));
+        data.insert(new ItemStack(Items.CHEST, VoidWarehouseShulker.CHEST_COST));
+        VoidWarehouseData.ExchangeOffer boxed = offerOf(data.exchangeOffers(), "prismarine");
+        check("Q12 盒模式下「一盒能装几个」还是 4（料只够 4 个，不许按一盒容量报数）",
+                boxed != null && boxed.boxed().equals(FOUR));
+
+        // ---- 混合族：一块海晶石 + 9 个碎片，够换 1 个砖 ----
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(prismarine, 1));
+        data.insert(new ItemStack(shard, 9));
+        VoidWarehouseData.ExchangeOffer mixed = offerOf(data.exchangeOffers(), "prismarine_bricks");
+        check("Q13 1 海晶石 + 9 碎片：海晶石砖可兑 1（4 + 9 = 13 价值，一个砖要 9）",
+                mixed != null && mixed.obtainable().equals(ONE) && mixed.bulk().equals(ONE));
+
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+    }
+
     private static void cleanup(MinecraftServer server) {
         ServerLevel level = server.overworld();
         if (hopperPos != null) {
@@ -1333,33 +1504,28 @@ public final class VoidWarehouseExchangeSelfCheck {
         return plan == null ? BigInteger.ZERO : plan.asMap().getOrDefault(itemId, BigInteger.ZERO);
     }
 
-    /** 守恒判据：{@code Σ(delta × 9^(层级 − 最低层级)) == −amount × 9^(目标层级 − 最低层级)} */
+    /**
+     * 守恒判据：{@code Σ(delta × 该物品价值) == −amount × 目标物品价值}。
+     *
+     * <p>价值直接从表里取（{@link VoidWarehouseExchange.Table#valueOf}），
+     * <b>不再自己按 9 的幂算</b> —— 自己算等于把「9」这个前提又抄了一遍，
+     * 表里一旦有多比例（4:1），断言就和被测代码一起错，测不出东西。</p>
+     */
     private static boolean conserved(VoidWarehouseExchange.Table table, VoidWarehouseExchange.Plan plan) {
         if (plan == null) {
             return false;
         }
-        int min = Integer.MAX_VALUE;
-        for (String itemId : table.items()) {
-            min = Math.min(min, table.levelOf(itemId));
-        }
-        if (min == Integer.MAX_VALUE) {
-            return false;
-        }
         BigInteger left = BigInteger.ZERO;
         for (VoidWarehouseExchange.Delta delta : plan.deltas()) {
-            left = left.add(delta.change().multiply(weight(table, delta.itemId(), min)));
+            left = left.add(delta.change().multiply(table.valueOf(delta.itemId())));
         }
-        BigInteger right = plan.amount().negate().multiply(weight(table, plan.itemId(), min));
+        BigInteger right = plan.amount().negate().multiply(table.valueOf(plan.itemId()));
         return left.equals(right);
-    }
-
-    private static BigInteger weight(VoidWarehouseExchange.Table table, String itemId, int minLevel) {
-        return NINE.pow(table.levelOf(itemId) - minLevel);
     }
 
     private static void checkConserved(VoidWarehouseExchange.Table table, String label,
                                        VoidWarehouseExchange.Plan plan) {
-        check(label + " 守恒（Σ 数量×9^层级 == −需求×9^目标层级）", conserved(table, plan));
+        check(label + " 守恒（Σ 数量×价值 == −需求×目标价值）", conserved(table, plan));
     }
 
     private static String ledger(VoidWarehouseExchange.Plan plan) {

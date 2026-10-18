@@ -194,7 +194,7 @@ final class VoidWarehouseNav {
                 + VoidWarehouseText.count(totalAmount) + " 个", VoidWarehouseText.VALUE));
         // 有「可兑」条目时补一行：不写的话玩家会以为那些灰格子是仓库里真有的东西
         if (offerCount > 0) {
-            lore.add(VoidWarehouseText.line("其中 " + offerCount + " 种可用 9 合 1 兑换取出"
+            lore.add(VoidWarehouseText.line("其中 " + offerCount + " 种可用合成兑换取出"
                     + "（格子上标着「可兑」）", VoidWarehouseText.FACT));
         }
         lore.add(VoidWarehouseText.line("每种物品一格，数量无上限", VoidWarehouseText.NOTE));

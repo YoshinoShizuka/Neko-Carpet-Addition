@@ -1,0 +1,93 @@
+name: Build
+
+# 五个 Minecraft 版本各是一个独立子工程，构建必须**逐个**跑：
+# 一次性 `./gradlew build` 会把全部版本塞进同一个 JVM，TinyRemapper 在 JDK 25 上会崩。
+# 所以这里用 matrix —— 每个版本一个独立 job（独立 JVM、独立缓存键），彼此隔离。
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: MC ${{ matrix.mc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 26.x：Minecraft 不再混淆，Loom 用 fabric-loom（无 remap）
+          - { mc: '26.3',    project: ':modern:26.3',      dir: 'modern/26.3' }
+          - { mc: '26.2',    project: ':modern:26.2',      dir: 'modern/26.2' }
+          - { mc: '26.1.2',  project: ':modern:26.1.2',    dir: 'modern/26.1.2' }
+          - { mc: '26.1.1',  project: ':modern:26.1.1',    dir: 'modern/26.1.1' }
+          # 1.21.x：仍是混淆版本，Loom 用 fabric-loom-remap + 映射（源码级 --release 21）
+          - { mc: '1.21.11', project: ':versions:1.21.11', dir: 'versions/1.21.11' }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 统一用 JDK 25：26.x 的 release=25 必须它；1.21.11 的 release=21 在 JDK 25 上靠
+      # `--release 21` 编译（本地五个版本都是用 JDK 25 构建验证过的，不另配 toolchain）。
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # 缓存 ~/.gradle（含 Loom 下载的 Minecraft jar 与映射），命中后单版本构建是秒级
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build ${{ matrix.project }}
+        run: ./gradlew ${{ matrix.project }}:build --no-daemon --stacktrace
+
+      - name: Collect jars
+        run: |
+          mkdir -p artifacts
+          cp "${{ matrix.dir }}"/build/libs/*.jar artifacts/
+          ls -la artifacts
+
+      - name: Upload jars (MC ${{ matrix.mc }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: carpet-Neko-Addition-mc${{ matrix.mc }}
+          path: artifacts/*.jar
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Release ${{ github.ref_name }}
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all jars
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -la artifacts
+          gh release create "$TAG" artifacts/*.jar \
+            --title "$TAG" \
+            --generate-notes \
+            --verify-tag

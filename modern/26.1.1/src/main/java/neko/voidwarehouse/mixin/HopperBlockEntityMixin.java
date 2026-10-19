@@ -1,0 +1,374 @@
+package neko.voidwarehouse.mixin;
+
+import neko.voidwarehouse.VoidWarehouseClassifier;
+import neko.voidwarehouse.VoidWarehouseExtractor;
+import neko.voidwarehouse.VoidWarehouseHopper;
+import neko.voidwarehouse.VoidWarehouseHopperFilter;
+import neko.voidwarehouse.VoidWarehouseSettings;
+import neko.voidwarehouse.VoidWarehouseTerminals;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.storage.ValueInput;
+import net.minecraft.world.level.storage.ValueOutput;
+import org.spongepowered.asm.mixin.Mixin;
+
+import java.util.List;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+/**
+ * 漏斗与虚空仓库之间的两个方向 + 分类物白名单。
+ *
+ * <h2>① 入库（无速率上限）—— 漏斗口<b>朝向</b>终端</h2>
+ * <p>挂在 {@code HopperBlockEntity#pushItemsTick} 的 HEAD 与 TAIL 两处，配合起来把
+ * 「8 gt 搬 1 个」这条节流彻底拆掉：</p>
+ * <ul>
+ *   <li><b>HEAD</b>（ {@link #carpetAutomending$voidWarehouseUnlimited}）：每 tick 一次
+ *       <b>全量清扫</b> —— 先搬空漏斗、再把上方容器 / 上方路过的掉落物能收的全收进来、
+ *       收完当场再搬空一次（{@link VoidWarehouseHopper#intake}）。HEAD 是原版 ticker 的必经之处，
+ *       <b>不看冷却脸色</b>，所以真正的搬运不再受 8 gt 限制；</li>
+ *   <li><b>TAIL</b>（ {@link #carpetAutomending$unlimitedCooldown}）：整条 tick 走完之后把
+ *       {@code cooldownTime} 清零，让原版 {@code tryMoveItems} 那两条路径
+ *       （{@code suckInItems} 本体、{@code entityInside} 触发的那次）也不被 8 gt 卡着。
+ *       必须放在这里 —— 早先放在 {@code suckInItems} 中途是<b>无效的</b>，
+ *       {@code tryMoveItems} 收尾会立刻把 {@code setCooldown(8)} 盖回去。</li>
+ * </ul>
+ * <p><b>不取消原版逻辑</b>，原因有两个：</p>
+ * <ol>
+ *   <li>原版只往「容器」里推东西，而工作台不是容器，所以原版这一段对本仓库是空操作，
+ *       不会把物品推到别处去；</li>
+ *   <li>保留原版逻辑，红石 /  comparator 等一套语义都还成立，我们只是把「能搬多少」
+ *       这一件事改成不受限。</li>
+ * </ol>
+ *
+ * <h2>② 出料 —— 终端压在漏斗<b>正上方</b></h2>
+ * <p>同一次注入里顺手判一下：正上方是不是也是终端。是的话就换成
+ * {@link VoidWarehouseExtractor#pull}，按漏斗 5 格里的<b>分类物</b>把仓库的料补进漏斗。
+ * 两个方向靠「漏斗口朝哪」区分；两者同时成立时<b>以入库为准</b>
+ * （{@link VoidWarehouseExtractor#isExtractor} 里说明），所以本轮之前搭好的机器行为不变。</p>
+ *
+ * <h2>③ 分类物保护 + 无上限出料 —— 接管 {@code ejectItems}</h2>
+ * <p>出料模式下，漏斗每格物品的<b>最后 1 个</b>是分类物，绝不能被下游容器吸走
+ * （不然仓库一抽空，分类就没了）。原版 {@code ejectItems} 是「从头扫、谁非空就搬 1 个」，
+ * 会毫不犹豫地把最后一并搬走，所以这里在 HEAD 处整段接管，换成
+ * {@link VoidWarehouseExtractor#eject}（跳过数量 ≤ 1 的格子，并把该格其余存货<b>整格</b>推下去）。</p>
+ * <p>整格搬 + 收尾清冷却（{@link #carpetAutomending$unlimitedCooldown}）合起来，
+ * 出料端就与入库端同一个速率口径：<b>一 tick 把漏斗能倒的全倒出去</b>，
+ * 下游容器的容量才是唯一的限制。</p>
+ * <p>非出料模式的漏斗一个字节都不碰，走的还是原版方法体。</p>
+ *
+ * <h2>④ 入库分类物白名单 —— 主闸门在 {@code Container#canPlaceItem}，这里是一份兜底</h2>
+ * <p><b>契约层主闸门</b>见 {@code ContainerClassifierMixin}：它挂在
+ * {@code Container#canPlaceItem} 上。vanilla 的 {@code canPlaceItemInContainer} 本身就是
+ * 「{@code canPlaceItem} && {@code canPlaceItemThroughFace}」，而会整个换掉漏斗搬运的优化模组
+ * （实测：Lithium 的 {@code HopperHelper#tryMoveSingleItem}）<b>只读容器契约、从不调
+ * canPlaceItemInContainer</b> —— 所以白名单必须挂在契约层，否则在实机上整条失效
+ * （服务端自检没有这些优化模组，会一直是绿的）。</p>
+ * <p>本类下面那份 {@code canPlaceItemInContainer} 注入只是<b>防御性副本</b>，
+ * 判定逻辑与契约层共用 {@link VoidWarehouseClassifier#blockMachineInsert} 一份代码。
+ * 玩家手动放物品走的是 {@code Slot#setByPlayer}，而漏斗界面槽位的
+ * {@code Slot#mayPlace} 恒为 {@code true}（已核对字节码），<b>不经过任何 canPlaceItem</b> ——
+ * 所以过滤的效果正好是「只有分类物进得来、玩家的手不受限制」。</p>
+ * <p>过滤是<b>两道</b>：先 {@link VoidWarehouseClassifier#matchesAny} 问
+ * 「是不是白名单上的物品」，再 {@link VoidWarehouseClassifier#isOwnSlot} 问
+ * 「这一格是不是它的格子」。第二道不能省 —— 少了它，分类物会被原版
+ * {@code addItem} 的逐格试放摊到 5 个格子上（详见
+ * {@link VoidWarehouseClassifier#isOwnSlot} 里记的那次事故）。</p>
+ * <p>过滤模式本身是个<b>跟着方块实体一起存进存档</b>的布尔标记（见
+ * {@link VoidWarehouseHopperFilter}），由 {@code SlotMixin} 在玩家手动放东西时打开、
+ * 在漏斗被掏空时关掉。标记只在「口朝向终端」的入库漏斗上生效，
+ * <b>普通漏斗即使带着标记也完全按原版跑</b>。</p>
+ * <p><b>旧存档兼容性</b>：种子清单上线前的旧存档只存了这个布尔标记、没有逐格种子，
+ * 当年的分类物是「反推漏斗当前内容」得来的（会把残留货物一并认成分类物，
+ * 事故现场 {@code 橡木 石头 空 空 空}）。这类存档加载时<b>不再信任</b>：
+ * {@link VoidWarehouseClassifier#healLegacy} 直接清掉种子、关掉过滤，让玩家重新手动指定
+ * （分类物只能由玩家的手声明）。带新格式 schema 标记（{@code CLASSIFIER_SCHEMA_TAG}）的
+ * 存档才信任其逐格种子。</p>
+ * <p>这一处注入写的是 {@code require = 0}：{@code canPlaceItemInContainer} 是
+ * {@code private static} 的私有实现，原版以后把它内联进 {@code tryMoveInItem} 是完全可能的。
+ * 真到那一天，我们宁可「这一个功能悄悄失效」，也不要「整个模组加载失败、把所有人的服务器带崩」 ——
+ * 而「失效」这件事本身在真实服务端的自检里是逐条断言过的，不会没人发现。</p>
+ *
+ * <h2>红石语义不变</h2>
+ * <p>漏斗被红石锁存时原版 {@code ENABLED = false}、整个漏斗停摆，这里同样直接返回，
+ * 不会「无视红石往仓库里灌」、也不会「无视红石往外倒料」。</p>
+ */
+@Mixin(HopperBlockEntity.class)
+public abstract class HopperBlockEntityMixin implements VoidWarehouseHopperFilter {
+
+    /** 存档里那个布尔标记的键名（与 {@code TransferCooldown} 平级，只在本模组用到时才写） */
+    private static final String CLASSIFIER_FILTER_TAG = "CarpetNekoAdditionClassifierFilter";
+
+    /** 存档里「玩家指定的分类物清单」的键名（定长 5 条，空格写 {@code ItemStack.EMPTY}） */
+    private static final String CLASSIFIER_SEED_TAG = "CarpetNekoAdditionClassifierSeeds";
+
+    /** 存档格式标记：带这个键的才信任其逐格种子；不带的一律按旧存档治愈（清掉污染） */
+    private static final String CLASSIFIER_SCHEMA_TAG = "CarpetNekoAdditionClassifierSchema";
+
+    /** 漏斗的格子数（原版固定 5，这里写成常量省得每次问容器） */
+    private static final int HOPPER_SLOTS = 5;
+
+    /**
+     * 这个漏斗有没有被玩家声明过分类物。
+     *
+     * <p>{@code @Unique} = 这个字段是混入 {@code HopperBlockEntity} 的，
+     * 每个漏斗一份、跟方块实体同生共死；默认 {@code false}（没有声明过 = 原版行为）。</p>
+     */
+    @Unique
+    private boolean carpetAutomending$classifierFilter;
+
+    /**
+     * <b>玩家亲手指定的分类物清单</b>（按格子下标对齐，{@code null} / 空 = 这一格没指定）。
+     *
+     * <p>与 {@link #carpetAutomending$classifierFilter} 的区别：开关只说「这个漏斗有分类物吗」，
+     * 这份清单才真正回答「是哪几件、分别在哪一格」。
+     * <b>绝不能靠反推漏斗当前内容来回答后一个问题</b> —— 那会把任何残留在漏斗里的
+     * 货物一并认成分类物（实测：玩家只摆了橡木，漏斗却变成 {@code 橡木 石头 空 空 空}）。</p>
+     */
+    @Unique
+    private ItemStack[] carpetAutomending$classifierSeeds = new ItemStack[HOPPER_SLOTS];
+
+    /**
+     * 原版的搬运冷却字段（{@code cooldownTime}，private）。
+     * 入库漏斗在整条 tick 收尾处把它清零（见 {@link #carpetAutomending$unlimitedCooldown}），
+     * 让原版 {@code tryMoveItems} 不再被「每 8 gt 才动一次」卡住。
+     */
+    @Shadow
+    private int cooldownTime;
+
+    @Override
+    public boolean hasClassifierFilter() {
+        return this.carpetAutomending$classifierFilter;
+    }
+
+    @Override
+    public void setClassifierFilter(boolean enabled) {
+        this.carpetAutomending$classifierFilter = enabled;
+    }
+
+    @Override
+    public ItemStack getClassifierSeed(int slot) {
+        if (slot < 0 || slot >= this.carpetAutomending$classifierSeeds.length) {
+            return ItemStack.EMPTY;
+        }
+        ItemStack seed = this.carpetAutomending$classifierSeeds[slot];
+        return seed == null ? ItemStack.EMPTY : seed;
+    }
+
+    @Override
+    public void setClassifierSeed(int slot, ItemStack stack) {
+        if (slot < 0 || slot >= this.carpetAutomending$classifierSeeds.length) {
+            return;
+        }
+        // 只存「种类」：数量归一是刻意的 —— 分类物回答的是「这是什么」，
+        // 与这一格此刻有几个无关（货物灌进来时数量会在 1 和 64 之间反复横跳）
+        this.carpetAutomending$classifierSeeds[slot] =
+                stack == null || stack.isEmpty() ? null : stack.copyWithCount(1);
+    }
+
+    @Override
+    public void resetCooldown() {
+        this.cooldownTime = 0;
+    }
+
+    /**
+     * 把标记写进方块实体自己的存档（只在打开过时才写，普通漏斗的 NBT 一个字节都不多）。
+     */
+    @Inject(method = "saveAdditional", at = @At("TAIL"))
+    private void carpetAutomending$saveClassifierFilter(ValueOutput output, CallbackInfo ci) {
+        if (this.carpetAutomending$classifierFilter) {
+            output.putBoolean(CLASSIFIER_FILTER_TAG, true);
+            // 新格式标记：带它才说明逐格种子是「玩家亲手指定的」，加载时值得信任。
+            // 旧存档（种子清单上线前写的）没有这个标记，加载时一律按污染治愈、清掉重来。
+            output.putBoolean(CLASSIFIER_SCHEMA_TAG, true);
+            // 按格子独立写 key，<b>空槽一律跳过</b>：ItemStack.CODEC 拒绝 air（count=0），
+            // 当初图省事用定长 list 把 5 格全写进去，空槽的 EMPTY 会触发
+            // 「Failed to append ... minecraft:air」警告并静默丢弃 —— 虽然不影响对齐，
+            // 但会把日志刷爆，也埋下「读回来数量对不上」的隐患。
+            for (int i = 0; i < HOPPER_SLOTS; i++) {
+                ItemStack seed = this.getClassifierSeed(i);
+                if (!seed.isEmpty()) {
+                    output.store(CLASSIFIER_SEED_TAG + i, ItemStack.CODEC, seed);
+                }
+            }
+        }
+    }
+
+    /**
+     * 从存档读回标记与分类物清单：<b>服务器重启、区块卸载重载之后，白名单照样在</b>。
+     *
+     * <p>标签不存在时读成 {@code false} / 全空（老存档 / 普通漏斗）。
+     * 老存档（种子清单上线前写的）只有开关、没有逐格种子，当年的分类物是「反推漏斗
+     * 当前内容」得来的 —— 会把残留货物一并认成分类物。这类存档<b>不再信任</b>：
+     * 由 {@link VoidWarehouseClassifier#healLegacy} 直接清掉种子、关掉过滤，
+     * 让玩家重新手动指定（分类物只能由玩家的手声明）。</p>
+     */
+    @Inject(method = "loadAdditional", at = @At("HEAD"))
+    private void carpetAutomending$loadClassifierFilter(ValueInput input, CallbackInfo ci) {
+        this.carpetAutomending$classifierFilter = input.getBooleanOr(CLASSIFIER_FILTER_TAG, false);
+        boolean schemaOk = input.getBooleanOr(CLASSIFIER_SCHEMA_TAG, false);
+        if (!schemaOk) {
+            // 旧存档（种子清单上线前写的）：filter 开关可能是开的，但分类物是当年靠
+            // 「反推漏斗当前内容」得来的 —— 漏斗里若混着杂物（事故现场 橡木 石头 空 空 空），
+            // 那份杂物会被一并认成分类物、写成永久的逐格种子，以后每次加载都复现。
+            // 不信任：直接清掉所有种子、关掉过滤，让玩家重新手动指定。
+            // （分类物只能由玩家的手声明，这是硬规则，不能靠反推漏斗内容猜。）
+            VoidWarehouseClassifier.healLegacy(this, false);
+            return;
+        }
+        for (int i = 0; i < HOPPER_SLOTS; i++) {
+            // 按格子独立读：写着的那几格读回来，没写的那几格保持空（没被指定过）
+            final int slot = i;
+            input.read(CLASSIFIER_SEED_TAG + i, ItemStack.CODEC)
+                    .ifPresent(seed -> this.setClassifierSeed(slot, seed));
+        }
+    }
+
+    @Inject(method = "pushItemsTick", at = @At("HEAD"))
+    private static void carpetAutomending$voidWarehouseUnlimited(Level level, BlockPos pos, BlockState state,
+                                                                 HopperBlockEntity hopper, CallbackInfo ci) {
+        if (!VoidWarehouseSettings.voidWarehouse) {
+            return;
+        }
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return;
+        }
+        // 红石锁存时与原版一致：整个漏斗停摆
+        if (!state.getValue(HopperBlock.ENABLED)) {
+            return;
+        }
+        // 漏斗口指向的方块是不是仓库终端？（下面的面：原版没有朝上的漏斗，天然排除）
+        if (VoidWarehouseHopper.isIntake(serverLevel, pos, state)) {
+            VoidWarehouseHopperFilter self = (VoidWarehouseHopperFilter) hopper;
+            if (self.hasClassifierFilter() && !VoidWarehouseClassifier.hasAnySeed(self)) {
+                // 一份分类物都没指定（正常路径上开关早被关掉了，这里只是兜底）→
+                // 回到「漏斗里有什么就搬什么」的原规则，不让一个空开关卡住搬运。
+                // 注意：不再像旧版那样「就地认下当前内容」当分类物 —— 那会把残留的
+                // 货物（比如上方容器流下来的石头）一并认成分类物，正是 橡木 石头 空 空 空 的元凶。
+                self.setClassifierFilter(false);
+                hopper.setChanged();
+            }
+            // 每 tick 一次全量清扫：搬空 + 进货 + 再搬空（见 VoidWarehouseHopper#intake）
+            VoidWarehouseHopper.intake(serverLevel, hopper, self.hasClassifierFilter());
+            return;
+        }
+        // 正上方是不是仓库终端？（终端压在漏斗上 → 反过来，从仓库往漏斗里出料）
+        if (VoidWarehouseExtractor.isExtractor(serverLevel, pos, state)) {
+            VoidWarehouseExtractor.pull(serverLevel, hopper);
+        }
+    }
+
+    /**
+     * <b>把 8 gt 节流真正拆掉</b>：整条 tick 走完之后，把这条漏斗（入库<b>或</b>出料）的搬运冷却清零。
+     *
+     * <p>为什么必须放在 {@code pushItemsTick} 的<b>收尾</b>而不是中途（逐个核对字节码后的结论）：</p>
+     * <pre>{@code
+     * tryMoveItems(...) {
+     *     if (hopper.isOnCooldown()) return false;     // ← 冷却未清，这里直接出队
+     *     ...
+     *     flag = ejectItems(...);                      // 出料
+     *     flag |= supplier.getAsBoolean();             // ← 26.3 里它 == suckInItems
+     *     if (flag) { hopper.setCooldown(8); ... }     // ← 无条件写回 8
+     *     return flag;
+     * }
+     * }</pre>
+     * <p>早先的版本在 {@code suckInItems} 的 HEAD 里调 {@code resetCooldown()}，
+     * 那一步<b>紧接着就被上面的 {@code setCooldown(8)} 盖掉</b>，等于白做 ——
+     * 「无上限吸取」实际一直是 8 gt 一次。所以清零必须发生在 {@code tryMoveItems} <b>之后</b>。</p>
+     *
+     * <h2>为什么出料端也要清（本轮新增）</h2>
+     * <p>出料漏斗的两段是「{@link VoidWarehouseExtractor#pull} 挂 HEAD 每 tick 补满」
+     * 与「{@link VoidWarehouseExtractor#eject} 接管原版出料」。第二段是走
+     * {@code ejectItems} 的，<b>它搬成功就会触发 {@code setCooldown(8)}</b> ——
+     * 只清入库不清出料的话，仓库这端每 tick 补满、下游却每 8 gt 才被喂一次，
+     * 「入库无上限、出库 2.5 个/秒」这种自相矛盾的状态就出现了。
+     * 现在两端共用同一个收尾，速率才真正对齐（都是「一 tick 搬空」）。</p>
+     *
+     * <p>这一手与 Carpet-TIS 的 {@code hopperCountersUnlimitedSpeed} 收尾的
+     * {@code setCooldown(0)} 是同一个意思：让漏斗永远处于「冷却已过」的状态。</p>
+     *
+     * <p>注意：<b>搬运本身已经不依赖这个冷却了</b>（{@code intake} / {@code pull} 都挂在 HEAD，
+     * 每 tick 必跑），这里清零只是把原版那两条路径也放开 ——
+     * 对入库漏斗是 {@code suckInItems} 本体、{@code entityInside} 触发的那次；
+     * 对出料漏斗就是 {@code tryMoveItems} 里的 {@code ejectItems}。
+     * <b>普通漏斗一个字节都不碰</b>（两个判定都不满足时直接返回）。</p>
+     */
+    @Inject(method = "pushItemsTick", at = @At("TAIL"))
+    private static void carpetAutomending$unlimitedCooldown(Level level, BlockPos pos, BlockState state,
+                                                            HopperBlockEntity hopper, CallbackInfo ci) {
+        if (!VoidWarehouseSettings.voidWarehouse) {
+            return;
+        }
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return;
+        }
+        // 入库或出料，两者都是「本模组接管的漏斗」，一律清冷却；其余漏斗（普通漏斗）原样不动
+        if (!VoidWarehouseHopper.isIntake(serverLevel, pos, state)
+                && !VoidWarehouseExtractor.isExtractor(serverLevel, pos, state)) {
+            return;
+        }
+        ((VoidWarehouseHopperFilter) hopper).resetCooldown();
+    }
+
+    /**
+     * <b>分类物白名单的防御性副本</b>（主闸门在 {@code ContainerClassifierMixin} 上）。
+     *
+     * <p>判定逻辑与 {@link VoidWarehouseClassifier#blockMachineInsert} 完全共用一份代码 ——
+     * 这里保留一份注入纯粹是兜底：万一某个环境里 {@code Container#canPlaceItem} 那条路
+     * 没走到（或被人覆盖），vanilla 自己的 {@code canPlaceItemInContainer} 仍然会被拦住。</p>
+     *
+     * <p>反过来单独挂这里是不够的：{@code canPlaceItemInContainer} 是原版
+     * {@code private static} 私有实现，Lithium 等优化模组会用
+     * {@code HopperHelper#tryMoveSingleItem} 整个换掉搬运，一次都不调这个方法
+     * （用户实机 2026-09-30 复现）。所以主闸门必须在契约层（{@code Container#canPlaceItem}）。</p>
+     *
+     * <p>写 {@code require = 0} 的理由不变：原版以后把这个私有实现内联掉是完全可能的，
+     * 那一天宁可「这一份兜底悄悄失效」，也不要「整个模组加载失败」——而且它失效也不影响
+     * 契约层闸门继续生效。</p>
+     */
+    @Inject(method = "canPlaceItemInContainer", at = @At("HEAD"), cancellable = true, require = 0)
+    private static void carpetAutomending$classifierFilter(Container container, ItemStack stack, int slot,
+                                                           Direction direction,
+                                                           CallbackInfoReturnable<Boolean> cir) {
+        if (VoidWarehouseClassifier.blockMachineInsert(container, slot, stack)) {
+            // 不是分类物（或不是它自己的格子）→ 原样留在上游容器 / 上游漏斗里，不进这个漏斗
+            cir.setReturnValue(false);
+        }
+    }
+
+    /**
+     * 出料模式下接管原版的「把东西推进下游容器」。
+     *
+     * <p>方法签名与原版完全一致（{@code private static boolean ejectItems(Level, BlockPos, HopperBlockEntity)}），
+     * 用完整描述符指定，避免以后原版加重载时注错方法。</p>
+     */
+    @Inject(
+            method = "ejectItems(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/entity/HopperBlockEntity;)Z",
+            at = @At("HEAD"),
+            cancellable = true
+    )
+    private static void carpetAutomending$keepClassifiers(Level level, BlockPos pos, HopperBlockEntity hopper,
+                                                          CallbackInfoReturnable<Boolean> cir) {
+        if (!VoidWarehouseSettings.voidWarehouse) {
+            return;
+        }
+        if (!(level instanceof ServerLevel serverLevel)) {
+            return;
+        }
+        if (!VoidWarehouseExtractor.isExtractor(serverLevel, pos, level.getBlockState(pos))) {
+            return;
+        }
+        cir.setReturnValue(VoidWarehouseExtractor.eject(serverLevel, pos, hopper));
+    }
+}

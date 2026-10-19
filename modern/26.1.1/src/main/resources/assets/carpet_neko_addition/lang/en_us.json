@@ -1,0 +1,13 @@
+{
+  "carpet.category.neko": "neko",
+  "carpet.rule.autoMending.name": "Automatic Mending",
+  "carpet.rule.autoMending.desc": "Automatically repairs one damaged Mending item per second (fully). Spends XP banked in the experience bar first, and draws from experience levels when the bar runs short; only stops once the player is out of XP entirely",
+  "carpet.rule.voidWarehouse.name": "Void Warehouse",
+  "carpet.rule.voidWarehouse.desc": "A crafting table renamed via anvil becomes a server-wide shared warehouse",
+  "carpet.rule.voidWarehouseRestock.name": "Void Warehouse Restock",
+  "carpet.rule.voidWarehouseRestock.desc": "Lets a printer that ran out of blocks while building take a full stack straight from the Void Warehouse. Warning: while enabled, any player with a compatible printer can draw from the shared stock",
+  "carpet.rule.voidWarehouseExchange.name": "Void Warehouse 9-in-1 Exchange",
+  "carpet.rule.voidWarehouseExchange.desc": "Lets an out-of-stock item be handed over by spending its 9-in-1 recipe ingredients: 1 iron ingot comes out of 9 iron nuggets, and 1 iron ingot can be broken out of an iron block with the change returned to the warehouse. Only kicks in when the item itself is out of stock, and only along recipes that really exist in vanilla (26.3: 29 edges over 53 items). Requires the Void Warehouse rule",
+  "carpet.rule.concretePowderToGlass.name": "Smelt Concrete Powder Into Stained Glass",
+  "carpet.rule.concretePowderToGlass.desc": "Lets a regular furnace smelt all 16 concrete powder colours into the matching stained glass (0.1 xp / 200 ticks, same as sand into glass). Only regular furnaces are affected; blast furnaces and smokers still reject concrete powder"
+}

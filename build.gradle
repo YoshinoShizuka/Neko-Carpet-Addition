@@ -1,0 +1,7 @@
+// ===== 根聚合工程 =====
+// 本文件不定义任何业务构建逻辑，只负责聚合各版本子工程。
+// 真正的构建逻辑在各子模块（modern/26.3、versions/1.21.x、common）各自的 build.gradle 里。
+
+// 让根项目的 `build` 任务也顺带把所有已启用的版本子工程都构建一遍。
+// 用法：在仓库根目录跑 `./gradlew build` 即可构建全部已 include 的版本。
+defaultTasks 'build'

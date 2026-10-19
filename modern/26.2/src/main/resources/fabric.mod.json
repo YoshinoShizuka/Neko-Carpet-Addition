@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "carpet_neko_addition",
+  "version": "${version}",
+
+  "name": "Carpet Neko Addition",
+  "description": "为 Carpet 增加两条规则：自动经验修补，以及把铁砧改名的工作台变成全服共享、可持久化的虚空仓库（支持漏斗双向自动化与潜影盒打包）。",
+  "authors": [
+    "Akirono"
+  ],
+  "license": "MIT",
+
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "neko.automending.AutoMendingMod"
+    ]
+  },
+
+  "mixins": [
+    "carpet_neko_addition.mixins.json",
+    "carpet_neko_addition.cooking.mixins.json"
+  ],
+
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": ">=26.2",
+    "carpet": ">=26.2",
+    "fabric-api": "*"
+  }
+}

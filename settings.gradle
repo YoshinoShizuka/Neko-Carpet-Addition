@@ -1,0 +1,36 @@
+pluginManagement {
+    repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+rootProject.name = 'carpet-Neko-Addition'
+
+// ===== 多版本适配：按 Minecraft 版本划分子工程 =====
+//
+// 两套互斥的工具链，分别挂在两个子目录下：
+//   - modern/<mc>/   26.x 及以后：Minecraft 本体不再混淆（Mojang 官方命名），
+//                    用 `net.fabricmc.fabric-loom`（不 remap），无需 mappings，Java 25。
+//   - versions/<mc>/ 1.21.x 及更早：仍是混淆版本，用 `net.fabricmc.fabric-loom-remap`
+//                    + Yarn / Mojang 映射，Java 21。
+//
+// 共享的纯逻辑（不引用 Minecraft 版本类型，如 Settings / 翻译加载 / 纯算法）放在
+// `common/`，各版本子工程以 `implementation project(':common')` 引用。
+//
+// 新增一个版本 = 复制一份对应目录、改它的 gradle.properties、在下面 include 一行。
+
+include ':common'
+
+// ---- modern（26.x，不混淆）----
+include ':modern:26.3'
+include ':modern:26.2'
+include ':modern:26.1.1'
+include ':modern:26.1.2'
+
+// ---- versions（1.21.x 及更早，混淆）----
+include ':versions:1.21.11'

@@ -1,0 +1,90 @@
+// ===== Minecraft 1.21.x 版本层（混淆版本）=====
+//
+// 这是 1.21.x 及更早版本的「接入点」骨架（当前落地目标 1.21.11）。1.21.x 仍是混淆版本，
+// 工具链与 26.x 完全不同：
+//   - 插件：net.fabricmc.fabric-loom-remap（不是 modern/26.x 用的 fabric-loom）
+//   - 映射：Mojang 官方映射（loom.officialMojangMappings()）
+//   - Java：21（不是 25）
+//   - 依赖：modImplementation（需要 remap），不是 implementation
+//
+// 落地一个版本 = 在 versions/<mc>/ 下放好 build.gradle + gradle.properties + src/，
+// 然后在根 settings.gradle 里 include 一行。源码与 26.x 共享 common/ 层（纯逻辑），
+// 但所有引用 MC 类型的类（VoidWarehouseData/Menu、各 mixin 等）必须按 1.21.x 的 API 改写。
+//
+// 注意：1.21.x 与 26.x 的核心 API 差异（需逐条用 javap 核对）：
+//   - ResourceLocation vs Identifier
+//   - ScreenHandler / GenericContainerScreenHandler vs AbstractContainerMenu / ChestMenu
+//   - NamedScreenHandlerFactory vs MenuProvider
+//   - SavedData 用 load/save(CompoundTag)，不是 SavedDataType + Codec
+//   - 聊天包类名、ServerGamePacketListenerImpl 的 handleChat 签名
+//   - CreativeModeTabs 是否在服务端可用（26.3 在，1.21.x 需要核实）
+
+plugins {
+    id 'net.fabricmc.fabric-loom-remap' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = "${project.archives_base_name}-mc${project.minecraft_version}"
+}
+
+repositories {
+    maven {
+        name = 'masa'
+        url = 'https://masa.dy.fi/maven'
+        content { includeGroup 'carpet' }
+    }
+    mavenCentral()
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    // 用 Mojang 官方映射而不是 Yarn：26.x 的源码本来就是 Mojang 名（AbstractContainerMenu /
+    // ChestMenu / Identifier / MenuProvider…），换成 Mojang 映射后这些类名可以原样搬过来，
+    // 只剩「版本之间真的变了」的 API 需要处理，改名噪音大幅减少。
+    mappings loom.officialMojangMappings()
+
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "carpet:fabric-carpet:${project.carpet_version}"
+
+    // Fabric API：打印机联动的 C2S/S2C 数据包要用它的 networking 抽象。
+    // 混淆版本必须用 modImplementation —— 否则 fabric-api 内部的中间名不会被 remap，
+    // 我们代码里写的 net.fabricmc.fabric.api.networking.* 运行时会找不到类。
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // 跨版本共享的纯逻辑
+    implementation project(':common')
+}
+
+loom {
+    runConfigs.configureEach {
+        runDir 'run'
+    }
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') {
+        expand 'version': project.version
+    }
+}
+
+jar {
+    from(project(':common').sourceSets.main.output)
+    from(rootProject.file('LICENSE')) {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
+}

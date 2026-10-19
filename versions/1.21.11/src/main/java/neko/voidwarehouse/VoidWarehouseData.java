@@ -1,0 +1,1926 @@
+package neko.voidwarehouse;
+
+import com.mojang.datafixers.util.Either;
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.DataResult;
+import com.mojang.serialization.DynamicOps;
+import com.mojang.serialization.MapCodec;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
+import net.minecraft.ChatFormatting;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.util.datafix.DataFixTypes;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemLore;
+import net.minecraft.world.level.saveddata.SavedData;
+import net.minecraft.world.level.saveddata.SavedDataType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * 虚空仓库的持久化数据（全存档唯一一份）。
+ *
+ * <h2>存储模型：一种物品 = 一格，数量无上限</h2>
+ * <p>仓库不是「一堆堆叠格」，而是一份 <b>物品类型 → 数量</b> 的清单：每种物品
+ * （同 Item、同数据组件）在仓库里 <b>只占一格</b>，该格的数量没有上限（内部用
+ * {@link BigInteger}，真正的任意精度，既不会溢出也不会饱和），因此不需要「一格装 64 个、
+ * 装满再开一格」的散列方式，也不会出现同类物品被拆成好几格的情况。</p>
+ *
+ * <p>每一格同时保存一份「原样堆叠」{@link Entry#template()}（数量恒为 1），
+ * 物品的 NBT / 耐久 / 附魔 / 自定义名全部原封不动留在里面；数量只存在于
+ * {@link Entry#amount()}，取物品时用 {@code template.copyWithCount(n)} 现做一份全新的堆叠给玩家。
+ * 这样即使一格里有十万个，也不会出现「超过 maxStackSize 的非法堆叠」。</p>
+ *
+ * <h2>界面展示</h2>
+ * <p>{@link Entry#display()} 是给界面看的展示堆叠：格子里<b>永远只画一个</b>
+ * （{@code count = 1}，原版就不会在右下角渲染数字）。真实数量动辄大于一组、
+ * 甚至远超一组的量级，画在格子里既不合理也会糊到隔壁格，所以格子只当图标用，
+ * 真实数量与操作提示全部写在物品描述的 lore 上
+ * （「数量：N / 左键：取出 1 个 / 右键：取出 64 个」）。展示堆叠是从 template
+ * 复制出来的<b>另一个实例</b>，给它加 lore 永远不会污染仓库里的真品。</p>
+ *
+ * <h2>排列顺序：只取决于物品本身，与存取历史无关</h2>
+ * <p>{@link #entries} <b>永远</b>按 {@link VoidWarehouseSort} 的顺序键（<b>创造模式物品栏顺序</b>）排好。
+ * 「谁先存进来谁在前」这套插入顺序已经被彻底废弃 —— 它会让同一件东西
+ * <b>取空之后再存回来就掉到队尾</b>（铁砧本来在最前面，取空再存一次就跑到最后）。</p>
+ * <p>排序是<b>惰性</b>的：写操作只把新格子追加到末尾并让顺序失效，读操作前
+ * {@link #ensureSorted()} 才会真正重排一次。<b>稳定排序</b>保证顺序键相同的条目保持原有相对次序。</p>
+ *
+ * <h2>两种视图顺序</h2>
+ * <ul>
+ *   <li><b>默认</b>：就是 {@link #entries} 本身的顺序（创造栏顺序）；</li>
+ *   <li><b>数量排序</b>（界面里第 6 行槽位 51 的开关）：{@link #amountOrder()} 给出一份
+ *       「数量从大到小」的视图映射（数量相同仍按创造栏顺序，不会同数量的物品互相抖动）。
+ *       它<b>只改显示</b>，仓库本体的顺序一个字都不动。</li>
+ * </ul>
+ *
+ * <h2>性能：O(1) 的物品索引（漏斗压力下的关键）</h2>
+ * <p>一次入库要回答「仓库里有没有这种物品」，而仓库最多能装下整个物品注册表
+ * （26.3 是一千多种），每次线性扫描一遍的话：<b>一个漏斗每 tick 最多 5 次查找</b>，
+ * 上千个漏斗同时灌料就是每 tick 几百万次比较，TPS 会被直接压垮。</p>
+ * <p>所以这里额外维护一份 {@link #index}（{@code 物品 → 装它的那些格}，增量维护，
+ * 只在新增 / 删除格子的那一次动它），把查找从 {@code O(格数)} 降到
+ * <b>哈希一次 + 桶内通常只有 1 个元素的比较</b>。桶里之所以可能不止一个，
+ * 是因为老存档里可能留下「同一种物品但带数据组件」的条目（现在的筛选规则已经不让它们进来了），
+ * 那种情况只在桶内再扫一下，不会退化成全表扫描。</p>
+ *
+ * <h2>序列化与老存档兼容</h2>
+ * <p>26.3 的 SavedData 体系：{@code SavedData#save/load(CompoundTag)} 已删除，改由
+ * {@link SavedDataType} 携带 {@link Codec}，{@code SavedData} 只保留 {@code setDirty()/isDirty()}，
+ * 写法照抄原版 {@code WeatherData}。</p>
+ *
+ * <p>新格式：{@code {"items":[{"item":{...},"count":1024}]}}，其中 {@code count} 小数值写 JSON 数字、
+ * 超过 {@code long} 的写字符串（不丢精度）。<br>
+ * 旧版本（一格最多 64 个）的格式是 {@code {"items":[{"slot":0,"stack":{...}}]}}，
+ * 解码时两种都认：旧格式拿 {@code stack} 里的数量当数量、{@code slot} 直接忽略
+ * （旧文件是按槽位升序写的，所以列表顺序就等于旧槽位顺序），
+ * 载入时自动把同类物品折叠成一格 —— <b>老存档不会丢东西，也不会再散成好几格</b>，
+ * 而且载入后的排列会被重排成创造栏顺序，与旧文件里的乱序无关。</p>
+ *
+ * <h2>入库筛选</h2>
+ * <p>仓库<b>不设筛选</b>：任何非空物品（含带 NBT / 数据组件的受损工具、附魔物品、改名物品、
+ * 药水、写了字的书……）一律按「同物品 + 同数据组件」各占一格入库。要不要放行某个物品，
+ * 由<b>玩家自己在漏斗里过滤</b>（分类物白名单，见 {@link VoidWarehouseHopper}）。</p>
+ *
+ * <h2>潜影盒：入库时拆开（空盒除外），取出时现造</h2>
+ * <p>潜影盒是原版里唯一能让玩家自己决定「一格装多少」的容器，所以它被当作仓库的
+ * <b>打包单位</b>，而不是普通物品（{@link VoidWarehouseShulker}）：</p>
+ * <ul>
+ *   <li><b>入库</b>：非空盒子被<b>拆开</b> —— 盒里的每种物品各按真实数量入库，盒子本身变成
+ *       {@code 2 个潜影壳 + 1 个箱子}（原版配方），染色盒再额外吐出 {@code 1 个对应颜色的染料}。
+ *       <b>空盒子不拆</b>，直接整盒入库，
+ *       占一格记 1 个「潜影盒」；</li>
+ *   <li><b>校验</b>：盒内物品不再做数据组件校验（带 NBT 的物品现在也允许入库）。</li>
+ * </ul>
+ * <p>拆是一个「全成或全不成」的操作：校验全部通过之后才真正写入，中间不存在写一半的情况。</p>
+ *
+ * <p>存储位置由 {@link VoidWarehouse} 固定取主世界的 {@code SavedDataStorage}，
+ * 因此是「全存档唯一、跨维度共享」。</p>
+ */
+public final class VoidWarehouseData extends SavedData {
+    /** 界面每行 9 格（与原版大箱子一致，不可改） */
+    public static final int COLUMNS = 9;
+
+    /** 留给仓库内容的行数：6 行里最下面那一行被导航按钮占用 */
+    public static final int CONTENT_ROWS = 5;
+
+    /** 每页可存放的格数（每种物品一格，所以也是「每页多少种物品」） */
+    public static final int PAGE_SIZE = COLUMNS * CONTENT_ROWS;
+
+    /** 导航行（第 6 行）在容器里的起始下标 */
+    public static final int NAV_START = PAGE_SIZE;
+
+    /** 容器总格数：必须保持 54，才能让原版客户端套用大箱子界面（GUI 尺寸不变） */
+    public static final int TOTAL_SLOTS = COLUMNS * (CONTENT_ROWS + 1);
+
+    private static final String ITEMS_KEY = "items";
+    private static final String ITEM_FIELD = "item";
+    private static final String COUNT_FIELD = "count";
+    /** 旧格式字段名，只用于解码，不再写出 */
+    private static final String LEGACY_STACK_FIELD = "stack";
+
+    // ------------------------------------------------------------------ 一格
+
+    /**
+     * 仓库里的一格 = 一种物品 + 一个无上限的数量。
+     *
+     * <p>{@code template} 的数量恒为 1，只当「长什么样」的样板；真品数量在 {@code amount}。
+     * {@code display} / {@code boxDisplay} 是两种模式下各自的展示堆叠缓存（带 lore），
+     * 数量一变就一起失效重建。</p>
+     */
+    public static final class Entry {
+        private final ItemStack template;
+        private BigInteger amount;
+        private ItemStack display;
+        /** 潜影盒模式下的展示堆叠（操作说明是「交出盒子」那套，与普通模式不是一回事） */
+        private ItemStack boxDisplay;
+
+        Entry(ItemStack template, BigInteger amount) {
+            // 只留一份数量为 1 的样板，彻底切断与原堆叠的实例关联（防复制）
+            this.template = template.copyWithCount(1);
+            this.amount = amount.signum() <= 0 ? BigInteger.ONE : amount;
+        }
+
+        /** 样板：数量恒为 1，数据组件完整 */
+        public ItemStack template() {
+            return this.template;
+        }
+
+        /** 真实数量，任意精度 */
+        public BigInteger amount() {
+            return this.amount;
+        }
+
+        /** 该物品一组有多少个（原版上限，16 / 64 / 1，取决于物品本身） */
+        public int maxStack() {
+            return Math.max(1, this.template.getMaxStackSize());
+        }
+
+        /** 累加数量。{@link BigInteger} 没有上限，永远不会溢出、也不会饱和 */
+        void add(BigInteger delta) {
+            if (delta.signum() <= 0) {
+                return;
+            }
+            this.amount = this.amount.add(delta);
+            this.display = null;
+            this.boxDisplay = null;
+        }
+
+        void subtract(BigInteger delta) {
+            if (delta.signum() <= 0) {
+                return;
+            }
+            this.amount = this.amount.subtract(delta);
+            if (this.amount.signum() < 0) {
+                this.amount = BigInteger.ZERO;
+            }
+            this.display = null;
+            this.boxDisplay = null;
+        }
+
+        /** 普通模式的展示堆叠（带数量与操作提示），缓存复用 */
+        public ItemStack display() {
+            if (this.display == null) {
+                this.display = buildDisplay(this.template, this.amount, false);
+            }
+            return this.display;
+        }
+
+        /**
+         * 潜影盒模式的展示堆叠，缓存复用。
+         *
+         * <p>这里<b>不是</b>在普通说明后面追加几行 —— 而是换一套说明：盒模式下
+         * 「左键取出 1 个 / 右键取出一整组」<b>根本不成立</b>（左键交出的是一整盒），
+         * 留着它们既占地方又误导人。两套说明各自精简，行数都控制在 5 行以内。</p>
+         */
+        public ItemStack displayInBoxMode() {
+            if (this.boxDisplay == null) {
+                this.boxDisplay = buildDisplay(this.template, this.amount, true);
+            }
+            return this.boxDisplay;
+        }
+
+        /**
+         * 造展示堆叠：两种模式共用「数据行」，各自接自己的「操作行」。
+         *
+         * @param boxMode 潜影盒模式？决定操作行说的是「取出」还是「交出盒子」
+         */
+        private static ItemStack buildDisplay(ItemStack template, BigInteger amount, boolean boxMode) {
+            int max = Math.max(1, template.getMaxStackSize());
+            // 格子里永远只画一个：count = 1 时原版不会渲染右下角的数字。
+            // 真实数量往往远超一组、甚至到亿级，画在格子里既不合理也会糊到隔壁格，
+            // 所以格子只当图标用，真实数量写在下面的 lore 里。
+            ItemStack stack = template.copyWithCount(1);
+            List<Component> lore = new ArrayList<>(5);
+
+            // ---- 数据行：数量 +（够多时的）盒 / 组 / 个换算 ----
+            // 「数量：」标签用浅灰、数字用亮金 —— 分段着色。玩家扫 tooltip 找的是「有多少」，
+            // 让数字跳出来、标签退到背景里；整行一个颜色时两者会互相抢视线。
+            // 亮金 #FFD700 不在原版 16 色枚举里（GOLD 偏橙），所以走 RGB 重载。
+            lore.add(VoidWarehouseText.pair("数量：", VoidWarehouseText.LABEL_RGB,
+                    format(amount), VoidWarehouseText.VALUE_RGB));
+            String packing = describePacking(amount, max);
+            if (packing != null) {
+                lore.add(VoidWarehouseText.line(packing, VoidWarehouseText.VALUE_RGB));
+            }
+
+            // ---- 操作行：两种模式各说各的，绝不混着显示 ----
+            // 整行统一青色（ACTION_RGB）：与上面金色的数字行形成明确分层，
+            // 一眼分得出「哪行是数据、哪行是能做的事」。
+            if (boxMode) {
+                int capacity = VoidWarehouseShulker.capacity(template);
+                lore.add(VoidWarehouseText.line(
+                        "左键：交出 1 盒（" + VoidWarehouseText.count(capacity) + " 个）",
+                        VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION_RGB));
+                // 这里原先还有一行，写明装盒要额外消耗多少个潜影壳与箱子（红色）。玩家要求去掉：
+                // 物品格是「拿东西」的地方，代价那行挤进来只会让人以为「取这一份要额外掏材料」。
+                // 材料账本身没变，说明留在「潜影盒模式」开关那个图标的 tooltip 上（VoidWarehouseNav）。
+            } else if (max > 1) {
+                lore.add(VoidWarehouseText.line("左键：取出 1 个", VoidWarehouseText.ACTION_RGB));
+                // 直接写数字而不是「1 组（64 个）」：玩家真正要读的是「右键给我多少个」，
+                // 括号里那个数字和「组」说的是同一件事，绕一道反而更慢。
+                lore.add(VoidWarehouseText.line(
+                        "右键：取出 " + max + " 个", VoidWarehouseText.ACTION_RGB));
+            } else {
+                // 不可堆叠物品（剑、工具…）左右键都是取 1 个，合成一行说，不重复两遍
+                lore.add(VoidWarehouseText.line("左键 / 右键：取出 1 个", VoidWarehouseText.ACTION_RGB));
+            }
+
+            stack.set(DataComponents.LORE, new ItemLore(lore));
+            return stack;
+        }
+
+        /**
+         * 把总数换算成「X 盒 X 组 X 个」，方便玩家一眼估出要带几个潜影盒出门。
+         *
+         * <p>换算口径与 {@link VoidWarehouseShulker} 完全一致：
+         * <b>1 盒 = 27 格 × 该物品的堆叠上限</b>（圆石 1728、末影珍珠 432），
+         * <b>1 组 = 该物品的堆叠上限</b>。所以 5000 个圆石 = 2 盒 24 组 8 个。</p>
+         *
+         * <p><b>这是精确换算而不是估算，所以不带「≈」</b> —— 加约等于号会让人以为数字不准。</p>
+         *
+         * <p><b>不足一组时返回 {@code null}</b>（那行就不显示）：库存只有 30 个圆石时
+         * 写「0 盒 0 组 30 个」纯属噪音。末尾余数为 0 时也省略那一段，
+         * 于是「整盒」显示成「3 盒」而不是「3 盒 0 组 0 个」。</p>
+         *
+         * <p><b>不可堆叠物品（剑、工具…）特殊处理</b>：它们一组就等于 1 个，写「N 组」
+         * 纯属废话，所以只在够一盒（27 个）时才显示，而且只说「几盒 + 几个」，
+         * 不出现「组」这一级。</p>
+         *
+         * <p>全程用 {@link BigInteger} 做除法（{@code divideAndRemainder}），
+         * 亿级数量也不会溢出 —— 数量本身是任意精度的，换算不能先把它降级成 long。</p>
+         */
+        private static String describePacking(BigInteger amount, int max) {
+            // 门槛：够「一组」才值得换算。不可堆叠物品一组 = 1 个，此时只有「盒」有意义，
+            // 所以门槛抬到「一盒」（27 个）。
+            BigInteger threshold = BigInteger.valueOf(
+                    max > 1 ? max : VoidWarehouseShulker.BOX_SLOTS);
+            if (amount.compareTo(threshold) < 0) {
+                return null;
+            }
+            BigInteger boxCapacity = BigInteger.valueOf((long) VoidWarehouseShulker.BOX_SLOTS * max);
+            BigInteger[] byBox = amount.divideAndRemainder(boxCapacity);
+            BigInteger boxes = byBox[0];
+            BigInteger stacks = BigInteger.ZERO;
+            BigInteger loose = byBox[1];
+            if (max > 1) {
+                BigInteger[] byStack = loose.divideAndRemainder(BigInteger.valueOf(max));
+                stacks = byStack[0];
+                loose = byStack[1];
+            }
+            StringBuilder text = new StringBuilder();
+            if (boxes.signum() > 0) {
+                text.append(format(boxes)).append(" 盒 ");
+            }
+            if (max > 1 && stacks.signum() > 0) {
+                text.append(format(stacks)).append(" 组 ");
+            }
+            if (loose.signum() > 0) {
+                text.append(format(loose)).append(" 个");
+            }
+            return text.toString().trim();
+        }
+
+        /** 千分位展示，{@code %,d} 原生支持 BigInteger */
+        private static String format(BigInteger amount) {
+            return String.format(Locale.ROOT, "%,d", amount);
+        }
+    }
+
+    // ------------------------------------------------------------------ 序列化
+
+    /**
+     * 存档里的一条记录。两种格式都能读：
+     * <ul>
+     *   <li>新：{@code {"item":{...},"count":1024}}</li>
+     *   <li>旧：{@code {"slot":0,"stack":{...64 个...}}}（{@code slot} 走默认忽略，未声明的键不会被读）</li>
+     * </ul>
+     * 写出去时永远是第一种。{@code count} 兼容 JSON 数字与字符串两种写法：
+     * 数值在 {@code long} 范围内写数字（存档可读），超过范围写字符串（不丢精度）。
+     */
+    private record RawEntry(Optional<ItemStack> item, Optional<ItemStack> legacyStack, Optional<BigInteger> count) {
+        /**
+         * 数量的编解码：读的时候数字、字符串都收；写的时候小数值写数字、大数值写字符串。
+         * {@code bitLength() <= 63} 等价于「非负且能用 long 表示」（2^63-1 的位长就是 63）。
+         */
+        private static final Codec<BigInteger> AMOUNT_CODEC =
+                Codec.either(Codec.LONG, Codec.STRING).xmap(
+                        either -> either.map(BigInteger::valueOf, RawEntry::parse),
+                        value -> value.bitLength() <= 63
+                                ? Either.left(value.longValue())
+                                : Either.right(value.toString()));
+
+        static final Codec<RawEntry> CODEC = RecordCodecBuilder.create(instance -> instance.group(
+                ItemStack.CODEC.optionalFieldOf(ITEM_FIELD).forGetter(RawEntry::item),
+                ItemStack.CODEC.optionalFieldOf(LEGACY_STACK_FIELD).forGetter(RawEntry::legacyStack),
+                AMOUNT_CODEC.optionalFieldOf(COUNT_FIELD).forGetter(RawEntry::count)
+        ).apply(instance, RawEntry::new));
+
+        private static BigInteger parse(String text) {
+            try {
+                return new BigInteger(text.trim());
+            } catch (NumberFormatException e) {
+                return BigInteger.ZERO;
+            }
+        }
+
+        Optional<Entry> toEntry() {
+            ItemStack source = this.item.or(() -> this.legacyStack).orElse(null);
+            if (source == null || source.isEmpty()) {
+                return Optional.empty();
+            }
+            // 新格式的数量在 count 上（样板数量恒为 1）；旧格式的数量在 stack 里。
+            // 取两者的较大值，两种格式都能得到正确的数量。
+            BigInteger amount = this.count.orElse(BigInteger.ZERO)
+                    .max(BigInteger.valueOf(source.getCount()));
+            if (amount.signum() <= 0) {
+                amount = BigInteger.ONE;
+            }
+            return Optional.of(new Entry(source, amount));
+        }
+    }
+
+    /**
+     * 一条记录的解码结果：要么是一条可用记录，要么是一条「读不出来的原文」。
+     *
+     * <p>为什么要区分这两种 —— 见 {@link #ITEMS_CODEC} 的说明。这是「不让一条坏数据
+     * 带走整个仓库」的关键：坏的那条被原样留下来（{@link Broken}），好的一条照常进仓库，
+     * 解码<b>永远不会整体失败</b>，于是 {@code computeIfAbsent} 也永远不会把仓库
+     * 替换成一个空实例。</p>
+     */
+    private sealed interface Decoded {
+        record Ok(RawEntry entry) implements Decoded {
+        }
+
+        /** 解析失败的原始 NBT 片段，只为「原样写回」而留，不会进仓库 */
+        record Broken(net.minecraft.nbt.Tag raw) implements Decoded {
+        }
+    }
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("carpet_neko_addition/void_warehouse");
+
+    /**
+     * {@code items} 列表的解码器：<b>逐条独立解码，单条失败不牵连整表</b>。
+     *
+     * <h2>为什么不能直接用 {@code RawEntry.CODEC.listOf()}</h2>
+     * <p>{@code Codec.list} 的语义是「全成或全不成」：只要列表里有<b>任意一条</b>解码
+     * 出错，整个 {@code DataResult} 就是 error 状态，{@code readSavedData} 拿到 null，
+     * 而 26.3 的 {@code SavedDataStorage.computeIfAbsent} 会把 null 当成「文件不存在」，
+     * <b>静默造一个空仓库</b>并标脏，退出时一路覆盖写盘 —— 仓库所有物品就此消失。
+     * 那条坏数据可能只是某个模组被卸载后残留的一件物品。</p>
+     *
+     * <p>所以这里自己做列表解码：逐条 {@code RawEntry.CODEC.parse}，
+     * 成功的进 {@link Decoded.Ok}，失败的<b>连同原文一起</b>进 {@link Decoded.Broken}
+     * （原文留着是为了写盘时原样写回，不至于因为一个读不懂的条目就把它删掉）。
+     * 无论多少条失败，这个方法<b>永远返回 success</b>。</p>
+     */
+    private static final Codec<List<Decoded>> ITEMS_CODEC = new Codec<>() {
+        @Override
+        public <T> DataResult<com.mojang.datafixers.util.Pair<List<Decoded>, T>> decode(
+                DynamicOps<T> ops, T input) {
+            return ops.getList(input).map(stream -> {
+                List<Decoded> out = new ArrayList<>();
+                final int[] failures = {0};
+                final int[] index = {0};
+                stream.accept(element -> {
+                    int at = index[0]++;
+                    DataResult<RawEntry> one = RawEntry.CODEC.parse(ops, element);
+                    Optional<RawEntry> ok = one.result();
+                    if (ok.isPresent()) {
+                        out.add(new Decoded.Ok(ok.get()));
+                    } else {
+                        failures[0]++;
+                        // 把失败原因写进日志：以前这条信息只在「整个仓库读不出来」时
+                        // 才以一句 Failed to parse 出现，现在精确到「第几条、为什么」。
+                        LOGGER.error("虚空仓库第 {} 条记录解码失败，已跳过（其余 {} 条不受影响）：{}",
+                                at, out.size(), one.error().map(Object::toString).orElse("未知原因"));
+                        // ops 是 NbtOps 时 element 就是 CompoundTag；转成 Tag 存原文。
+                        out.add(new Decoded.Broken(element instanceof net.minecraft.nbt.Tag tag
+                                ? tag : net.minecraft.nbt.EndTag.INSTANCE));
+                    }
+                });
+                if (failures[0] > 0) {
+                    LOGGER.error("虚空仓库共有 {} 条记录解码失败（总 {} 条），已保留可读部分继续运行。",
+                            failures[0], out.size());
+                }
+                return com.mojang.datafixers.util.Pair.of(out, ops.empty());
+            });
+        }
+
+        @Override
+        public <T> DataResult<T> encode(List<Decoded> input, DynamicOps<T> ops, T prefix) {
+            com.mojang.serialization.ListBuilder<T> builder = ops.listBuilder();
+            for (Decoded decoded : input) {
+                if (decoded instanceof Decoded.Ok ok) {
+                    builder.add(RawEntry.CODEC.encodeStart(ops, ok.entry()));
+                } else if (decoded instanceof Decoded.Broken broken) {
+                    // 原文写回：读不懂 ≠ 可以丢。下次说不定就有人能读懂它
+                    // （比如那个模组又装回来了），在那之前原样留着。
+                    // NbtOps 的元素类型就是 Tag，此时可以直接原样放回去；
+                    // 换成别的 ops（理论上不会）时退回「转过去」的通用路径。
+                    @SuppressWarnings("unchecked")
+                    T raw = (T) broken.raw();
+                    builder.add(DataResult.success(raw));
+                }
+            }
+            return builder.build(prefix);
+        }
+    };
+
+    public static final Codec<VoidWarehouseData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
+            ITEMS_CODEC
+                    .optionalFieldOf(ITEMS_KEY, List.of())
+                    .forGetter(VoidWarehouseData::decodedEntries)
+    ).apply(instance, VoidWarehouseData::new));
+
+    public static final SavedDataType<VoidWarehouseData> TYPE = new SavedDataType<>(
+            "carpet_neko_addition_void_warehouse",
+            VoidWarehouseData::new,
+            CODEC,
+            DataFixTypes.LEVEL);
+
+    // ------------------------------------------------------------------ 状态
+
+    /** 唯一数据源：界面、序列化、数量统计全都读这一份清单（<b>永远</b>按 {@link VoidWarehouseSort} 的顺序排好） */
+    private final List<Entry> entries = new ArrayList<>();
+
+    /**
+     * 从存档里读不出来的那些条目的<b>原始 NBT</b>。
+     *
+     * <p>它们不参与仓库的任何逻辑，只是一直跟着走：读出来 → 原样写回去。
+     * 这样「某个模组被临时卸载、它的物品现在没人认识」不会导致那些条目被永久抹掉 ——
+     * 模组装回来之后它们还能用。见 {@link #ITEMS_CODEC}。</p>
+     */
+    private final List<net.minecraft.nbt.Tag> brokenEntries = new ArrayList<>();
+
+    /**
+     * 从存档载入时，{@code items} 列表里<b>一共读到了多少条</b>（不管读没读懂）。
+     *
+     * <p>用于 {@link #loadedCount()}：上层拿它和「可读条目数」对比，就能判断
+     * 「这份数据到底是本来就是空的，还是文件在那儿、内容却整片读丢了」。</p>
+     */
+    private int loadedEntryCount;
+
+    /** 载入时读不出来的条数（诊断用） */
+    private int loadedBrokenCount;
+
+    /**
+     * 「这一份是不是空壳」—— <b>在构造函数里一次性定下来，之后永不改变</b>。
+     *
+     * <p>必须这么做：判据里有一半是「此刻 {@link #entries} 是不是空的」，而
+     * <b>仓库随时会被玩家取空</b>。若等到用的时候才判定，玩家把仓库搬空的那一刻
+     * 就会被误判成「读到空壳」，每次访问都抛异常、仓库彻底不可用
+     * （实测踩过：载入 2 条 → 清空 → 闸门误报）。「载入成不成」是<b>当时的事实</b>，
+     * 只能在当时记账。</p>
+     */
+    private boolean loadedSuspicious;
+
+    /**
+     * 物品 → 装它的那些格（增量维护的查找索引，见类注释「性能」一节）。
+     *
+     * <p>与 {@link #entries} 严格同步：新增一格、删除一格、清空仓库时都会跟着改。
+     * 绝大多数物品只有一格，所以每个桶通常就一个元素。</p>
+     */
+    private final Map<Item, List<Entry>> index = new HashMap<>();
+
+    /** 统计缓存，-1 / null 表示需要重算 */
+    private int cachedCount = -1;
+    private BigInteger cachedTotal = null;
+
+    /** {@link #entries} 已经按哪一版顺序排好了；与 {@link VoidWarehouseSort#generation()} 不符就要重排 */
+    private int sortedGeneration = -1;
+
+    /** 数量降序视图的缓存（视图下标 → 展示序号）；任何改动都会把它置空 */
+    private int[] amountOrder;
+
+    /**
+     * 「可兑」条目缓存（{@link #exchangeOffers()}）。
+     *
+     * <p>算一次要跑 53 次规划，而规划本身是几十次递归 —— 放在渲染路径上每次重算虽然也就毫秒级，
+     * 但界面一帧要问 45 次「这一格是谁」，累起来就不划算了。所以缓存，由
+     * {@link #markChanged()} 在库存有任何改动时整体作废。</p>
+     */
+    private List<ExchangeOffer> offers;
+
+    /**
+     * 统一展示序缓存（{@link #unifiedOrder()}）：真实库存格与可兑条目按创造栏顺序归并后的序列。
+     *
+     * <p>编码：值 {@code >= 0} = {@link #entries} 下标；值 {@code < 0} = 可兑条目 {@code -(下标 + 1)}。</p>
+     */
+    private int[] unifiedOrder;
+
+    /**
+     * 上面两个缓存是在「9 合 1 兑换规则开着还是关着」的哪种状态下算出来的。
+     *
+     * <p>规则开关是 Carpet 的 {@code /carpet} 命令改的，<b>不会经过 {@link #markChanged()}</b>，
+     * 所以缓存不能只认库存改动。这里的做法是每次取缓存前对一下当前开关：
+     * 开关一变就把两个缓存整体作废（见 {@link #revalidateExchangeCache()}）。
+     * 少了这一下，玩家把规则关掉之后那些「可兑」幽灵格会一直留在界面上，
+     * 点下去却什么都不发生 —— 与 {@link #exchangeEnabled()} 的承诺正好相反。</p>
+     */
+    private boolean exchangeCacheEnabled;
+
+    public VoidWarehouseData() {
+    }
+
+    /**
+     * 从解码结果建仓库。
+     *
+     * <p>好条目进仓库（同物品合并）；坏条目原文留在 {@link #brokenEntries} 里，
+     * 下次写盘时原样写回。<b>注意这里绝不能因为「一条都读不出来」就抛异常</b> ——
+     * 抛异常会让上层把整个仓库当成读取失败，那才是真正会丢数据的路径。
+     * 「读到空」这种情况由 {@link VoidWarehouse#data} 那一层的指纹校验负责拦截。</p>
+     */
+    VoidWarehouseData(List<Decoded> loaded) {
+        for (Decoded decoded : loaded) {
+            if (decoded instanceof Decoded.Ok ok) {
+                ok.entry().toEntry().ifPresent(this::absorb);
+            } else if (decoded instanceof Decoded.Broken broken) {
+                this.brokenEntries.add(broken.raw());
+            }
+        }
+        this.loadedEntryCount = this.entries.size();
+        this.loadedBrokenCount = this.brokenEntries.size();
+        // 「读到空壳」这件事只在<b>此刻</b>有意义 —— entries 之后会随着玩家存取变化，
+        // 那一半判据必须就地冻结。全是坏条目（一条都读不懂）不算空壳：
+        // 那是 ITEMS_CODEC 有意保留下来的原文，会在下次写盘时原样写回。
+        this.loadedSuspicious = !loaded.isEmpty() && this.entries.isEmpty() && this.brokenEntries.isEmpty();
+        // 这里不排序：载入进来的顺序可能是旧文件的乱序，但第一次读之前
+        // ensureSorted() 一定会把它整成创造栏顺序（见 sortedGeneration 的初值 -1）。
+    }
+
+    /**
+     * 统一合并入口：同一种物品只保留一格，数量累加。
+     * 老存档里「同类物品散在多格」的情况在这里被折叠成一格。
+     */
+    private void absorb(Entry entry) {
+        Entry existing = this.find(entry.template());
+        if (existing == null) {
+            this.entries.add(entry);
+            this.indexEntry(entry);
+            this.invalidateOrder();
+        } else {
+            existing.add(entry.amount());
+        }
+    }
+
+    /**
+     * 按「同 Item + 同数据组件」找那一格；找不到返回 null。
+     *
+     * <p>先按 {@link Item} 哈希到桶（通常是 1 个元素），再在桶内比对数据组件 ——
+     * 所以对「纯净物品」这个主流情况来说就是一次哈希查找，与仓库里有多少种物品无关。</p>
+     */
+    private Entry find(ItemStack stack) {
+        List<Entry> bucket = this.index.get(stack.getItem());
+        if (bucket == null) {
+            return null;
+        }
+        for (int i = 0; i < bucket.size(); i++) {
+            Entry entry = bucket.get(i);
+            if (ItemStack.isSameItemSameComponents(entry.template(), stack)) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    /** 新增一格时把它登记进索引 */
+    private void indexEntry(Entry entry) {
+        this.index.computeIfAbsent(entry.template().getItem(), key -> new ArrayList<>(1)).add(entry);
+    }
+
+    /** 删除一格时把它从索引里摘掉（桶空了就把键一起删掉，不让索引白占内存） */
+    private void unindexEntry(Entry entry) {
+        Item item = entry.template().getItem();
+        List<Entry> bucket = this.index.get(item);
+        if (bucket == null) {
+            return;
+        }
+        // Entry 没有覆写 equals，所以 List#remove(Object) 按身份移除，正好是我们想要的
+        bucket.remove(entry);
+        if (bucket.isEmpty()) {
+            this.index.remove(item);
+        }
+    }
+
+    // ------------------------------------------------------------------ 排列顺序
+
+    /**
+     * 保证 {@link #entries} 按当前顺序键排好。<b>惰性 + 幂等</b>，所有读路径的开头都会调它。
+     *
+     * <p>用 {@link List#sort}（底层 TimSort）而不是自己写比较 —— 它是<b>稳定排序</b>，
+     * 顺序键相同的条目会保持原有相对次序，不会出现「两个物品来回换位」的抖动。
+     * 而顺序键本身就是「物品 → 唯一序号」，本来也不会重复。</p>
+     *
+     * <p>只在版本对不上时才真正动手，所以稳态下每次读只是一次 int 比较；
+     * 已经排好的列表再排一次因为 TimSort 能识别有序段，也只是 O(n)。</p>
+     */
+    private void ensureSorted() {
+        int generation = VoidWarehouseSort.generation();
+        if (this.sortedGeneration == generation) {
+            return;
+        }
+        this.entries.sort(Comparator.comparingInt(entry -> VoidWarehouseSort.rankOf(entry.template())));
+        this.sortedGeneration = generation;
+        // 基础顺序变了 → 与可兑条目归并出来的统一展示序也作废
+        this.unifiedOrder = null;
+        // 顺序变了，写出去的存档也就变了（内容没变，但文件里的排列会更新）
+        this.setDirty();
+    }
+
+    /** 有新格子追加到末尾时调：下次读之前整体重排一次 */
+    private void invalidateOrder() {
+        this.sortedGeneration = -1;
+        this.unifiedOrder = null;
+    }
+
+    // ------------------------------------------------------------------ 读
+
+    /** 仓库里有多少种物品 = 占了多少格 */
+    public int entryCount() {
+        this.recompute();
+        return this.cachedCount;
+    }
+
+    /** 仓库里一共有多少个物品（任意精度，不会溢出） */
+    public BigInteger totalAmount() {
+        this.recompute();
+        return this.cachedTotal;
+    }
+
+    private void recompute() {
+        if (this.cachedCount >= 0 && this.cachedTotal != null) {
+            return;
+        }
+        BigInteger total = BigInteger.ZERO;
+        for (Entry entry : this.entries) {
+            total = total.add(entry.amount());
+        }
+        this.cachedCount = this.entries.size();
+        this.cachedTotal = total;
+    }
+
+    /**
+     * 总页数，空仓库也算 1 页。
+     *
+     * <p>按 {@link #displayCount()}（真实格 + 可兑虚拟条目）算，不是按物品种类数 ——
+     * 少算一页的话，落在最后一页的可兑条目会<b>永远翻不到</b>：
+     * 那不仅是个死格，玩家还会以为「这里明明说能兑，界面里却没有」。</p>
+     */
+    public int pageCount() {
+        return Math.max(1, (this.displayCount() + PAGE_SIZE - 1) / PAGE_SIZE);
+    }
+
+    public boolean isEmpty() {
+        this.ensureSorted();
+        return this.entries.isEmpty();
+    }
+
+    /** 按格号取那一格；越界或空格返回 null */
+    public Entry entryAt(int index) {
+        if (index < 0) {
+            return null;
+        }
+        this.ensureSorted();
+        if (index >= this.entries.size()) {
+            return null;
+        }
+        return this.entries.get(index);
+    }
+
+    /** 按格号取展示堆叠（带 lore），空格返回 {@link ItemStack#EMPTY} */
+    public ItemStack displayAt(int index) {
+        Entry entry = this.entryAt(index);
+        return entry == null ? ItemStack.EMPTY : entry.display();
+    }
+
+    // ------------------------------------------------------------------ 写
+
+    /**
+     * 入库。<b>潜影盒会被拆开</b>（空盒除外，见 {@link #unpackShulkerBox}），
+     * 其余物品（含带数据组件的物品）一律按「同物品 + 同数据组件」入库。</p>
+     *
+     * <p>同一种物品只会占一格，数量直接累加到那一格上（无上限）；
+     * 仓库里还没有这种物品时才新增一格 —— 新格子<b>追加在末尾</b>，位置由下一次读之前的
+     * {@link #ensureSorted()} 统一纠正成创造栏顺序，跟「第几个存进来」无关。</p>
+     *
+     * <p>收下时<b>会就地清空 {@code incoming}</b>（数量置 0）；被拒收时
+     * <b>原样不动 {@code incoming}</b>，调用方据此把物品留给玩家 / 留在漏斗里。
+     * 内部用 {@code copyWithCount(1)} 造样板，绝不会把同一个 {@link ItemStack} 实例
+     * 同时挂在两处，从根上杜绝复制。</p>
+     *
+     * @return 是否收下（{@code false} = 空物品）
+     */
+    public boolean insert(ItemStack incoming) {
+        if (incoming == null || incoming.isEmpty()) {
+            return false;
+        }
+        if (VoidWarehouseShulker.isShulkerBox(incoming)) {
+            return this.unpackShulkerBox(incoming);
+        }
+        return this.put(incoming);
+    }
+
+    /**
+     * 把潜影盒<b>拆开</b>入库：盒内物品按各自数量入库，盒子本身变成
+     * {@code 2 个潜影壳 + 1 个箱子}（原版配方）；<b>染色盒再额外吐出 1 个对应颜色的染料</b>
+     * （原版：染色盒 = 潜影盒 + 1 染料）。见 {@link VoidWarehouseShulker#dyeOf(ItemStack)}。
+     *
+     * <p><b>空盒子不拆</b>：一个东西都没装的潜影盒，直接当成普通物品整盒入库
+     * （占一格，记 1 个「潜影盒」）。这样玩家手里那个空盒子不会被偷偷换成壳和箱子，
+     * 语义也最直观 —— 空盒子就是空盒子。染色空盒同理，整盒入库、颜色原样保留。</p>
+     *
+     * <p><b>盒内物品照单全收</b>：不再校验盒内物品是否带数据组件（带 NBT 的物品
+     * 现在也允许入库），拆出来的每件都按各自数量入库。</p>
+     *
+     * <p>拆是一个「全成或全不成」的操作：校验全部通过之后才真正写入，中间不存在写一半的情况。</p>
+     *
+     * @return 是否收下
+     */
+    private boolean unpackShulkerBox(ItemStack box) {
+        if (VoidWarehouseShulker.isEmptyBox(box)) {
+            // 空盒子：当普通物品整盒入库（不拆成壳 + 箱）
+            this.put(box);
+            this.markChanged();
+            return true;
+        }
+        List<ItemStack> contents = VoidWarehouseShulker.contentsOf(box);
+        for (ItemStack inside : contents) {
+            // contentsOf 给的是拷贝，put 会把它清空，不会影响到盒子本身
+            this.put(inside);
+        }
+        this.put(new ItemStack(Items.SHULKER_SHELL, VoidWarehouseShulker.SHELL_COST));
+        this.put(new ItemStack(Items.CHEST, VoidWarehouseShulker.CHEST_COST));
+        // 染色盒：原版是「潜影盒 + 1 染料」合成的，拆开时染料必须一起还回来。
+        // 无色盒这里拿到的是 EMPTY，直接跳过（不要 put 一个空堆叠）。
+        ItemStack dye = VoidWarehouseShulker.dyeOf(box);
+        if (!dye.isEmpty()) {
+            this.put(dye);
+        }
+        // 盒子本身已被「拆解」消耗掉
+        box.setCount(0);
+        this.markChanged();
+        return true;
+    }
+
+    /**
+     * 放进仓库（不做筛选），返回是否成功。
+     *
+     * <p>只有 {@link #insert} 与 {@link #restore} 会走到这里。</p>
+     */
+    private boolean put(ItemStack incoming) {
+        BigInteger count = BigInteger.valueOf(incoming.getCount());
+        Entry entry = this.find(incoming);
+        if (entry == null) {
+            Entry created = new Entry(incoming, count);
+            this.entries.add(created);
+            this.indexEntry(created);
+            // 新格子是追加在末尾的，顺序作废 —— 下次读之前 ensureSorted() 会把它插回正确位置
+            this.invalidateOrder();
+        } else {
+            entry.add(count);
+        }
+        incoming.setCount(0);
+        this.markChanged();
+        return true;
+    }
+
+    /**
+     * 回滚专用：把<b>刚刚从仓库里取出来、却没地方放</b>的物品原样放回去。
+     *
+     * <p>不受筛选规则限制 —— 这些物品本来就在仓库里（可能是本规则生效之前存进来的），
+     * 放回去是「归还」而不是「新存」，绝不能让它们卡在筛选规则外丢掉。</p>
+     */
+    void restore(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return;
+        }
+        this.put(stack);
+    }
+
+    // ------------------------------------------------------------------ 扣减 / 增加的两个原语
+
+    /**
+     * 从某一格扣掉 {@code amount} 个；扣到 0 就把这一格连同索引一起摘掉。
+     *
+     * <p><b>这是整个仓库唯一一处「减少数量」的实现</b>：取出 1 个、取走一组、
+     * 聊天按量取货、漏斗出料、打印机补货、装盒扣材料、9 合 1 兑换……全部走这里。
+     * 早先这段「{@code subtract} + {@code entries.remove} + {@code unindexEntry}」
+     * 在 5 个方法里各抄了一份，靠人眼保证它们一致；现在只有一份，
+     * 想漏掉 {@code unindexEntry}（那会导致索引里挂着一格已经不在清单里的幽灵，
+     * 后续 {@code find} 返回一个 numbers 已经归零的对象）都不可能。</p>
+     *
+     * <p><b>不标脏</b>：调用方负责。理由是一次兑换要改好几格，
+     * 中间标脏会让「数量排序」视图缓存反复失效重建，纯属浪费。</p>
+     */
+    private void consume(Entry entry, BigInteger amount) {
+        entry.subtract(amount);
+        if (entry.amount().signum() <= 0) {
+            // Entry 没有覆写 equals，List#remove(Object) 按身份移除，正好只能摘掉这一格
+            this.entries.remove(entry);
+            this.unindexEntry(entry);
+        }
+    }
+
+    /**
+     * 给某件<b>纯净物品</b>增加 {@code amount} 个；仓库里还没有这种物品就新开一格。
+     *
+     * <p>目前唯一的调用方是 9 合 1 兑换里的「找零」：拆一个铁块取出 1 个铁锭，
+     * 剩下的 8 个要作为<b>铁锭</b>退回仓库 —— 仓库原来可能一个铁锭都没有，
+     * 那就得凭空开出一格来。</p>
+     *
+     * <p>这里造的是<b>纯净</b>物品（{@code new ItemStack(item)}，无任何数据组件），
+     * 与 {@link #insert} 那条「玩家存进来的东西」完全不同：找零本来就是合成产物，
+     * 不可能带附魔或改名。所以它<b>不能</b>走 {@code insert}（那条路会拆潜影盒、会判筛选规则），
+     * 也不该走 {@code put}（那是给玩家存货用的，语义不同）。</p>
+     *
+     * <p>同样<b>不标脏</b>，由调用方统一收口。</p>
+     */
+    private void produce(Item item, BigInteger amount) {
+        if (item == null || item == Items.AIR || amount.signum() <= 0) {
+            return;
+        }
+        Entry entry = this.find(new ItemStack(item));
+        if (entry == null) {
+            Entry created = new Entry(new ItemStack(item), amount);
+            this.entries.add(created);
+            this.indexEntry(created);
+            // 新格子是追加在末尾的，顺序作废（与 put 一致）
+            this.invalidateOrder();
+        } else {
+            entry.add(amount);
+        }
+    }
+
+    // ------------------------------------------------------------------ 按物品查询 / 扣减
+
+    /**
+     * 仓库里现在有多少个「这种<b>纯净</b>物品」。
+     *
+     * <p>只按物品本身查（不考虑数据组件），因为潜影壳 / 箱子这类装盒原料本来就是纯净物品。
+     * 需要按「物品 + 数据组件」精确查时用 {@link #amountExact(ItemStack)}。</p>
+     */
+    public BigInteger amountOf(Item item) {
+        if (item == null || item == Items.AIR) {
+            return BigInteger.ZERO;
+        }
+        Entry entry = this.find(new ItemStack(item));
+        return entry == null ? BigInteger.ZERO : entry.amount();
+    }
+
+    /**
+     * 按「物品 + 数据组件」精确查数量（与 {@link #takeExact} 同一口径）。
+     *
+     * <p>取消 NBT 限制之后，仓库里同一 Item 可能有多格（不同数据组件各一格），
+     * 所以「取某个具体堆叠」之前必须用它的样板精确查，而不是 {@link #amountOf(Item)}
+     * 那种只按物品查的宽口径。</p>
+     */
+    public BigInteger amountExact(ItemStack sample) {
+        if (sample == null || sample.isEmpty()) {
+            return BigInteger.ZERO;
+        }
+        Entry entry = this.find(sample);
+        return entry == null ? BigInteger.ZERO : entry.amount();
+    }
+
+    /**
+     * 按「纯净物品」扣减数量，用于潜影盒装盒时消耗潜影壳 / 箱子。
+     *
+     * <p>数量不够时<b>什么都不改</b>并返回 {@code false}，调用方据此放弃整次操作。
+     * 扣到 0 的那一格会被移除（与 {@link #take} 一致，不留空洞）。</p>
+     */
+    public boolean takeItem(Item item, int count) {
+        if (count <= 0) {
+            return true;
+        }
+        if (item == null || item == Items.AIR) {
+            return false;
+        }
+        Entry entry = this.find(new ItemStack(item));
+        BigInteger need = BigInteger.valueOf(count);
+        if (entry == null || entry.amount().compareTo(need) < 0) {
+            return false;
+        }
+        this.consume(entry, need);
+        this.markChanged();
+        return true;
+    }
+
+    // ------------------------------------------------------------------ 空潜影盒库存
+
+    /**
+     * 仓库里现在有多少个<b>空潜影盒</b>（各种颜色都算）。
+     *
+     * <p>空潜影盒是「整盒入库」的（见 {@link #unpackShulkerBox}），所以它们各自占一格
+     * （不同颜色各一格）。这里把所有空盒的格子数量累加，用于「装盒时优先用空盒」：
+     * 有空盒就用空盒装，省下潜影壳和箱子。</p>
+     */
+    public BigInteger emptyBoxCount() {
+        BigInteger total = BigInteger.ZERO;
+        for (Entry entry : this.entries) {
+            if (VoidWarehouseShulker.isEmptyBox(entry.template())) {
+                total = total.add(entry.amount());
+            }
+        }
+        return total;
+    }
+
+    /**
+     * 消耗至多 {@code wanted} 个空潜影盒，返回实际扣掉的个数。
+     *
+     * <p>从各种颜色的空盒格子里依次扣，扣到 0 的格子会被移除。库存不足时扣到没有为止，
+     * 返回实际消耗数（调用方据此决定剩下的盒子需要多少个潜影壳 + 箱子）。</p>
+     */
+    public int takeEmptyBoxes(int wanted) {
+        if (wanted <= 0) {
+            return 0;
+        }
+        int taken = 0;
+        // 反向遍历，边扣边移除是安全的
+        for (int i = this.entries.size() - 1; i >= 0 && taken < wanted; i--) {
+            Entry entry = this.entries.get(i);
+            if (!VoidWarehouseShulker.isEmptyBox(entry.template())) {
+                continue;
+            }
+            int available = entry.amount().min(BigInteger.valueOf(wanted - taken)).intValue();
+            if (available <= 0) {
+                continue;
+            }
+            this.consume(entry, BigInteger.valueOf(available));
+            taken += available;
+        }
+        if (taken > 0) {
+            this.markChanged();
+        }
+        return taken;
+    }
+
+    /**
+     * 「装 {@code totalBoxes} 个盒子」需要哪些材料。
+     *
+     * <p>= 尽量用<b>仓库里已有的空盒</b>，用完了的那部分才退化成原版配方
+     * （每盒 {@code SHELL_COST} 个潜影壳 + {@code CHEST_COST} 个箱子）。</p>
+     *
+     * <p>两条使用口（界面点击取一盒 / 聊天按数量取货）必须共用这一份算法：
+     * 早期只有「聊天按数量取货」做了空盒优先，界面里点格子却硬要壳 + 箱，
+     * 于是玩家会遇到「同一个操作，在聊天里能取、点格子却说材料不够」的分裂行为。</p>
+     *
+     * @param totalBoxes 这一次一共要几个盒子（含「散货顺手装出来的那个」）
+     */
+    public BoxMaterials planBoxMaterials(long totalBoxes) {
+        BigInteger want = BigInteger.valueOf(Math.max(0L, totalBoxes));
+        BigInteger empty = this.emptyBoxCount().min(want);
+        BigInteger craft = want.subtract(empty);
+        return new BoxMaterials(
+                empty.intValueExact(),
+                craft.multiply(BigInteger.valueOf(VoidWarehouseShulker.SHELL_COST)).intValueExact(),
+                craft.multiply(BigInteger.valueOf(VoidWarehouseShulker.CHEST_COST)).intValueExact());
+    }
+
+    /**
+     * 这些材料的库存够不够。
+     *
+     * <p>只在 {@code plan} 里「需要现合成」的那些盒子对应的壳 / 箱上做校验 ——
+     * 空盒能吃下的部分不需要再看壳 + 箱。</p>
+     */
+    public boolean hasBoxMaterials(BoxMaterials plan) {
+        if (plan.shells() > 0 && this.amountOf(Items.SHULKER_SHELL)
+                .compareTo(BigInteger.valueOf(plan.shells())) < 0) {
+            return false;
+        }
+        return plan.chests() <= 0
+                || this.amountOf(Items.CHEST).compareTo(BigInteger.valueOf(plan.chests())) >= 0;
+    }
+
+    /**
+     * 按 {@link #planBoxMaterials} 的结果扣账。
+     *
+     * <p>返回实际扣掉的空盒数量（正常应等于 {@code plan.emptyBoxes()}）；
+     * 少扣了说明并发操作把空盒抢走了，调用方不必在意 —— 那部分材料本来就不该花出去。</p>
+     */
+    public int consumeBoxMaterials(BoxMaterials plan) {
+        int taken = plan.emptyBoxes() > 0 ? this.takeEmptyBoxes(plan.emptyBoxes()) : 0;
+        if (plan.shells() > 0) {
+            this.takeItem(Items.SHULKER_SHELL, plan.shells());
+        }
+        if (plan.chests() > 0) {
+            this.takeItem(Items.CHEST, plan.chests());
+        }
+        return taken;
+    }
+
+    /** 一次「装盒」操作的材料账：几个用空盒、剩下要多少潜影壳 / 箱子 */
+    public record BoxMaterials(int emptyBoxes, int shells, int chests) {
+    }
+
+    // ------------------------------------------------------------------ 9 合 1 兑换
+
+    /**
+     * 「9 合 1 兑换」这条规则现在生效吗。
+     *
+     * <p>两个条件都要满足：主开关 {@link VoidWarehouseSettings#voidWarehouse}（关了它连界面都开不了）
+     * 与兑换开关 {@link VoidWarehouseSettings#voidWarehouseExchange}。
+     * <b>所有兑换路径都必须先过这一关</b>，包括「可兑」虚拟条目 —— 规则关掉时
+     * 那些格子必须立刻消失，否则玩家会看到一个点不动的幽灵格。</p>
+     */
+    public static boolean exchangeEnabled() {
+        return VoidWarehouseSettings.voidWarehouse && VoidWarehouseSettings.voidWarehouseExchange;
+    }
+
+    /**
+     * 规则开关变过就把「可兑条目」与「统一展示序」两个缓存整体作废。
+     *
+     * <p>库存改动走 {@link #markChanged()} 已经清过一次，但<b>规则开关不走那条路</b> ——
+     * 它是 {@code /carpet voidWarehouseExchange false} 直接改的静态字段。
+     * 少了这一下，关掉规则后界面上那些「可兑」幽灵格会一直留着。</p>
+     *
+     * <p>开销就是一次布尔比较，所以可以放在每次取缓存之前。</p>
+     */
+    private void revalidateExchangeCache() {
+        boolean enabled = exchangeEnabled();
+        if (this.exchangeCacheEnabled != enabled) {
+            this.exchangeCacheEnabled = enabled;
+            this.offers = null;
+            this.unifiedOrder = null;
+            this.amountOrder = null;
+        }
+    }
+
+    /**
+     * 一个「可兑」条目：仓库里<b>一件都没有</b>这种物品，但靠 9 合 1 兑换能拿出来。
+     *
+     * @param itemId     物品 id（如 {@code "iron_ingot"}）
+     * @param template   这一件物品的样板（数量恒 1，无数据组件）
+     * @param obtainable 现在最多能兑出多少个
+     * @param bulk       普通模式右键「取一组」实际能取到的量。<b>不等于
+     *                   {@code min(堆叠上限, obtainable)}</b> —— 仓库里只有铜块时那个算式给 64，
+     *                   而真值是 63（7 块 = 63；要 64 就得拆 8 块、在仓库里留下 8 个零头）。
+     *                   tooltip 必须写这个数，否则又变成「数字对不上」
+     * @param boxed      潜影盒模式左键「交出 1 盒」实际能装进去的量，同理必须问规划器
+     * @param totalCost  把这 {@code obtainable} 个<b>一次性全兑出来</b>的账目：
+     *                   负数 = 要从仓库扣走的，正数 = 找零退回仓库的
+     *
+     * <p><b>为什么是总量而不是单价</b>：拆零场景下每一步的边际成本都不一样，
+     * 「单价 × 个数」会算出仓库里根本不存在的账。手上只有 1 个铁块时兑 9 个铁锭，
+     * 真账是「铁块 −1」（第一步拆出 9 个铁锭，后面几个直接用退回的那些）；
+     * 而单价是「铁块 −1、铁锭 +8」，乘 9 会得到「铁块 −9」这种明显荒谬的消耗 ——
+     * 拿它去显示，玩家一眼就看出数字对不上。所以这里直接存规划器给出的那一份真账。</p>
+     */
+    public record ExchangeOffer(String itemId, ItemStack template, BigInteger obtainable, BigInteger bulk,
+                                BigInteger boxed, List<VoidWarehouseExchange.Delta> totalCost) {
+        public ExchangeOffer {
+            totalCost = List.copyOf(totalCost);
+        }
+    }
+
+    /**
+     * 一个展示格背后的东西：真实库存格、可兑虚拟条目、或空。
+     *
+     * <p>三种形态打平成一个类型，是因为界面层的 45 个格子要一起渲染、一起响应点击，
+     * 分成两条并行的映射（真实一套、虚拟一套）会让「第几格是谁」这件事出现两个真相。</p>
+     */
+    public static final class DisplaySlot {
+        private static final DisplaySlot EMPTY = new DisplaySlot(-1, null, null);
+
+        private final int realIndex;
+        private final Entry entry;
+        private final ExchangeOffer offer;
+
+        private DisplaySlot(int realIndex, Entry entry, ExchangeOffer offer) {
+            this.realIndex = realIndex;
+            this.entry = entry;
+            this.offer = offer;
+        }
+
+        /** 空的展示格 */
+        public static DisplaySlot empty() {
+            return EMPTY;
+        }
+
+        /** 这个是空的吗 */
+        public boolean isEmpty() {
+            return this.entry == null && this.offer == null;
+        }
+
+        /** 这是「可兑」虚拟条目吗 */
+        public boolean isExchange() {
+            return this.offer != null;
+        }
+
+        /** 真实格在 {@link VoidWarehouseData#entries} 里的下标；虚拟条目与空格都是 {@code -1} */
+        public int realIndex() {
+            return this.realIndex;
+        }
+
+        /** 真实库存格；虚拟条目与空格返回 {@code null} */
+        public Entry entry() {
+            return this.entry;
+        }
+
+        /** 可兑条目；真实格与空格返回 {@code null} */
+        public ExchangeOffer offer() {
+            return this.offer;
+        }
+
+        /** 这一格的样板堆叠（真实格给库存样板、虚拟条目给那件物品），空格返回 {@link ItemStack#EMPTY} */
+        public ItemStack template() {
+            if (this.entry != null) {
+                return this.entry.template();
+            }
+            return this.offer == null ? ItemStack.EMPTY : this.offer.template();
+        }
+    }
+
+    /**
+     * 给兑换引擎看的库存快照。
+     *
+     * <p>只数<b>纯净物品</b>（{@link #amountOf(Item)} 的口径）：兑换表描述的全是原版合成，
+     * 附魔书、药水、改过名的工具<b>不算</b>「同类物品」，拿它们来合成等于把数据丢掉。</p>
+     *
+     * <p>做成快照而不是让引擎直接回调仓库，是因为一次规划要把整个递归走几十上百次，
+     * 每次都去查索引既慢，更麻烦的是<b>规划期间仓库必须冻住</b> ——
+     * 否则「先算出来 3 个可行、执行时库存已经变了」就会变成一次部分成功。</p>
+     */
+    public Map<String, BigInteger> exchangeStock() {
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
+        Map<String, BigInteger> stock = new HashMap<>();
+        for (String itemId : table.items()) {
+            Item item = VoidWarehouseExchangeBootstrap.itemOf(itemId);
+            stock.put(itemId, item == null ? BigInteger.ZERO : this.amountOf(item));
+        }
+        return stock;
+    }
+
+    /**
+     * 规划「用兑换<b>正好</b>拿到 {@code want} 个 {@code sample}」。
+     *
+     * <p>只读、不改仓库。返回 {@code null} 的三种情形：规则没开 / 这件物品不在兑换表里 /
+     * 现有库存凑不出来（凑不出来时仓库<b>一个字节都没动</b>，调用方据此整次拒绝）。</p>
+     */
+    public VoidWarehouseExchange.Plan planExchange(ItemStack sample, BigInteger want) {
+        return this.planExchange(sample, want, false);
+    }
+
+    /**
+     * 规划「用兑换<b>最多</b>拿到 {@code limit} 个」—— 拿不满就拿能拿的最大值。
+     *
+     * <p>界面上右键「取一组」用的是这一个：仓库里只有 10 个铁粒时，
+     * 点铁锭那一格给出 1 个（不是「凑不出 64 个所以整次失败」）。</p>
+     */
+    public VoidWarehouseExchange.Plan planExchangeMax(ItemStack sample, BigInteger limit) {
+        return this.planExchange(sample, limit, true);
+    }
+
+    private VoidWarehouseExchange.Plan planExchange(ItemStack sample, BigInteger amount, boolean allowPartial) {
+        if (!exchangeEnabled() || sample == null || sample.isEmpty()
+                || amount == null || amount.signum() <= 0) {
+            return null;
+        }
+        String itemId = VoidWarehouseExchangeBootstrap.idOf(sample.getItem());
+        if (itemId == null) {
+            return null;
+        }
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
+        if (!table.contains(itemId)) {
+            return null;
+        }
+        VoidWarehouseExchange.Stock stock = VoidWarehouseExchange.Stock.of(this.exchangeStock());
+        return allowPartial
+                ? VoidWarehouseExchange.planMax(table, itemId, amount, stock)
+                : VoidWarehouseExchange.plan(table, itemId, amount, stock);
+    }
+
+    /**
+     * 执行一份兑换计划（{@link #planExchange} 的结果）。
+     *
+     * <p><b>原子</b>：计划里的每一笔一次性改完，最后只标一次脏。中途不存在「扣了铁粒还没退回铁锭」
+     * 这种半截状态 —— 因为计划本身是一份完整的账，没有任何一步需要读仓库的中间状态。</p>
+     *
+     * <p><b>回滚也走这里</b>：把计划的 {@link VoidWarehouseExchange.Plan#negate()} 再执行一遍，
+     * 加减量精确到个位数地反向抵消。背包放不下要退回时就是这么做 ——
+     * 不需要重新规划（重新规划时库存已经变了，算出来的账和刚才那一笔未必一样）。</p>
+     */
+    public void applyExchange(VoidWarehouseExchange.Plan plan) {
+        if (plan == null || plan.isEmpty()) {
+            return;
+        }
+        for (VoidWarehouseExchange.Delta delta : plan.deltas()) {
+            Item item = VoidWarehouseExchangeBootstrap.itemOf(delta.itemId());
+            if (item == null) {
+                // 启动时已经复核过表，这里正常到不了；真到了也只是跳过这一笔（绝不清零）
+                continue;
+            }
+            BigInteger change = delta.change();
+            if (change.signum() > 0) {
+                this.produce(item, change);
+            } else if (change.signum() < 0) {
+                Entry entry = this.find(new ItemStack(item));
+                if (entry != null) {
+                    this.consume(entry, change.negate());
+                }
+            }
+        }
+        this.markChanged();
+    }
+
+    /**
+     * 一次「从仓库取出若干个」的结果，并且<b>可以精确撤销</b>。
+     *
+     * <h2>为什么要一个专门的类型</h2>
+     * <p>「取出」在界面 / 打印机 / 漏斗三条路上都必须是 all-or-nothing：
+     * 先把东西挪进背包，挪不下就<b>一点都不能扣</b>。历史上这件事靠
+     * {@code take(...)} 之后再来一句 {@link VoidWarehouseData#restore}，
+     * 之所以成立，是因为扣的和退的<b>是同一种物品</b>，加回去就完事了。</p>
+     *
+     * <p>9 合 1 兑换打破了这个前提：那次操作可能扣了 9 个铁粒、还退回了 8 个铁锭，
+     * 是<b>一笔多物品的账</b>。想撤销，唯一的正确做法是把整笔账反向执行一遍
+     * （{@link VoidWarehouseExchange.Plan#negate()}），再按真正放进背包的数量重新规划一次 ——
+     * 而不是去猜「该退回哪个物品多少个」。</p>
+     *
+     * <h2>两条路互斥</h2>
+     * <ul>
+     *   <li>{@link #viaExchange()} 为 {@code false}：走的是老路，直接扣成品，
+     *       撤销就是 {@link VoidWarehouseData#restore}；</li>
+     *   <li>{@link #viaExchange()} 为 {@code true}：走的是兑换，撤销就是「反向执行 + 重做
+     *       实际用掉的那部分」。<b>成品有货时绝不会走到这条</b>（见 {@link #withdraw}）。</li>
+     * </ul>
+     */
+    public static final class Withdrawal {
+        private final VoidWarehouseData data;
+        private final ItemStack sample;
+        private final ItemStack stack;
+        private final VoidWarehouseExchange.Plan plan;
+
+        Withdrawal(VoidWarehouseData data, ItemStack sample, ItemStack stack,
+                   VoidWarehouseExchange.Plan plan) {
+            this.data = data;
+            this.sample = sample;
+            this.stack = stack;
+            this.plan = plan;
+        }
+
+        /** 一件都没取到 */
+        public boolean isEmpty() {
+            return this.stack.isEmpty();
+        }
+
+        /** 实际取出了多少个 */
+        public int taken() {
+            return this.stack.getCount();
+        }
+
+        /** 取出的堆叠（带完整数据组件，可直接塞进背包 / 漏斗） */
+        public ItemStack stack() {
+            return this.stack;
+        }
+
+        /** 这次是通过 9 合 1 兑换拿到的吗 */
+        public boolean viaExchange() {
+            return this.plan != null;
+        }
+
+        /**
+         * 把「没真正用出去的那部分」还回仓库。
+         *
+         * @param kept 真正放进了背包 / 漏斗的数量（{@code 0} = 整笔撤销）
+         */
+        public void returnUnplaced(int kept) {
+            int keep = Math.max(0, Math.min(kept, this.stack.getCount()));
+            int back = this.stack.getCount() - keep;
+            if (back <= 0 || this.sample == null) {
+                return;
+            }
+            if (this.plan == null) {
+                // 直接扣成品那条：把剩下的原样放回去（归还语义，不受任何筛选规则影响）
+                this.data.restore(this.sample.copyWithCount(back));
+                return;
+            }
+            // 兑换那条：先把整笔账反向执行（此时仓库回到取货前的状态），
+            // 再按「真正用掉的 keep 个」重新规划并执行一次。
+            // 库存完全相同 ⇒ 规划是确定性的 ⇒ 重新算出来的账和刚才那笔一字不差。
+            this.data.applyExchange(this.plan.negate());
+            if (keep <= 0) {
+                return;
+            }
+            VoidWarehouseExchange.Plan redo =
+                    this.data.planExchange(this.sample, BigInteger.valueOf(keep));
+            if (redo == null) {
+                // 理论上不可能（刚才的规划连更大的量都能满足）。真出现了也绝不凭空补货：
+                // 宁可少给玩家 keep 个，也不让仓库的账对不上。
+                return;
+            }
+            this.data.applyExchange(redo);
+        }
+    }
+
+    /**
+     * 取出最多 {@code want} 个 {@code sample}：<b>有货就直接扣成品，成品一件都没有时才走兑换</b>。
+     *
+     * <p>「有货就绝不兑换」在这里是结构性保证：{@link #withdraw} 一进来先看成品库存，
+     * 只要 {@code > 0} 就立刻走老路返回，后面那些兑换代码根本不会被执行。
+     * 所以玩家不会遇到「明明有铁锭，取的时候却被扣了铁粒」。</p>
+     *
+     * <p>取不满时按「有多少给多少」返回（不是整次失败）—— 这一条是给界面右键
+     * 「取一组」和打印机补货用的，它们要的是「尽量给」。</p>
+     *
+     * @return 结果对象；取不到任何东西时 {@link Withdrawal#isEmpty()} 为 {@code true}
+     */
+    public Withdrawal withdraw(ItemStack sample, BigInteger want) {
+        if (sample == null || sample.isEmpty() || want == null || want.signum() <= 0) {
+            return new Withdrawal(this, sample, ItemStack.EMPTY, null);
+        }
+        int cap = Math.max(1, sample.getMaxStackSize());
+        BigInteger limit = want.min(BigInteger.valueOf(cap));
+
+        // ① 成品有货：走老路，绝不兑换
+        Entry entry = this.find(sample);
+        if (entry != null && entry.amount().signum() > 0) {
+            int ask = limit.min(BigInteger.valueOf(Integer.MAX_VALUE)).intValue();
+            ItemStack taken = this.takeStack(sample, ask);
+            return new Withdrawal(this, sample, taken, null);
+        }
+
+        // ② 成品一件都没有：规则允许时用 9 合 1 兑换
+        VoidWarehouseExchange.Plan plan = this.planExchangeMax(sample, limit);
+        if (plan == null || plan.amount().signum() <= 0) {
+            return new Withdrawal(this, sample, ItemStack.EMPTY, null);
+        }
+        this.applyExchange(plan);
+        return new Withdrawal(this, sample, sample.copyWithCount(plan.amount().intValue()), plan);
+    }
+
+    /**
+     * 当前所有「可兑」条目，按创造模式物品栏顺序排好（缓存，任何改动即失效）。
+     *
+     * <p>入选条件两条，缺一不可：</p>
+     * <ol>
+     *   <li>这件物品<b>仓库里一件都没有</b> —— 有货就不该出现「可兑」格，
+     *       否则玩家会看到一个假的库存量，而且点下去会意外消耗别的东西；</li>
+     *   <li>现有库存<b>真的能兑出至少 1 个</b> —— 只列「理论上能兑」会把
+     *       兑换表里 54 个物品全列出来，其中绝大多数当前兑不动，纯属噪音。</li>
+     * </ol>
+     */
+    public List<ExchangeOffer> exchangeOffers() {
+        this.revalidateExchangeCache();
+        if (this.offers != null) {
+            return this.offers;
+        }
+        if (!exchangeEnabled()) {
+            this.offers = List.of();
+            return this.offers;
+        }
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
+        VoidWarehouseExchange.Stock stock = VoidWarehouseExchange.Stock.of(this.exchangeStock());
+        List<ExchangeOffer> built = new ArrayList<>();
+        for (String itemId : table.items()) {
+            Item item = VoidWarehouseExchangeBootstrap.itemOf(itemId);
+            if (item == null || this.amountOf(item).signum() > 0) {
+                continue;
+            }
+            // 可兑数量的上限<b>由本族库存推出来</b>，不是一个固定值。
+            // 曾经写死过「一组 64」（盒模式下永远只装 1/27 盒），又改成「一盒容量 1728」
+            // （仓库里只有 81 个铁锭时，铁块那格显示 1728 —— 跟仓库里有什么毫无关系）。
+            // 两次都被玩家指出不合理。见 VoidWarehouseExchange#maxObtainable。
+            // 顺带的好事：本族没料时上界是 0，直接跳过，省掉一次注定失败的规划。
+            BigInteger cap = VoidWarehouseExchange.maxObtainable(table, itemId, stock);
+            if (cap.signum() <= 0) {
+                continue;
+            }
+            VoidWarehouseExchange.Plan plan = VoidWarehouseExchange.planMax(table, itemId, cap, stock);
+            if (plan == null || plan.amount().signum() <= 0) {
+                continue;
+            }
+            // 「一次取货实际能拿到多少」一律交给规划器收敛，**不许自己算**：
+            // min(堆叠上限, obtainable) 会给出 64，而真值是 63（按整块拆、不留零头，
+            // 见 VoidWarehouseExchange#drain 第 ③ 条路）。这两个数写反就是「tooltip 说 64、
+            // 实际给 63」—— 跟玩家连着报两次的「凭空常数」是同一类毛病。
+            ItemStack sample = new ItemStack(item);
+            BigInteger bulk = takeAmount(table, itemId, plan.amount(),
+                    Math.max(1, sample.getMaxStackSize()), stock);
+            BigInteger boxed = takeAmount(table, itemId, plan.amount(),
+                    VoidWarehouseShulker.capacity(sample), stock);
+            built.add(new ExchangeOffer(itemId, sample, plan.amount(), bulk, boxed, plan.deltas()));
+        }
+        built.sort(Comparator.comparingInt(offer -> VoidWarehouseSort.rankOf(offer.template())));
+        this.offers = List.copyOf(built);
+        return this.offers;
+    }
+
+    /**
+     * 一次取货动作（左键一盒 / 右键一组）<b>实际能拿到多少</b>：把上限交给规划器收敛，取回真值。
+     *
+     * <p>为什么不直接写 {@code min(上限, obtainable)}：那个算式在「仓库里只有上级」时会高估 ——
+     * 9 个铜块、一组 64，算式给 64，而实际只能给 63（拆 7 块 = 63；要 64 就得拆 8 块、
+     * 把 8 个零头留在仓库里，而这个动作已经被否掉了）。
+     * 所以 tooltip 上的每一个数字都要走这里，宁可多跑一次规划，也不让界面写出一个做不到的数。</p>
+     */
+    private static BigInteger takeAmount(VoidWarehouseExchange.Table table, String itemId,
+                                         BigInteger obtainable, long cap,
+                                         VoidWarehouseExchange.Stock stock) {
+        BigInteger limit = obtainable.min(BigInteger.valueOf(Math.max(1, cap)));
+        if (limit.signum() <= 0) {
+            return BigInteger.ZERO;
+        }
+        VoidWarehouseExchange.Plan plan = VoidWarehouseExchange.planMax(table, itemId, limit, stock);
+        return plan == null ? BigInteger.ZERO : plan.amount();
+    }
+
+    // ------------------------------------------------------------------ 统一展示序
+
+    /**
+     * 统一展示序：把「真实库存格」与「可兑虚拟条目」<b>按创造模式物品栏顺序合并</b>成一条序列。
+     *
+     * <p>编码：值 {@code >= 0} = {@link #entries} 的下标；值 {@code < 0} = 可兑条目
+     * {@code -(下标 + 1)}。用一个 {@code int[]} 而不是对象数组，是因为界面每渲染一帧
+     * 就要问 45 次「这一格是谁」，走基本类型数组没有装箱开销。</p>
+     *
+     * <p><b>为什么要合并而不是把虚拟条目接在末尾</b>：库里只有铁粒时，
+     * 「铁锭（可兑）」这一格应该出现在铁粒附近、按创造栏的位次排，而不是被挤到第 7 页去。
+     * 两边的输入都已经是有序的（{@code entries} 由 {@link #ensureSorted()} 保证、
+     * 可兑条目在 {@link #exchangeOffers()} 里排过），所以这就是一次 O(n) 归并。</p>
+     */
+    private int[] unifiedOrder() {
+        this.revalidateExchangeCache();
+        this.ensureSorted();
+        if (this.unifiedOrder != null) {
+            return this.unifiedOrder;
+        }
+        List<ExchangeOffer> offers = this.exchangeOffers();
+        int real = this.entries.size();
+        int[] order = new int[real + offers.size()];
+        int i = 0;
+        int j = 0;
+        int k = 0;
+        while (i < real && j < offers.size()) {
+            int realRank = VoidWarehouseSort.rankOf(this.entries.get(i).template());
+            int offerRank = VoidWarehouseSort.rankOf(offers.get(j).template());
+            // 位次相同时真实格优先（真实格代表「真有货」）
+            if (realRank <= offerRank) {
+                order[k++] = i++;
+            } else {
+                order[k++] = -(j++) - 1;
+            }
+        }
+        while (i < real) {
+            order[k++] = i++;
+        }
+        while (j < offers.size()) {
+            order[k++] = -(j++) - 1;
+        }
+        this.unifiedOrder = order;
+        return order;
+    }
+
+    /** 一共要画几格 = 真实库存格 + 可兑虚拟条目（分页按这个数算） */
+    public int displayCount() {
+        return this.unifiedOrder().length;
+    }
+
+    /** 第 {@code displayIndex} 个展示格背后是什么（越界返回空） */
+    public DisplaySlot displaySlotAt(int displayIndex) {
+        int[] order = this.unifiedOrder();
+        if (displayIndex < 0 || displayIndex >= order.length) {
+            return DisplaySlot.empty();
+        }
+        int code = order[displayIndex];
+        if (code >= 0) {
+            return new DisplaySlot(code, this.entries.get(code), null);
+        }
+        List<ExchangeOffer> offers = this.exchangeOffers();
+        int offerIndex = -code - 1;
+        if (offerIndex < 0 || offerIndex >= offers.size()) {
+            return DisplaySlot.empty();
+        }
+        return new DisplaySlot(-1, null, offers.get(offerIndex));
+    }
+
+    /** 展示序里一共有几个可兑条目（界面提示用） */
+    public int exchangeOfferCount() {
+        return this.exchangeOffers().size();
+    }
+
+    /**
+     * 「按数量从大到小」的<b>展示</b>顺序：视图下标 → 展示序号。
+     *
+     * <p>真实格用库存数量、可兑条目用「现在能兑出多少」当排序键 ——
+     * 两者都是「这一格现在能给我多少个东西」，口径是一致的。
+     * 数量相同的格<b>保持创造栏顺序</b>（用展示序号当第二关键字），所以不会互相抖动。</p>
+     *
+     * <p><b>只影响显示</b>：{@link #entries} 本身一个字都不动。</p>
+     */
+    int[] displayAmountOrder() {
+        int[] base = this.unifiedOrder();
+        if (this.amountOrder != null && this.amountOrder.length == base.length) {
+            return this.amountOrder;
+        }
+        int size = base.length;
+        Integer[] boxed = new Integer[size];
+        for (int i = 0; i < size; i++) {
+            boxed[i] = i;
+        }
+        Arrays.sort(boxed, (a, b) -> {
+            int byAmount = this.amountAtDisplay(b).compareTo(this.amountAtDisplay(a));
+            // 数量相同 → 用展示序号当第二关键字，也就是「保持创造栏顺序」
+            return byAmount != 0 ? byAmount : Integer.compare(a, b);
+        });
+        int[] order = new int[size];
+        for (int i = 0; i < size; i++) {
+            order[i] = boxed[i];
+        }
+        this.amountOrder = order;
+        return order;
+    }
+
+    /** 某个展示格「现在能给出多少个东西」：真实格 = 库存数量，可兑条目 = 能兑出的数量 */
+    private BigInteger amountAtDisplay(int displayIndex) {
+        DisplaySlot slot = this.displaySlotAt(displayIndex);
+        if (slot.entry() != null) {
+            return slot.entry().amount();
+        }
+        return slot.offer() == null ? BigInteger.ZERO : slot.offer().obtainable();
+    }
+
+    /**
+     * 「可兑」虚拟条目的展示堆叠。
+     *
+     * <p>数据只有<b>一行</b>，口径与聊天里的补货提示完全一致（灰底文字 + 亮绿数字），
+     * 所以直接复用 {@link VoidWarehouseText#body}/{@link VoidWarehouseText#key}：</p>
+     * <ul>
+     *   <li>向上合成：{@code 可合成 2 个，用 绿宝石 18 个}；</li>
+     *   <li>拆上级找零：{@code 可拆出 9 个，拆 铁块 1 个}，有找零时接 {@code ，找回 铁锭 8 个}。</li>
+     * </ul>
+     *
+     * <p><b>为什么合成一行</b>：原先拆成「能兑多少」「消耗什么」两行，玩家反馈
+     * <b>双排冗余</b> —— 两行说的是同一件事（这一格现在能拿走什么、要付什么），
+     * 分成两行反而要来回对数字。合成一行后，「能拿几个」和「要付什么」挨着读，
+     * 像补货提示那样一句读完。</p>
+     *
+     * <p><b>数量写的是总量，不是单价</b>：账目直接取 {@link ExchangeOffer#totalCost()}，
+     * 那是规划器为「正好兑出 {@link ExchangeOffer#obtainable()} 个」算出来的真账。
+     * 早先写的是单价（「消耗：铁粒 ×9」），玩家一眼看成「点一下就要 9 个」，
+     * 而仓库里有 18 个铁粒时真账是 18 —— 数字对不上，所以改成总量。
+     * 而且<b>单价根本算不出真账</b>：手上只有 1 个铁块时兑 9 个铁锭，
+     * 单价是「铁块 −1、铁锭 +8」，乘 9 会得到「铁块 −9」这种仓库里不存在的消耗。</p>
+     *
+     * <p><b>「可合成」还是「可拆出」不是拍脑袋定的</b>：看被扣走的那几样
+     * 在兑换表里的<b>价值</b> —— 比目标便宜 = 向上合成，比目标值钱 = 拆上级找零。
+     * 光看「有没有找零」会判错：手里只有 1 个铁块时兑 9 个铁锭，
+     * 真账是「铁块 −1」而<b>一个找回都没有</b>（9 个正好用完），那明明是拆零。</p>
+     *
+     * <p>物品名一律走 {@code getHoverName()} 保持成组件，<b>不 {@code getString()}</b> ——
+     * 否则专用服务器上会解析成英文名（说明见 {@link VoidWarehouseText#tinted(Component, ChatFormatting)}）。</p>
+     *
+     * <p><b>操作行里的数量同样不许自己算</b>：无论是「右键：兑换 64 个」还是「交出 1 盒（N 个）」，
+     * 数字都必须来自规划器的真值（{@link ExchangeOffer#bulk()} / {@link ExchangeOffer#boxed()}），
+     * 而不是 {@code min(堆叠上限, 可兑数量)} 之类的算式 —— 后者在「仓库里只有上级」时会高估：
+     * 9 个铜块时它给 64，而实际只能给 63（拆 7 块 = 63；要 64 就得拆 8 块、把 8 个零头留在仓库里）。
+     * 界面写出一个做不到的数，跟可兑数量本身写死一样，都属于「凭空常数」。</p>
+     *
+     * @param boxMode 潜影盒模式（操作行换成「交出盒子」那一套，与普通格的口径保持一致）
+     */
+    public static ItemStack buildExchangeDisplay(ExchangeOffer offer, boolean boxMode) {
+        ItemStack stack = offer.template().copyWithCount(1);
+        stack.set(DataComponents.CUSTOM_NAME,
+                VoidWarehouseText.tinted(offer.template().getHoverName(), VoidWarehouseText.FACT)
+                        .append(VoidWarehouseText.line("（可兑）", VoidWarehouseText.FACT)));
+
+        List<Component> lore = new ArrayList<>(4);
+        lore.add(exchangeSummary(offer));
+
+        // 操作行：与普通格一样的说法，口径统一（盒模式下就换成盒模式那一套）
+        int max = Math.max(1, offer.template().getMaxStackSize());
+        if (boxMode) {
+            // 盒里实际能装多少：同样来自规划器（offer.boxed），不是「容量」也不是
+            // 「min(可兑数量, 容量)」。可兑数量可能远超一盒（上限由库存推出来，不是固定值），
+            // 所以这里必须写「实际装进去的个数」。
+            long packed = offer.boxed().longValue();
+            lore.add(VoidWarehouseText.line("左键：交出 1 盒（"
+                    + VoidWarehouseText.count(packed) + " 个）", VoidWarehouseText.ACTION_RGB));
+            lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION_RGB));
+        } else {
+            // 右键一次「取一组」，但一次实际能拿走多少必须问规划器（offer.bulk），
+            // 不能写 min(一组, 可兑数量)：仓库里只有铜块时那个算式给 64，
+            // 而真值是 63（拆 7 块 = 63；要 64 就得拆 8 块、仓库里留下 8 个零头）。
+            // 照抄那个算式就是在数量后面又写一个跟仓库无关的常数。
+            long bulk = offer.bulk().longValue();
+            if (bulk <= 1) {
+                lore.add(VoidWarehouseText.line("左键 / 右键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
+            } else if (bulk >= max) {
+                lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：兑换 " + max + " 个", VoidWarehouseText.ACTION_RGB));
+            } else if (bulk >= offer.obtainable().longValue()) {
+                // 仓库里一共就这么多可兑 —— 一次就能全拿走
+                lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：兑换 " + VoidWarehouseText.count(bulk)
+                        + " 个（最多兑出这么多）", VoidWarehouseText.ACTION_RGB));
+            } else {
+                // 仓库里能兑更多，但一次取不到一组 —— 因为上级只能按整块拆
+                lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：兑换 " + VoidWarehouseText.count(bulk)
+                        + " 个（按整块拆，不留零头）", VoidWarehouseText.ACTION_RGB));
+            }
+        }
+        lore.add(VoidWarehouseText.line("仓库里没有这种物品，靠合成兑换取出", VoidWarehouseText.NOTE));
+
+        stack.set(DataComponents.LORE, new ItemLore(lore));
+        return stack;
+    }
+
+    /**
+     * 数据行本体：{@code 可合成 2 个，用 绿宝石 18 个} / {@code 可拆出 9 个，拆 铁块 1 个}。
+     *
+     * <p>配色与聊天提示同一套：<b>无关紧要的文字灰、关键数字亮绿</b>。
+     * 整行只有两个数字，所以「哪个是要拿的量、哪个是要付的量」靠紧挨着的词就能读出来。</p>
+     */
+    private static Component exchangeSummary(ExchangeOffer offer) {
+        boolean split = splitsFromAbove(offer);
+        MutableComponent line = VoidWarehouseText.body(split ? "可拆出 " : "可合成 ");
+        line.append(VoidWarehouseText.key(VoidWarehouseText.count(offer.obtainable())));
+        line.append(VoidWarehouseText.body(" 个"));
+        line.append(ledgerSegment(offer, true, split ? "，拆 " : "，用 "));
+        line.append(ledgerSegment(offer, false, "，找回 "));
+        return line;
+    }
+
+    /**
+     * 拼一段账目：{@code prefix} + 若干「物品 数字 个」。
+     *
+     * <p>一段里一个物品都解析不出来时返回<b>空组件</b>（那一小段就整体不出现）——
+     * 免得只留下一个孤零零的「，找回 」。</p>
+     */
+    private static MutableComponent ledgerSegment(ExchangeOffer offer, boolean negatives, String prefix) {
+        MutableComponent segment = Component.empty();
+        boolean first = true;
+        for (VoidWarehouseExchange.Delta delta : offer.totalCost()) {
+            if (negatives != (delta.change().signum() < 0)) {
+                continue;
+            }
+            Item item = VoidWarehouseExchangeBootstrap.itemOf(delta.itemId());
+            if (item == null) {
+                continue;
+            }
+            segment.append(VoidWarehouseText.body(first ? prefix : " ＋ "));
+            segment.append(VoidWarehouseText.body(new ItemStack(item).getHoverName()));
+            segment.append(VoidWarehouseText.body(" "));
+            segment.append(VoidWarehouseText.key(VoidWarehouseText.count(delta.change().abs())));
+            segment.append(VoidWarehouseText.body(" 个"));
+            first = false;
+        }
+        return segment;
+    }
+
+    /**
+     * 这份账目是「拆上级找零」还是「向上合成」？
+     *
+     * <p>判据是<b>被扣走的物品在兑换表里的价值</b>（{@code 9 个下级 = 1 个上级} 那个价值）：
+     * 比目标物品值钱 = 拆零，比目标便宜 = 合成。只要被扣的里面有一个比目标值钱，
+     * 就按拆零说 —— 这是能让玩家一眼看懂的口径，
+     * 因为「拆」和「用」指向的是完全不同的仓库格子。</p>
+     *
+     * <p>为什么不用「层级」：表里现在同时有 9:1 与 4:1 两种比例，
+     * 海晶石和海晶石砖离海晶碎片都只有一跳，但一个值 4、一个值 9 ——
+     * 层级分不出谁大谁小，价值才分得出。</p>
+     */
+    private static boolean splitsFromAbove(ExchangeOffer offer) {
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
+        if (!table.contains(offer.itemId())) {
+            return false;
+        }
+        BigInteger target = table.valueOf(offer.itemId());
+        for (VoidWarehouseExchange.Delta delta : offer.totalCost()) {
+            if (delta.change().signum() < 0 && table.contains(delta.itemId())
+                    && table.valueOf(delta.itemId()).compareTo(target) > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 这个堆叠允不允许存进虚空仓库。
+     *
+     * <p>规则：<b>只要非空就收</b>。带 NBT（数据组件）的物品 —— 受损工具 / 附魔物品 /
+     * 改过名的物品 / 药水 / 写了字的书 —— 现在<b>一律放行</b>，不再在仓库这一层做筛选。
+     * 「一格一种形态」仍然成立：带不同数据组件的物品各占一格，数量照常无上限。</p>
+     *
+     * <p>是否放行某个物品，改由<b>玩家自己在漏斗里过滤</b>（分类物白名单，见
+     * {@link VoidWarehouseHopper} / {@link VoidWarehouseClassifier}），仓库本身不替玩家做主。</p>
+     *
+     * <p><b>潜影盒是例外</b>：它虽然常常带 {@code CONTAINER} 组件，但不走这条路 ——
+     * 它在 {@link #insert} 里就被拆成原料了，见 {@link #isInsertable}。</p>
+     */
+    public static boolean isStorable(ItemStack stack) {
+        return stack != null && !stack.isEmpty();
+    }
+
+    /**
+     * 这个堆叠能不能「交给仓库处理」（可以被 {@link #insert} 收下或拆解）。
+     *
+     * <p>= 任意非空物品 <b>或</b> 潜影盒（非空潜影盒会被拆开，空盒整盒入库）。
+     * 漏斗那类「先筛一遍再决定要不要搬」的调用方要用的是这一个，而不是 {@link #isStorable}。</p>
+     */
+    public static boolean isInsertable(ItemStack stack) {
+        return VoidWarehouseShulker.isShulkerBox(stack) || isStorable(stack);
+    }
+
+    /**
+     * 从第 {@code index} 格取出至多 {@code wanted} 个，返回实际取出的数量。
+     *
+     * <p>取空的那一格会被移除，后面的格子整体前移（「一种物品一格」，不留空洞）。</p>
+     */
+    public int take(int index, int wanted) {
+        Entry entry = this.entryAt(index);
+        if (entry == null || wanted <= 0) {
+            return 0;
+        }
+        BigInteger actual = entry.amount().min(BigInteger.valueOf(wanted));
+        if (actual.signum() <= 0) {
+            return 0;
+        }
+        this.consume(entry, actual);
+        this.markChanged();
+        // actual <= wanted（int），安全
+        return actual.intValue();
+    }
+
+    /**
+     * 按「分类物」扣减：用手里这个堆叠当<b>样板</b>，从仓库里拿走至多 {@code wanted} 个。
+     *
+     * <p>与 {@link #take(int, int)} 的区别是「按格号取」和「按拿着的那件东西取」。
+     * 漏斗出料时手里只有漏斗格里的那一个分类物，并没有仓库格号 ——
+     * 而且仓库的格号会随着取空/入库不断变化，拿格号当凭据不安全，
+     * 所以这里用<b>物品 + 数据组件</b>精确匹配（与 {@link #find} 同一套判定，
+     * 也就是「仓库里那一格到底存的是不是这种东西」的唯一定义）。</p>
+     *
+     * <p>取空的那一格会被移除（不留空洞），与其它取出路径完全一致。</p>
+     *
+     * @return 实际取出的数量（0 = 仓库里没有这种物品，或数量本来就不够/参数非法）
+     */
+    public int takeExact(ItemStack sample, int wanted) {
+        if (sample == null || sample.isEmpty() || wanted <= 0) {
+            return 0;
+        }
+        Entry entry = this.find(sample);
+        if (entry == null) {
+            return 0;
+        }
+        BigInteger actual = entry.amount().min(BigInteger.valueOf(wanted));
+        if (actual.signum() <= 0) {
+            return 0;
+        }
+        this.consume(entry, actual);
+        this.markChanged();
+        // actual <= wanted（int），安全
+        return actual.intValue();
+    }
+
+    /**
+     * 与 {@link #takeExact} 一样按样板扣减，但<b>把扣下来的东西作为真实堆叠返回</b>。
+     *
+     * <p>为什么需要它：打印机这类「替玩家把货放进背包」的场景，光知道
+     * 「扣成功了」不够 —— 还得拿到那个带完整数据组件的 {@link ItemStack} 才能塞进
+     * 背包槽位，否则玩家拿到的是凭空 {@code new ItemStack(item)}，附魔书、
+     * 药水一类的数据会在搬运过程中被抹掉。</p>
+     *
+     * <p>数量不够时返回「能给的最大数量」而不是整批失败 —— 仓库里只剩 3 个圆石时，
+     * 能拿 3 个总比一个都拿不到强。</p>
+     *
+     * @param wanted 想要多少个（会被该物品的原版堆叠上限夹住）
+     * @return 取出的堆叠；一件都没有（或参数非法）时返回<b>空堆叠</b>，绝不返回 null
+     */
+    public ItemStack takeStack(ItemStack sample, int wanted) {
+        if (sample == null || sample.isEmpty() || wanted <= 0) {
+            return ItemStack.EMPTY;
+        }
+        Entry entry = this.find(sample);
+        if (entry == null) {
+            return ItemStack.EMPTY;
+        }
+        ItemStack template = entry.template();
+        int limit = Math.min(wanted, Math.max(1, template.getMaxStackSize()));
+        BigInteger actual = entry.amount().min(BigInteger.valueOf(limit));
+        if (actual.signum() <= 0) {
+            return ItemStack.EMPTY;
+        }
+        this.consume(entry, actual);
+        this.markChanged();
+        // copyWithCount：切断与 template 的实例关联（template 恒为 1 个样用）
+        return template.copyWithCount(actual.intValue());
+    }
+
+    /** 清空整个仓库（目前没有界面入口，保留给指令 / 调试使用） */
+    public void clearContent() {
+        if (this.entries.isEmpty()) {
+            return;
+        }
+        this.entries.clear();
+        this.index.clear();
+        this.markChanged();
+    }
+
+    // ------------------------------------------------------------------ 载入指纹
+
+    /**
+     * 这份数据<b>是不是从一份「本该有内容、却一条都没读出来」的存档加载出来的</b>。
+     *
+     * <p>用途只有一个：{@link VoidWarehouse#data} 在把实例交出去之前用它做最后一道
+     * 闸门 —— 一旦为 true，说明数据层出了严重问题（文件里有记录，却没能变成任何一格），
+     * 此时<b>绝不能</b>让这个空壳继续工作并写盘，必须直接拒绝服务。</p>
+     *
+     * <p>判据很严：必须「文件里确实有条目」且「一条都没变成可用的格子」，也不存在
+     * 被特意保留下来的坏条目。</p>
+     *
+     * <p><b>这个结论在构造的那一刻就定死了</b>（见 {@link #loadedSuspicious}）：
+     * 玩家可以随时把仓库里的东西取空，那时 {@link #entries} 为空是<b>正常的</b>，
+     * 不能反过来说它是空壳 —— 实测踩过：载入 2 条合法数据 → 玩家清空 → 闸门误报、
+     * 整个仓库再也访问不了。true 空仓库（新世界 / 玩家自己清空的）不会误报。</p>
+     */
+    public boolean isSuspiciouslyEmpty() {
+        return this.loadedSuspicious;
+    }
+
+    /** 从存档里一共读到了多少条（含读不懂的）。0 表示文件本来就是空的 / 新建的。 */
+    public int loadedCount() {
+        return this.loadedEntryCount;
+    }
+
+    /** 载入时读不懂的条数 */
+    public int loadedBrokenCount() {
+        return this.loadedBrokenCount;
+    }
+
+    /** 读不懂、但仍会原样写回的那些条目条数 */
+    public int brokenCount() {
+        return this.brokenEntries.size();
+    }
+
+    /**
+     * 任何改动都要走这里：让统计缓存与「数量排序」视图缓存失效，并标记存档为脏。
+     *
+     * <p>注意<b>不动</b> {@link #sortedGeneration}：删格子（取空）与改数量都不会破坏
+     * 基础顺序，只有「新增一种物品」才会（那由 {@link #invalidateOrder()} 单独负责）。
+     * 这样普通的取出/存入不会触发一次无谓的重排。</p>
+     */
+    void markChanged() {
+        this.cachedCount = -1;
+        this.cachedTotal = null;
+        this.amountOrder = null;
+        // 库存一动，「能兑出什么、能兑多少」就全变了 —— 两个缓存一起作废
+        this.offers = null;
+        this.unifiedOrder = null;
+        this.setDirty();
+    }
+
+    // ------------------------------------------------------------------ 序列化输出
+
+    /**
+     * 写盘用的条目列表：仓库里的每一格 + 读不出来的原文（原样带回去）。
+     *
+     * <p>坏原文排在最后，顺序稳定；它们不参与仓库的任何逻辑，只是「借道」存续。</p>
+     */
+    private List<Decoded> decodedEntries() {
+        List<Decoded> list = new ArrayList<>(this.entries.size() + this.brokenEntries.size());
+        for (Entry entry : this.entries) {
+            list.add(new Decoded.Ok(
+                    new RawEntry(Optional.of(entry.template()), Optional.empty(), Optional.of(entry.amount()))));
+        }
+        for (net.minecraft.nbt.Tag raw : this.brokenEntries) {
+            list.add(new Decoded.Broken(raw));
+        }
+        return list;
+    }
+}

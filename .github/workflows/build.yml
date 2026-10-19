@@ -85,9 +85,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        # 这个 job 没有 checkout（只需要产物），所以必须显式给 gh 传 --repo，
+        # 否则它会去读本地 git 仓库，报 `fatal: not a git repository` 然后 exit 1。
         run: |
           ls -la artifacts
           gh release create "$TAG" artifacts/*.jar \
+            --repo "$REPO" \
             --title "$TAG" \
             --generate-notes \
             --verify-tag

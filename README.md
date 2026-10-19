@@ -1,5 +1,7 @@
 # Carpet Neko Addition
 
+[![Build](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/actions/workflows/build.yml/badge.svg)](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/actions/workflows/build.yml)
+
 为 **Minecraft 26.3** 上的 **Carpet** 提供三条规则的 Carpet 扩展模组：
 
 - **自动经验修补 (autoMending)** —— 逻辑移植自 [Carpet-GUGU-Addition](https://github.com/DaCong114514qwq/Carpet-GUGU-Addition) 的 `autoMending_new`

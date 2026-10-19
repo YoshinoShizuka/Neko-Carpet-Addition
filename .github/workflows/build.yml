@@ -68,7 +68,7 @@ jobs:
           retention-days: 30
 
   release:
-    name: Release ${{ github.ref_name }}
+    name: Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest

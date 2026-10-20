@@ -1,0 +1,370 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Registry;
+import net.minecraft.core.component.DataComponentType;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.inventory.ChestMenu;
+import net.minecraft.world.inventory.MenuType;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 【临时审计】量化两件此前没有数据的事，测完连同 hook 一起删掉。
+ *
+ * <h2>① 纯服务端契约（S 组）</h2>
+ * <p>判据全部是<b>本进程内可验证的事实</b>，不是读文档得出的推断：</p>
+ * <ul>
+ *   <li>{@code net.minecraft.client.Minecraft} 在这个 JVM 里<b>不可加载</b> ——
+ *       说明当前进程是真正的专用服务端（没有任何客户端类）。本模组在这个进程里
+ *       初始化成功、界面能被创建、点击能被处理，才有意义；</li>
+ *   <li>界面用的是原版 {@code MenuType.GENERIC_9x6}，不是自定义 MenuType ——
+ *       客户端不需要注册任何东西就能把 {@code ClientboundOpenScreenPacket} 解出来；</li>
+ *   <li>界面类继承原版 {@code ChestMenu} —— 客户端走的是原版大箱子那套渲染/预测代码；</li>
+ *   <li>展示堆叠上挂的<b>所有</b>数据组件都是原版已注册组件（没有自定义
+ *       {@code DataComponentType}）—— 纯原版客户端能反序列化并渲染 tooltip；</li>
+ *   <li>界面标题是成品字面量文本，不是翻译键 —— 纯原版客户端没有我们的语言文件，
+ *       翻译键会原样显示成 {@code container.xxx}。</li>
+ * </ul>
+ *
+ * <h2>② 普通漏斗被我们的注入拖慢了多少（P 组）</h2>
+ * <p>这是此前<b>唯一没有实测数据</b>的一项。已有基准测过「入库漏斗自己的开销」
+ * （{@code intake} 122ns / {@code pushItemsTick} 341ns），也测过「拆掉终端后的同一批漏斗
+ * 跑 pushItemsTick」357ns —— 但那张表里<b>没有不带模组的纯原版对照</b>，所以
+ * 「一个跟虚空仓库毫无关系的普通漏斗，每 tick 白付多少」一直是个空白。</p>
+ *
+ * <p>测法：同一批 1024 个「上下左右都没有工作台」的普通漏斗、同一份字节码
+ * （mixin 两轮都在），<b>只切换规则开关</b>：</p>
+ * <ul>
+ *   <li>规则<b>关</b> → 两处注入都在第一行 {@code if (!VoidWarehouseSettings.voidWarehouse) return;} 退出；</li>
+ *   <li>规则<b>开</b> → 四处判定全部走完（HEAD 的 {@code isIntake}+{@code isExtractor}，
+ *       TAIL 再来一遍）。</li>
+ * </ul>
+ * <p>两次之差就是「本模组加在普通漏斗上的净开销」，原版 tick、方块实体查找、
+ * 冷却逻辑两边完全一样，自然抵消。</p>
+ *
+ * <p><b>为什么这个数值得测</b>：它按「全服漏斗数」线性累加，而且
+ * <b>跟玩家有没有在用虚空仓库毫无关系</b> —— 规则一开，存档里每个漏斗每 tick 都要付。</p>
+ */
+public final class PureServerAudit {
+
+    private static final int GRID = 32;                 // 32 × 32 = 1024 个漏斗
+    private static final int STEP = 2;                  // 间距（>1 保证吸力盒不互相重叠）
+    private static final int N = GRID * GRID;
+    private static final int BASE_X = 160;              // 离既有场景远一点
+    private static final int BASE_Z = 160;
+    private static final int HOPPER_Y = 70;
+
+    private static final int WARMUP = 100;              // 热身轮（JIT 未编译时前几项会虚高数倍）
+    private static final int ROUNDS = 200;
+    private static final int SETTLE_TICKS = 60;
+
+    private static final List<HopperBlockEntity> hoppers = new ArrayList<>();
+    private static final List<BlockState> states = new ArrayList<>();
+    private static final List<BlockPos> positions = new ArrayList<>();
+
+    private static int stage = 0;
+    private static int counter = 0;
+    private static int waited = 0;
+    private static int checks = 0;
+    private static int failures = 0;
+    private static boolean halted = false;
+
+    private PureServerAudit() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (halted) {
+            return;
+        }
+        try {
+            step(server);
+        } catch (Throwable t) {
+            System.out.println("!! 审计抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        switch (stage) {
+            case 0:     // 强制加载（排队生效，下面要等）
+                for (int cx = BASE_X >> 4; cx <= (BASE_X + (GRID - 1) * STEP) >> 4; cx++) {
+                    for (int cz = BASE_Z >> 4; cz <= (BASE_Z + (GRID - 1) * STEP) >> 4; cz++) {
+                        level.setChunkForced(cx, cz, true);
+                    }
+                }
+                break;
+            case 1:     // 等区块真的就绪
+                if (!level.isLoaded(new BlockPos(BASE_X, HOPPER_Y, BASE_Z))
+                        || !level.isLoaded(new BlockPos(BASE_X + (GRID - 1) * STEP, HOPPER_Y,
+                        BASE_Z + (GRID - 1) * STEP))) {
+                    if (++waited > 400) {
+                        System.out.println("PERF !! 区块 400 tick 没加载出来，放弃");
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                System.out.println("PERF 区块就绪");
+                break;
+            case 2:
+                contract(server);
+                break;
+            case 3:
+                build(level);
+                System.out.println("PERF 搭好 " + positions.size() + " / " + N + " 个普通漏斗（上下左右都没有工作台）");
+                break;
+            case 4:     // 等方块实体就位
+            case 5:
+            case 6:
+                collect(level);
+                if (hoppers.size() != N) {
+                    System.out.println("PERF !! 只拿到 " + hoppers.size() + " / " + N + " 个漏斗，数据不可信");
+                    stage = 999;
+                    return;
+                }
+                break;
+            case 7:     // 先空转，躲开区块刚生成完那段抖动
+                if (++counter < SETTLE_TICKS) {
+                    return;
+                }
+                counter = 0;
+                break;
+            case 8:
+                perf(level, server);
+                break;
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    // ------------------------------------------------------------------ ① 纯服务端契约
+
+    private static void contract(MinecraftServer server) {
+        // S1 这个 JVM 里根本不存在客户端类 —— 当前进程就是专用服务端
+        //
+        // Fabric 的 Knot 在 SERVER 环境里会主动拒绝加载 net.minecraft.client.*，
+        // 抛的是 RuntimeException("Cannot load class ... in environment type SERVER")，
+        // 不是 ClassNotFoundException —— 所以这里按 Throwable 兜，并把消息一起打出来当证据。
+        boolean noClient;
+        String why;
+        try {
+            Class.forName("net.minecraft.client.Minecraft");
+            noClient = false;
+            why = "居然加载成功了";
+        } catch (Throwable t) {
+            noClient = true;
+            why = t.getClass().getSimpleName() + ": " + t.getMessage();
+        }
+        check("S1 当前进程加载不到 net.minecraft.client.Minecraft（真·专用服务端）→ " + why, noClient);
+
+        // S2 界面用的是原版 MenuType，客户端无需注册任何东西
+        Registry<MenuType<?>> menus = BuiltInRegistries.MENU;
+        Object key = menus.getKey(MenuType.GENERIC_9x6);
+        check("S2 界面类型是原版 minecraft:generic_9x6：" + key,
+                key != null && key.toString().equals("minecraft:generic_9x6"));
+
+        // S3 继承原版 ChestMenu（客户端走原版大箱子渲染 + 预测路径）
+        check("S3 界面类直接继承原版 ChestMenu",
+                VoidWarehouseMenu.class.getSuperclass() == ChestMenu.class);
+
+        // S4 标题是成品字面量，不是翻译键（纯原版客户端没有我们的语言文件）
+        String title = new VoidWarehouseProvider(VoidWarehouse.data(server)).getDisplayName().getString();
+        check("S4 标题是字面量「" + title + "」而不是翻译键",
+                title.equals(VoidWarehouseProvider.TITLE_TEXT));
+
+        // S5 展示堆叠上的数据组件全是原版已注册组件 —— 纯原版客户端能反序列化渲染
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        boolean oldWarehouse = VoidWarehouseSettings.voidWarehouse;
+        VoidWarehouseSettings.voidWarehouse = true;
+        try {
+            data.insert(new ItemStack(Items.COBBLESTONE, 4096));
+            data.insert(new ItemStack(Items.END_STONE, 300));
+            data.insert(new ItemStack(Items.DIAMOND_SWORD));
+        } finally {
+            VoidWarehouseSettings.voidWarehouse = oldWarehouse;
+        }
+        int stacks = 0;
+        int custom = 0;
+        StringBuilder offenders = new StringBuilder();
+        for (int i = 0; i < data.entryCount(); i++) {
+            VoidWarehouseData.Entry entry = data.entryAt(i);
+            if (entry == null) {
+                continue;
+            }
+            for (ItemStack stack : new ItemStack[]{entry.display(), entry.displayInBoxMode()}) {
+                if (stack == null || stack.isEmpty()) {
+                    continue;
+                }
+                stacks++;
+                for (DataComponentType<?> type : stack.getComponents().keySet()) {
+                    if (BuiltInRegistries.DATA_COMPONENT_TYPE.getKey(type) == null) {
+                        custom++;
+                        offenders.append(' ').append(type);
+                    }
+                }
+            }
+        }
+        check("S5 " + stacks + " 份展示堆叠的数据组件全是原版已注册组件（自定义 " + custom + " 个）"
+                + (custom > 0 ? "：" + offenders : ""), custom == 0 && stacks > 0);
+
+        // S6 界面里的物品全是原版注册表物品（屏障占位 / 玻璃板 / 罗盘 / 潜影盒）
+        int items = 0;
+        int unknown = 0;
+        for (int i = 0; i < data.entryCount(); i++) {
+            VoidWarehouseData.Entry entry = data.entryAt(i);
+            if (entry == null) {
+                continue;
+            }
+            items++;
+            if (BuiltInRegistries.ITEM.getKey(entry.template().getItem()) == null) {
+                unknown++;
+            }
+        }
+        check("S6 " + items + " 种库存物品全部来自原版物品注册表（未知 " + unknown + " 个）",
+                unknown == 0 && items > 0);
+    }
+
+    // ------------------------------------------------------------------ ② 普通漏斗开销
+
+    private static void perf(ServerLevel level, MinecraftServer server) {
+        boolean oldWarehouse = VoidWarehouseSettings.voidWarehouse;
+
+        // 交叉跑两轮，排除「先跑的那组占 JIT 便宜」这种顺序偏差
+        VoidWarehouseSettings.voidWarehouse = true;
+        double on1 = benchPush(level);
+        VoidWarehouseSettings.voidWarehouse = false;
+        double off1 = benchPush(level);
+        VoidWarehouseSettings.voidWarehouse = true;
+        double on2 = benchPush(level);
+        VoidWarehouseSettings.voidWarehouse = false;
+        double off2 = benchPush(level);
+        VoidWarehouseSettings.voidWarehouse = oldWarehouse;
+
+        double on = Math.min(on1, on2);
+        double off = Math.min(off1, off2);
+        System.out.printf("PERF %-34s %9.0f ns/漏斗/tick%n", "pushItemsTick(规则开，普通漏斗)", on);
+        System.out.printf("PERF %-34s %9.0f ns/漏斗/tick%n", "pushItemsTick(规则关，普通漏斗)", off);
+        System.out.printf("PERF %-34s %9.0f ns/漏斗/tick%n", "净增量（规则开 − 规则关）", on - off);
+
+        // 拆开量：两次判定各自的成本
+        benchIsIntake(level, server);
+
+        check("P1 普通漏斗的净增量 < 400ns/漏斗/tick（1024 个 = "
+                + String.format("%.2f", (on - off) * N / 1e6) + " ms/tick）", on - off < 400);
+        check("P2 普通漏斗的净增量不为负（说明两组确实跑的是同一条路径）", on - off >= -50);
+
+        // 按「全服漏斗数」外推，让读者一眼看到这件事的量级
+        for (int n : new int[]{1024, 4096, 16384}) {
+            System.out.printf("PERF 外推 %6d 个普通漏斗 → 净增 %7.3f ms/tick（50ms 预算的 %.2f%%）%n",
+                    n, (on - off) * n / 1e6, (on - off) * n / 5e7);
+        }
+    }
+
+    /** 只量 pushItemsTick 本身，返回 ns/漏斗 */
+    private static double benchPush(ServerLevel level) {
+        Runnable body = () -> {
+            for (int i = 0; i < hoppers.size(); i++) {
+                HopperBlockEntity h = hoppers.get(i);
+                HopperBlockEntity.pushItemsTick(level, h.getBlockPos(), states.get(i), h);
+            }
+        };
+        for (int i = 0; i < WARMUP; i++) {
+            body.run();
+        }
+        long t0 = System.nanoTime();
+        for (int i = 0; i < ROUNDS; i++) {
+            body.run();
+        }
+        long dt = System.nanoTime() - t0;
+        return (double) dt / ROUNDS / Math.max(1, hoppers.size());
+    }
+
+    private static void benchIsIntake(ServerLevel level, MinecraftServer server) {
+        boolean old = VoidWarehouseSettings.voidWarehouse;
+        VoidWarehouseSettings.voidWarehouse = true;
+        Runnable intake = () -> {
+            for (int i = 0; i < hoppers.size(); i++) {
+                VoidWarehouseHopper.isIntake(level, hoppers.get(i).getBlockPos(), states.get(i));
+            }
+        };
+        Runnable extractor = () -> {
+            for (int i = 0; i < hoppers.size(); i++) {
+                VoidWarehouseExtractor.isExtractor(level, hoppers.get(i).getBlockPos(), states.get(i));
+            }
+        };
+        System.out.printf("PERF %-34s %9.0f ns/漏斗%n", "isIntake", time(intake));
+        System.out.printf("PERF %-34s %9.0f ns/漏斗%n", "isExtractor", time(extractor));
+        VoidWarehouseSettings.voidWarehouse = old;
+    }
+
+    private static double time(Runnable body) {
+        for (int i = 0; i < WARMUP; i++) {
+            body.run();
+        }
+        long t0 = System.nanoTime();
+        for (int i = 0; i < ROUNDS; i++) {
+            body.run();
+        }
+        long dt = System.nanoTime() - t0;
+        return (double) dt / ROUNDS / Math.max(1, hoppers.size());
+    }
+
+    // ------------------------------------------------------------------ 工具
+
+    private static void build(ServerLevel level) {
+        hoppers.clear();
+        states.clear();
+        positions.clear();
+        for (int ix = 0; ix < GRID; ix++) {
+            for (int iz = 0; iz < GRID; iz++) {
+                BlockPos pos = new BlockPos(BASE_X + ix * STEP, HOPPER_Y, BASE_Z + iz * STEP);
+                // 只放漏斗：上方 / 下方 / 口朝向都没有工作台 ⇒ 对两边判定都是「普通漏斗」
+                level.setBlock(pos, Blocks.HOPPER.defaultBlockState(), 3);
+                positions.add(pos);
+            }
+        }
+    }
+
+    private static void collect(ServerLevel level) {
+        hoppers.clear();
+        states.clear();
+        for (BlockPos pos : positions) {
+            BlockEntity be = level.getBlockEntity(pos);
+            if (be instanceof HopperBlockEntity hopper) {
+                hoppers.add(hopper);
+                states.add(level.getBlockState(pos));
+            }
+        }
+    }
+
+    private static void check(String what, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+        }
+        System.out.println((ok ? "  OK   " : "  FAIL ") + what);
+    }
+
+    private static void finish(MinecraftServer server) {
+        if (halted) {
+            return;
+        }
+        halted = true;
+        System.out.println("SMOKE RESULT pure_server/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+}

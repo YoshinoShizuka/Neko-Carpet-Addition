@@ -46,7 +46,7 @@ import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
  *
  * <h2>要证的东西（每组都配反证）</h2>
  * <ol>
- *   <li><b>A 静态表</b>：31 条边 + 1 条多原料配方 / 57 个物品 / 双向 20 + 只能向上 9 + 只能向下 2，价值自洽
+ *   <li><b>A 静态表</b>：47 条边 + 1 条多原料配方 / 88 个物品 / 双向 20 + 只能向上 25 + 只能向下 2，价值自洽
  *       （{@code value(big) == count × value(small)}）；</li>
  *   <li><b>B 启动复核</b>：拿真实 {@code RecipeManager} 复核后一条都没被砍（说明表与 26.3 的现实一致）；</li>
  *   <li><b>C 反向核对</b>：把表里每条边<b>按它自己的比例还原成真实物品</b>（9 个摆 3×3、4 个摆 2×2），
@@ -68,6 +68,11 @@ import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
  *       只有 4:1 能咬住这种 bug；</li>
  *   <li><b>R 多原料配方</b>：海晶灯（5 碎片 + 4 晶体）端到端跑一遍 —— 玩家要求「只能使用原料兑换」，
  *       所以要同时证「两种原料都真扣」和「同族成品一个都不许折算」。</li>
+ *   <li><b>S 骨头族</b>：{@code 1 骨头 → 3 骨粉}（只能拆）与骨块的 9:1 合成拼成「一个下级两个上级」，
+ *       重点咬「骨粉永远变不出骨头」；</li>
+ *   <li><b>T 4:1 原料族</b>：本轮新增的 16 条（线→羊毛、石英→石英块、雪球→雪块…），
+ *       逐条咬「比例就是 4、只有合成方向、仓库里只有上级时取不出下级」——
+ *       这 16 条和已存在的 4:1 海晶石边一起，是「引擎里不许写死 9 或 4」的第二组判据。</li>
  * </ol>
  *
  * <h2>反证组（区分「改对了」与「断言是空转」）</h2>
@@ -187,6 +192,9 @@ public final class VoidWarehouseExchangeSelfCheck {
                 boneFamilyChecks(server);
                 break;
             case 18:
+                materialFamilyChecks(server);
+                break;
+            case 19:
                 cleanup(server);
                 break;
             default:
@@ -202,10 +210,10 @@ public final class VoidWarehouseExchangeSelfCheck {
         System.out.println("=== A 静态表 ===");
         VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
 
-        check("A1 声明 31 条边", VoidWarehouseExchange.EDGES.size() == 31);
-        check("A2 建表后生效 31 条边", table.edges().size() == 31);
+        check("A1 声明 47 条边", VoidWarehouseExchange.EDGES.size() == 47);
+        check("A2 建表后生效 47 条边", table.edges().size() == 47);
         check("A3 价值自相矛盾被丢掉的边 = 0", table.dropped().isEmpty());
-        check("A4 表里共 57 个物品（55 个来自单原料边 + 海晶棱镜 / 海晶灯）", table.items().size() == 57);
+        check("A4 表里共 88 个物品（86 个来自单原料边 + 海晶棱镜 / 海晶灯）", table.items().size() == 88);
 
         int both = 0;
         int combineOnly = 0;
@@ -220,7 +228,8 @@ public final class VoidWarehouseExchangeSelfCheck {
             }
         }
         check("A5 双向边 20 条（实际 " + both + "）", both == 20);
-        check("A6 只能向上合成 9 条（实际 " + combineOnly + "）", combineOnly == 9);
+        check("A6 只能向上合成 25 条（9 条 9:1 + 16 条 4:1 原料族，实际 " + combineOnly + "）",
+                combineOnly == 25);
         check("A7 只能向下拆分 2 条（骨头 / 涂蜡铜块，实际 " + splitOnly + "）", splitOnly == 2);
 
         // 价值（不是「层级」）：value(big) == count × value(small)
@@ -325,7 +334,7 @@ public final class VoidWarehouseExchangeSelfCheck {
         System.out.println("   [B] 声明 " + declared + " 条边，其中 " + unavailable
                 + " 条的物品在本版本不存在（26.2 起才有硫磺 / 浓缩硫）");
 
-        check("B1 声明 31 条边（表本身不随版本变）", declared == 31);
+        check("B1 声明 47 条边（表本身不随版本变）", declared == 47);
         check("B2 作废条数 == 「物品在本版本不存在」的条数（" + unavailable + "，实际 "
                 + summary.dropped() + "）", summary.dropped() == unavailable);
         check("B3 kept + dropped == declared", summary.kept() + summary.dropped() == declared);
@@ -1825,6 +1834,225 @@ public final class VoidWarehouseExchangeSelfCheck {
                 offerOf(data.exchangeOffers(), "bone") == null);
 
         VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+    }
+
+    // ================================================================ T 4:1 原料族
+
+    /**
+     * 本轮新增的 16 条「4 个原料 → 1 个原料块」的边，按 (small, big) 字典序。
+     *
+     * <p>这组边和 A19~A23 那条 4:1 海晶石边的区别是<b>两端都是常见原料</b>，
+     * 所以它同时是两件事的判据：</p>
+     * <ol>
+     *   <li><b>比例不许写死</b>：引擎里任何一处把 9 或 4 写死，用 9:1 的物品测都是绿的，
+     *       只有 4:1 能咬住；</li>
+     *   <li><b>方向不许想当然</b>：16 条<b>全部</b>只有合成方向 —— 原版没有任何
+     *       「1 个块 → 4 个原料」的配方。一旦某条被误写成双向，
+     *       玩家就能拿 1 个雪块换 4 个雪球，而界面只会显示「可兑」。</li>
+     * </ol>
+     *
+     * <p>反过来，「4 个原料 → 1 个块」这一侧是真的要保证能兑出来：
+     * 仓库只剩 4 个雪球时，雪块那格必须显示可兑 1（T13 走的是真实界面）。</p>
+     */
+    private static final String[][] FOUR_TO_ONE = {
+            {"amethyst_shard", "amethyst_block"},
+            {"brick", "bricks"},
+            {"clay_ball", "clay"},
+            {"glowstone_dust", "glowstone"},
+            {"honeycomb", "honeycomb_block"},
+            {"magma_cream", "magma_block"},
+            {"nether_brick", "nether_bricks"},
+            {"pointed_dripstone", "dripstone_block"},
+            {"quartz", "quartz_block"},
+            {"rabbit_hide", "leather"},
+            {"red_sand", "red_sandstone"},
+            {"resin_brick", "resin_bricks"},
+            {"sand", "sandstone"},
+            {"snowball", "snow_block"},
+            {"string", "white_wool"},
+            {"sulfur_spike", "sulfur"},
+    };
+
+    /**
+     * T 组：16 条 4:1 原料族。
+     *
+     * <p>几条断言是<b>汇总式</b>的（16 条边循环一圈，只报「哪几条不对」），
+     * 因为逐条各出一条断言会让五版本输出膨胀到看不完，而失败信息仍然精确到边。</p>
+     */
+    private static void materialFamilyChecks(MinecraftServer server) {
+        System.out.println("=== T 4:1 原料族：16 条「4 个原料 -> 1 个原料块」 ===");
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
+
+        // ---- ① 这 16 条真的在表里，比例 4、只有合成方向 ----
+        List<String> missing = new ArrayList<>();
+        for (String[] pair : FOUR_TO_ONE) {
+            VoidWarehouseExchange.Edge found = findEdge(table, pair[0], pair[1]);
+            if (found == null || found.count() != 4 || !found.canCombine() || found.canSplit()) {
+                missing.add(pair[0] + "->" + pair[1] + "(" + found + ")");
+            }
+        }
+        check("T1 16 条 4:1 原料族都在表里、比例 4、只有合成方向（异常：" + missing + "）",
+                missing.isEmpty());
+
+        // ---- ② 全表「4:1 且只能合成」正好 17 条（16 条原料族 + 4 碎片→1 海晶石）----
+        int fourOnly = 0;
+        for (VoidWarehouseExchange.Edge edge : table.edges()) {
+            if (edge.count() == 4 && edge.canCombine() && !edge.canSplit()) {
+                fourOnly++;
+            }
+        }
+        check("T2 全表「4:1 且只能合成」的边 = 17 条（16 条原料族 + 海晶石，实际 " + fourOnly + "）",
+                fourOnly == 17);
+
+        // ---- ③ 不重复、没有反向边 ----
+        List<String> dup = new ArrayList<>();
+        for (String[] pair : FOUR_TO_ONE) {
+            int forward = 0;
+            int backward = 0;
+            for (VoidWarehouseExchange.Edge edge : table.edges()) {
+                if (edge.small().equals(pair[0]) && edge.big().equals(pair[1])) {
+                    forward++;
+                }
+                if (edge.small().equals(pair[1]) && edge.big().equals(pair[0])) {
+                    backward++;
+                }
+            }
+            if (forward != 1 || backward != 0) {
+                dup.add(pair[0] + "->" + pair[1] + " 正向=" + forward + " 反向=" + backward);
+            }
+        }
+        check("T3 每条边在表里恰好一次、且没有反向边（异常：" + dup + "）", dup.isEmpty());
+
+        // ---- ④ 价值自洽 + 「谁也不能变成原料」 ----
+        List<String> badValue = new ArrayList<>();
+        List<String> badDirection = new ArrayList<>();
+        for (String[] pair : FOUR_TO_ONE) {
+            if (!table.valueOf(pair[1]).equals(table.valueOf(pair[0]).multiply(FOUR))) {
+                badValue.add(pair[1] + "=" + table.valueOf(pair[1]) + " 应=" + table.valueOf(pair[0]).multiply(FOUR));
+            }
+            if (hasSplitter(table, pair[0], pair[1])) {
+                badDirection.add(pair[1] + " 能拆成 " + pair[0]);
+            }
+            if (!table.suppliersOf(pair[0]).equals(Set.of(pair[0]))) {
+                badDirection.add(pair[0] + " 的供给者=" + table.suppliersOf(pair[0]));
+            }
+            if (!table.suppliersOf(pair[1]).contains(pair[0])) {
+                badDirection.add(pair[1] + " 的供给者缺 " + pair[0]);
+            }
+        }
+        check("T4 value(块) = 4 × value(原料)（异常：" + badValue + "）", badValue.isEmpty());
+        check("T5 方向：块拆不回原料、suppliersOf(原料) 只有自己、suppliersOf(块) 含原料"
+                + "（异常：" + badDirection + "）", badDirection.isEmpty());
+
+        // ---- ⑤ 规划：4 个原料换 1 个块；3 个不够；1 个块换不出原料 ----
+        List<String> planBad = new ArrayList<>();
+        for (String[] pair : FOUR_TO_ONE) {
+            VoidWarehouseExchange.Plan enough = plan(table, pair[1], 1, Map.of(pair[0], 4));
+            if (enough == null || !change(enough, pair[0]).equals(FOUR.negate())) {
+                planBad.add("4x" + pair[0] + " 换不出 1x" + pair[1] + "（" + ledger(enough) + "）");
+            }
+            if (plan(table, pair[1], 1, Map.of(pair[0], 3)) != null) {
+                planBad.add("3x" + pair[0] + " 竟然够换 1x" + pair[1]);
+            }
+            if (plan(table, pair[0], 1, Map.of(pair[1], 1)) != null) {
+                planBad.add("1x" + pair[1] + " 竟然能拆出 " + pair[0]);
+            }
+        }
+        check("T6 4 个原料正好换 1 个块、3 个不够、1 个块换不出原料（异常：" + planBad + "）",
+                planBad.isEmpty());
+        checkConserved(table, "T7 4 线换 1 白羊毛", plan(table, "white_wool", 1, Map.of("string", 4)));
+
+        // ---- ⑥ 上界必须按 4 算 ----
+        List<String> boundBad = new ArrayList<>();
+        for (String[] pair : FOUR_TO_ONE) {
+            BigInteger cap = VoidWarehouseExchange.maxObtainable(table, pair[1], stock(Map.of(pair[0], 8)));
+            if (!cap.equals(BigInteger.TWO)) {
+                boundBad.add(pair[1] + " 上界=" + cap);
+            }
+        }
+        check("T8 8 个原料的上界是 2 个块（按 4 算，写成 9 会得 0；异常：" + boundBad + "）",
+                boundBad.isEmpty());
+
+        // ---- ⑦ 族隔离：不许把这 16 族粘到别的族上 ----
+        List<String> famBad = new ArrayList<>();
+        for (String[] pair : FOUR_TO_ONE) {
+            // 硫磺族本轮之前就存在（硫磺 → 浓缩硫），加了尖刺之后是 3 个成员
+            int want = pair[1].equals("sulfur") ? 3 : 2;
+            if (table.familyOf(pair[1]).size() != want) {
+                famBad.add(pair[1] + " 族=" + table.familyOf(pair[1]));
+            }
+        }
+        check("T9 15 个新族各自 2 个成员、硫磺族 3 个（异常：" + famBad + "）", famBad.isEmpty());
+
+        // ---- ⑧ 版本差异：硫磺那两条按物品存在性整条生效 / 整条作废 ----
+        boolean sulfurPresent = VoidWarehouseExchangeBootstrap.itemOf("sulfur") != null
+                && VoidWarehouseExchangeBootstrap.itemOf("sulfur_spike") != null;
+        int sulfurKept = 0;
+        for (VoidWarehouseExchange.Edge edge : VoidWarehouseExchange.active().edges()) {
+            if (edge.big().equals("sulfur") || edge.big().equals("potent_sulfur")) {
+                sulfurKept++;
+            }
+        }
+        check("T10 硫磺族 2 条边整条生效 / 整条作废（本版本"
+                        + (sulfurPresent ? "有" : "没有") + "硫磺，生效 " + sulfurKept + " 条）",
+                sulfurPresent ? sulfurKept == 2 : sulfurKept == 0);
+
+        // ---- ⑨ 界面：玩家真的点一下 ----
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        check("T11 假玩家可构造", player != null);
+        if (player == null) {
+            return;
+        }
+        Item string = VoidWarehouseExchangeBootstrap.itemOf("string");
+        Item wool = VoidWarehouseExchangeBootstrap.itemOf("white_wool");
+        if (string == null || wool == null) {
+            check("T12 本版本缺线 / 白羊毛（不该发生）", false);
+            return;
+        }
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(string, 8));
+        List<VoidWarehouseData.ExchangeOffer> offers = data.exchangeOffers();
+        VoidWarehouseData.ExchangeOffer woolOffer = offerOf(offers, "white_wool");
+        check("T12 仓库只有 8 个线 → 白羊毛那格「可兑 2」（按 4:1 算，按 9 算会是 0）",
+                woolOffer != null && woolOffer.obtainable().equals(BigInteger.TWO));
+
+        VoidWarehouseMenu menu = openMenu(player);
+        if (menu != null) {
+            VoidWarehousePageContainer container = (VoidWarehousePageContainer) menu.getContainer();
+            int slot = findExchangeSlot(container, "white_wool");
+            check("T13 界面上找得到白羊毛的可兑槽", slot >= 0);
+            if (slot >= 0) {
+                int before = countInInventory(player, wool);
+                menu.clicked(slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                check("T14 左键真的拿到 1 个白羊毛", countInInventory(player, wool) - before == 1);
+                // 仓库里原有 8 个线，扣掉 4 个正好换 1 个白羊毛 ⇒ 应该剩 4 个，且不该有余料退回
+                check("T15 仓库变成「线 −4」，即 8 → 4（4 个正好用完，无找零/无退回），实际：" + snapshot(data),
+                        data.amountOf(string).equals(FOUR) && data.amountOf(wool).signum() == 0);
+            }
+        }
+
+        // 反证：仓库里堆满白羊毛，也换不出线
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(wool, 64));
+        check("T16 反证：仓库有 64 个白羊毛时，线仍然不在可兑列表（不能拆）",
+                offerOf(data.exchangeOffers(), "string") == null);
+
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+    }
+
+    /** 表里 (small → big) 这条边，没有则返回 {@code null} */
+    private static VoidWarehouseExchange.Edge findEdge(VoidWarehouseExchange.Table table,
+                                                       String small, String big) {
+        for (VoidWarehouseExchange.Edge edge : table.edges()) {
+            if (edge.small().equals(small) && edge.big().equals(big)) {
+                return edge;
+            }
+        }
+        return null;
     }
 
     private static void cleanup(MinecraftServer server) {

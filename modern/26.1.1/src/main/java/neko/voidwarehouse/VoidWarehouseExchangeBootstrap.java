@@ -19,7 +19,7 @@ import java.util.Set;
  * 把 {@link VoidWarehouseExchange} 里那张<b>纯字符串的静态表</b>绑到当前版本真实的物品与配方上。
  *
  * <h2>为什么需要这一层</h2>
- * <p>静态表是在 Minecraft 26.3 的全量配方上采集的（30 条单原料边 + 1 条多原料配方 / 56 个物品），
+ * <p>静态表是在 Minecraft 26.3 的全量配方上采集的（47 条单原料边 + 1 条多原料配方 / 88 个物品），
  * 是<b>26.x 的超集</b>。但本模组还编译到 1.21.x：那些版本里既可能没有某些物品
  * （硫磺、树脂是后来才加的），也可能没有某些配方。如果不复核就照单执行，
  * 结果就是「点一下说换了，实际什么也没发生」，甚至更糟 —— 凭空变出物品。</p>
@@ -65,7 +65,7 @@ public final class VoidWarehouseExchangeBootstrap {
     /**
      * 一次绑定的结果。
      *
-     * @param declared    静态表里声明了多少条边（26.3 版本是 30）
+     * @param declared    静态表里声明了多少条边（26.3 版本是 47）
      * @param kept        这个版本真正生效了多少条
      * @param dropped     整条作废了几条（物品不存在，或两个方向的配方都不存在）
      * @param downgraded  保留但砍掉了半个方向的条数
@@ -110,7 +110,7 @@ public final class VoidWarehouseExchangeBootstrap {
     /**
      * {@link Item} → 物品 id（不含命名空间）；<b>非原版命名空间的物品一律返回 {@code null}</b>。
      *
-     * <p>为什么要卡命名空间：兑换表只描述原版那 29 条配方，别的模组自己加一个
+     * <p>为什么要卡命名空间：兑换表只描述原版那 47 条配方，别的模组自己加一个
      * {@code mymod:iron_ingot} 不该被当成铁锭拿去兑换 —— 那是两个完全不同的物品。</p>
      */
     public static String idOf(Item item) {
@@ -232,7 +232,7 @@ public final class VoidWarehouseExchangeBootstrap {
      * 把结果打到日志里。
      *
      * <p><b>全绿时不刷屏</b>：只在「丢东西了」的时候列出逐条详情 ——
-     * 正常服主不需要知道内部有 30 条边，但一旦某条边因为版本差异没生效，
+     * 正常服主不需要知道内部有 47 条边，但一旦某条边因为版本差异没生效，
      * 他必须能从日志里看出是哪一条、为什么。</p>
      */
     private static void log(Summary summary) {

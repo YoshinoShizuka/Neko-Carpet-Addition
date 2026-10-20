@@ -32,9 +32,10 @@ import java.util.TreeSet;
  * 仓库里只有 1 个铁块时，取 1 个铁锭就是「把铁块拆了，1 个给玩家、8 个退回仓库」。</p>
  *
  * <h2>为什么这件事不能靠「等价总量」直接算</h2>
- * <p>26.3 全部 30 条边里，只有 20 条是双向的。另外 9 条<b>只能向上合成</b>
+ * <p>26.3 全部 47 条边里，只有 20 条是双向的。另外 25 条<b>只能向上合成</b>
  * （原版没有对应的拆分配方，例如 {@code 9 冰 → 1 浮冰}，但浮冰拆不回冰），
- * 还有 1 条<b>只能向下拆分</b>（{@code 1 涂蜡铜块 → 9 铜锭}，但 9 个铜锭合不出涂蜡铜块）。
+ * 还有 2 条<b>只能向下拆分</b>（{@code 1 骨头 → 3 骨粉}、{@code 1 涂蜡铜块 → 9 铜锭}，
+ * 这两条的反向配方原版都没有）。
  * 所以这是一个<b>有向图</b>，「把库存折成一个总数」的做法会把不存在的配方也算进去，
  * 那才是真正会凭空造物的地方。</p>
  *
@@ -134,9 +135,9 @@ public final class VoidWarehouseExchange {
     }
 
     /**
-     * 全部兑换边（<b>31 条 / 55 个物品</b>），先按方向分组、组内按 (small, big) 字典序。
+     * 全部兑换边（<b>47 条 / 86 个物品</b>），先按方向分组、组内按 (small, big) 字典序。
      * 另有 <b>1 条多原料配方</b>（海晶灯，2 种原料），见 {@link #MULTI_RECIPES} ——
-     * 算上它表里一共 57 个物品。
+     * 算上它表里一共 88 个物品。
      *
      * <p>采集口径（对 Minecraft 26.3 的原版配方全集做过一次全量扫描，2042 个配方文件）：</p>
      * <ul>
@@ -145,14 +146,16 @@ public final class VoidWarehouseExchange {
      *   <li>{@code splitRecipe} 非空 = 存在配方「1 个 {@code big} → {@code count} 个 {@code small}」。</li>
      * </ul>
      *
-     * <p>26.3 的实测分布：<b>双向 20 条、只能向上合成 9 条、只能向下拆分 2 条</b>。
-     * 只能向上合成的 9 条是：竹→竹块、唱片碎片→唱片 5、冰→浮冰、西瓜片→西瓜、
-     * 地狱疣→地狱疣块、浮冰→蓝冰、海晶碎片→海晶砖、硫磺→浓缩硫，
-     * 以及 <b>4 个海晶碎片→海晶石</b>（2×2 配方）；
+     * <p>26.3 的实测分布：<b>双向 20 条、只能向上合成 25 条、只能向下拆分 2 条</b>。
+     * 只能向上合成的 25 条里，前 8 条是「原料 → 成品」的 9:1 边：
+     * 竹→竹块、唱片碎片→唱片 5、冰→浮冰、西瓜片→西瓜、地狱疣→地狱疣块、浮冰→蓝冰、
+     * 海晶碎片→海晶砖、硫磺→浓缩硫；
+     * 另有 <b>4 个海晶碎片→海晶石</b>（2×2），
+     * 以及 <b>16 条 4:1 原料族</b>（两端都是常见原料，见下方分组注释）；
      * 只能向下拆分的 2 条是：<b>骨头→3 骨粉</b>（<b>反向不成立</b>，原版没有骨粉合成骨头）、
      * 涂蜡铜块→9 铜锭（<b>反向不成立，绝不能逆用</b>）。</p>
      *
-     * <p>比例<b>不是常数 9</b>：全表 29 条 9:1、1 条 <b>4:1</b>（4 海晶碎片→海晶石）、
+     * <p>比例<b>不是常数 9</b>：全表 29 条 9:1、<b>17 条 4:1</b>（16 条原料族 + 4 海晶碎片→海晶石）、
      * 1 条 <b>3:1</b>（3 骨粉←1 骨头）。</p>
      *
      * <p><b>其中「冰 → 浮冰 → 蓝冰」是一条三级链</b>（81 个冰 = 1 个蓝冰），
@@ -228,7 +231,8 @@ public final class VoidWarehouseExchange {
             new Edge("prismarine_shard", "prismarine_bricks", 9, "prismarine_bricks", null),
             // 9 x sulfur -> 1 x potent_sulfur
             new Edge("sulfur", "potent_sulfur", 9, "potent_sulfur", null),
-            // 4 x prismarine_shard -> 1 x prismarine（原版 2x2，全表唯一的 4:1；
+            // 4 x prismarine_shard -> 1 x prismarine（原版 2x2；本组唯一的 4:1，
+            // 另外 16 条同样 4:1 的原料族在文件末尾单独分组；
             // 原版没有「1 个海晶石 → 4 个碎片」的配方，所以只能向上合成，不能拆）
             new Edge("prismarine_shard", "prismarine", 4, "prismarine", null),
 
@@ -241,7 +245,54 @@ public final class VoidWarehouseExchange {
             // 这条边的比例是 3 而不是 9，也是全表唯一一条 3:1；引擎里没有写死任何比例。
             new Edge("bone_meal", "bone", 3, null, "bone_meal"),
             // 9 x copper_ingot -> 1 x waxed_copper_block
-            new Edge("copper_ingot", "waxed_copper_block", 9, null, "copper_ingot_from_waxed_copper_block"));
+            new Edge("copper_ingot", "waxed_copper_block", 9, null, "copper_ingot_from_waxed_copper_block"),
+
+            // ---- 只能向上合成：4:1 原料族（16 条，原版一律没有反向拆解配方） ----
+            //
+            // 这一组和上面「冰 → 浮冰」那类不同：两端都是<b>常见原料</b>（线 / 石英 / 雪球…），
+            // 而不是「原料 → 成品」，所以对虚空仓库的实际价值最高 ——
+            // 仓库里剩 4 个雪球就能顶 1 个雪块，不必先攒够 9 个。
+            //
+            // ⚠️ 16 条一律 splitRecipe = null：逐条查过 26.3 的 2042 个配方文件，
+            // 原版<b>没有</b>任何一条「1 个块 → 4 个原料」的配方（墙 / 台阶那类能拆的
+            // 都不是「同物品 4 合 1」的成对关系，别拿它们类比）。
+            // 【4 x amethyst_shard -> 1 x amethyst_block】
+            new Edge("amethyst_shard", "amethyst_block", 4, "amethyst_block", null),
+            // 【4 x brick -> 1 x bricks】
+            new Edge("brick", "bricks", 4, "bricks", null),
+            // 【4 x clay_ball -> 1 x clay】
+            new Edge("clay_ball", "clay", 4, "clay", null),
+            // 【4 x glowstone_dust -> 1 x glowstone】
+            new Edge("glowstone_dust", "glowstone", 4, "glowstone", null),
+            // 【4 x honeycomb -> 1 x honeycomb_block】
+            new Edge("honeycomb", "honeycomb_block", 4, "honeycomb_block", null),
+            // 【4 x magma_cream -> 1 x magma_block】
+            new Edge("magma_cream", "magma_block", 4, "magma_block", null),
+            // 【4 x nether_brick -> 1 x nether_bricks】
+            new Edge("nether_brick", "nether_bricks", 4, "nether_bricks", null),
+            // 【4 x pointed_dripstone -> 1 x dripstone_block】
+            new Edge("pointed_dripstone", "dripstone_block", 4, "dripstone_block", null),
+            // 【4 x quartz -> 1 x quartz_block】
+            new Edge("quartz", "quartz_block", 4, "quartz_block", null),
+            // 【4 x rabbit_hide -> 1 x leather】
+            new Edge("rabbit_hide", "leather", 4, "leather", null),
+            // 【4 x red_sand -> 1 x red_sandstone】
+            new Edge("red_sand", "red_sandstone", 4, "red_sandstone", null),
+            // 【4 x resin_brick -> 1 x resin_bricks】
+            new Edge("resin_brick", "resin_bricks", 4, "resin_bricks", null),
+            // 【4 x sand -> 1 x sandstone】
+            new Edge("sand", "sandstone", 4, "sandstone", null),
+            // 【4 x snowball -> 1 x snow_block】
+            new Edge("snowball", "snow_block", 4, "snow_block", null),
+            // 【4 x string -> 1 x white_wool】
+            new Edge("string", "white_wool", 4, "white_wool_from_string", null),
+            // 【4 x sulfur_spike -> 1 x sulfur】
+            //
+            // ⚠️ 这条边是 16 条里<b>唯一</b>有版本差异的：硫磺那一族 26.2 才加，
+            // 26.1.1 / 26.1.2 / 1.21.11 里 sulfur 与 sulfur_spike 都不存在，
+            // 启动复核会把这条（连同 sulfur → potent_sulfur）一起整条砍掉。
+            // 顺带一提它让硫磺族变成一条链：硫磺尖刺 = 1、硫磺 = 4、浓缩硫 = 36。
+            new Edge("sulfur_spike", "sulfur", 4, "sulfur_from_sulfur_spikes", null));
 
     // ------------------------------------------------------------------ 多原料配方
 
@@ -514,7 +565,7 @@ public final class VoidWarehouseExchange {
      *
      * <h2>拿来当限制还有个副作用是好事</h2>
      * <p>一点相关料都没有时上界是 0，调用方可以<b>直接跳过</b>，不用跑一次注定失败的规划 ——
-     * 界面每次刷可兑条目要问 56 个物品，这一下省掉的是绝大多数。</p>
+     * 界面每次刷可兑条目要问 86 个物品，这一下省掉的是绝大多数。</p>
      *
      * @return 上界（没有任何能变成它的库存时为 {@code 0}）；{@code itemId} 不在表里也返回 {@code 0}
      */

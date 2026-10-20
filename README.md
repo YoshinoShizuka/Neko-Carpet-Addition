@@ -40,7 +40,7 @@
   （**潜行且手上有东西时除外**，那种情况是原版的「放置」语义，见下）。
 
 - 类型：`boolean`
-- 默认值：`true`
+- 默认值：`false`
 - 分类：`neko`、`survival`
 - 用法：`/carpet voidWarehouse true|false`
 - 共享范围：**全服唯一一份**，跨维度共享（存在主世界的 SavedData 里）

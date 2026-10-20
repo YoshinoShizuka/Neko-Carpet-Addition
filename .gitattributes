@@ -1,0 +1,12 @@
+# 行尾约定
+#
+# `gradlew` 是 shell 脚本，必须是 LF：一旦被转成 CRLF，Linux（含 GitHub Actions 的
+# ubuntu runner）上执行会直接 `cannot execute: required file not found`（exit 127）。
+# Windows 的 .bat 反过来保留 CRLF。
+gradlew      text eol=lf
+*.sh         text eol=lf
+gradlew.bat  text eol=crlf
+
+# 二进制：不要做任何行尾转换
+*.jar        binary
+*.png        binary

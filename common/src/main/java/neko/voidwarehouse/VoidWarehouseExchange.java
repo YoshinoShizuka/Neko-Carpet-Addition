@@ -504,13 +504,30 @@ public final class VoidWarehouseExchange {
      * 这就是玩家报的「铜锭显示可兑后，右键第一下给 8/9 个、第二下才给一组」。
      *
      * <h2>现在怎么做</h2>
-     * <p>先由价值守恒算出「再怎么折腾也超不过去」的上界（{@link #maxObtainable}），
-     * 与 {@code limit} 取小，然后<b>从上往下逐个试</b>；第一个规划得出来的就是答案，
-     * 所以返回值必定是「真做得到的最大量」，不依赖任何单调性假设。</p>
+     * <p>先算「再怎么折腾也超不过去」的上界，与 {@code limit} 取小，然后<b>从上往下逐个试</b>；
+     * 第一个规划得出来的就是答案，所以返回值必定是「真做得到的最大量」，
+     * 不依赖任何单调性假设。上界取两道里更紧的那道：</p>
+     * <ol>
+     *   <li>{@link #maxObtainable}：价值守恒（{@code Σ 供货者价值 ÷ 目标价值}）；</li>
+     *   <li>{@link #reachableBound}：照 {@code drain} 的分支结构推（一条路线，不叠加）。</li>
+     * </ol>
      *
-     * <p>代价可接受，因为这个上界很紧（仓库里有多少料，它就只给出对应那么多），
-     * 而「9 的倍数」这一档永远可行，实际往下退的步数是个位数；
-     * {@code limit} 本身也只是「堆叠上限 64」或「一盒容量」这个量级。</p>
+     * <h2>⚠️ 探针次数 = 「上界 − 真值」，这就是 1.0.13 卡死的地方</h2>
+     * <p>玩家报「打开虚空仓库 GUI 服务器就卡住」，根因不在别处，就在这一行循环上：
+     * 界面每刷新一次可兑条目要问 88 个物品，每个物品都从「上界」一路往下试，
+     * 而每次试探都是一整轮递归 {@code drain}。上界只要虚高几百万，就是几百万次
+     * <b>注定失败</b>的递归，主线程直接被钉死。</p>
+     * <p>所以这里做了两件事，缺一不可：</p>
+     * <ul>
+     *   <li><b>把上界压紧</b>（{@link #reachableBound}，两处重复计数已修）。正常仓库里
+     *       上界就等于真值，<b>第一次试探就命中</b>；</li>
+     *   <li><b>留一条硬预算</b>（{@link #MAX_PROBES}）。再紧的上界也可能差一点点，
+     *       而「差多少」在病态库存下可以到天文数字 —— 例如骨粉库存恰好是
+     *       {@code 1000000}（≡1 mod 3）时，<b>任何</b>骨块数都凑不出来
+     *       （{@code 9n − 1000000} 永远不是 3 的倍数），要证明「没有」就只能试到底。
+     *       探够预算就老实返回 {@code null}（这一格不显示「可兑」），
+     *       绝不把服务器主线程钉死。</li>
+     * </ul>
      *
      * @return 可行的计划（数量可能小于 {@code limit}）；一个都拿不到时返回 {@code null}
      */
@@ -519,7 +536,20 @@ public final class VoidWarehouseExchange {
             return null;
         }
         BigInteger upper = limit.min(maxObtainable(table, itemId, stock));
+        // ⚠️ 再压一次：maxObtainable 是「Σ 全部供货者价值 ÷ 目标价值」，把**多条互斥路线**也加在一起了
+        // （骨粉既能拆骨头、又能拆骨块；铜锭既能用铜粒合、又能拆铜块 / 涂蜡铜块）。
+        // 而 drain 一次只能走一条路，所以那种上界在「多来源库存」时能松好几倍 ——
+        // 上界松多少，下面这个「从上往下逐个试」就要白试多少次（1.0.13 的卡死就是这么来的：
+        // 骨头 100 万 + 骨块 100 万时上界 1200 万，真值只有 900 万，等于 300 万次注定失败的递归）。
+        upper = upper.min(reachableBound(table, itemId, stock));
+
+        int probes = 0;
         for (BigInteger probe = upper; probe.signum() > 0; probe = probe.subtract(ONE)) {
+            if (++probes > MAX_PROBES) {
+                // 兜底：探够预算还没命中就直接收手。
+                // 宁可这一格不显示「可兑」，也绝不允许把服务器主线程钉死几十秒。
+                return null;
+            }
             Plan plan = plan(table, itemId, probe, stock);
             if (plan != null) {
                 return plan;
@@ -575,6 +605,142 @@ public final class VoidWarehouseExchange {
 
     /** 递归深度上限：多原料配方目前只有一层，留 4 层足够并且能防止将来手滑写出环 */
     private static final int MAX_RECIPE_DEPTH = 4;
+
+    /**
+     * {@link #planMax} 往下试探的<b>硬预算</b>（次）。
+     *
+     * <p>上界压紧之后，正常仓库里<b>第一次试探就命中</b>（自检 U 组逐条咬「上界 == 真值」），
+     * 所以这个预算只在两种情况下才会用到：</p>
+     * <ul>
+     *   <li><b>零头对不上</b>：上界是按「零头可以随便补」推的，真凑的时候会被取整卡掉几个，
+     *       缺口最多是「每条边 {@code count − 1}」，两级链也不过几十；</li>
+     *   <li><b>真的一个都兑不出</b>：例如仓库里骨粉恰好 {@code 1000000} 个（≡1 mod 3）、
+     *       骨头 100 万、没有骨块时，<b>任何</b>骨块都凑不出来
+     *       （{@code 9n − 1000000} 永远不是 3 的倍数）。要证明「没有」只能试到底，
+     *       这时预算就是止损线。</li>
+     * </ul>
+     * <p>1024 相对「几十」有十倍余量，而单次失败的试探只要几微秒 ——
+     * 实测病态仓库（每件 1 亿）整轮界面规划 35ms，其中最慢的一格（就是上面那个骨块）33ms。</p>
+     */
+    private static final int MAX_PROBES = 1024;
+
+    /** {@link #reachableBound} 的递归深度上限（与 {@link #MAX_DEPTH} 同口径） */
+    private static final int MAX_BOUND_DEPTH = 8;
+
+    /**
+     * 第 ③ 条路里 {@code units} 枚举<b>超过这个数才做钳位</b>（见 {@link #unitsCeiling}）。
+     *
+     * <p>日常取货的上限是「一盒 1728」，{@code floor(1728 / 2)} 也就 864，够不到这里 ——
+     * 所以正常玩法的 {@code drain} 一次上界都不用算，这个常量保证优化只作用在
+     * 「界面问可兑数量」那条大数字路径上。</p>
+     */
+    private static final BigInteger CLAMP_UNITS_ABOVE = BigInteger.valueOf(1024);
+
+    /**
+     * 「照 {@code drain} 真正能走的那几条路」推出来的<b>可达上界</b> —— 比 {@link #maxObtainable} 紧得多。
+     *
+     * <h2>为什么 {@link #maxObtainable} 不够紧</h2>
+     * <p>它把<b>全部供货者</b>的价值直接相加，可是 {@code drain} 一次<b>只能走一条路</b>：</p>
+     * <ul>
+     *   <li>骨粉既能「拆骨头（3:1）」又能「拆骨块（9:1）」—— 两条都是拆上级，一次只走一条；</li>
+     *   <li>铜锭既能「用铜粒合」又能「拆铜块」「拆涂蜡铜块」—— 同样互斥。</li>
+     * </ul>
+     * <p>所以「骨头 100 万 + 骨块 100 万 → 骨粉」的真实上限是 max(300 万, 900 万) = 900 万，
+     * 而被加出来的上界是 1200 万。{@code planMax} 是「从上界往下逐个试」，
+     * 这 300 万的差额就是 300 万次注定失败的递归 —— 服务器直接卡死。</p>
+     *
+     * <h2>这个上界怎么算</h2>
+     * <p>按 {@code drain} 的分支结构，一次成功取料最多是「<b>自己库存 + 最好的一条路线</b>」：</p>
+     * <ul>
+     *   <li>② 合成：{@code floor(reachable(下级) / count)}；</li>
+     *   <li>②b 多原料：每种原料各自是硬顶，取 {@code min}；</li>
+     *   <li>③ 拆上级：{@code reachable(上级) × count}，<b>加上</b>零头那一侧的
+     *       {@code base}（自身库存 + 最好的一条合成路线）—— 这正是 ③ 分支允许的
+     *       「拆整块 + 用下级补零头」。</li>
+     * </ul>
+     *
+     * <h2>⚠️ 两条「同一份库存只许算一次」的红线（1.0.13 卡死的两个真正来源）</h2>
+     * <p>这个函数是<b>上界</b>，写松一点只是慢一点；但松的方式必须是「路线取并」，
+     * 绝不能是「把同一份料数两遍」。第一版就是两处都在重复计数，于是上界虚高好几倍，
+     * 而 {@code planMax} 的代价恰好等于「上界 − 真值」：</p>
+     * <ol>
+     *   <li><b>撞环时不许返回自身库存</b>：{@code 铜粒 ← 铜锭 ← 铜块} 这条链回头算铜锭时，
+     *       会把「铜粒 100 万」原样再数一遍 ⇒ 铜锭上界 1000 万涨到 1099 万，
+     *       铜粒上界跟着从 9000 万涨到 <b>9899 万</b>（真值 9000 万，多试 900 万次）。
+     *       {@code drain} 的 {@code visiting} 会让「回头再要它」这一整支<b>直接失败</b>，
+     *       所以这一支能额外产出的就是 <b>0</b>。</li>
+     *   <li><b>拆上级分支里不许再加 {@code own}</b>：{@code own} 已经在 {@code base} 里算过，
+     *       外层又加一次就是两遍。A↔B（9:1 双向）、A 有 100、B 有 10 时上界会给出 290
+     *       （真值 190）。</li>
+     * </ol>
+     * <p>同理，多条拆解路线之间<b>取 {@code max} 不取和</b>：{@code drain} 的 ③ 是
+     * 「试到成功为止」，一条成功就返回，绝不会把骨头和骨块的好处叠加。</p>
+     *
+     * <p><b>安全性</b>（自检 U 组逐条咬）：任何一次成功的 {@code drain}，其 {@code need}
+     * 都 ≤ 这个上界 —— 归纳法：① 吃库存 / ② 合成 / ②b 多原料 / ③ 拆整块 + 零头，
+     * 四种消耗方式的上界都被这里覆盖。所以拿它当 {@code planMax} 的起点，
+     * 只会少试几次注定失败的递归，不会把一个做得到的数量判成做不到。</p>
+     */
+    static BigInteger reachableBound(Table table, String itemId, Stock stock) {
+        if (table == null || itemId == null || !table.contains(itemId)) {
+            return ZERO;
+        }
+        return reachableBound(table, itemId, stock, new HashSet<>(), 0);
+    }
+
+    private static BigInteger reachableBound(Table table, String item, Stock stock,
+                                             Set<String> path, int depth) {
+        BigInteger own = orZero(stock.amountOf(item));
+        if (depth >= MAX_BOUND_DEPTH) {
+            // 深到上限：只数自己那点库存，不再往下推（保守，见方法注释）
+            return own;
+        }
+        if (!path.add(item)) {
+            // 撞上环：口径同 drain 的 visiting —— 那一整支直接失败，能额外产出的就是 0。
+            // ⚠️ 绝不能返回 own（见方法注释第 1 条红线）。
+            return ZERO;
+        }
+        try {
+            // ② 合成 / ②b 多原料：能额外给出多少个（不含自身库存）
+            BigInteger bestExtra = ZERO;
+            for (Edge maker : table.makersOf(item)) {
+                BigInteger fromMaker = reachableBound(table, maker.small(), stock, path, depth + 1)
+                        .divide(countOf(maker));
+                if (fromMaker.compareTo(bestExtra) > 0) {
+                    bestExtra = fromMaker;
+                }
+            }
+            for (MultiRecipe recipe : table.recipesOf(item)) {
+                BigInteger tightest = null;
+                for (Part part : recipe.inputs()) {
+                    BigInteger fromPart = reachableBound(table, part.itemId(), stock, path, depth + 1)
+                            .divide(countOf(part));
+                    tightest = tightest == null ? fromPart : tightest.min(fromPart);
+                }
+                if (tightest != null && tightest.compareTo(bestExtra) > 0) {
+                    bestExtra = tightest;
+                }
+            }
+            // base = 自身库存 + 最好的一条合成路线（③ 的「零头那一侧」就是它）
+            BigInteger base = own.add(bestExtra);
+            BigInteger best = base;
+
+            // ③ 拆上级：一次只走**一条**上级路线 —— drain 的循环是「试到成功为止」，
+            // 一条成功就返回，绝不会把两条拆解路线的好处叠加，所以这里取 max 不取和。
+            // 零头那一侧正是 base，与 drain ③ 的「拆整块 + 用下级补零头」口径一致。
+            // ⚠️ 这里不许再 + own（见方法注释第 2 条红线）。
+            for (Edge splitter : table.splittersOf(item)) {
+                BigInteger blocks = reachableBound(table, splitter.big(), stock, path, depth + 1);
+                BigInteger viaSplit = base.add(blocks.multiply(countOf(splitter)));
+                if (viaSplit.compareTo(best) > 0) {
+                    best = viaSplit;
+                }
+            }
+            return best;
+        } finally {
+            path.remove(item);
+        }
+    }
 
     private static BigInteger maxObtainable(Table table, String itemId, Stock stock, int depth) {
         if (table == null || itemId == null || !table.contains(itemId)) {
@@ -662,6 +828,68 @@ public final class VoidWarehouseExchange {
     // ------------------------------------------------------------------ 递归取数
 
     /**
+     * 递归下去<b>必然失败</b>吗？
+     *
+     * <p>{@link #drain} 一进门就判两件事：{@code depth > MAX_DEPTH}（太深）和
+     * {@code visiting.contains(item)}（撞环）。这两条与「要多少个」毫无关系 ——
+     * 不论 {@code need} 是多少，这一支都返回 {@code false}。</p>
+     *
+     * <p>所以枚举时提前跳过它们，<b>结果逐字节相同</b>，只是不再白白复制状态副本、
+     * 跑一轮注定失败的递归。</p>
+     *
+     * <p><b>这不是可有可无的小优化</b>（1.0.13 卡死的第三处代价）：铜锭那条路上
+     * 「铜粒 ← 铜锭」会回头拆铜锭，{@code units} 从 {@code need / count} 一路往下试到 1，
+     * 每一次都撞在 {@code visiting} 上 —— 实测单次界面规划 20ms 以上，
+     * 仓库上千万件时直接是秒级，而这一整段计算<b>一个结果都不可能改变</b>。</p>
+     */
+    private static boolean blocked(State state, String item, int depth) {
+        return depth + 1 > MAX_DEPTH || state.visiting.contains(item);
+    }
+
+    /** 多原料配方里<b>只要有一种原料</b>撞环/超深，整条配方就必然失败（见 {@link #blocked}） */
+    private static boolean anyBlocked(State state, MultiRecipe recipe, int depth) {
+        for (Part part : recipe.inputs()) {
+            if (blocked(state, part.itemId(), depth)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 第 ③ 条路里 {@code units} 枚举的起点：{@code floor(need / count)}，但**先按「上级到底拿得到几个」钳一次**。
+     *
+     * <h2>为什么必须钳</h2>
+     * <p>{@code need} 在「界面问可兑数量」时是<b>几百万、几千万</b>（见 {@link #planMax} 的探针），
+     * 于是 {@code floor(need / count)} 也就那么大。可是仓库里的上级往往只有仓库里那一点 ——
+     * 从几百万一路减到真量级，中间的每一次都是在<b>注定失败</b>的 {@code drain} 上复制一份状态副本。</p>
+     * <p>实测（每件 1 亿的病态仓库）：铜块那一格单次规划 <b>2087 ms</b>，全耗在这段空转上；
+     * 而探针次数已经是 <b>1</b>（上界＝真值），说明瓶颈根本不在上界。</p>
+     *
+     * <h2>为什么钳了也不改变结果</h2>
+     * <p>钳的值是 {@link #reachableBound}(上级)：任何一次成功的 {@code drain(上级, units)}
+     * 都必须满足 {@code units ≤ 该上界}，所以钳掉的那些 {@code units} <b>本来就一个都不可能成功</b>。
+     * 传 {@code path = visiting} 是为了与 {@code drain} 的口径一致 ——
+     * 递归栈上的物品不能回头再取，上界里它们也就只能算 0。</p>
+     *
+     * <p>小数量（日常「取一组 / 取一盒」，{@code need ≤ 1728}）根本不进这个分支，
+     * 免得为了省几次循环反而多算一遍上界。返回 {@code 0} 表示<b>这个上级一个都拿不到</b>，
+     * 循环直接不进入，交给下一个 splitter。</p>
+     */
+    private static BigInteger unitsCeiling(BigInteger wanted, String big, Table table, State state) {
+        if (wanted.signum() <= 0) {
+            // need < count：退回「拆 1 块 + 找零」（玩家明确要的能力），必须保留
+            return ONE;
+        }
+        if (wanted.compareTo(CLAMP_UNITS_ABOVE) <= 0) {
+            return wanted;
+        }
+        BigInteger reachable = reachableBound(table, big, Stock.of(state.stock),
+                new HashSet<>(state.visiting), 0);
+        return reachable.compareTo(wanted) < 0 ? reachable : wanted;
+    }
+
+    /**
      * 让仓库的账目<b>正好少掉 {@code need} 个 {@code item}</b>。
      *
      * <p>三条路按「目标本身 → 下级合成 → 上级拆零」的优先级依次试；
@@ -699,6 +927,9 @@ public final class VoidWarehouseExchange {
 
             // ② 用下级合成：count 个 Y 换 1 个 item（合成出来的直接给玩家，不进仓库账）
             for (Edge maker : table.makersOf(item)) {
+                if (blocked(state, maker.small(), depth)) {
+                    continue;
+                }
                 State branch = state.copy();
                 if (drain(table, maker.small(), need.multiply(countOf(maker)), branch, depth + 1)) {
                     state.adopt(branch);
@@ -711,6 +942,9 @@ public final class VoidWarehouseExchange {
             // 哪怕它们在价值上刚好等价 —— 原版里根本没有「3 个海晶石 → 1 个海晶灯」这种配方。
             // 每种原料各自递归取，任何一项凑不出来就整支作废（分支副本保证仓库没被改）。
             for (MultiRecipe recipe : table.recipesOf(item)) {
+                if (anyBlocked(state, recipe, depth)) {
+                    continue;
+                }
                 State branch = state.copy();
                 boolean all = true;
                 for (Part part : recipe.inputs()) {
@@ -747,11 +981,13 @@ public final class VoidWarehouseExchange {
             // 那时退回「拆 1 块 + 找零」—— 这正是玩家要的「拆上级找零」，必须保留。
             BigInteger cover = coverBound(table, item, state);
             for (Edge splitter : table.splittersOf(item)) {
+                if (blocked(state, splitter.big(), depth)) {
+                    // 整个 splitter 都不成立：units 试多少都一样，别进那个循环
+                    continue;
+                }
                 BigInteger count = countOf(splitter);
-                BigInteger maxUnits = need.divide(count);
-                for (BigInteger units = maxUnits.signum() <= 0 ? ONE : maxUnits;
-                        units.signum() > 0;
-                        units = units.subtract(ONE)) {
+                BigInteger maxUnits = unitsCeiling(need.divide(count), splitter.big(), table, state);
+                for (BigInteger units = maxUnits; units.signum() > 0; units = units.subtract(ONE)) {
                     BigInteger rest = need.subtract(units.multiply(count));
                     if (rest.signum() > 0 && rest.compareTo(cover) > 0) {
                         // 少拆一块，零头就多 count 个，只会更补不上 —— 这条支路整体作废
@@ -815,6 +1051,9 @@ public final class VoidWarehouseExchange {
         }
         // ② 下级合成
         for (Edge maker : table.makersOf(item)) {
+            if (blocked(state, maker.small(), depth)) {
+                continue;
+            }
             State branch = state.copy();
             if (drain(table, maker.small(), need.multiply(countOf(maker)), branch, depth + 1)) {
                 state.adopt(branch);
@@ -823,6 +1062,9 @@ public final class VoidWarehouseExchange {
         }
         // ②b 多原料配方（口径同 {@link #drain}：几种原料一样都不能少）
         for (MultiRecipe recipe : table.recipesOf(item)) {
+            if (anyBlocked(state, recipe, depth)) {
+                continue;
+            }
             State branch = state.copy();
             boolean all = true;
             for (Part part : recipe.inputs()) {

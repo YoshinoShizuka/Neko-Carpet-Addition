@@ -195,6 +195,9 @@ public final class VoidWarehouseExchangeSelfCheck {
                 materialFamilyChecks(server);
                 break;
             case 19:
+                boundChecks(server);
+                break;
+            case 20:
                 cleanup(server);
                 break;
             default:
@@ -2053,6 +2056,155 @@ public final class VoidWarehouseExchangeSelfCheck {
             }
         }
         return null;
+    }
+
+    // ================================================================ U 可兑数量的上界
+
+    /**
+     * U 组：1.0.13「打开虚空仓库 GUI 服务器就卡死」的回归断言。
+     *
+     * <h2>这一组<b>不咬墙钟</b>，咬的是两件结构性的事</h2>
+     * <ol>
+     *   <li><b>上界必须等于真值</b>：{@code reachableBound == planMax 的结果}。
+     *       {@code planMax} 是「从上界往下逐个试」，<b>上界松多少就白试多少次</b>，
+     *       所以「这两个数相等」就是「第一次试探即命中」的机器无关判据；</li>
+     *   <li><b>上界必须安全</b>：任何一次成功的 {@code plan(n)} 都满足 {@code n ≤ 上界}。
+     *       压紧可以，压过头会把本来兑得出的数量判成兑不出（那是反向 bug）。</li>
+     * </ol>
+     *
+     * <p>为什么专门拿「每件都堆满」这种病态仓库来咬：卡死的触发条件<b>不是</b>「物品多」，
+     * 而是「同一件成品有多个来源、且库存都很大」。真实玩家的仓库恰好就是这种形状
+     * （铜锭既能用铜粒合、又能拆铜块和涂蜡铜块）。</p>
+     */
+    private static void boundChecks(MinecraftServer server) {
+        System.out.println("=== U 可兑数量的上界（GUI 卡死回归） ===");
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
+
+        // ---- ① 病态大仓库：每件 100 万，只有目标那件是 0 ----
+        //
+        // ⚠️ 骨块<b>不在</b>这一组：它是「上界 444,444，真值却一个都兑不出」的那种病态
+        // （见 U6），上界和真值本来就该不相等。别把「上界紧」误解成「上界一定可达」。
+        for (String target : new String[]{"bone_meal", "copper_nugget", "copper_ingot",
+                "iron_nugget", "gold_ingot"}) {
+            Map<String, Integer> snap = fullOf(table, target, 1_000_000);
+            VoidWarehouseExchange.Stock st = stock(snap);
+            BigInteger loose = VoidWarehouseExchange.maxObtainable(table, target, st);
+            BigInteger tight = VoidWarehouseExchange.reachableBound(table, target, st);
+            VoidWarehouseExchange.Plan p = VoidWarehouseExchange.planMax(table, target, tight, st);
+            System.out.println(String.format("   [U] %-14s 价值上界=%-12s 可达上界=%-12s 真值=%-12s",
+                    target, loose, tight, p == null ? "null" : p.amount()));
+            check("U1." + target + " 可达上界就是真值（第一次试探即命中）",
+                    p != null && p.amount().equals(tight));
+        }
+
+        // 逐条钉死数字：这几个数正是「同一份库存被数了两遍」的现场
+        check("U2 骨粉：骨头 100 万 + 骨块 100 万 → 上界 9,000,000（旧实现把两条路线相加得 12,000,000）",
+                VoidWarehouseExchange.reachableBound(table, "bone_meal",
+                        stock(fullOf(table, "bone_meal", 1_000_000))).equals(BigInteger.valueOf(9_000_000)));
+        check("U3 铜粒：上界 90,000,000（旧实现撞环时又数了一遍自身库存，虚高到 98,999,991）",
+                VoidWarehouseExchange.reachableBound(table, "copper_nugget",
+                        stock(fullOf(table, "copper_nugget", 1_000_000))).equals(BigInteger.valueOf(90_000_000)));
+        check("U4 铜锭：上界 9,111,111（= 铜块 900 万 + 铜粒折算 11.1 万）",
+                VoidWarehouseExchange.reachableBound(table, "copper_ingot",
+                        stock(fullOf(table, "copper_ingot", 1_000_000))).equals(BigInteger.valueOf(9_111_111)));
+
+        // ---- ② 安全方向：成功的规划绝不超过上界（零头全都露出来的库存）----
+        Map<String, Integer> mixed = new LinkedHashMap<>();
+        for (String id : table.items()) {
+            mixed.put(id, 0);
+        }
+        for (String id : new String[]{"copper_ingot", "copper_nugget", "copper_block",
+                "waxed_copper_block", "bone_meal", "bone", "bone_block", "gold_nugget",
+                "gold_ingot", "iron_nugget", "iron_ingot", "ice", "packed_ice", "blue_ice",
+                "prismarine_shard", "prismarine_bricks", "prismarine", "sea_lantern",
+                "sulfur", "sulfur_spike", "potent_sulfur", "slime_ball", "slime_block"}) {
+            if (table.contains(id)) {
+                mixed.put(id, 137);
+            }
+        }
+        int soundnessProbes = 0;
+        int violations = 0;
+        for (String target : table.items()) {
+            Map<String, Integer> snap = new LinkedHashMap<>(mixed);
+            snap.put(target, 0);
+            VoidWarehouseExchange.Stock st = stock(snap);
+            BigInteger bound = VoidWarehouseExchange.reachableBound(table, target, st);
+            for (long n : new long[]{1, 2, 3, 7, 8, 9, 10, 63, 64, 137, 138, 1728}) {
+                VoidWarehouseExchange.Plan p = VoidWarehouseExchange.plan(table, target,
+                        BigInteger.valueOf(n), st);
+                if (p == null) {
+                    continue;
+                }
+                soundnessProbes++;
+                if (BigInteger.valueOf(n).compareTo(bound) > 0) {
+                    violations++;
+                    System.out.println("   !! 上界不安全：" + target + " 取 " + n + " 成功了，上界却是 " + bound);
+                }
+            }
+        }
+        check("U5 安全方向：" + soundnessProbes + " 次成功规划全部 ≤ 可达上界（违规 " + violations + " 条）",
+                violations == 0 && soundnessProbes > 100);
+
+        // ---- ③ 预算兜底：「及时收手」≠「乱报」 ----
+        //
+        // 这一格是「上界 444,444，真值却一个都兑不出」的病态：骨粉 100 万 + 骨头 100 万、
+        // 没有骨块。要 1 个骨块就得先凑 9 个骨粉，而 ① 会先把 100 万骨粉吃光，
+        // 剩下的 9n − 1000000 只能由骨头一根 3 个补 —— 可 9n ≡ 0、1000000 ≡ 1 (mod 3)，
+        // 差值永远 ≡ 2，<b>一根都不成立</b>。所以正确答案就是 null，
+        // 这里要的是「探够预算老实收手」，而不是耗到把主线程钉死。
+        check("U6 骨粉 / 骨头各 100 万且没有骨块时，任何骨块都凑不出来 ⇒ planMax 老实返回 null"
+                        + "（9n − 1000000 永远除不尽 3）",
+                planMaxOf(table, "bone_block", fullOf(table, "bone_block", 1_000_000)) == null);
+        Map<String, Integer> residue0 = new LinkedHashMap<>();
+        residue0.put("bone_meal", 999_999);
+        VoidWarehouseExchange.Plan residuePlan = planMaxOf(table, "bone_block", residue0);
+        check("U7 只差一个：骨粉 999,999 个（≡0 mod 3）→ 111,111 个骨块"
+                        + "（预算截断没有把可行解砍掉），实际："
+                        + (residuePlan == null ? "null" : residuePlan.amount()),
+                residuePlan != null && residuePlan.amount().equals(BigInteger.valueOf(111_111)));
+
+        // ---- ④ 枚举起点钳位：1 亿库存下「单次规划」不再是 O(库存) ----
+        //
+        // 这一条用了墙钟，但余量给到 250 倍（改前实测 2087ms / 改后 0~2ms）：
+        // 真正结构性咬住的是 U1~U4（上界 == 真值 ⇒ 第一次试探就命中），
+        // 这里只防「units 循环又退回去空转几百万次」这类纯性能回归。
+        Map<String, Integer> huge = fullOf(table, "copper_block", 100_000_000);
+        VoidWarehouseExchange.Stock hugeStock = stock(huge);
+        BigInteger hugeBound = VoidWarehouseExchange.reachableBound(table, "copper_block", hugeStock);
+        long t0 = System.nanoTime();
+        VoidWarehouseExchange.Plan hugePlan = VoidWarehouseExchange.plan(table, "copper_block",
+                hugeBound, hugeStock);
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+        check("U8 每件 1 亿时铜块上界 = 真值（" + hugeBound + "）",
+                hugePlan != null && hugePlan.amount().equals(hugeBound));
+        check("U9 每件 1 亿时铜块单次规划 " + elapsedMs + " ms（改前 2087ms，阈值 500ms）",
+                elapsedMs < 500);
+
+        // ---- ⑤ 硫磺族只在 26.2+ 存在，两支各记一条，五个版本 check 数保持一致 ----
+        if (table.contains("sulfur")) {
+            check("U10 硫磺族：硫磺 100 万 → 上界 250,000（4 尖刺 = 1 硫磺）",
+                    VoidWarehouseExchange.reachableBound(table, "sulfur",
+                            stock(fullOf(table, "sulfur", 1_000_000))).equals(BigInteger.valueOf(250_000)));
+        } else {
+            check("U10 本版本没有硫磺（26.2 才加），跳过硫磺族上界", true);
+        }
+    }
+
+    /** 病态仓库快照：表里每件都堆 {@code each} 个，只有 {@code target} 是 0（正是「可兑」的入选条件） */
+    private static Map<String, Integer> fullOf(VoidWarehouseExchange.Table table, String target, int each) {
+        Map<String, Integer> snap = new LinkedHashMap<>();
+        for (String id : table.items()) {
+            snap.put(id, id.equals(target) ? 0 : each);
+        }
+        return snap;
+    }
+
+    /** 走界面的真实口径：上界由价值守恒给出，再交给 {@code planMax} 收敛 */
+    private static VoidWarehouseExchange.Plan planMaxOf(VoidWarehouseExchange.Table table, String itemId,
+                                                        Map<String, Integer> snapshot) {
+        VoidWarehouseExchange.Stock st = stock(snapshot);
+        BigInteger cap = VoidWarehouseExchange.maxObtainable(table, itemId, st);
+        return cap.signum() <= 0 ? null : VoidWarehouseExchange.planMax(table, itemId, cap, st);
     }
 
     private static void cleanup(MinecraftServer server) {

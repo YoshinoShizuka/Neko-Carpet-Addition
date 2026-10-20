@@ -46,7 +46,7 @@ import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
  *
  * <h2>要证的东西（每组都配反证）</h2>
  * <ol>
- *   <li><b>A 静态表</b>：30 条边 + 1 条多原料配方 / 56 个物品 / 双向 20 + 只能向上 9 + 只能向下 1，价值自洽
+ *   <li><b>A 静态表</b>：31 条边 + 1 条多原料配方 / 57 个物品 / 双向 20 + 只能向上 9 + 只能向下 2，价值自洽
  *       （{@code value(big) == count × value(small)}）；</li>
  *   <li><b>B 启动复核</b>：拿真实 {@code RecipeManager} 复核后一条都没被砍（说明表与 26.3 的现实一致）；</li>
  *   <li><b>C 反向核对</b>：把表里每条边<b>按它自己的比例还原成真实物品</b>（9 个摆 3×3、4 个摆 2×2），
@@ -83,6 +83,7 @@ import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
 public final class VoidWarehouseExchangeSelfCheck {
 
     private static final BigInteger ONE = BigInteger.ONE;
+    private static final BigInteger THREE = BigInteger.valueOf(3);
     private static final BigInteger FOUR = BigInteger.valueOf(4);
     private static final BigInteger NINE = BigInteger.valueOf(9);
 
@@ -183,6 +184,9 @@ public final class VoidWarehouseExchangeSelfCheck {
                 seaLanternChecks(server);
                 break;
             case 17:
+                boneFamilyChecks(server);
+                break;
+            case 18:
                 cleanup(server);
                 break;
             default:
@@ -198,10 +202,10 @@ public final class VoidWarehouseExchangeSelfCheck {
         System.out.println("=== A 静态表 ===");
         VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
 
-        check("A1 声明 30 条边", VoidWarehouseExchange.EDGES.size() == 30);
-        check("A2 建表后生效 30 条边", table.edges().size() == 30);
+        check("A1 声明 31 条边", VoidWarehouseExchange.EDGES.size() == 31);
+        check("A2 建表后生效 31 条边", table.edges().size() == 31);
         check("A3 价值自相矛盾被丢掉的边 = 0", table.dropped().isEmpty());
-        check("A4 表里共 56 个物品（54 个来自单原料边 + 海晶棱镜 / 海晶灯）", table.items().size() == 56);
+        check("A4 表里共 57 个物品（55 个来自单原料边 + 海晶棱镜 / 海晶灯）", table.items().size() == 57);
 
         int both = 0;
         int combineOnly = 0;
@@ -217,7 +221,7 @@ public final class VoidWarehouseExchangeSelfCheck {
         }
         check("A5 双向边 20 条（实际 " + both + "）", both == 20);
         check("A6 只能向上合成 9 条（实际 " + combineOnly + "）", combineOnly == 9);
-        check("A7 只能向下拆分 1 条（实际 " + splitOnly + "）", splitOnly == 1);
+        check("A7 只能向下拆分 2 条（骨头 / 涂蜡铜块，实际 " + splitOnly + "）", splitOnly == 2);
 
         // 价值（不是「层级」）：value(big) == count × value(small)
         check("A8 铁锭价值 = 9 × 铁粒价值",
@@ -321,7 +325,7 @@ public final class VoidWarehouseExchangeSelfCheck {
         System.out.println("   [B] 声明 " + declared + " 条边，其中 " + unavailable
                 + " 条的物品在本版本不存在（26.2 起才有硫磺 / 浓缩硫）");
 
-        check("B1 声明 30 条边（表本身不随版本变）", declared == 30);
+        check("B1 声明 31 条边（表本身不随版本变）", declared == 31);
         check("B2 作废条数 == 「物品在本版本不存在」的条数（" + unavailable + "，实际 "
                 + summary.dropped() + "）", summary.dropped() == unavailable);
         check("B3 kept + dropped == declared", summary.kept() + summary.dropped() == declared);
@@ -1672,6 +1676,153 @@ public final class VoidWarehouseExchangeSelfCheck {
         data.insert(new ItemStack(bricks, 3));
         check("R15 反证：仓库只有海晶石砖时，海晶灯也不在可兑列表（不许折算）",
                 offerOf(data.exchangeOffers(), "sea_lantern") == null);
+
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+    }
+
+    // ================================================================ S 骨头族（3:1 单向）
+
+    /**
+     * 骨头这一族：<b>骨头 1 个 → 骨粉 3 个</b>（原版唯一方向），<b>骨粉 9 个 → 骨块 1 个</b>（双向）。
+     *
+     * <p>它和前面所有族的<b>形状都不一样</b>，所以必须单独钉一遍：</p>
+     * <ol>
+     *   <li><b>比例是 3，不是 9</b> —— 与海晶石的 4:1 同级，都是「引擎里绝不能写死 9」的判据；</li>
+     *   <li><b>只能拆、不能合</b> —— 原版没有「3 骨粉 → 1 骨头」这条配方。
+     *       这是本表里<b>唯一</b>一条「大件只能碎成小件、小件永远拼不回去」的实物边；
+     *       一旦 {@code combineRecipe} 被误写成非 null，骨粉就会凭空换出骨头，
+     *       而界面只会表现为「骨头那格显示可兑」—— 所以这里连着用三条断言（S3/S4/S5）盯死它；</li>
+     *   <li><b>一个下级、两个上级</b> —— 骨粉的上级有骨头（3:1）和骨块（9:1）两个，
+     *       于是价值必须同时满足 {@code 3×1=3} 与 {@code 9×1=9}（S2），
+     *       并且天然支持跨两级取料：<b>3 骨头 = 9 骨粉 = 1 骨块</b>（S9）。</li>
+     * </ol>
+     *
+     * <p>海晶族也是「一个下级、两个上级」（碎片 ← 海晶石 4:1 / 海晶砖 9:1），
+     * 但那边两条边都是<b>只能合</b>；骨头这条是<b>只能拆</b>。两种方向各自成立，
+     * 合起来才说明「边有方向」这件事在整张表上是成立的，而不是靠巧合。</p>
+     */
+    private static void boneFamilyChecks(MinecraftServer server) {
+        System.out.println("=== S 骨头族：1 骨头 → 3 骨粉（只能拆），9 骨粉 → 1 骨块（双向） ===");
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.Table.of(VoidWarehouseExchange.EDGES);
+
+        // ---- ① 边的形状 ----
+        VoidWarehouseExchange.Edge boneEdge = null;
+        for (VoidWarehouseExchange.Edge edge : table.edges()) {
+            if (edge.small().equals("bone_meal") && edge.big().equals("bone")) {
+                boneEdge = edge;
+                break;
+            }
+        }
+        check("S1 骨头边存在，比例 3:1，且<b>只有拆解方向</b>（canCombine=false）",
+                boneEdge != null && boneEdge.count() == 3
+                        && !boneEdge.canCombine() && boneEdge.canSplit());
+
+        // ---- ② 价值自洽：两条边都从「骨粉 = 1」推得出来 ----
+        check("S2 价值自洽：骨头 = 3 × 骨粉（" + table.valueOf("bone") + "），骨块 = 9 × 骨粉（"
+                        + table.valueOf("bone_block") + "）",
+                table.valueOf("bone").equals(table.valueOf("bone_meal").multiply(THREE))
+                        && table.valueOf("bone_block").equals(table.valueOf("bone_meal").multiply(NINE)));
+
+        // ---- ③ 方向：谁也不能变成骨头 ----
+        check("S3 suppliersOf(骨头) 只有骨头自己（骨粉 / 骨块都变不出骨头）",
+                table.suppliersOf("bone").equals(Set.of("bone")));
+        check("S4 反证：仓库堆 1 万个骨粉，骨头的上界仍是 0",
+                VoidWarehouseExchange.maxObtainable(table, "bone", stock(Map.of("bone_meal", 10000)))
+                        .signum() == 0);
+        check("S5 反证：价值够了也换不出来 —— 100 骨粉 → 1 骨头 无解",
+                plan(table, "bone", 1, Map.of("bone_meal", 100)) == null);
+        check("S6 反证：100 个骨块（价值 900）也换不出 1 个骨头",
+                plan(table, "bone", 1, Map.of("bone_block", 100)) == null);
+
+        // ---- ④ 正常取料 ----
+        //
+        // ⚠️ 账目口径（与 D13 一致）：`plan.deltas()` 只记**仓库被扣掉/退回**的东西，
+        // 不记「交给玩家的那 N 个」—— 后者由 plan.amount() 表达。所以「正好 3 个、
+        // 无找零」这一笔账里只有「骨头 −1」，bone_meal 那条 delta 压根不存在。
+        VoidWarehouseExchange.Plan p = plan(table, "bone_meal", 3, Map.of("bone", 1));
+        System.out.println("   [S] 1 骨头 -> 3 骨粉：" + ledger(p));
+        check("S7 只有 1 个骨头时，取 3 个骨粉：只扣 1 骨头、不产生找零项",
+                p != null && change(p, "bone").equals(ONE.negate())
+                        && change(p, "bone_meal").signum() == 0);
+        checkConserved(table, "S7 1 骨头拆 3 骨粉", p);
+
+        check("S8 反证：1 个骨头取不出 4 个骨粉（只够 3 个）",
+                plan(table, "bone_meal", 4, Map.of("bone", 1)) == null);
+
+        // 跨两级：骨头 → 骨粉 → 骨块（3 骨头 = 9 骨粉 = 1 骨块）
+        p = plan(table, "bone_block", 1, Map.of("bone", 3));
+        System.out.println("   [S] 3 骨头 -> 1 骨块（跨两级）：" + ledger(p));
+        check("S9 3 个骨头能换出 1 个骨块（骨头→骨粉→骨块，跨两级）",
+                p != null && change(p, "bone").equals(THREE.negate()));
+        checkConserved(table, "S9 3 骨头换 1 骨块", p);
+        check("S10 反证：2 个骨头只够 6 个骨粉，换不出 1 个骨块",
+                plan(table, "bone_block", 1, Map.of("bone", 2)) == null);
+
+        // 拆上级找零：1 骨块 = 9 骨粉，只要 5 个 → 退 4 个
+        p = plan(table, "bone_meal", 5, Map.of("bone_block", 1));
+        System.out.println("   [S] 1 骨块 -> 取 5 骨粉（找零 4）：" + ledger(p));
+        check("S11 只有 1 个骨块时取 5 个骨粉：扣 1 骨块、找零 4 骨粉退回仓库",
+                p != null && change(p, "bone_block").equals(ONE.negate())
+                        && change(p, "bone_meal").equals(FOUR));
+        checkConserved(table, "S11 拆骨块找零", p);
+
+        // 上界：1 个骨头最多 3 个骨粉（不能按 9 算）
+        p = VoidWarehouseExchange.planMax(table, "bone_meal", BigInteger.valueOf(1_000_000),
+                stock(Map.of("bone", 1)));
+        check("S12 planMax 在只有 1 个骨头时收敛到 3（不是 9、也不是上限）",
+                p != null && p.amount().equals(THREE));
+
+        // ---- ⑤ 界面：玩家真的点一下 ----
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        check("S13 假玩家可构造", player != null);
+        if (player == null) {
+            return;
+        }
+        Item bone = VoidWarehouseExchangeBootstrap.itemOf("bone");
+        Item meal = VoidWarehouseExchangeBootstrap.itemOf("bone_meal");
+        Item block = VoidWarehouseExchangeBootstrap.itemOf("bone_block");
+        if (bone == null || meal == null || block == null) {
+            check("S14 本版本缺骨头 / 骨粉 / 骨块（不该发生）", false);
+            return;
+        }
+
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(bone, 1));
+        List<VoidWarehouseData.ExchangeOffer> offers = data.exchangeOffers();
+        VoidWarehouseData.ExchangeOffer mealOffer = offerOf(offers, "bone_meal");
+        check("S14 仓库只有 1 个骨头 → 骨粉那格「可兑 3」（按 3:1 算，不是 9）",
+                mealOffer != null && mealOffer.obtainable().equals(THREE));
+        check("S15 反证：骨头自己<b>不</b>出现在可兑列表（骨粉变不出骨头）",
+                offerOf(offers, "bone") == null);
+        check("S16 骨块也不出现在可兑列表（1 骨头 = 3 骨粉，凑不出 9）",
+                offerOf(offers, "bone_block") == null);
+
+        VoidWarehouseMenu menu = openMenu(player);
+        if (menu != null) {
+            VoidWarehousePageContainer container = (VoidWarehousePageContainer) menu.getContainer();
+            int slot = findExchangeSlot(container, "bone_meal");
+            check("S17 界面上找得到骨粉的可兑槽", slot >= 0);
+            if (slot >= 0) {
+                int before = countInInventory(player, meal);
+                menu.clicked(slot, 0, net.minecraft.world.inventory.ContainerInput.PICKUP, player);
+                check("S18 左键真的拿到 1 个骨粉", countInInventory(player, meal) - before == 1);
+                // 1 骨头拆开是 3 个，只要 1 个 → 2 个零头必须写回仓库，不能凭空消失
+                check("S19 仓库变成「骨头 −1、骨粉 +2」（拆上级找零 2 个骨粉）"
+                                + "，实际：" + snapshot(data),
+                        data.amountOf(bone).signum() == 0
+                                && data.amountOf(meal).equals(BigInteger.TWO));
+            }
+        }
+
+        // 骨头那格永远点不出来（反证：连界面都不该给它留位置）
+        prepare(data, player);
+        VoidWarehouseViews.viewFor(player).setShulkerMode(false);
+        data.insert(new ItemStack(meal, 64));
+        check("S20 反证：仓库有 64 个骨粉时，骨头仍然不在可兑列表",
+                offerOf(data.exchangeOffers(), "bone") == null);
 
         VoidWarehouseViews.viewFor(player).setShulkerMode(false);
     }

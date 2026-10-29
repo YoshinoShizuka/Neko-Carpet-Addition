@@ -70,7 +70,7 @@
 3. 启动后用 `/carpet <规则> true` 逐条开启
 4. 客户端可以原版直连；要用打印机补货，客户端另装 `litematica-printer`，并在服务端开 `voidWarehouseRestock`
 
-> 本模组原名 `carpet-automending`（包 `carpetaddition`），现已改名。新旧版本的仓库数据**互不兼容**：旧版的 `carpet_automending:void_warehouse*` 存档记录不会被读取，升级相当于换一个新仓库。
+> 旧版 `carpet-automending`（包 `carpetaddition`）的仓库数据不兼容，升级相当于换一个新仓库。
 
 ## 支持版本
 

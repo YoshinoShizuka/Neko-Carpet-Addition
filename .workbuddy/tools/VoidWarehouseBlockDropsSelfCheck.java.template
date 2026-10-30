@@ -314,15 +314,19 @@ public final class VoidWarehouseBlockDropsSelfCheck {
     // ================================================================ G 聊天提示：汇总成一条
 
     /**
-     * 提示的验收口径只有两条：<b>该说的都说了</b>、<b>只准说一句</b>。
+     * 提示的验收口径只有三条：<b>该说的都说了</b>（挖到啥 + 仓库里现在有多少）、<b>只准说一句</b>、
+     * <b>不是所有情况都该报库存</b>（潜影盒被拆开、折成「N 种共 M 个」时故意不报）。
      *
      * <p>所以这里不去抓「玩家真的收到了几条」（那要拦 {@code sendSystemMessage}，属于另一层），
-     * 而是直接咬三样纯逻辑：累计关系（同物品相加 / 不同物品并列 / 超 4 种折算）、
-     * 限流判据、以及拼出来的那一行文本本身。文本断言全部避开物品名 —— 专用服务器上
-     * {@code getHoverName()} 会按 {@code en_us} 解析，咬名字等于咬环境。</p>
+     * 而是直接咬四样纯逻辑：累计关系（同物品相加 / 不同物品并列 / 超 4 种折算）、限流判据、
+     * 拼出来的那一行文本本身、以及库存数字与 {@code amountExact} 是否对得上。文本断言全部避开
+     * 物品名 —— 专用服务器上 {@code getHoverName()} 会按 {@code en_us} 解析，咬名字等于咬环境。</p>
+     *
+     * <p>「形状」类断言（G3–G9）一律传 {@code null} 数据：<b>库存数字是会变的</b>（前面几组已经往仓库里
+     * 放过东西），拿带库存的文本去咬「只有一种」「只有一个顿号」会把数字也咬进去，断言就脆了。</p>
      */
     private static void groupG_messageSummary() {
-        System.out.println("[G] 聊天提示：汇总成一条、不刷屏");
+        System.out.println("[G] 聊天提示：汇总成一条、不刷屏、带上仓库现有数量");
         VoidWarehouseBlockDrops.takePending(bot);   // 先把之前几组可能留下的清干净
 
         long now = 1_000_000L;
@@ -336,7 +340,7 @@ public final class VoidWarehouseBlockDropsSelfCheck {
         List<VoidWarehouseBlockDrops.Kind> one = VoidWarehouseBlockDrops.takePending(bot);
         check("G2 同一种物品合并成一项（2 + 3 = 5）",
                 one != null && one.size() == 1 && one.get(0).total == 5L);
-        String single = one == null ? "" : VoidWarehouseBlockDrops.summary(one).getString();
+        String single = one == null ? "" : VoidWarehouseBlockDrops.summary(one, null).getString();
         check("G3 只有一种时没有顿号（不是把两条拼起来）", !single.contains("、"));
         check("G4 数量写进了提示正文", single.contains("5"));
         check("G5 前缀与补货提示完全一致",
@@ -347,7 +351,7 @@ public final class VoidWarehouseBlockDropsSelfCheck {
         VoidWarehouseBlockDrops.record(bot, new ItemStack(Items.DIRT, 1));
         VoidWarehouseBlockDrops.record(bot, new ItemStack(Items.COBBLESTONE, 12));
         List<VoidWarehouseBlockDrops.Kind> two = VoidWarehouseBlockDrops.takePending(bot);
-        String both = two == null ? "" : VoidWarehouseBlockDrops.summary(two).getString();
+        String both = two == null ? "" : VoidWarehouseBlockDrops.summary(two, null).getString();
         check("G6 两种物品合成一条（只有一个顿号）",
                 two != null && two.size() == 2 && occurrences(both, "、") == 1);
         check("G7 两种的数量都在同一条里", both.contains("12") && both.contains("1"));
@@ -359,7 +363,7 @@ public final class VoidWarehouseBlockDropsSelfCheck {
             VoidWarehouseBlockDrops.record(bot, new ItemStack(many[i], i + 1));
         }
         List<VoidWarehouseBlockDrops.Kind> lots = VoidWarehouseBlockDrops.takePending(bot);
-        String folded = lots == null ? "" : VoidWarehouseBlockDrops.summary(lots).getString();
+        String folded = lots == null ? "" : VoidWarehouseBlockDrops.summary(lots, null).getString();
         check("G8 超过 4 种折成「N 种共 M 个」",
                 lots != null && lots.size() == 5 && folded.contains("种共") && folded.contains("15"));
         note("折算：" + folded);
@@ -368,7 +372,7 @@ public final class VoidWarehouseBlockDropsSelfCheck {
         VoidWarehouseBlockDrops.record(bot,
                 VoidWarehouseShulker.pack(new ItemStack(Items.DIRT), 5));
         List<VoidWarehouseBlockDrops.Kind> box = VoidWarehouseBlockDrops.takePending(bot);
-        String boxLine = box == null ? "" : VoidWarehouseBlockDrops.summary(box).getString();
+        String boxLine = box == null ? "" : VoidWarehouseBlockDrops.summary(box, null).getString();
         check("G9 非空潜影盒标出「已拆开」", box != null && boxLine.contains("已拆开"));
         note("潜影盒：" + boxLine);
 
@@ -383,6 +387,29 @@ public final class VoidWarehouseBlockDropsSelfCheck {
         List<VoidWarehouseBlockDrops.Kind> recorded = VoidWarehouseBlockDrops.takePending(bot);
         check("G11 入库成功时真的记了一笔",
                 on && recorded != null && recorded.size() == 1 && recorded.get(0).total == 1L);
+
+        // ---- 库存数字：拼提示这一刻现读仓库，口径必须与 record 的分组一致（物品 + 数据组件）
+        VoidWarehouseData data = VoidWarehouse.data(contextServer());
+        BigInteger stock = data.amountExact(new ItemStack(Items.DIRT));
+        String withStock = recorded == null ? "" : VoidWarehouseBlockDrops.summary(recorded, data).getString();
+        check("G13 提示里带上仓库现有数量（与 amountExact 一致）",
+                stock.signum() > 0
+                        && withStock.contains("仓库共")
+                        && withStock.contains(VoidWarehouseText.count(stock)));
+        check("G14 不再出现「已直接入库」", !withStock.contains("已直接入库"));
+        note("带库存：" + withStock);
+
+        check("G15 读不到仓库时照样发提示、只是不带库存数字",
+                recorded != null
+                        && !VoidWarehouseBlockDrops.summary(recorded, null).getString().contains("仓库共"));
+
+        // 潜影盒被拆开：盒子本身没进仓库，报它的库存只会让人以为仓库里多了个盒子
+        String boxWithStock = box == null ? "" : VoidWarehouseBlockDrops.summary(box, data).getString();
+        check("G16 潜影盒那条只说「已拆开」、不报盒子库存",
+                box != null && boxWithStock.contains("已拆开") && !boxWithStock.contains("仓库共"));
+
+        check("G17 折成「N 种共 M 个」时不逐种报库存",
+                lots != null && !VoidWarehouseBlockDrops.summary(lots, data).getString().contains("仓库共"));
 
         // 同一个上下文里把规则关掉：这一次必须什么都不收、也不记账
         VoidWarehouseSettings.voidWarehouseBlockDrops = false;

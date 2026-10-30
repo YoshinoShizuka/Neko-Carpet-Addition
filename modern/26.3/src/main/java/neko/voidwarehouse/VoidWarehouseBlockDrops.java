@@ -7,6 +7,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -45,6 +46,11 @@ import java.util.UUID;
  * 样式与补货提示（{@code PrinterRestockNetwork#notifyTaken}）同一套：
  * 统一 {@code [虚空仓库] } 前缀 + 浅灰正文 + 亮绿数字（{@link VoidWarehouseText#info}）。</p>
  *
+ * <p>说的不只是「收了几个」，还有<b>收完仓库里一共有多少</b>：挖矿时玩家真正关心的是
+ * 「够不够了」，光报「挖到 3 个」还得自己心算加上原有库存。库里那个数在拼提示这一刻
+ * 现读（{@link VoidWarehouseData#amountExact}，与 {@link #PENDING} 的分组同为
+ * 「物品 + 数据组件」口径），所以连着挖好几种时报出来的都是发消息那一刻的真值。</p>
+ *
  * <p>但挖掘是<b>高频</b>动作：一棵树、一面墙、一条矿道，一秒能刨掉十来个方块。
  * 若每次入库都发一条，聊天栏会被自家消息淹没，玩家自己的聊天全被顶掉。于是：</p>
  * <ul>
@@ -53,7 +59,8 @@ import java.util.UUID;
  *   <li><b>按玩家每秒最多一条</b>（{@link #MESSAGE_INTERVAL_MS}）：窗口内新来的继续累加，
  *       到下一条时一并报数。**不是延迟通知**，而是把「同一段时间挖到的东西」合成一句；</li>
  *   <li><b>一条里最多列 4 种</b>（{@link #MAX_LISTED_KINDS}）：再多就折成「N 种共 M 个」，
- *       免得一条提示比整个聊天框还长。</li>
+ *       免得一条提示比整个聊天框还长；折起来之后<b>不再逐种报库存</b> ——
+ *       五个「（仓库共 …）」串在一起，比单纯报总数难读得多。</li>
  * </ul>
  * <p>数字一律用 {@link VoidWarehouseText#count(long)}（千分位）+ {@link VoidWarehouseText#key}，
  * 物品名一律保持「可翻译组件」原样发（{@code getHoverName()}，<b>绝不 {@code getString()}</b>）——
@@ -170,6 +177,10 @@ public final class VoidWarehouseBlockDrops {
             return;
         }
         long now = System.currentTimeMillis();
+        // 「仓库里现在有多少」要现读：玩家关心的是够不够，不是刚收了几份。
+        // 同一次冲刷里多个玩家共用一份 data（取数据本身有磁盘/闸门开销，能省就省）。
+        VoidWarehouseData data = null;
+        boolean dataResolved = false;
         Iterator<Map.Entry<UUID, Pending>> it = PENDING.entrySet().iterator();
         while (it.hasNext()) {
             Pending pending = it.next().getValue();
@@ -190,8 +201,16 @@ public final class VoidWarehouseBlockDrops {
             if (kinds == null) {
                 continue;
             }
+            if (!dataResolved) {
+                dataResolved = true;
+                try {
+                    data = VoidWarehouse.data(server);
+                } catch (RuntimeException ignored) {
+                    // 仓库读不出来（存档闸门）：提示照发，只是不带库存数字
+                }
+            }
             try {
-                pending.player.sendSystemMessage(summary(kinds));
+                pending.player.sendSystemMessage(summary(kinds, data));
             } catch (RuntimeException ignored) {
                 // 发不出去（玩家正在断开、别的模组接管了聊天通道）不能反过来影响挖掘
             }
@@ -244,14 +263,25 @@ public final class VoidWarehouseBlockDrops {
      * 把一份汇总拼成<b>一行</b>聊天提示。
      *
      * <p>格式与补货提示同一套（{@code [虚空仓库] } + 灰正文 + 亮绿数字），
-     * 区别只是这里可能一次报好几种：</p>
+     * 区别是有两处数字：<b>挖到了几个</b>、<b>仓库里一共有几个</b>。后者绑在各自物品后面，
+     * 用括号收住 —— 一句里报好几种时，只有绑在一起才不会让人对错行：</p>
      * <ul>
-     *   <li>一种：{@code 挖到 3 个 泥土，已直接入库}</li>
-     *   <li>多种：{@code 挖到 3 个 泥土、12 个 圆石，已直接入库}</li>
-     *   <li>超过 4 种：{@code 挖到 5 种共 120 个，已直接入库}</li>
+     *   <li>一种：{@code 挖到 3 个 泥土（仓库共 128 个）}</li>
+     *   <li>多种：{@code 挖到 3 个 泥土（仓库共 128 个）、12 个 圆石（仓库共 64 个）}</li>
+     *   <li>超过 4 种：{@code 挖到 5 种共 120 个}</li>
      * </ul>
+     *
+     * <p>两种情况下<b>故意不报库存</b>：</p>
+     * <ul>
+     *   <li><b>非空潜影盒</b>：入库时被拆开，盒子本身并没进仓库，报它的数量只会让玩家
+     *       以为仓库里多了个盒子 —— 所以只留「（已拆开）」；</li>
+     *   <li><b>折成「N 种共 M 个」</b>：这时没有「那一种物品」，逐种报库存会把提示拉成一堵墙。</li>
+     * </ul>
+     *
+     * @param kinds 这一轮要报的物品
+     * @param data  仓库数据，用来现读库存；{@code null} = 读不到，此时只报挖到的数量
      */
-    static Component summary(List<Kind> kinds) {
+    static Component summary(List<Kind> kinds, VoidWarehouseData data) {
         MutableComponent body = VoidWarehouseText.body("挖到 ");
         if (kinds.size() > MAX_LISTED_KINDS) {
             long total = 0L;
@@ -262,7 +292,7 @@ public final class VoidWarehouseBlockDrops {
                     .append(VoidWarehouseText.key(VoidWarehouseText.count(kinds.size())))
                     .append(VoidWarehouseText.body(" 种共 "))
                     .append(VoidWarehouseText.key(VoidWarehouseText.count(total)))
-                    .append(VoidWarehouseText.body(" 个，已直接入库")));
+                    .append(VoidWarehouseText.body(" 个")));
         }
         for (int i = 0; i < kinds.size(); i++) {
             Kind kind = kinds.get(i);
@@ -275,9 +305,38 @@ public final class VoidWarehouseBlockDrops {
                     .append(VoidWarehouseText.body(kind.sample.getHoverName()));
             if (kind.unpacked) {
                 body.append(VoidWarehouseText.body("（已拆开）"));
+                continue;
+            }
+            BigInteger after = afterCount(data, kind);
+            if (after != null) {
+                body.append(VoidWarehouseText.body("（仓库共 "))
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(after)))
+                        .append(VoidWarehouseText.body(" 个）"));
             }
         }
-        return VoidWarehouseText.info(body.append(VoidWarehouseText.body("，已直接入库")));
+        return VoidWarehouseText.info(body);
+    }
+
+    /**
+     * 这种物品此刻在仓库里一共有多少（含刚收进去的那几个）。
+     *
+     * <p>口径必须与 {@link #record} 的分组一致 —— {@code amountExact} 内部同样用
+     * {@link ItemStack#isSameItemSameComponents}，所以「一条提示里的一项」正好对上「仓库里的一格」。
+     * 用 {@code amountOf(Item)} 那种只按物品查的宽口径，会把不同数据组件的几格加在一起，
+     * 报出来的数对不上玩家打开仓库看到的那一行。</p>
+     *
+     * @return {@code null} = 读不到仓库，这条提示就不带库存数字
+     */
+    private static BigInteger afterCount(VoidWarehouseData data, Kind kind) {
+        if (data == null || kind == null) {
+            return null;
+        }
+        try {
+            return data.amountExact(kind.sample);
+        } catch (RuntimeException ex) {
+            // 提示是附带的，读库存出任何问题都只丢这个数字，不影响整条消息
+            return null;
+        }
     }
 
     /** 一种物品（物品 + 数据组件）在这一份汇总里的总数 */

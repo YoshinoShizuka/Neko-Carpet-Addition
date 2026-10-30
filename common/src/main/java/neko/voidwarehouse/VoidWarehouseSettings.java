@@ -75,4 +75,31 @@ public class VoidWarehouseSettings {
      */
     @Rule(categories = {NEKO, SURVIVAL})
     public static boolean voidWarehouseCraft = false;
+
+    /**
+     * 「方块掉落物直接进虚空仓库」：玩家挖掉方块的那些掉落物，不再掉在地上，直接入库。
+     *
+     * <p>灵感来自 <a href="https://github.com/fcsailboat/Carpet-Org-Addition">Carpet-Org-Addition</a>
+     * 的 {@code blockDropsDirectlyEnterInventory}，但去处从「玩家背包」改成了「虚空仓库」。
+     * 规则名<b>故意不同</b>：Carpet 的 {@code SettingsManager#addCarpetRule} 遇重名会直接抛异常，
+     * 沿用原名意味着「两个模组同装 = 服务端起不来」。</p>
+     *
+     * <h2>收哪些</h2>
+     * <p>只认「<b>玩家挖掉一个方块</b>时产生的那批物品」—— 判据是这些掉落物是不是在
+     * {@code ServerPlayerGameMode#destroyBlock} 这次调用里被创建出来的。
+     * 所以苦力怕炸掉的一地、怪物死亡掉的东西、玩家自己扔出去的东西<b>都不受影响</b>，
+     * 照原样留在世界里；经验球也不是物品，不参与。</p>
+     *
+     * <h2>收不进去怎么办</h2>
+     * <p>入库不是「吞掉」：仓库读不出来（比如存档闸门拦下）、规则刚好被关掉、
+     * 物品为空，这几种情况下<b>一律照原样掉在地上</b> —— 失败时绝不静默消失。
+     * 潜影盒走的是与漏斗入库完全相同的那条路（<b>拆盒</b>：盒内物品逐件入库、盒子折成
+     * 潜影壳 + 箱子、染色盒再还一份染料；空盒整盒入库），因为「进仓库」在别处就是这个语义，
+     * 不值得为一条规则发明第二套。</p>
+     *
+     * <p><b>默认关</b>：它会改变「挖方块」这件事的产出归属（东西不再落在地上给旁边的人捡），
+     * 属于服主需要主动知情的授权。依赖 {@link #voidWarehouse}：主开关关了就没有仓库可进。</p>
+     */
+    @Rule(categories = {NEKO, SURVIVAL})
+    public static boolean voidWarehouseBlockDrops = false;
 }

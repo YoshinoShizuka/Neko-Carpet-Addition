@@ -10,6 +10,8 @@
   "carpet.rule.voidWarehouseExchange.desc": "允许在成品缺货时改用 9 合 1 配方的原料顶替：没有铁锭就用 9 个铁粒换 1 个；也可以拆上级找零，比如拆 1 个铁块取出 1 个铁锭、剩下的退回仓库。只在成品本身没货时才会兑换，且只走原版真实存在的配方（26.3 共 47 条边 / 86 个物品）。依赖「虚空仓库」规则",
   "carpet.rule.voidWarehouseCraft.name": "虚空仓库配方扣料",
   "carpet.rule.voidWarehouseCraft.desc": "允许在成品缺货时按「玩家亲手合成过的那条配方」扣原料，直接取出成品：合成过一次活塞，之后就能用仓库里的 4 个圆石、3 个木板、1 个铁锭、1 个红石直接取活塞。原料不够时会顺着别的已学配方往下钻（最多 4 层），配方本全服共用，合成台上的产物与原料一经取出即记录。依赖「虚空仓库」规则",
+  "carpet.rule.voidWarehouseBlockDrops.name": "虚空仓库方块掉落",
+  "carpet.rule.voidWarehouseBlockDrops.desc": "玩家挖掉方块时产生的掉落物不再掉在地上，直接进虚空仓库（既不进世界，也不进背包）。只认「玩家挖掉的方块」：爆炸、怪物死亡、玩家丢弃的掉落物照原样留在地上，经验球不受影响。仓库读不出来时照原样掉落，绝不静默消失；潜影盒按与漏斗入库相同的方式拆开（空盒整盒入库）。依赖「虚空仓库」",
   "carpet.rule.concretePowderToGlass.name": "混凝土粉末烧制染色玻璃",
   "carpet.rule.concretePowderToGlass.desc": "允许在普通熔炉里把 16 种混凝土粉末烧成对应颜色的染色玻璃（0.1 经验 / 200 tick，与「沙子 → 玻璃」一致）。只影响普通熔炉，高炉与烟熏炉仍不受理混凝土粉末"
 }

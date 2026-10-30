@@ -16,7 +16,9 @@
     "ContainerClassifierMixin",
     "SlotMixin",
     "ChatInputMixin",
-    "CraftResultMixin"
+    "CraftResultMixin",
+    "ServerLevelAddEntityMixin",
+    "ServerPlayerGameModeDestroyMixin"
   ],
   "injectors": {
     "defaultRequire": 1

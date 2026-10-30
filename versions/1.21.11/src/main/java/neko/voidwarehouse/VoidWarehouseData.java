@@ -1485,7 +1485,7 @@ public final class VoidWarehouseData extends SavedData {
         // 同一件物品可能有多条已学配方（用橡木木板做过一次、用云杉木板又做过一次）。
         // 按学会的顺序逐条试，第一条做得出来的就用它 —— 顺序稳定，账才稳定。
         for (VoidWarehouseRecipes.Recipe recipe : candidates) {
-            Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(this, recipe);
+            Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(this, recipe, this.recipesByOutput);
             // 已经划给玩家的 fromStock 个必须从配方可用的料里<b>先扣掉</b>。
             // 否则「产物自己就是原料」的配方（地图缩放：1 地图 + 8 纸 → 1 地图；地图复制：
             // 1 地图 + 1 空地图 → 2 地图；潜影盒染色同理）会把同一份库存数两遍 ——
@@ -1497,25 +1497,31 @@ public final class VoidWarehouseData extends SavedData {
             BigInteger wantOut = need;
             if (allowPartial) {
                 // 「尽量给」：做得少就少给，不整次失败（右键取一组要的就是这个语义）
-                BigInteger maxOut = VoidWarehouseRecipes.maxCraftable(recipe, stock);
+                BigInteger maxOut = VoidWarehouseRecipes.maxCraftable(recipe, stock, this.recipesByOutput);
                 if (maxOut.signum() <= 0) {
                     continue;
                 }
                 wantOut = need.min(maxOut);
             }
-            VoidWarehouseRecipes.Plan plan = VoidWarehouseRecipes.plan(recipe, wantOut, stock);
+            VoidWarehouseRecipes.Plan plan = VoidWarehouseRecipes.plan(recipe, wantOut, stock, this.recipesByOutput);
             if (plan == null) {
                 continue;
             }
-            BigInteger produced = plan.crafts().multiply(BigInteger.valueOf(recipe.outputCount()));
-            // 真正给到玩家手上的新做出来的数量 = 做出来的 − 退回仓库的余量
-            BigInteger gained = produced.subtract(plan.surplus());
+            // 玩家真正拿到手上的「新做出来的」数量。
+            // 为什么不再写 `produced − surplus`：往下钻之后 surplus 是一个 map（每一层都可能做出零头），
+            // 拿它跟单个数字比就错了。而按定义，做 crafts 次、给 wantOut 个，玩家拿到的就是 wantOut 个
+            // —— 多做的部分全部记在 surplus 里回仓库。这两个写法必须等价，所以自检里有一条
+            // 「账平」断言盯着它（做出来的 − 入账的 == 玩家拿到的）。
+            BigInteger gained = wantOut;
             Map<String, BigInteger> deltas = new java.util.LinkedHashMap<>();
             for (Map.Entry<String, BigInteger> entry : plan.consumed().entrySet()) {
                 deltas.merge(entry.getKey(), entry.getValue().negate(), BigInteger::add);
             }
-            if (plan.surplus().signum() > 0) {
-                deltas.merge(itemId, plan.surplus(), BigInteger::add);
+            // 余量全部入账（含根产物做多的零头，以及往下钻时中间产物多出来的部分）
+            for (Map.Entry<String, BigInteger> entry : plan.surplus().entrySet()) {
+                if (entry.getValue().signum() > 0) {
+                    deltas.merge(entry.getKey(), entry.getValue(), BigInteger::add);
+                }
             }
             deltas.merge(itemId, fromStock.negate(), BigInteger::add);
             return this.toExchangePlan(itemId, fromStock.add(gained), deltas);
@@ -1796,14 +1802,15 @@ public final class VoidWarehouseData extends SavedData {
     /**
      * 收集「可合成」条目：仓库里没货、但有已学配方、且<b>此刻真的做得出来</b>的产物。
      *
-     * <h2>为什么这里不用「探针」那一套</h2>
+     * <h2>为什么这里不用 9 合 1 的「探针」那一套</h2>
      * <p>9 合 1 的 {@code planMax} 要从上界往下逐个试，因为「能拿 5 个不一定能拿 4 个」（拆整块会跳档）。
-     * 配方扣料<b>没有这个问题</b>：能做 {@code n} 次就一定能做 {@code 1..n} 次
-     * （原料按倍数扣，没有任何取整陷阱），所以上限直接由 {@link VoidWarehouseRecipes#maxCraftable}
-     * 一次算出来，<b>零次试探</b>。这就是这条路径在界面上几乎不花钱的原因。</p>
+     * 配方扣料<b>没有这个跳档</b>：原料按倍数扣，能做 {@code n} 次就一定能做 {@code 1..n} 次
+     * （{@code ceil} 是单调的，往下钻的层数也只会变少）。所以这里只需要一次上界 + 最多几次验证，
+     * 而不是把「能拿 64 个」这个上界一路试到 63、62……</p>
      *
      * <p>也因此这里<b>不会</b>出现 1.0.13 那种「打开界面卡死」的形态 ——
-     * 那个事故的根因是「上界虚高 × 逐个试探」，而这里两个乘数之一（试探次数）恒等于 0。</p>
+     * 那个事故的根因是「上界虚高 × 逐个试探几百次」，而这里的试探上限是
+     * {@code MAX_VERIFY = 64} 且正常数据里第一次就成。</p>
      */
     private void collectCraftOffers(List<ExchangeOffer> built) {
         if (this.recipesByOutput.isEmpty()) {
@@ -1829,8 +1836,8 @@ public final class VoidWarehouseData extends SavedData {
             BigInteger maxOut = BigInteger.ZERO;
             Map<String, BigInteger> bestStock = Map.of();
             for (VoidWarehouseRecipes.Recipe recipe : group.getValue()) {
-                Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(this, recipe);
-                BigInteger out = VoidWarehouseRecipes.maxCraftable(recipe, stock);
+                Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(this, recipe, this.recipesByOutput);
+                BigInteger out = VoidWarehouseRecipes.maxCraftable(recipe, stock, this.recipesByOutput);
                 if (out.compareTo(maxOut) > 0) {
                     maxOut = out;
                     best = recipe;
@@ -1843,7 +1850,7 @@ public final class VoidWarehouseData extends SavedData {
             // 账单 = 做满 maxOut 个要扣的原料（全部是负数）。余量不入账目：
             // tooltip 的「用 X 12 个」说的是成本，「找回」那一段对配方扣料是噪音
             // （产物多出来的部分会静静回到仓库，玩家不需要为此读一行字）。
-            VoidWarehouseRecipes.Plan plan = VoidWarehouseRecipes.plan(best, maxOut, bestStock);
+            VoidWarehouseRecipes.Plan plan = VoidWarehouseRecipes.plan(best, maxOut, bestStock, this.recipesByOutput);
             if (plan == null) {
                 continue;
             }

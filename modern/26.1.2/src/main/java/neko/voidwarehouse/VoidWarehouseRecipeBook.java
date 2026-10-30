@@ -213,30 +213,28 @@ public final class VoidWarehouseRecipeBook {
     }
 
     /**
-     * 一条配方要用到的原料，现在仓库里各有多少（只数<b>纯净</b>物品，口径同 {@code amountOf}）。
+     * 一条配方<b>整条闭包</b>的库存快照：配方要用到的每一样东西（含往下钻几层才用得上的原料），
+     * 现在仓库里各有多少。只数<b>纯净</b>物品，口径同 {@code amountOf}。
      *
-     * <p>只为这条配方涉及的候选 id 建快照，<b>不是</b>整仓快照：一条配方通常 1~9 项，
-     * 而仓库可能有几百格。这样 {@link VoidWarehouseRecipes#plan} 拿到的 map 小、
-     * 复制它的成本可以忽略（它在内部会复制两三份）。</p>
+     * <p>为什么是闭包而不是「这条配方的原料」：1.0.15 报过一个 bug ——
+     * 学过一次「深色橡木原木 → 深色橡木木板」和一次活塞之后，木板用完了、原木还有一堆，
+     * 取活塞却说做不出来。根因就是快照里只有木板、没有原木：模拟器看到「木板 0、原木 0」，
+     * 自然判「没料」。把闭包一起取出来，模拟器才有机会顺着「原木 → 木板」往下钻。
+     * 闭包本身由 {@link VoidWarehouseRecipes#stockClosure} 走，深度与条目数都有硬上限。</p>
+     *
+     * <p>只收闭包、<b>不是整仓快照</b>：一条配方通常 1~9 项、往下最多 4 层，
+     * 闭包也就几十种物品，而仓库可能有几百格。这样模拟器拿到的 map 小、
+     * 每个分支复制一份的成本可以忽略。</p>
      *
      * <p>带数据组件的同一物品<b>不算</b>：配方要的是「能拿去合成的东西」，
      * 附魔书 / 改名物品 / 药水被当成原料扣掉等于把玩家的数据扔了 —— 与 9 合 1 同一口径。</p>
      */
     public static Map<String, BigInteger> stockFor(VoidWarehouseData data,
-                                                   VoidWarehouseRecipes.Recipe recipe) {
-        Map<String, BigInteger> stock = new HashMap<>();
+                                                   VoidWarehouseRecipes.Recipe recipe,
+                                                   Map<String, List<VoidWarehouseRecipes.Recipe>> byOutput) {
         if (data == null || recipe == null) {
-            return stock;
+            return new HashMap<>();
         }
-        for (VoidWarehouseRecipes.Part part : recipe.parts()) {
-            for (String candidate : part.candidates()) {
-                if (stock.containsKey(candidate)) {
-                    continue;
-                }
-                Item item = itemOf(candidate);
-                stock.put(candidate, item == null ? BigInteger.ZERO : data.amountOf(item));
-            }
-        }
-        return stock;
+        return VoidWarehouseRecipes.stockClosure(recipe, byOutput, data::amountOfId);
     }
 }

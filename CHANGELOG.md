@@ -42,11 +42,17 @@
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
 | 26.3 | `carpet-Neko-Addition-mc26.3-1.0.15.jar` | 198,146 B | `a3160387adc0ce2b03a125e41011b604` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.15-sources.jar` | 209,058 B | `6d130e4abcaf75b7d45d660bf80a9e9d` |
 | 26.2 | `carpet-Neko-Addition-mc26.2-1.0.15.jar` | 198,099 B | `504ced76273bc9b904c8a5df2bb7de8f` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.15-sources.jar` | 209,334 B | `89560ecb79eebca58312ab31b6ee7e08` |
 | 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.15.jar` | 201,349 B | `0b43a0675f040db3fc017734015801eb` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.15-sources.jar` | 210,351 B | `9cb752a68c3e69a7c0c04699d60cd66d` |
 | 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.15.jar` | 201,351 B | `0ca36f2dd485ff38eaa9ebc87299f235` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.15-sources.jar` | 210,351 B | `9396bef47542d5c67ee3e50ec34bfd54` |
 | 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.15.jar` | 199,787 B | `41997550448f02b84342473315a83728` |
 | 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.15-sources.jar` | 211,058 B | `053b353b03fa5209526137158eec9c2f` |
+
+> 只需要能跑的 jar：下 `-1.0.15.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 
 ### ⚠️ 升级提示 / Upgrade Notes
 

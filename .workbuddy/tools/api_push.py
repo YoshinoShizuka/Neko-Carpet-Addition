@@ -17,6 +17,8 @@
 
 用法：
     GH_TOKEN=... python api_push.py --repo owner/name [--branch main] [--dry-run]
+    # 上一次也是用本脚本推的（远端 SHA 与本地不同）→ 指明「远端 HEAD 对应本地哪个提交」
+    GH_TOKEN=... python api_push.py --repo owner/name --from <上次的本地 HEAD>
 
 token 也可以用 `git credential fill` 取（脚本内置），不必写进命令行。
 """

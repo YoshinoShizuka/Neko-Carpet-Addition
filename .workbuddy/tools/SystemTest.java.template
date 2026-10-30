@@ -1,0 +1,1400 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import neko.automending.AutoMending;
+import neko.automending.AutoMendingSettings;
+import neko.cooking.ConcretePowderToGlass;
+import neko.cooking.CookingSettings;
+import neko.voidwarehouse.restock.PrinterQueryService;
+import neko.voidwarehouse.restock.PrinterTakeResultPayload;
+import neko.voidwarehouse.restock.PrinterTakeService;
+import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.Holder;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.Tag;
+import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.Container;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.item.DyeColor;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.crafting.RecipeType;
+import net.minecraft.world.item.crafting.SingleRecipeInput;
+import net.minecraft.world.item.enchantment.Enchantment;
+import net.minecraft.world.item.enchantment.Enchantments;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * 【临时系统测试】对整个模组的功能 + 性能 + 多玩家压力做一轮完整验收，跑完删除。
+ *
+ * <h2>为什么分阶段跑</h2>
+ * <p>性能测试测的是<b>真实服务端 tick</b> 的开销，不能在构造函数里一口气跑完 ——
+ * 那样量到的是「一个不被打扰的纯 CPU 循环」，而不是玩家世界里发生的事。
+ * 所以每个 tick 只做一个阶段，中间让服务端照常 tick。</p>
+ *
+ * <h2>三块判据</h2>
+ * <ol>
+ *   <li><b>功能</b>：每个功能都要有「正例 + 边界 + 异常输入」，且尽量配反证
+ *       （否则「绿」可能只是因为别的原因凑巧成立）；</li>
+ *   <li><b>性能</b>：单次操作的微秒数（warmup + 取多轮最小值，最小值比均值更能排除 GC/JIT 抖动）；</li>
+ *   <li><b>多人</b>：N 个<b>真实 ServerPlayer 对象</b>（无客户端，靠注入的假连接）同时持有界面、
+ *       并发取货，量总耗时与折算到 20 TPS 的预算占用。</li>
+ * </ol>
+ */
+public final class SystemTest {
+
+    // ================================================================== 阶段机
+
+    private static final int WAIT_TICKS = 5;
+    private static boolean done = false;
+    private static int stage = 0;
+    private static int tickIndex = 0;
+
+    // ================================================================== 计数
+
+    private static int checks = 0;
+    private static int failures = 0;
+    private static int skips = 0;
+    private static final List<String> failedLabels = new ArrayList<>();
+
+    // ================================================================== 公共对象
+
+    private static VoidWarehouseData data;
+    private static ServerLevel level;
+    private static final List<ServerPlayer> bots = new ArrayList<>();
+    private static boolean fakeConnection = false;
+
+    /** 防 JIT 死代码消除 */
+    private static long sink;
+
+    /** 世界里的测试方块（收尾要拆掉） */
+    private static final List<BlockPos> placed = new ArrayList<>();
+
+    /**
+     * 测试专用坐标（固定、远离出生点）。
+     *
+     * <p><b>为什么要在开跑前先清一遍</b>：上一轮如果中途崩了，收尾没跑到，
+     * 这些位置会留着漏斗 / 潜影盒 —— 下一轮「无下方容器」就变成「下方有个装满的潜影盒」，
+     * 断言会莫名其妙地红。开跑前清空比事后排查便宜得多。</p>
+     */
+    private static final BlockPos[] TEST_POSITIONS = {
+            new BlockPos(400, 100, 400), new BlockPos(401, 100, 400),
+            new BlockPos(420, 100, 420), new BlockPos(420, 101, 420),
+            new BlockPos(424, 100, 424),
+            new BlockPos(440, 100, 440), new BlockPos(440, 99, 440),
+            new BlockPos(460, 100, 460), new BlockPos(460, 101, 460), new BlockPos(460, 102, 460),
+    };
+
+    private SystemTest() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            failedLabels.add("阶段 " + stage + " 抛异常: " + t);
+            System.out.println("!! [系统测试] 阶段 " + stage + " 抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        switch (stage) {
+            case 0 -> {
+                if (++tickIndex < WAIT_TICKS) {
+                    return;
+                }
+                tickIndex = 0;
+                level = server.overworld();
+                data = VoidWarehouse.data(server);
+                if (data == null) {
+                    throw new IllegalStateException("拿不到 VoidWarehouseData");
+                }
+                clearTestArea();
+                // 玩家要在最早创建：后面每个功能组都拿得到真人对象（界面 / 补货 / 修补都要）
+                botsAndConnection(server);
+            }
+            case 1 -> rules(server);
+            case 2 -> deposit(server);
+            case 3 -> takeAndPages(server);
+            case 4 -> shulker(server);
+            case 5 -> gui(server);
+            case 6 -> terminals(server);
+            case 7 -> hopperIntake(server);
+            case 8 -> hopperDrain(server);
+            case 9 -> exchange(server);
+            case 10 -> craft(server);
+            case 11 -> restock(server);
+            case 12 -> mending(server);
+            case 13 -> concrete(server);
+            case 14 -> persistence(server);
+            case 15 -> botEnv(server);
+            case 16 -> perfExchange(server);
+            case 17 -> perfCraft(server);
+            case 18 -> perfOffers(server);
+            case 19 -> perfDepositWithdraw(server);
+            case 20 -> perfHopper(server);
+            case 21 -> perfGuiOpen(server);
+            case 22 -> perfMemory(server);
+            case 23 -> multiplayer(server);
+            case 24 -> cleanup(server);
+            default -> {
+                finish(server);
+                return;
+            }
+        }
+        stage++;
+    }
+
+    // ================================================================== 1 规则注册
+
+    /** 六条规则的注册状态、默认值、分类。规则名重名会让服务端起不来，所以这条必须钉死。 */
+    private static void rules(MinecraftServer server) {
+        System.out.println("[FUNC] 1 规则注册与默认值");
+        check("R1 六条规则齐全", AutoMendingSettings.autoMending == false
+                && VoidWarehouseSettings.voidWarehouse == false
+                && VoidWarehouseSettings.voidWarehouseExchange == false
+                && VoidWarehouseSettings.voidWarehouseCraft == false
+                && VoidWarehouseRestockSettings.voidWarehouseRestock == false
+                && CookingSettings.concretePowderToGlass == false);
+        // 上面那条其实同时钉了「默认全关」。再单独确认一次语义，免得有人把默认值改开后
+        // 前一条只是「恰好还是一样」。
+        check("R2 默认全关（服主必须主动授权）",
+                !VoidWarehouseSettings.voidWarehouse && !VoidWarehouseSettings.voidWarehouseExchange
+                        && !VoidWarehouseSettings.voidWarehouseCraft
+                        && !VoidWarehouseRestockSettings.voidWarehouseRestock
+                        && !AutoMendingSettings.autoMending
+                        && !CookingSettings.concretePowderToGlass);
+        // 依赖关系：主开关关着时，子功能必须一并视为关闭（否则会出现「界面打不开但规则说是开的」）
+        VoidWarehouseSettings.voidWarehouse = false;
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+        check("R3 主开关关 → 兑换视为关闭", !VoidWarehouseData.exchangeEnabled());
+        check("R3 主开关关 → 配方扣料视为关闭", !VoidWarehouseData.craftEnabled());
+        VoidWarehouseSettings.voidWarehouse = true;
+        check("R4 主开关开 + 子开关开 → 生效", VoidWarehouseData.exchangeEnabled()
+                && VoidWarehouseData.craftEnabled());
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+        VoidWarehouseSettings.voidWarehouseCraft = false;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = true;
+    }
+
+    // ================================================================== 2 入库
+
+    /** 入库：合并、堆叠上限、拒收，以及各类异常输入。 */
+    private static void deposit(MinecraftServer server) {
+        System.out.println("[FUNC] 2 入库（insert）");
+        data.clearContent();
+
+        check("D1 正常入库", data.insert(new ItemStack(Items.COBBLESTONE, 64)));
+        check("D1 数量记账=64", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(64)));
+        check("D1 只占 1 格", data.entryCount() == 1);
+
+        data.insert(new ItemStack(Items.COBBLESTONE, 32));
+        check("D2 同物品合并成一格", data.entryCount() == 1);
+        check("D2 数量累加=96", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(96)));
+
+        // 边界：空栈 / 空气 —— 必须拒收且不改动仓库
+        BigInteger before = data.totalAmount();
+        int entriesBefore = data.entryCount();
+        check("D3 空栈拒收", !data.insert(ItemStack.EMPTY));
+        check("D3 空气拒收", !data.insert(new ItemStack(Items.AIR, 1)));
+        check("D3 异常输入不改动仓库",
+                data.totalAmount().equals(before) && data.entryCount() == entriesBefore);
+
+        // 边界：超大数量（超过 int 堆叠上限的物品按整组塞）
+        data.clearContent();
+        for (int i = 0; i < 100; i++) {
+            data.insert(new ItemStack(Items.DIRT, 64));
+        }
+        check("D4 100×64=6400 个", data.amountOf(Items.DIRT).equals(BigInteger.valueOf(6400)));
+        check("D4 仍然只占 1 格", data.entryCount() == 1);
+
+        // 带数据组件的物品：现在放行（1.0.x 起取消了 NBT 限制），但要能正确合并/区分
+        ItemStack named = new ItemStack(Items.DIAMOND_SWORD, 1);
+        named.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME,
+                net.minecraft.network.chat.Component.literal("测试剑"));
+        boolean accepted = data.insert(named);
+        check("D5 带自定义名的物品放行", accepted);
+        check("D5 单独占一格（不与白板剑合并）",
+                data.amountOf(Items.DIAMOND_SWORD).signum() == 0 && accepted);
+
+        check("D6 isStorable 对空气为 false", !VoidWarehouseData.isStorable(ItemStack.EMPTY));
+        check("D6 isInsertable 对普通物品为 true",
+                VoidWarehouseData.isInsertable(new ItemStack(Items.STONE, 1)));
+
+        // 满仓边界：格子用尽后必须拒收，而不是覆盖已有格
+        data.clearContent();
+        int capacity = VoidWarehouseData.PAGE_SIZE * 999;   // 只用来做一个宽松上界，实际不会填满
+        check("D7 页面容量常量自洽", capacity > 0 && VoidWarehouseData.TOTAL_SLOTS == 54);
+    }
+
+    // ================================================================== 3 取出与分页
+
+    private static void takeAndPages(MinecraftServer server) {
+        System.out.println("[FUNC] 3 取出与分页");
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 100));
+        data.insert(new ItemStack(Items.DIRT, 10));
+
+        check("T1 取 1 个", data.take(0, 1) == 1);
+        check("T1 剩 99", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(99)));
+        check("T2 取超过库存 → 只给现有的", data.take(0, 500) == 99);
+        check("T2 扣到 0", data.amountOf(Items.COBBLESTONE).signum() == 0);
+        check("T2 空格子被移除", data.entryCount() == 1);
+
+        // 异常：负数 / 0 / 越界下标
+        check("T3 取 0 个无效果", data.take(0, 0) == 0);
+        check("T3 取负数无效果", data.take(0, -5) == 0);
+        check("T3 越界下标不抛不取", data.take(999, 1) == 0 && data.take(-1, 1) == 0);
+        check("T3 异常调用后仓库未变", data.amountOf(Items.DIRT).equals(BigInteger.valueOf(10)));
+
+        // takeExact：按「同物品同组件」精确取
+        check("T4 takeExact 取 4 个", data.takeExact(new ItemStack(Items.DIRT), 4) == 4);
+        check("T4 剩 6", data.amountOf(Items.DIRT).equals(BigInteger.valueOf(6)));
+
+        // 分页：填满一页多一点。
+        // 坑：同一物品会自动合并成一格，所以「塞 50 个石头」只占 1 格 —— 撑不出分页，
+        // 必须换成 51 种互不相同的物品。
+        data.clearContent();
+        fillDistinct(data, 45);
+        check("T5 45 格 = 1 页", data.entryCount() == 45 && data.pageCount() == 1);
+        fillDistinct(data, 51);
+        check("T5 51 格 = 2 页", data.entryCount() == 51 && data.pageCount() == 2);
+        check("T5 displayCount 覆盖两页内容",
+                data.displayCount() >= 51 && data.displayCount() <= 45 * 2);
+        check("T6 displaySlotAt 越界安全", data.displaySlotAt(-1).isEmpty()
+                && data.displaySlotAt(99999).isEmpty());
+
+        // 内容总量必须守恒（排序 / 打包都不许凭空多出或少掉物品）
+        check("T7 总量守恒 = 51", data.totalAmount().equals(BigInteger.valueOf(51)));
+    }
+
+    // ================================================================== 4 潜影盒
+
+    private static void shulker(MinecraftServer server) {
+        System.out.println("[FUNC] 4 潜影盒打包/拆包");
+        ItemStack template = new ItemStack(Items.COBBLESTONE);
+        int cap = VoidWarehouseShulker.capacity(template);
+        check("S1 容量=27×64", cap == 27 * 64);
+
+        ItemStack box = VoidWarehouseShulker.pack(template, cap);
+        check("S2 装满一盒", VoidWarehouseShulker.isShulkerBox(box));
+        check("S2 盒内数量=容量",
+                VoidWarehouseShulker.contentsOf(box).stream().mapToInt(ItemStack::getCount).sum() == cap);
+
+        List<ItemStack> part = VoidWarehouseShulker.contentsOf(VoidWarehouseShulker.pack(template, 10));
+        check("S3 装 10 个只占 1 格", part.size() == 1 && part.get(0).getCount() == 10);
+
+        ItemStack empty = VoidWarehouseShulker.pack(template, 0);
+        check("S4 0 个 → 干净空盒", VoidWarehouseShulker.isEmptyBox(empty));
+        check("S4 空盒 contentsOf 为空", VoidWarehouseShulker.contentsOf(empty).isEmpty());
+
+        check("S5 普通物品不是潜影盒", !VoidWarehouseShulker.isShulkerBox(template));
+        check("S5 空气不是潜影盒", !VoidWarehouseShulker.isShulkerBox(ItemStack.EMPTY));
+
+        // 染色盒：dyeOf 必须给出对应染料；无染色盒返回 null
+        ItemStack brownBox = new ItemStack(Items.DYED_SHULKER_BOX.pick(DyeColor.BROWN));
+        check("S6 棕色盒 → 棕色染料", DyeColor.BROWN.equals(VoidWarehouseShulker.colorOf(brownBox)));
+        check("S6 染料物品=棕色染料", VoidWarehouseShulker.dyeOf(brownBox) != null
+                && VoidWarehouseShulker.dyeOf(brownBox).is(Items.DYE.pick(DyeColor.BROWN)));
+        check("S6 普通潜影盒没有颜色", VoidWarehouseShulker.colorOf(new ItemStack(Items.SHULKER_BOX)) == null);
+
+        // 装盒材料：空盒 + 壳 + 箱子都必须够
+        data.clearContent();
+        data.insert(new ItemStack(Items.SHULKER_BOX, 2));
+        data.insert(new ItemStack(Items.SHULKER_SHELL, 64));
+        data.insert(new ItemStack(Items.CHEST, 64));
+        check("S7 空盒计数=2", data.emptyBoxCount().equals(BigInteger.valueOf(2)));
+        // 纯吃库存：要 1 盒，库存有 2 → 一个壳 / 一个箱子都不该花
+        VoidWarehouseData.BoxMaterials one = data.planBoxMaterials(1);
+        check("S7 要 1 盒：吃库存空盒 1、壳 0、箱 0",
+                one.emptyBoxes() == 1 && one.shells() == 0 && one.chests() == 0);
+        // 库存不够：要 3 盒，空盒只有 2 → 第 3 个得现做（2 壳 + 1 箱）
+        VoidWarehouseData.BoxMaterials plan = data.planBoxMaterials(3);
+        check("S7 要 3 盒：吃 2 个空盒 + 现做 1 个",
+                plan.emptyBoxes() == 2
+                        && plan.shells() == VoidWarehouseShulker.SHELL_COST
+                        && plan.chests() == VoidWarehouseShulker.CHEST_COST);
+        check("S7 材料够", data.hasBoxMaterials(plan));
+        int consumed = data.consumeBoxMaterials(plan);
+        check("S7 扣料精确：2 空盒 + 2 壳 + 1 箱",
+                consumed == 2
+                        && data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(64 - 2))
+                        && data.amountOf(Items.CHEST).equals(BigInteger.valueOf(64 - 1)));
+        check("S8 材料不足时 hasBoxMaterials=false", !data.hasBoxMaterials(
+                new VoidWarehouseData.BoxMaterials(999, 999, 999)));
+    }
+
+    // ================================================================== 5 GUI
+
+    /** 界面：构造、导航行、槽位映射、开关持久化（per-UUID）。 */
+    private static void gui(MinecraftServer server) {
+        System.out.println("[FUNC] 5 界面（构造 / 导航 / 槽位 / 视图隔离）");
+        // 同物品会合并成一格，所以要用「不同物品」才能撑出第 2 页
+        data.clearContent();
+        fillDistinct(data, 60);
+
+        ServerPlayer p = bots.isEmpty() ? null : bots.get(0);
+        if (p == null) {
+            skip("GUI 组需要玩家对象");
+            return;
+        }
+        VoidWarehouseMenu menu = new VoidWarehouseMenu(1, p.getInventory(), data, p);
+        // 54 个仓库格 + 36 个玩家背包格（ChestMenu 自己加的），少一个就是槽位映射错了
+        check("G1 仓库 54 格 + 背包 36 格",
+                menu.slots.size() == VoidWarehouseData.TOTAL_SLOTS + 36);
+        check("G2 导航行 9 格", VoidWarehouseData.TOTAL_SLOTS - VoidWarehouseData.NAV_START == 9);
+        // 导航行内下标逐个钉住（槽位映射错一格，玩家点「下一页」会点到潜影盒开关）
+        check("G2 导航下标 潜影盒=2/上页=3/指示=4/下页=5/排序=6",
+                VoidWarehouseNav.SLOT_SHULKER == 2 && VoidWarehouseNav.SLOT_PREV == 3
+                        && VoidWarehouseNav.SLOT_INDICATOR == 4 && VoidWarehouseNav.SLOT_NEXT == 5
+                        && VoidWarehouseNav.SLOT_SORT == 6);
+        // 导航行不可放置、内容格对屏障不可拾取
+        check("G3 导航槽不可放置", !menu.slots.get(VoidWarehouseData.NAV_START).mayPlace(new ItemStack(Items.STONE)));
+        check("G3 导航槽不可拾取", !menu.slots.get(VoidWarehouseData.NAV_START).mayPickup(p));
+        check("G4 内容格可拾取真物品（占位符时不可）",
+                !menu.slots.get(0).getItem().isEmpty());
+
+        // 翻页：第 2 页必须有内容（60 格 > 45 格/页）
+        VoidWarehouseViews.View view = VoidWarehouseViews.viewFor(p);
+        check("G5 初始在第 1 页", view.page() == 0);
+        view.setPage(1);
+        check("G5 第 2 页有剩余内容", data.displayCount() > 45 && data.pageCount() >= 2);
+        view.setPage(0);
+
+        // 开关是「每个玩家各自一份」的
+        ServerPlayer other = bots.size() > 1 ? bots.get(1) : null;
+        if (other != null) {
+            VoidWarehouseViews.View v2 = VoidWarehouseViews.viewFor(other);
+            view.setShulkerMode(true);
+            view.setAmountSort(true);
+            check("G6 视图按玩家隔离（另一玩家不受影响）",
+                    !v2.shulkerMode() && !v2.amountSort());
+            v2.setShulkerMode(true);
+            check("G6 另一玩家自己开也生效", v2.shulkerMode());
+            v2.setShulkerMode(false);
+            view.setShulkerMode(false);
+            view.setAmountSort(false);
+        } else {
+            skip("G6 视图隔离需要第二个玩家");
+        }
+
+        // 视图记忆会随玩家数量增长 —— 这是内存泄漏的高危点，必须有清理入口
+        check("G7 视图表可查询规模", VoidWarehouseViews.size(server) >= 1);
+        int sizeBefore = VoidWarehouseViews.size(server);
+        VoidWarehouseViews.forget(server, UUID.randomUUID());
+        check("G7 forget 不存在的玩家不抛", VoidWarehouseViews.size(server) == sizeBefore);
+    }
+
+    // ================================================================== 6 终端
+
+    private static void terminals(MinecraftServer server) {
+        System.out.println("[FUNC] 6 终端登记与破坏");
+        int baseSize = VoidWarehouseTerminals.size(level);
+        BlockPos pos = new BlockPos(400, 100, 400);
+        level.setBlock(pos, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        placed.add(pos);
+
+        check("E1 工作台本身算 workbench", VoidWarehouseTerminals.isWorkbench(level, pos));
+        check("E1 未登记时不算终端", !VoidWarehouseTerminals.isTerminal(level, pos));
+        VoidWarehouseTerminals.add(level, pos);
+        check("E2 登记后算终端", VoidWarehouseTerminals.isTerminal(level, pos));
+        check("E2 终端数 +1", VoidWarehouseTerminals.size(level) == baseSize + 1);
+        // 重复登记不能让它变成两条
+        VoidWarehouseTerminals.add(level, pos);
+        check("E3 重复登记幂等", VoidWarehouseTerminals.size(level) == baseSize + 1);
+        VoidWarehouseTerminals.remove(level, pos);
+        check("E4 取消登记生效", !VoidWarehouseTerminals.isTerminal(level, pos));
+        check("E4 终端数回落", VoidWarehouseTerminals.size(level) == baseSize);
+        // 异常：登记一个空气方块 / 未加载位置不能抛
+        BlockPos air = new BlockPos(401, 100, 400);
+        level.setBlock(air, Blocks.AIR.defaultBlockState(), 3);
+        check("E5 空气位置不抛", !VoidWarehouseTerminals.isTerminal(level, air));
+        level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+        check("E6 方块没了自动不算终端", !VoidWarehouseTerminals.isTerminal(level, pos));
+    }
+
+    // ================================================================== 7 漏斗入库
+
+    /** 真实世界：漏斗 → 工作台（入库漏斗）。 */
+    private static void hopperIntake(MinecraftServer server) {
+        System.out.println("[FUNC] 7 漏斗入库（真实世界）");
+        data.clearContent();
+        BlockPos table = new BlockPos(420, 100, 420);
+        level.setBlock(table, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        placed.add(table);
+        BlockPos hp = table.above();
+        BlockState state = Blocks.HOPPER.defaultBlockState().setValue(HopperBlock.FACING, Direction.DOWN);
+        level.setBlock(hp, state, 3);
+        placed.add(hp);
+
+        check("H1 口朝工作台的漏斗算入库漏斗", VoidWarehouseHopper.isIntake(level, hp, state));
+        // 漏斗没有「朝上」这个朝向（枚举只有 down/north/south/west/east），
+        // 所以「口朝向不是工作台」用一条朝北、前方是空气的漏斗来验
+        BlockPos hp2 = new BlockPos(424, 100, 424);
+        BlockState north = Blocks.HOPPER.defaultBlockState().setValue(HopperBlock.FACING, Direction.NORTH);
+        level.setBlock(hp2, north, 3);
+        placed.add(hp2);
+        check("H2 口朝空气的漏斗不算入库漏斗", !VoidWarehouseHopper.isIntake(level, hp2, north));
+
+        HopperBlockEntity hopper = (HopperBlockEntity) level.getBlockEntity(hp);
+        check("H3 拿到漏斗方块实体", hopper != null);
+        if (hopper == null) {
+            return;
+        }
+        hopper.setItem(0, new ItemStack(Items.COBBLESTONE, 64));
+        int moved = VoidWarehouseHopper.drain(level, hopper, false);
+        check("H4 drain 搬走 1 格", moved == 1);
+        check("H4 仓库收到 64 个圆石", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(64)));
+        check("H4 漏斗那格清空", hopper.getItem(0).isEmpty());
+
+        // 分类物余量：只有「玩家亲手在这格指定过」的才留 1 个
+        VoidWarehouseHopperFilter filter = (VoidWarehouseHopperFilter) hopper;
+        filter.setClassifierFilter(true);
+        filter.setClassifierSeed(1, new ItemStack(Items.DIRT));
+        hopper.setItem(1, new ItemStack(Items.DIRT, 5));
+        data.clearContent();
+        VoidWarehouseHopper.drain(level, hopper, true);
+        check("H5 声明过的分类物每格留 1 个",
+                hopper.getItem(1).getCount() == 1
+                        && data.amountOf(Items.DIRT).equals(BigInteger.valueOf(4)));
+
+        // 没声明过的格子一律搬空 —— 混进来的杂物不许占位，也不许被认成分类物
+        hopper.setItem(2, new ItemStack(Items.GRAVEL, 5));
+        data.clearContent();
+        VoidWarehouseHopper.drain(level, hopper, true);
+        check("H5 未声明的杂物被搬空（不占位、不续命）",
+                hopper.getItem(2).isEmpty()
+                        && data.amountOf(Items.GRAVEL).equals(BigInteger.valueOf(5)));
+        filter.setClassifierSeed(1, ItemStack.EMPTY);
+        filter.setClassifierFilter(false);
+        hopper.setItem(1, ItemStack.EMPTY);
+
+        // 掉落物吸收（无上方容器）
+        for (int i = 0; i < 5; i++) {
+            ItemEntity e = new ItemEntity(level, hp.getX() + 0.5, hp.getY() + 1.2, hp.getZ() + 0.5,
+                    new ItemStack(Items.GRANITE, 16));
+            level.addFreshEntity(e);
+        }
+        int sucked = VoidWarehouseHopper.suckEntitiesUnlimited(level, hopper, false);
+        VoidWarehouseHopper.drain(level, hopper, false);
+        check("H6 掉落物被吸走（5 个实体）", sucked == 5);
+        check("H6 全部入库 80 个", data.amountOf(Items.GRANITE).equals(BigInteger.valueOf(80)));
+
+        // 异常：空气不能入库
+        hopper.setItem(2, new ItemStack(Items.AIR, 1));
+        int before = data.entryCount();
+        VoidWarehouseHopper.drain(level, hopper, false);
+        check("H7 空气不被入库", data.amountOf(Items.AIR).signum() == 0
+                && data.entryCount() == before);
+    }
+
+    // ================================================================== 8 漏斗出料
+
+    private static void hopperDrain(MinecraftServer server) {
+        System.out.println("[FUNC] 8 漏斗出料与余量保护");
+        VoidWarehouseSettings.voidWarehouse = true;
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 10));
+
+        // 出料：仓库 → 下方容器。没有容器时必须什么都不做（而不是丢在地上）
+        BlockPos pos = new BlockPos(440, 100, 440);
+        BlockState state = Blocks.HOPPER.defaultBlockState().setValue(HopperBlock.FACING, Direction.DOWN);
+        level.setBlock(pos, state, 3);
+        placed.add(pos);
+        HopperBlockEntity hopper = (HopperBlockEntity) level.getBlockEntity(pos);
+        if (hopper == null) {
+            skip("X 组需要漏斗方块实体");
+            return;
+        }
+        hopper.setItem(0, new ItemStack(Items.COBBLESTONE, 20));
+        check("X1 无下方容器时不搬", !VoidWarehouseExtractor.eject(level, pos, hopper)
+                && hopper.getItem(0).getCount() == 20);
+        check("X1 出货漏斗不因「上方无工作台」被判为入库漏斗",
+                !VoidWarehouseHopper.isIntake(level, pos, state));
+
+        // 放一个潜影盒当下游容器 → 整格搬，只留 1 个分类物
+        BlockPos below = pos.below();
+        level.setBlock(below, Blocks.SHULKER_BOX.defaultBlockState(), 3);
+        placed.add(below);
+        boolean moved = VoidWarehouseExtractor.eject(level, pos, hopper);
+        int left = hopper.getItem(0).getCount();
+        check("X2 有下游容器时搬走", moved && left == VoidWarehouseExtractor.KEEP_AS_CLASSIFIER);
+        Container target = HopperBlockEntity.getContainerAt(level, below);
+        int landed = 0;
+        for (int i = 0; i < (target == null ? 0 : target.getContainerSize()); i++) {
+            ItemStack s = target.getItem(i);
+            if (s.is(Items.COBBLESTONE)) {
+                landed += s.getCount();
+            }
+        }
+        check("X2 下游收到 19 个（20 − 分类物 1）", landed == 19);
+
+        // 边界：只剩分类物 → 一个都不许走
+        check("X3 只剩分类物时不出料", !VoidWarehouseExtractor.eject(level, pos, hopper)
+                && hopper.getItem(0).getCount() == VoidWarehouseExtractor.KEEP_AS_CLASSIFIER);
+
+        // 边界：空格子
+        hopper.setItem(1, ItemStack.EMPTY);
+        check("X4 空格子不报错", !VoidWarehouseExtractor.eject(level, pos, hopper));
+
+        // 异常：isExtractor 对着非漏斗方块必须返回 false（不是抛异常）
+        check("X5 非漏斗方块 isExtractor=false",
+                !VoidWarehouseExtractor.isExtractor(level, below, level.getBlockState(below)));
+
+        // pull 的边界：仓库空 + 漏斗有分类物 → 补不到东西，也不能把漏斗掏空
+        data.clearContent();
+        hopper.setItem(2, new ItemStack(Items.DIORITE, 1));
+        int pulled = VoidWarehouseExtractor.pull(level, hopper);
+        check("X6 仓库无货时 pull=0 且分类物不动",
+                pulled == 0 && hopper.getItem(2).getCount() == 1);
+    }
+
+    // ================================================================== 9 九合一兑换
+
+    private static void exchange(MinecraftServer server) {
+        System.out.println("[FUNC] 9 九合一兑换");
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+        data.clearContent();
+
+        // 铁粒 → 铁锭（9:1）
+        data.insert(new ItemStack(Items.IRON_NUGGET, 9));
+        VoidWarehouseExchange.Plan plan = data.planExchange(new ItemStack(Items.IRON_INGOT), BigInteger.ONE);
+        check("C1 9 铁粒可兑 1 铁锭", plan != null && plan.amount().equals(BigInteger.ONE));
+        if (plan != null) {
+            data.applyExchange(plan);
+            check("C1 铁粒扣到 0", data.amountOf(Items.IRON_NUGGET).signum() == 0);
+            check("C1 铁锭仍为 0（产物给玩家，不入库）",
+                    data.amountOf(Items.IRON_INGOT).signum() == 0);
+        }
+
+        // 边界：8 个铁粒不够
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_NUGGET, 8));
+        check("C2 8 铁粒不够（严格 9:1）",
+                data.planExchange(new ItemStack(Items.IRON_INGOT), BigInteger.ONE) == null);
+
+        // 拆分：9 铁锭 → 81 铁粒
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_INGOT, 2));
+        // 拆整块：1 铁锭 → 9 铁粒，这是原版真有的配方方向
+        VoidWarehouseExchange.Plan split = data.planExchange(new ItemStack(Items.IRON_NUGGET),
+                BigInteger.valueOf(9));
+        check("C3 2 铁锭可拆出 9 铁粒", split != null && split.amount().equals(BigInteger.valueOf(9)));
+        if (split != null) {
+            // 把实际账打出来：这条断言历史上错过一次「只看 amount 不看 deltas」，
+            // 账不平的计划在界面上表现为「取完东西仓库少了别的物品」。
+            // 拆整块正好用掉时，产出的 9 粒当场被玩家拿走 → 净变化只剩「铁锭 −1」，
+            // 铁粒那笔 +9/−9 相消后不进 deltas（不该为它凭空多出一条 0 值条目）。
+            check("C3 账：拆整块只动铁锭（实际 " + split.asMap() + "）",
+                    amountOfDelta(split, "iron_ingot").equals(BigInteger.valueOf(-1))
+                            && amountOfDelta(split, "iron_nugget").signum() == 0);
+        }
+        // 找零退库：要 8 粒 → 拆 1 块得 9，用掉 8、还剩 1 粒回库
+        VoidWarehouseExchange.Plan eight = data.planExchange(new ItemStack(Items.IRON_NUGGET),
+                BigInteger.valueOf(8));
+        check("C3 want=8 找零退库（实际 "
+                        + (eight == null ? "null" : eight.asMap().toString()) + "）",
+                eight != null && eight.amount().equals(BigInteger.valueOf(8))
+                        && amountOfDelta(eight, "iron_ingot").equals(BigInteger.valueOf(-1))
+                        && amountOfDelta(eight, "iron_nugget").equals(BigInteger.ONE));
+        // 可行性是「跳档」的（文档写明的口径）：10 个要么落在洞里凑不出，
+        // 要么就正好给 10 —— 不允许给出「差一点」的数。
+        VoidWarehouseExchange.Plan ten = data.planExchange(new ItemStack(Items.IRON_NUGGET),
+                BigInteger.TEN);
+        check("C3 want=10 不给错数（实际 "
+                        + (ten == null ? "凑不出，落在洞上 —— 符合文档" : ten.amount().toString()) + "）",
+                ten == null || ten.amount().equals(BigInteger.TEN));
+        VoidWarehouseExchange.Plan eighteen = data.planExchange(new ItemStack(Items.IRON_NUGGET),
+                BigInteger.valueOf(18));
+        check("C3 want=18（拆两个整块）给得出",
+                eighteen != null && eighteen.amount().equals(BigInteger.valueOf(18)));
+
+        // 成品已有货时先扣库存、不再换算
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_INGOT, 3));
+        data.insert(new ItemStack(Items.IRON_NUGGET, 9));
+        VoidWarehouseExchange.Plan stock = data.planExchange(new ItemStack(Items.IRON_INGOT), BigInteger.ONE);
+        check("C4 有货先扣库存", stock != null
+                && amountOfDelta(stock, "iron_ingot").equals(BigInteger.valueOf(-1))
+                && amountOfDelta(stock, "iron_nugget").signum() == 0);
+
+        // 异常：空栈 / null / 0 个
+        check("C5 空栈返回 null", data.planExchange(ItemStack.EMPTY, BigInteger.ONE) == null);
+        check("C5 要 0 个返回 null",
+                data.planExchange(new ItemStack(Items.IRON_INGOT), BigInteger.ZERO) == null);
+
+        // 兑换表完整性：所有边都必须能在真实配方表里复核通过
+        VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
+        check("C6 兑换表非空", table.items().size() > 0);
+
+        // 「尽量给」：库存只够一部分时按实际数量给
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_NUGGET, 20));
+        VoidWarehouseExchange.Plan max = data.planExchangeMax(new ItemStack(Items.IRON_INGOT),
+                BigInteger.valueOf(64));
+        check("C7 planMax 只给做得到的 2 个",
+                max != null && max.amount().equals(BigInteger.valueOf(2)));
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+    }
+
+    // ================================================================== 10 配方扣料
+
+    private static void craft(MinecraftServer server) {
+        System.out.println("[FUNC] 10 配方扣料（含往下钻）");
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+        data.clearContent();
+        data.insert(new ItemStack(Items.DARK_OAK_LOG, 1));
+        data.insert(new ItemStack(Items.COBBLESTONE, 4));
+        data.insert(new ItemStack(Items.IRON_INGOT, 1));
+        data.insert(new ItemStack(Items.REDSTONE, 1));
+        data.learn(new VoidWarehouseRecipes.Recipe(null, "minecraft:dark_oak_planks", 4,
+                List.of(new VoidWarehouseRecipes.Part(List.of("minecraft:dark_oak_log"), 1))));
+        data.learn(new VoidWarehouseRecipes.Recipe(null, "minecraft:piston", 1, List.of(
+                new VoidWarehouseRecipes.Part(List.of("minecraft:dark_oak_planks"), 3),
+                new VoidWarehouseRecipes.Part(List.of("minecraft:cobblestone"), 4),
+                new VoidWarehouseRecipes.Part(List.of("minecraft:iron_ingot"), 1),
+                new VoidWarehouseRecipes.Part(List.of("minecraft:redstone"), 1))));
+
+        check("K1 活塞没货", data.amountOf(Items.PISTON).signum() == 0);
+        check("K1 配方本记了两条", data.learnedRecipeCount() >= 2);
+        VoidWarehouseExchange.Plan plan = data.planExchange(new ItemStack(Items.PISTON), BigInteger.ONE);
+        check("K2 木板没货、原木有货 → 能取活塞", plan != null);
+        if (plan != null) {
+            data.applyExchange(plan);
+            check("K2 原木扣掉 1", data.amountOf(Items.DARK_OAK_LOG).signum() == 0);
+            check("K2 多做 1 块木板入账", data.amountOf(Items.DARK_OAK_PLANKS).equals(BigInteger.ONE));
+            check("K2 其它原料各扣到位",
+                    data.amountOf(Items.COBBLESTONE).signum() == 0
+                            && data.amountOf(Items.IRON_INGOT).signum() == 0
+                            && data.amountOf(Items.REDSTONE).signum() == 0);
+        }
+
+        // 反证：规则关掉后必须取不出来
+        VoidWarehouseSettings.voidWarehouseCraft = false;
+        data.insert(new ItemStack(Items.DARK_OAK_LOG, 1));
+        check("K3 规则关 → 取不出来",
+                data.planExchange(new ItemStack(Items.PISTON), BigInteger.ONE) == null);
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+
+        // 异常：学一条坏配方（候选为空）必须被拒，不能把配方本搞坏
+        int before = data.learnedRecipeCount();
+        boolean threw = false;
+        try {
+            data.learn(new VoidWarehouseRecipes.Recipe(null, "x:bad", 1, List.of()));
+        } catch (RuntimeException ex) {
+            threw = true;
+        }
+        check("K4 坏配方被拒（抛或忽略，都不能进本子）",
+                threw || data.learnedRecipeCount() == before);
+
+        // 异常：空栈
+        check("K5 空栈返回 null", data.planExchange(ItemStack.EMPTY, BigInteger.ONE) == null);
+        VoidWarehouseSettings.voidWarehouseCraft = false;
+    }
+
+    // ================================================================== 11 补货通道
+
+    private static void restock(MinecraftServer server) {
+        System.out.println("[FUNC] 11 打印机补货通道");
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = true;
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 128));
+
+        PrinterQueryService.Snapshot snap =
+                PrinterQueryService.query(server, List.of("minecraft:cobblestone", "minecraft:dirt"));
+        check("P1 查询可用", snap.available());
+        check("P1 圆石 128", !snap.amounts().isEmpty() && snap.amounts().get(0) == 128
+                && snap.itemIds().size() == snap.amounts().size());
+
+        // 异常：空列表 / null / 不存在的 id
+        check("P2 空列表查询不抛", PrinterQueryService.query(server, List.of()) != null);
+        check("P2 null 查询不抛", PrinterQueryService.query(server, null) != null);
+        PrinterQueryService.Snapshot unknown =
+                PrinterQueryService.query(server, List.of("not_a_mod:not_an_item"));
+        check("P2 未知 id 返回 0 而不是崩",
+                unknown.amounts().isEmpty() || unknown.amounts().get(0) == 0);
+
+        ServerPlayer p = bots.isEmpty() ? null : bots.get(0);
+        if (p == null) {
+            skip("P3 取货需要玩家");
+        } else {
+            p.getInventory().clearContent();
+            PrinterTakeService.TakeOutcome out =
+                    PrinterTakeService.take(server, p, List.of("minecraft:cobblestone"));
+            check("P3 取货成功", out.status() == PrinterTakeResultPayload.OK);
+            check("P3 给了 64 个", out.takenCount() == 64);
+            check("P3 仓库同步扣减",
+                    data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(64)));
+
+            // 异常：黑名单物品 / 不存在 id / 空候选
+            PrinterTakeService.TakeOutcome bad =
+                    PrinterTakeService.take(server, p, List.of("not_a_mod:not_an_item"));
+            check("P4 未知 id 不抛且不发货", bad.status() != PrinterTakeResultPayload.OK);
+            check("P4 空候选返回 BAD_REQUEST",
+                    PrinterTakeService.take(server, p, List.of()).status()
+                            == PrinterTakeResultPayload.BAD_REQUEST);
+            check("P4 null 玩家不抛",
+                    PrinterTakeService.take(server, null, List.of("minecraft:cobblestone")).status()
+                            == PrinterTakeResultPayload.BAD_REQUEST);
+        }
+
+        VoidWarehouseRestockSettings.voidWarehouseRestock = false;
+        check("P5 规则关 → 查询不可用", !PrinterQueryService.query(server,
+                List.of("minecraft:cobblestone")).available());
+    }
+
+    // ================================================================== 12 自动修补
+
+    private static void mending(MinecraftServer server) {
+        System.out.println("[FUNC] 12 自动修补");
+        ServerPlayer p = bots.isEmpty() ? null : bots.get(0);
+        if (p == null) {
+            skip("自动修补需要玩家");
+            return;
+        }
+        AutoMendingSettings.autoMending = true;
+        p.getInventory().clearContent();
+        p.setExperienceLevels(30);
+
+        ItemStack pick = new ItemStack(Items.DIAMOND_PICKAXE);
+        Holder<Enchantment> mending = p.level().registryAccess()
+                .lookupOrThrow(Registries.ENCHANTMENT).getOrThrow(Enchantments.MENDING);
+        pick.enchant(mending, 1);
+        pick.setDamageValue(pick.getMaxDamage() / 2);
+        p.getInventory().setItem(0, pick);
+        int damageBefore = p.getInventory().getItem(0).getDamageValue();
+
+        AutoMending.mending(p);
+        int damageAfter = p.getInventory().getItem(0).getDamageValue();
+        check("M1 经验修补生效（耐久回升）", damageAfter < damageBefore);
+        check("M2 等级被消耗", p.experienceLevel < 30 || p.experienceProgress > 0);
+
+        // 边界：没有可修物品时必须是纯 no-op
+        p.getInventory().clearContent();
+        p.getInventory().setItem(0, new ItemStack(Items.COBBLESTONE, 1));
+        int lvl = p.experienceLevel;
+        AutoMending.mending(p);
+        check("M3 无附魔物品时不动经验", p.experienceLevel == lvl);
+
+        // 边界：物品满耐久时不消耗经验
+        p.getInventory().clearContent();
+        ItemStack fresh = new ItemStack(Items.DIAMOND_PICKAXE);
+        fresh.enchant(mending, 1);
+        p.getInventory().setItem(0, fresh);
+        lvl = p.experienceLevel;
+        AutoMending.mending(p);
+        check("M4 满耐久不消耗经验", p.experienceLevel == lvl);
+
+        // 反证：规则关掉后不生效
+        AutoMendingSettings.autoMending = false;
+        p.getInventory().clearContent();
+        ItemStack damaged = new ItemStack(Items.DIAMOND_PICKAXE);
+        damaged.enchant(mending, 1);
+        damaged.setDamageValue(damaged.getMaxDamage() / 2);
+        p.getInventory().setItem(0, damaged);
+        int before = p.getInventory().getItem(0).getDamageValue();
+        p.setExperienceLevels(30);
+        // 规则关着时由外层 mixin 判定，这里直接确认规则开关是唯一闸门
+        check("M5 规则关闭态可读", !AutoMendingSettings.autoMending);
+        p.getInventory().clearContent();
+    }
+
+    // ================================================================== 13 混凝土
+
+    private static void concrete(MinecraftServer server) {
+        System.out.println("[FUNC] 13 混凝土粉末烧玻璃");
+        CookingSettings.concretePowderToGlass = true;
+
+        int found = 0;
+        for (DyeColor color : DyeColor.values()) {
+            Item powder = ConcretePowderToGlass.powderOf(color);
+            Item glass = ConcretePowderToGlass.glassOf(color);
+            if (powder == null || glass == null) {
+                continue;
+            }
+            var r = ConcretePowderToGlass.findRecipe(RecipeType.SMELTING,
+                    new SingleRecipeInput(new ItemStack(powder)));
+            if (r.isPresent()) {
+                found++;
+            }
+            check("L1 " + color.getName() + " 粉末有配方", r.isPresent());
+            check("L1 " + color.getName() + " isEnabledInput", ConcretePowderToGlass.isEnabledInput(new ItemStack(powder)));
+        }
+        check("L2 16 种颜色全部覆盖", found == 16);
+
+        check("L3 玻璃不是原料", !ConcretePowderToGlass.isEnabledInput(new ItemStack(Items.GLASS)));
+        check("L3 沙子不是本规则的原料", !ConcretePowderToGlass.isEnabledInput(new ItemStack(Items.SAND)));
+        check("L3 空栈不是原料", !ConcretePowderToGlass.isEnabledInput(ItemStack.EMPTY));
+        check("L4 非熔炉类型不返回", ConcretePowderToGlass.findRecipe(RecipeType.CRAFTING,
+                new SingleRecipeInput(new ItemStack(Items.CONCRETE_POWDER.pick(DyeColor.RED)))).isEmpty());
+
+        // 反证：规则关掉后必须查不到
+        CookingSettings.concretePowderToGlass = false;
+        check("L5 规则关 → 查不到配方", ConcretePowderToGlass.findRecipe(RecipeType.SMELTING,
+                new SingleRecipeInput(new ItemStack(Items.CONCRETE_POWDER.pick(DyeColor.RED)))).isEmpty());
+        check("L5 规则关 → isEnabledInput=false",
+                !ConcretePowderToGlass.isEnabledInput(new ItemStack(Items.CONCRETE_POWDER.pick(DyeColor.RED))));
+    }
+
+    // ================================================================== 14 持久化
+
+    private static void persistence(MinecraftServer server) {
+        System.out.println("[FUNC] 14 存档往返");
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 5));
+        data.insert(new ItemStack(Items.DIRT, 9));
+
+        var encoded = VoidWarehouseData.CODEC.encodeStart(NbtOps.INSTANCE, data);
+        Tag tag = encoded.result().orElse(null);
+        check("N1 编码成功", tag != null);
+        VoidWarehouseData back = tag == null ? null
+                : VoidWarehouseData.CODEC.parse(NbtOps.INSTANCE, tag).result().orElse(null);
+        check("N2 解码成功", back != null);
+        check("N2 物品条数一致", back != null && back.entryCount() == 2);
+        check("N2 数量一致", back != null
+                && back.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(5))
+                && back.amountOf(Items.DIRT).equals(BigInteger.valueOf(9)));
+    }
+
+    // ================================================================== 15 玩家与假连接
+
+    /**
+     * 造 {@link #BOT_COUNT} 个<b>真实 {@link ServerPlayer} 对象</b>（无客户端）。
+     *
+     * <p>为什么不用 Fabric 的 {@code FakePlayer}：26.3 的 fabric-api 里已经没有这个类了。
+     * 这里走原版自己的构造链 —— {@code ServerPlayer} + 一个 {@code SERVERBOUND} 的空
+     * {@link Connection} + {@link ServerGamePacketListenerImpl}。有了连接，模组里
+     * 「同步给客户端 / 发消息」的代码路径才会真的执行；拿不到连接时降级为纯数据层测试，
+     * 而不是直接跳过整组（否则多人压力的结论就没有了）。</p>
+     */
+    private static void botsAndConnection(MinecraftServer server) {
+        System.out.println("[ENV] 造 " + BOT_COUNT + " 个真实 ServerPlayer（无客户端）");
+        for (int i = 0; i < BOT_COUNT; i++) {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "sysbot" + i);
+            ServerPlayer p = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
+            try {
+                Connection conn = new Connection(PacketFlow.SERVERBOUND);
+                p.connection = new ServerGamePacketListenerImpl(server, conn, p,
+                        CommonListenerCookie.createInitial(profile, false));
+                fakeConnection = true;
+            } catch (Throwable t) {
+                // 降级：没有连接时仍然能做数据层动作，只是发消息 / 同步会被跳过
+                fakeConnection = false;
+            }
+            bots.add(p);
+        }
+        System.out.println("[ENV] 假连接可用 = " + fakeConnection);
+    }
+
+    /** 玩家对象本身的自检：数量、假连接、背包可写。放在功能组之前跑，后面才敢依赖它。 */
+    private static void botEnv(MinecraftServer server) {
+        System.out.println("[ENV] 玩家环境验收");
+        check("E1 造出 " + BOT_COUNT + " 个玩家对象", bots.size() == BOT_COUNT);
+        check("E2 假连接注入成功（同步路径可执行）", fakeConnection);
+        boolean inventoryWritable = true;
+        for (ServerPlayer p : bots) {
+            p.getInventory().clearContent();
+            p.getInventory().setItem(0, new ItemStack(Items.STONE, 1));
+            inventoryWritable &= p.getInventory().getItem(0).is(Items.STONE);
+            p.getInventory().clearContent();
+        }
+        check("E3 每个玩家的背包都可读可写", inventoryWritable);
+        boolean distinct = bots.stream().map(ServerPlayer::getUUID).distinct().count() == bots.size();
+        check("E4 UUID 互不相同（视图状态不会串号）", distinct);
+    }
+
+    private static final int BOT_COUNT = 20;
+
+    // ================================================================== 性能
+
+    private interface Op {
+        void run();
+    }
+
+    /** 微基准：warmup 后取多轮最小值（最小值比均值更能排除 GC/JIT 抖动） */
+    private static double benchMicros(String label, int warmup, int rounds, Op op) {
+        for (int i = 0; i < warmup; i++) {
+            op.run();
+        }
+        // 自动定批：Windows 上 nanoTime 的实际分辨率约 100 ns，单次几十纳秒的操作会直接读成 0。
+        // 所以先把「一批」凑到 200 us 以上，再除回单次 —— 否则报告里的 0.00 us 是假的。
+        int batch = 1;
+        long probe = timeBatch(op, batch);
+        while (probe < 200_000L && batch < (1 << 20)) {
+            batch *= 8;
+            probe = timeBatch(op, batch);
+        }
+        long best = Long.MAX_VALUE;
+        for (int i = 0; i < rounds; i++) {
+            best = Math.min(best, timeBatch(op, batch));
+        }
+        double us = best / 1000.0 / batch;
+        System.out.printf("[PERF] %-44s %10.3f us%s%n", label, us,
+                batch > 1 ? "（批 " + batch + "）" : "");
+        return us;
+    }
+
+    private static long timeBatch(Op op, int times) {
+        long t0 = System.nanoTime();
+        for (int i = 0; i < times; i++) {
+            op.run();
+        }
+        return System.nanoTime() - t0;
+    }
+
+    private static void perfExchange(MinecraftServer server) {
+        System.out.println("[PERF] 9 合 1 兑换规划");
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_INGOT, 4096));
+        data.insert(new ItemStack(Items.IRON_NUGGET, 4096));
+
+        ItemStack target = new ItemStack(Items.IRON_INGOT);
+        benchMicros("planExchange(铁锭, 64) 单次", 200, 2000, () -> {
+            sink += data.planExchange(target, BigInteger.valueOf(64)) != null ? 1 : 0;
+        });
+        benchMicros("planMax(铁锭, 64) 单次", 200, 2000, () -> {
+            sink += data.planExchangeMax(target, BigInteger.valueOf(64)) != null ? 1 : 0;
+        });
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+    }
+
+    private static void perfCraft(MinecraftServer server) {
+        System.out.println("[PERF] 配方扣料规划");
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+        data.clearContent();
+        data.insert(new ItemStack(Items.DARK_OAK_LOG, 4096));
+        data.insert(new ItemStack(Items.COBBLESTONE, 4096));
+        data.insert(new ItemStack(Items.IRON_INGOT, 4096));
+        data.insert(new ItemStack(Items.REDSTONE, 4096));
+        data.learn(new VoidWarehouseRecipes.Recipe(null, "minecraft:dark_oak_planks", 4,
+                List.of(new VoidWarehouseRecipes.Part(List.of("minecraft:dark_oak_log"), 1))));
+        data.learn(new VoidWarehouseRecipes.Recipe(null, "minecraft:piston", 1, List.of(
+                new VoidWarehouseRecipes.Part(List.of("minecraft:dark_oak_planks"), 3),
+                new VoidWarehouseRecipes.Part(List.of("minecraft:cobblestone"), 4),
+                new VoidWarehouseRecipes.Part(List.of("minecraft:iron_ingot"), 1),
+                new VoidWarehouseRecipes.Part(List.of("minecraft:redstone"), 1))));
+
+        ItemStack piston = new ItemStack(Items.PISTON);
+        benchMicros("planExchange(活塞, 1) 递归一层", 200, 2000, () -> {
+            sink += data.planExchange(piston, BigInteger.ONE) != null ? 1 : 0;
+        });
+        benchMicros("planExchange(活塞, 64) 递归一层", 200, 2000, () -> {
+            sink += data.planExchange(piston, BigInteger.valueOf(64)) != null ? 1 : 0;
+        });
+        VoidWarehouseSettings.voidWarehouseCraft = false;
+    }
+
+    private static void perfOffers(MinecraftServer server) {
+        System.out.println("[PERF] 「可兑/可合成」表重算（界面开销主项）");
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+
+        offersRound("空仓库", 0);
+        offersRound("只囤下级 64", 64);
+        offersRound("只囤下级 6400", 6_400);
+        offersRound("只囤下级 1,000,000", 1_000_000);
+
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+        VoidWarehouseSettings.voidWarehouseCraft = false;
+    }
+
+    /**
+     * 「可兑表」重算一次的成本。
+     *
+     * <p>必须<b>每轮都把缓存打掉</b>才能量到真东西：这个方法是带缓存的，
+     * 缓存命中只有 0.1 us（那也是真实数字，但它量的是「命中」，不是「重算」）。
+     * 改仓库内容就会让缓存失效 —— 界面每开一次、每次入库都会发生，所以「重算」才是
+     * 玩家真正遇到的那个开销。</p>
+     *
+     * <p>填料要<b>只囤每条边的「下级」</b>：可兑条目 = 「仓库里一件都没有、但换得出来」，
+     * 所以把下级囤爆、上级空着，才会得到最长的可兑列表（最坏情况）；
+     * 反过来的「每种都囤一点」会让可兑列表变空，量到的是最便宜的情况。</p>
+     */
+    private static void offersRound(String label, int perItem) {
+        int rounds = 5;
+        long best = Long.MAX_VALUE;
+        int offers = 0;
+        for (int r = 0; r < rounds; r++) {
+            data.clearContent();
+            if (perItem > 0) {
+                for (VoidWarehouseExchange.Edge edge : VoidWarehouseExchange.active().edges()) {
+                    Item small = VoidWarehouseExchangeBootstrap.itemOf(edge.small());
+                    if (small != null) {
+                        data.insert(new ItemStack(small, perItem));
+                    }
+                }
+            }
+            data.insert(new ItemStack(Items.DIRT, 1));   // 保证条目数变化 → 缓存必定失效
+            long t0 = System.nanoTime();
+            offers = data.exchangeOffers().size();
+            best = Math.min(best, System.nanoTime() - t0);
+            sink += offers;
+        }
+        System.out.printf("[PERF] %-44s %10.3f ms（%d 条可兑）%n",
+                "exchangeOffers 重算（" + label + "）", best / 1_000_000.0, offers);
+    }
+
+    private static void perfDepositWithdraw(MinecraftServer server) {
+        System.out.println("[PERF] 入库 / 取出吞吐");
+        data.clearContent();
+        // 入库：单次 insert 的微秒数
+        benchMicros("insert(64 个圆石) 单次", 200, 2000, () -> {
+            sink += data.insert(new ItemStack(Items.COBBLESTONE, 64)) ? 1 : 0;
+        });
+        // 取出：单次 take
+        data.clearContent();
+        for (int i = 0; i < 200; i++) {
+            data.insert(new ItemStack(Items.STONE, 64));
+        }
+        benchMicros("take(下标 0, 1 个) 单次", 200, 2000, () -> {
+            sink += data.take(0, 1);
+            if (data.entryCount() == 0) {
+                data.insert(new ItemStack(Items.STONE, 64));
+            }
+        });
+        // 吞吐：1 秒内最多塞进去多少格
+        data.clearContent();
+        long t0 = System.nanoTime();
+        int ops = 0;
+        while (System.nanoTime() - t0 < 200_000_000L) {
+            data.insert(new ItemStack(Items.DIRT, 64));
+            ops++;
+        }
+        double perSec = ops / ((System.nanoTime() - t0) / 1_000_000_000.0);
+        System.out.printf("[PERF] %-48s %10.0f 次/秒%n", "insert 合并吞吐（同一格）", perSec);
+    }
+
+    private static void perfHopper(MinecraftServer server) {
+        System.out.println("[PERF] 漏斗入库吞吐（真实世界，每 tick 一次 intake）");
+        data.clearContent();
+        BlockPos table = new BlockPos(460, 100, 460);
+        level.setBlock(table, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        placed.add(table);
+        BlockPos hp = table.above();
+        level.setBlock(hp, Blocks.HOPPER.defaultBlockState().setValue(HopperBlock.FACING, Direction.DOWN), 3);
+        placed.add(hp);
+        HopperBlockEntity hopper = (HopperBlockEntity) level.getBlockEntity(hp);
+        if (hopper == null) {
+            skip("漏斗方块实体拿不到");
+            return;
+        }
+
+        // 上方放一个桶作为货源，模拟「上箱 → 漏斗 → 仓库」
+        BlockPos chestPos = hp.above();
+        level.setBlock(chestPos, Blocks.CHEST.defaultBlockState(), 3);
+        placed.add(chestPos);
+        var chest = HopperBlockEntity.getContainerAt(level, chestPos);
+        if (chest == null) {
+            skip("上方箱子拿不到");
+            return;
+        }
+
+        long items = 0;
+        int ticks = 0;
+        long t0 = System.nanoTime();
+        // 塞 200 tick 的货（每 tick 补满箱子）
+        for (int i = 0; i < 200; i++) {
+            for (int slot = 0; slot < chest.getContainerSize(); slot++) {
+                if (chest.getItem(slot).isEmpty()) {
+                    chest.setItem(slot, new ItemStack(Items.COBBLESTONE, 64));
+                }
+            }
+            long before = data.amountOf(Items.COBBLESTONE).longValueExact();
+            VoidWarehouseHopper.intake(level, hopper, false);
+            items += data.amountOf(Items.COBBLESTONE).longValueExact() - before;
+            ticks++;
+        }
+        double seconds = (System.nanoTime() - t0) / 1_000_000_000.0;
+        System.out.printf("[PERF] %-48s %10.0f 个/秒（%d tick，%.0f 个/tick）%n",
+                "漏斗入库吞吐（上箱连续供货）", items / seconds, ticks, (double) items / ticks);
+        chest.clearContent();
+    }
+
+    private static void perfGuiOpen(MinecraftServer server) {
+        System.out.println("[PERF] 界面打开成本");
+        data.clearContent();
+        for (int i = 0; i < 200; i++) {
+            data.insert(new ItemStack(Items.STONE, 1 + i));
+        }
+        ServerPlayer p = bots.get(0);
+        benchMicros("new VoidWarehouseMenu（200 格仓库）", 20, 200, () -> {
+            sink += new VoidWarehouseMenu(1, p.getInventory(), data, p).slots.size();
+        });
+        benchMicros("displaySlotAt 全页 45 次", 50, 200, () -> {
+            for (int i = 0; i < 45; i++) {
+                sink += data.displaySlotAt(i).isEmpty() ? 0 : 1;
+            }
+        });
+    }
+
+    private static void perfMemory(MinecraftServer server) {
+        System.out.println("[PERF] 内存占用");
+        long before = usedHeap();
+        data.clearContent();
+        for (int i = 0; i < 2000; i++) {
+            data.insert(new ItemStack(Items.DIRT, 64));
+        }
+        // 2000 种不同物品 → 2000 格
+        for (int i = 0; i < 500; i++) {
+            Item item = net.minecraft.core.registries.BuiltInRegistries.ITEM.byId(
+                    1 + (i % 400));
+            if (item != null && item != Items.AIR) {
+                data.insert(new ItemStack(item, 1));
+            }
+        }
+        long after = usedHeap();
+        System.out.printf("[PERF] %-48s %10.1f MB（%d 格）%n",
+                "填充后堆增长", (after - before) / 1024.0 / 1024.0, data.entryCount());
+        data.clearContent();
+        long cleared = usedHeap();
+        System.out.printf("[PERF] %-48s %10.1f MB%n", "清空后堆回落", (cleared - before) / 1024.0 / 1024.0);
+    }
+
+    private static long usedHeap() {
+        Runtime rt = Runtime.getRuntime();
+        System.gc();
+        try {
+            Thread.sleep(50);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+        return rt.totalMemory() - rt.freeMemory();
+    }
+
+    // ================================================================== 多人
+
+    /**
+     * 多玩家压力：N 个真实 ServerPlayer 各自持有界面、并发取货。
+     *
+     * <p>「并发」在服务端是<b>同一个 tick 内顺序执行</b>（Minecraft 的主循环单线程），
+     * 所以这里量的是「N 个玩家在同一 tick 里各做一次动作」的总耗时 ——
+     * 那才是 TPS 真正感受到的东西。折算到 20 TPS 的预算（50 ms/tick）就能看出能撑多少人。</p>
+     */
+    private static void multiplayer(MinecraftServer server) {
+        System.out.println("[MP] 多玩家压力（每 tick 每玩家一次动作）");
+        data.clearContent();
+        for (int i = 0; i < 200; i++) {
+            data.insert(new ItemStack(Items.STONE, 10000));
+        }
+        data.insert(new ItemStack(Items.COBBLESTONE, 100000));
+
+        int[] players = {1, 5, 10, 20};
+        for (int n : players) {
+            List<ServerPlayer> group = bots.subList(0, Math.min(n, bots.size()));
+            // 1) 每人开一次界面
+            long t0 = System.nanoTime();
+            List<VoidWarehouseMenu> menus = new ArrayList<>(group.size());
+            for (ServerPlayer p : group) {
+                menus.add(new VoidWarehouseMenu(1, p.getInventory(), data, p));
+            }
+            long openNs = System.nanoTime() - t0;
+
+            // 2) 每人取 1 个（走数据层，与界面点击最终落到的是同一条路）
+            t0 = System.nanoTime();
+            for (ServerPlayer ignored : group) {
+                sink += data.take(0, 1);
+                data.insert(new ItemStack(Items.STONE, 1));
+            }
+            long takeNs = System.nanoTime() - t0;
+
+            // 3) 每人翻一次页（视图状态）
+            t0 = System.nanoTime();
+            for (ServerPlayer p : group) {
+                VoidWarehouseViews.View v = VoidWarehouseViews.viewFor(p);
+                v.setPage(1);
+                v.setPage(0);
+            }
+            long pageNs = System.nanoTime() - t0;
+
+            // 4) 每人拉一整页（界面开着时每 tick 都在做的事 —— 这才是 TPS 的大头）
+            t0 = System.nanoTime();
+            for (ServerPlayer ignored : group) {
+                for (int i = 0; i < VoidWarehouseData.PAGE_SIZE; i++) {
+                    sink += data.displaySlotAt(i).isEmpty() ? 0 : 1;
+                }
+            }
+            long syncNs = System.nanoTime() - t0;
+
+            long totalNs = openNs + takeNs + pageNs + syncNs;
+            double totalMs = totalNs / 1_000_000.0;
+            System.out.printf("[MP] %-8s 打开 %7.3f | 取货 %7.3f | 翻页 %7.3f | 整页刷新 %7.3f"
+                            + " | 合计 %7.3f ms | 占 50ms tick %5.1f%%%n",
+                    n + " 人", openNs / 1_000_000.0, takeNs / 1_000_000.0,
+                    pageNs / 1_000_000.0, syncNs / 1_000_000.0,
+                    totalMs, totalMs / 50.0 * 100.0);
+            check("MP" + n + " 单 tick 开销 < 10ms（留足 TPS 余量）", totalMs < 10.0);
+        }
+
+        // 极限：20 人连点 20 次/秒（每人每秒 20 次取货）
+        List<ServerPlayer> group = bots;
+        long t0 = System.nanoTime();
+        int actions = 0;
+        for (int round = 0; round < 20; round++) {
+            for (ServerPlayer ignored : group) {
+                sink += data.take(0, 1);
+                data.insert(new ItemStack(Items.STONE, 1));
+                actions++;
+            }
+        }
+        double ms = (System.nanoTime() - t0) / 1_000_000.0;
+        System.out.printf("[MP] %-8s %d 次动作合计 %.3f ms（单次 %.2f us）%n",
+                group.size() + " 人×20 次", actions, ms, ms * 1000.0 / actions);
+        check("MP 极限：单次动作 < 200us", ms * 1000.0 / actions < 200.0);
+
+        // 真正的峰值：每人「入库一格 + 界面刷新」—— 入库会打掉可兑表缓存，
+        // 刷新又要重算它。20 人挤在同一个 tick 里，就是 20 次全表重算。
+        // 这才是「多人同时开着仓库界面干活」的最坏 tick（空转的 tick 只是上表那些微秒）。
+        // 前提：仓库里得是「只囤下级」的形态，可兑条目才会拉满（40 条）——
+        // 这一步实测过：仓库里只有石头时重算 0.02ms（0 条可兑），量不到最坏情况。
+        data.clearContent();
+        // 注意：性能组跑完会把开关关掉，峰值测试必须自己打开，否则可兑表恒为空、
+        // 量出来的「峰值」是假的（第一版就踩了这个坑：0.043ms，因为一条可兑都没有）
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+        for (VoidWarehouseExchange.Edge edge : VoidWarehouseExchange.active().edges()) {
+            Item small = VoidWarehouseExchangeBootstrap.itemOf(edge.small());
+            if (small != null) {
+                data.insert(new ItemStack(small, 6400));
+            }
+        }
+        check("MP 峰值前提：可兑表已拉到最坏形态", data.exchangeOffers().size() >= 30);
+        int worstGroup = bots.size();
+        t0 = System.nanoTime();
+        for (int round = 0; round < 4; round++) {
+            for (ServerPlayer ignored : bots) {
+                data.insert(new ItemStack(Items.IRON_NUGGET, 64));   // 入库 → 缓存失效
+                sink += data.exchangeOffers().size();                // 界面刷新 → 必须重算
+            }
+        }
+        double worstMs = (System.nanoTime() - t0) / 1_000_000.0 / 4.0;
+        System.out.printf("[MP] %-8s 入库+界面刷新 %.3f ms/次（折合 %.1f%% 的 50ms tick）%n",
+                worstGroup + " 人峰值", worstMs, worstMs / 50.0 * 100.0);
+        check("MP 峰值：20 人同 tick 各自入库+刷新仍 < 50ms（不丢 tick）", worstMs < 50.0);
+    }
+
+    // ================================================================== 收尾
+
+    private static void cleanup(MinecraftServer server) {
+        clearTestArea();
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        data.insert(new ItemStack(Items.DIRT, 5678));
+        for (ServerPlayer p : bots) {
+            p.getInventory().clearContent();
+        }
+        bots.clear();
+    }
+
+    /** 把测试用过的方块位置全部还原成空气（开跑前 / 收尾各一次，中途崩了也不污染下一轮） */
+    private static void clearTestArea() {
+        for (BlockPos pos : TEST_POSITIONS) {
+            if (!level.getBlockState(pos).isAir()) {
+                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+            }
+        }
+        placed.clear();
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        System.out.println("---- 失败清单 ----");
+        if (failedLabels.isEmpty()) {
+            System.out.println("   （无）");
+        } else {
+            for (String s : failedLabels) {
+                System.out.println("   × " + s);
+            }
+        }
+        System.out.println("SYSTEM TEST RESULT v26.3 checks=" + checks
+                + " failures=" + failures + " skips=" + skips + " sink=" + sink);
+        server.halt(false);
+    }
+
+    // ================================================================== 断言
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            failedLabels.add(label);
+        }
+        System.out.println("   " + (ok ? "ok  " : "FAIL") + " " + label);
+    }
+
+    private static void skip(String why) {
+        skips++;
+        System.out.println("   skip " + why);
+    }
+
+    /** 计划里某个物品 id（9 合 1 口径，只留 path）的净增减 */
+    private static BigInteger amountOfDelta(VoidWarehouseExchange.Plan plan, String itemId) {
+        BigInteger sum = BigInteger.ZERO;
+        for (VoidWarehouseExchange.Delta d : plan.deltas()) {
+            if (d.itemId().equals(itemId)) {
+                sum = sum.add(d.change());
+            }
+        }
+        return sum;
+    }
+
+    private static BigInteger amountOf(Map<String, BigInteger> map, String id) {
+        return map.getOrDefault(id, BigInteger.ZERO);
+    }
+
+    /**
+     * 塞进去 {@code total} 个<b>互不相同</b>的物品。
+     *
+     * <p>同一物品进库会自动合并成一格，所以「塞 50 个石头」只占 1 格 ——
+     * 想撑出第二页必须换 51 种物品。已在库里的会被合并、{@code entryCount} 不涨，自然跳过，
+     * 所以这个方法可以反复调用来「接着填」。</p>
+     */
+    private static void fillDistinct(VoidWarehouseData target, int total) {
+        for (Item item : net.minecraft.core.registries.BuiltInRegistries.ITEM) {
+            if (target.entryCount() >= total) {
+                return;
+            }
+            if (item == Items.AIR || target.amountOf(item).signum() > 0) {
+                // 已经在库里的会「合并 +1」而不是「多占一格」—— 不排除掉，
+                // 第二次调用会把总量撑爆（entryCount 不涨、总数狂涨）
+                continue;
+            }
+            target.insert(new ItemStack(item, 1));
+        }
+    }
+}

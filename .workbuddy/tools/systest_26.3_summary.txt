@@ -1,0 +1,48 @@
+[ENV] 造 20 个真实 ServerPlayer（无客户端）
+[ENV] 假连接可用 = true
+[FUNC] 1 规则注册与默认值
+[FUNC] 2 入库（insert）
+[FUNC] 3 取出与分页
+[FUNC] 4 潜影盒打包/拆包
+[FUNC] 5 界面（构造 / 导航 / 槽位 / 视图隔离）
+[FUNC] 6 终端登记与破坏
+[FUNC] 7 漏斗入库（真实世界）
+[FUNC] 8 漏斗出料与余量保护
+[FUNC] 9 九合一兑换
+[FUNC] 10 配方扣料（含往下钻）
+[FUNC] 11 打印机补货通道
+[FUNC] 12 自动修补
+[FUNC] 13 混凝土粉末烧玻璃
+[FUNC] 14 存档往返
+[ENV] 玩家环境验收
+[PERF] 9 合 1 兑换规划
+[m[PERF] planExchange(铁锭, 64) 单次                           9.720 us（批 64）
+[PERF] planMax(铁锭, 64) 单次                               12.627 us（批 64）
+[PERF] 配方扣料规划
+[m[PERF] planExchange(活塞, 1) 递归一层                          5.238 us（批 8）
+[PERF] planExchange(活塞, 64) 递归一层                         4.064 us（批 64）
+[PERF] 「可兑/可合成」表重算（界面开销主项）
+[m[PERF] exchangeOffers 重算（空仓库）                            0.057 ms（0 条可兑）
+[PERF] exchangeOffers 重算（只囤下级 64）                        1.741 ms（40 条可兑）
+[PERF] exchangeOffers 重算（只囤下级 6400）                      1.639 ms（40 条可兑）
+[PERF] exchangeOffers 重算（只囤下级 1,000,000）                 1.624 ms（40 条可兑）
+[PERF] 入库 / 取出吞吐
+[m[PERF] insert(64 个圆石) 单次                                 0.021 us（批 4096）
+[PERF] take(下标 0, 1 个) 单次                                0.018 us（批 4096）
+[PERF] insert 合并吞吐（同一格）                                   20558097 次/秒
+[PERF] 漏斗入库吞吐（真实世界，每 tick 一次 intake）
+[m[PERF] 漏斗入库吞吐（上箱连续供货）                                      7309737 个/秒（200 tick，1728 个/tick）
+[PERF] 界面打开成本
+[m[PERF] new VoidWarehouseMenu（200 格仓库）                    2.875 us（批 8）
+[PERF] displaySlotAt 全页 45 次                             0.219 us（批 64）
+[PERF] 内存占用
+[m[PERF] 填充后堆增长                                                  0.1 MB（400 格）
+[PERF] 清空后堆回落                                                  0.0 MB
+[MP] 多玩家压力（每 tick 每玩家一次动作）
+[m[MP] 1 人      打开   0.066 | 取货   0.030 | 翻页   0.002 | 整页刷新   0.036 | 合计   0.134 ms | 占 50ms tick   0.3%
+[m[MP] 5 人      打开   0.046 | 取货   0.003 | 翻页   0.003 | 整页刷新   0.046 | 合计   0.098 ms | 占 50ms tick   0.2%
+[m[MP] 10 人     打开   0.032 | 取货   0.002 | 翻页   0.003 | 整页刷新   0.054 | 合计   0.091 ms | 占 50ms tick   0.2%
+[m[MP] 20 人     打开   0.057 | 取货   0.004 | 翻页   0.012 | 整页刷新   0.070 | 合计   0.143 ms | 占 50ms tick   0.3%
+[m[MP] 20 人×20 次 400 次动作合计 0.032 ms（单次 0.08 us）
+[m[MP] 20 人峰值   入库+界面刷新 30.573 ms/次（折合 61.1% 的 50ms tick）
+SYSTEM TEST RESULT v26.3 checks=187 failures=0 skips=0 sink=16958631

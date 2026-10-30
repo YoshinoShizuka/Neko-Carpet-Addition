@@ -14,7 +14,7 @@
 - **拦的是掉落物的唯一出口**：`ServerLevel#addFreshEntity` 的 HEAD。所有方块掉落物都要经过这一个方法，所以不用逐个方块改掉落逻辑 —— 附魔、时运、精准采集、草方块掉种子、蜜块粘方块，全部照原版算完再入库(Intercepting the single funnel every block drop passes through, so vanilla loot rules stay completely untouched.)。
 - **只认玩家挖的**：上下文由 `ServerPlayerGameMode#destroyBlock` 的 HEAD / RETURN 圈出。TNT、苦力怕、活塞拆的、怪物掉落的、玩家丢弃的都不收；经验球不是物品，也不收(Only blocks actually broken by a player are affected.)。
 - **入库口径和漏斗完全一致**：空潜影盒整盒占一格、带数据组件的按物品 + 组件归并(Drops merge exactly the way the hopper intake does.)。
-- **聊天栏会说一声，而且只说一句**：`[虚空仓库] 挖到 3 个 泥土、12 个 圆石，已直接入库` —— 与补货提示同一套配色（灰正文 + 亮绿数字）。同一种物品合并报数、一条最多列 4 种（再多折成「N 种共 M 个」）、同一玩家**每秒最多一条**，连挖不会刷屏；非空潜影盒标「（已拆开）」，因为它入库时被拆成了内容物 + 壳/箱(A chat summary in the same style as the restock notice, coalesced per player to at most one line per second.)。
+- **聊天栏会说一声，而且只说一句**：`[虚空仓库] 挖到 3 个 泥土（仓库共 128 个）、12 个 圆石（仓库共 64 个）` —— 与补货提示同一套配色（灰正文 + 亮绿数字）。除了「挖到几个」，还报**收完之后仓库里一共有多少**：数量在拼提示那一刻现读（口径 = 物品 + 数据组件，正好对上仓库里的那一格），所以连挖几种时报的都是发消息那一刻的真值。同一种物品合并报数、一条最多列 4 种（再多折成「N 种共 M 个」）、同一玩家**每秒最多一条**，连挖不会刷屏；非空潜影盒标「（已拆开）」且**不报库存**——它入库时被拆成了内容物 + 壳/箱，盒子本身没进仓库(A chat summary in the same style as the restock notice, including how many of that item the warehouse now holds, coalesced per player to at most one line per second.)。
 - **绝不吞物品**：仓库没开、存档读不出、`insert` 返回 false、任何异常 —— 每一条失败路径都照原样掉在地上，不存在「东西凭空没了」(Never swallows items: every failure path falls back to vanilla behaviour.)。
 - 🔴 **上下文泄漏兜底**：HEAD / RETURN 不是 `try/finally`。万一 `destroyBlock` 抛了异常，RETURN 那份不会执行、上下文会永久挂在 static 上，之后**世界里每一个物品实体都会被吸进仓库**。所以 `begin` 记下当次服务端 tick，`collect` 只认**同一 tick**，最坏影响被压到「本次 tick 的剩余部分」(Tick-stamped context stops a leaked context from eating unrelated drops.)。
 - 默认 `false`，**依赖** `voidWarehouse`：没有仓库就什么都不做(Disabled by default and requires `voidWarehouse`.)。
@@ -22,8 +22,8 @@
 
 ### 🧪 Testing / 测试
 
-- 真服务端自检 **39 条断言 / 7 组**，五个版本全绿(39 assertions in 7 groups, green on all five targets.)：26.3 / 26.2 / 26.1.2 / 26.1.1 / 1.21.11 均 `checks=39 failures=0`。
-- 聊天提示单独成组（G 组 12 条）：累计关系（同物品相加 / 不同物品并列 / 超 4 种折算）、限流判据、拼出来的文本本身（前缀、顿号、数量）。文本断言一律避开物品名 —— 专用服务器上 `getHoverName()` 按 `en_us` 解析，咬名字等于咬环境(A dedicated group pins the chat coalescing rules, and avoids asserting on localized item names.)。
+- 真服务端自检 **44 条断言 / 7 组**，五个版本全绿(44 assertions in 7 groups, green on all five targets.)：26.3 / 26.2 / 26.1.2 / 26.1.1 / 1.21.11 均 `checks=44 failures=0`。
+- 聊天提示单独成组（G 组 17 条）：累计关系（同物品相加 / 不同物品并列 / 超 4 种折算）、限流判据、拼出来的文本本身（前缀、顿号、数量），以及**库存数字是否等于 `amountExact`**、潜影盒与折算情形是否**故意不报**库存、`null` 数据时是否照发。文本断言一律避开物品名 —— 专用服务器上 `getHoverName()` 按 `en_us` 解析，咬名字等于咬环境(A dedicated group pins the chat coalescing rules and the warehouse-count reporting, and avoids asserting on localized item names.)。
 - 用真 `ServerPlayer` **真挖方块**，同时看三件事：仓库 +1、世界里**没有**多出物品实体、玩家背包也没多 —— 少看任何一项都抓不到「既入库又掉地上」这种复制 bug(The test digs for real and checks all three outcomes, which is the only way to catch dupe bugs.)。
 - **反证**：把两条 mixin 从 `mixins.json` 里临时摘掉，同一套自检 `failures=7`，其中「世界里没有多出物品实体」打出「dirt 实体 2 个，仓库 0」—— 证明这些断言咬的是真代码(Negative control: removing the mixins makes 7 assertions fail.).
 
@@ -31,16 +31,16 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 206,421 B | `3178272e973bbb214d367829b0130b41` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 218,986 B | `af7b537772db38c7818345f6a0e7c35d` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 206,369 B | `d0ab16b44c04478848904ee50dd114b8` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 219,077 B | `dbad38d9a855b1fd12f77c3e495d390b` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 209,619 B | `11f49dd46f32a050288414fd4bf7cd15` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 220,094 B | `a6c667828463e2e73a08c349708cb39b` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 209,621 B | `b3be66bd7fae386a7ab7acc19e7b460f` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 220,094 B | `bc6fca8b07d25fff5916d26439fcb69e` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 208,123 B | `655a8b0ef3378c63f841e4f292115690` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 220,872 B | `adc345c57a8c50f5855eecb096d3094e` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 206,725 B | `f562b11abd09b9dbe80d3a6ab7a9a78f` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 220,118 B | `dee8258a8e1a328a34d5600c44580071` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 206,673 B | `e4d97b1766df65c2e2c462b0f7106fec` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 220,209 B | `e6ea11ea0a7ceef97581510dd79a6e77` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 209,923 B | `90de7cb47692f83bebf9b281483132c3` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 221,226 B | `e3fa7e6b26ea613142bcb03c466b299b` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 209,925 B | `5349d6b841d61e720fd47c031367e596` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 221,226 B | `07a97a60bf2aaf7c814ef5b4af3bd720` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 208,428 B | `6e2e185accebb1b45626e34ab1c421c9` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 222,006 B | `108beb80495e14ace05b3e38f1c7aed7` |
 
 > 只需要能跑的 jar：下 `-1.0.16.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 
@@ -48,7 +48,7 @@
 
 - mixin 从 13 条增到 15 条（新增 `ServerLevelAddEntityMixin`、`ServerPlayerGameModeDestroyMixin`），规则名、配置键与存档格式均未变，**直接替换 jar 即可**(Two new mixins; no config or data-format change, just swap the jar.)。
 - 新规则默认关闭：`/carpet voidWarehouseBlockDrops true`，且 `voidWarehouse` 也要开着。
-- **同版本号原地更新**：这条规则的聊天提示是在 1.0.16 首次发布之后补的，所以 1.0.16 的 jar 变过一次 —— 以文件名旁的 md5 为准（本表已刷新）(This release was updated in place; compare the md5 next to the file name.)。
+- **同版本号原地更新**：这条规则的聊天提示在 1.0.16 首次发布之后改过两次（先加提示，再去掉「已直接入库」、改成报仓库现有数量），所以 1.0.16 的 jar 变过几次 —— 以文件名旁的 md5 为准（本表已刷新）(This release was updated in place; compare the md5 next to the file name.)。
 - 反方向提醒：开这条规则之后**挖掘产出不再落在地上**。靠「挖掉 → 掉落物被水流冲走」的生电收集结构会失效，开之前先确认你的收集系统不依赖世界里的掉落物。
 
 * * *

@@ -49,6 +49,10 @@ public class VoidWarehouseExtension implements CarpetExtension {
         // 是 static 调用，不碰 VoidWarehouse.data()，所以不会牵动「空壳闸门」那条异常路径。
         VoidWarehouseData.noteServerTick(server.getTickCount());
 
+        // 「方块掉落物直接进虚空仓库」的聊天提示：按玩家汇总、每秒最多一条（见 VoidWarehouseBlockDrops#tick）。
+        // 必须在「规则关着就提前 return」之前 —— 规则刚被关掉时，攒下的那几条也要发出去。
+        VoidWarehouseBlockDrops.tick(server);
+
         if (VoidWarehouseSettings.voidWarehouse && VoidWarehouseSettings.voidWarehouseExchange) {
             VoidWarehouseExchangeBootstrap.tick(server);
         }

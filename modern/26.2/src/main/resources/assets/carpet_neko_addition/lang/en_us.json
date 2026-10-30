@@ -8,6 +8,8 @@
   "carpet.rule.voidWarehouseRestock.desc": "Lets a printer that ran out of blocks while building take a full stack straight from the Void Warehouse. Warning: while enabled, any player with a compatible printer can draw from the shared stock",
   "carpet.rule.voidWarehouseExchange.name": "Void Warehouse 9-in-1 Exchange",
   "carpet.rule.voidWarehouseExchange.desc": "Lets an out-of-stock item be handed over by spending its 9-in-1 recipe ingredients: 1 iron ingot comes out of 9 iron nuggets, and 1 iron ingot can be broken out of an iron block with the change returned to the warehouse. Only kicks in when the item itself is out of stock, and only along recipes that really exist in vanilla (26.3: 29 edges over 53 items). Requires the Void Warehouse rule",
+  "carpet.rule.voidWarehouseCraft.name": "Void Warehouse Recipe Crafting",
+  "carpet.rule.voidWarehouseCraft.desc": "Lets an out-of-stock item be handed over by spending the ingredients of the recipe the player has actually crafted before: craft one piston by hand and from then on 4 cobblestone, 3 planks, 1 iron ingot and 1 redstone from the warehouse hand over a piston. Single-layer only (ingredients must already be in stock), the recipe book is shared server-wide, and a recipe is recorded the moment the result is taken from a crafting grid. Requires the Void Warehouse rule",
   "carpet.rule.concretePowderToGlass.name": "Smelt Concrete Powder Into Stained Glass",
   "carpet.rule.concretePowderToGlass.desc": "Lets a regular furnace smelt all 16 concrete powder colours into the matching stained glass (0.1 xp / 200 ticks, same as sand into glass). Only regular furnaces are affected; blast furnaces and smokers still reject concrete powder"
 }

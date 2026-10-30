@@ -15,7 +15,8 @@
     "HopperBlockEntityMixin",
     "ContainerClassifierMixin",
     "SlotMixin",
-    "ChatInputMixin"
+    "ChatInputMixin",
+    "CraftResultMixin"
   ],
   "injectors": {
     "defaultRequire": 1

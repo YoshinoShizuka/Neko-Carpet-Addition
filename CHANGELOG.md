@@ -3,6 +3,53 @@
 > **版本号只代表「规则集变了」**：只有新增一条 carpet 规则才升号；修 bug、改算法、补自检、改文档一律**原地覆盖当前版本**。
 > 所以同一个版本号下的 jar 可能比首次发布更新，靠文件名旁的 md5 区分。
 
+## Carpet Neko Addition 1.0.16
+
+### ✨ Added & Improved / 新增与优化
+
+#### 方块掉落物直接进虚空仓库（`voidWarehouseBlockDrops`）
+
+玩家**挖掉**的方块，掉落物不进世界、直接进共享仓库(Block drops go straight into the shared warehouse instead of landing on the ground.)。
+
+- **拦的是掉落物的唯一出口**：`ServerLevel#addFreshEntity` 的 HEAD。所有方块掉落物都要经过这一个方法，所以不用逐个方块改掉落逻辑 —— 附魔、时运、精准采集、草方块掉种子、蜜块粘方块，全部照原版算完再入库(Intercepting the single funnel every block drop passes through, so vanilla loot rules stay completely untouched.)。
+- **只认玩家挖的**：上下文由 `ServerPlayerGameMode#destroyBlock` 的 HEAD / RETURN 圈出。TNT、苦力怕、活塞拆的、怪物掉落的、玩家丢弃的都不收；经验球不是物品，也不收(Only blocks actually broken by a player are affected.)。
+- **入库口径和漏斗完全一致**：空潜影盒整盒占一格、带数据组件的按物品 + 组件归并(Drops merge exactly the way the hopper intake does.)。
+- **绝不吞物品**：仓库没开、存档读不出、`insert` 返回 false、任何异常 —— 每一条失败路径都照原样掉在地上，不存在「东西凭空没了」(Never swallows items: every failure path falls back to vanilla behaviour.)。
+- 🔴 **上下文泄漏兜底**：HEAD / RETURN 不是 `try/finally`。万一 `destroyBlock` 抛了异常，RETURN 那份不会执行、上下文会永久挂在 static 上，之后**世界里每一个物品实体都会被吸进仓库**。所以 `begin` 记下当次服务端 tick，`collect` 只认**同一 tick**，最坏影响被压到「本次 tick 的剩余部分」(Tick-stamped context stops a leaked context from eating unrelated drops.)。
+- 默认 `false`，**依赖** `voidWarehouse`：没有仓库就什么都不做(Disabled by default and requires `voidWarehouse`.)。
+- 规则名**故意**不同于上游 [Carpet-Org-Addition](https://github.com/fcsailboat/Carpet-Org-Addition) 的 `blockDropsDirectlyEnterInventory`：`SettingsManager#addCarpetRule` 遇重名直接抛异常，同名意味着两个附加包同装就起不来(Named differently from the upstream rule to avoid a carpet rule-name clash.)。
+
+### 🧪 Testing / 测试
+
+- 真服务端自检 **27 条断言 / 6 组**，五个版本全绿(27 assertions in 6 groups, green on all five targets.)：26.3 / 26.2 / 26.1.2 / 26.1.1 / 1.21.11 均 `checks=27 failures=0`。
+- 用真 `ServerPlayer` **真挖方块**，同时看三件事：仓库 +1、世界里**没有**多出物品实体、玩家背包也没多 —— 少看任何一项都抓不到「既入库又掉地上」这种复制 bug(The test digs for real and checks all three outcomes, which is the only way to catch dupe bugs.)。
+- **反证**：把两条 mixin 从 `mixins.json` 里临时摘掉，同一套自检 `failures=7`，其中「世界里没有多出物品实体」打出「dirt 实体 2 个，仓库 0」—— 证明这些断言咬的是真代码(Negative control: removing the mixins makes 7 assertions fail.).
+
+### 📦 Builds / 构建产物
+
+| MC 版本 | 文件 | 体积 | md5 |
+| --- | --- | --- | --- |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 202,343 B | `ee196483eaeac2017bfff99a3cc3e7c7` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 215,592 B | `f12418082f5fe280f73ab7b192294370` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 202,291 B | `4b05dbc500de41a315636f1e7d60d439` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 215,683 B | `910946bd8bb8180d427ef81231d0c1b6` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 205,541 B | `ef22e3b81aee18047b9d28007751db50` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 216,700 B | `d85206b2b0e6541bfbf95ac6355e630f` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 205,543 B | `71d54f6ca1940206493dacf5631d3646` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 216,700 B | `551890fbcfaa7a37a296601d4ee07ef7` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 204,033 B | `c112b80d9090f18409303cc720b15fb3` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 217,479 B | `211d9eaa5a2be79bbc6f5eec8b647ea0` |
+
+> 只需要能跑的 jar：下 `-1.0.16.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
+
+### ⚠️ 升级提示 / Upgrade Notes
+
+- mixin 从 13 条增到 15 条（新增 `ServerLevelAddEntityMixin`、`ServerPlayerGameModeDestroyMixin`），规则名、配置键与存档格式均未变，**直接替换 jar 即可**(Two new mixins; no config or data-format change, just swap the jar.)。
+- 新规则默认关闭：`/carpet voidWarehouseBlockDrops true`，且 `voidWarehouse` 也要开着。
+- 反方向提醒：开这条规则之后**挖掘产出不再落在地上**。靠「挖掉 → 掉落物被水流冲走」的生电收集结构会失效，开之前先确认你的收集系统不依赖世界里的掉落物。
+
+* * *
+
 ## Carpet Neko Addition 1.0.15
 
 ### ✨ Added & Improved / 新增与优化
@@ -57,7 +104,7 @@
 
 ### ⚠️ 升级提示 / Upgrade Notes
 
-- 15 个 mixin、六个规则名、配置键与存档格式均未变，**直接替换 jar 即可**，不需要 `/reload` 之外的重置动作。
+- 13 个 mixin、六个规则名、配置键与存档格式均未变，**直接替换 jar 即可**，不需要 `/reload` 之外的重置动作。
 - `voidWarehouseCraft` 依赖 `voidWarehouse`，默认关闭；配方本从空开始，玩家需要在新版本里正常合成一次才会学到。
 - 旧版 `carpet-automending`（包 `carpetaddition`）的仓库数据不兼容，升级相当于换一个新仓库。
 

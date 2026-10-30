@@ -130,6 +130,9 @@ public final class VoidWarehouseCraftSelfCheck {
                 groupK_recursive(server);
                 break;
             case 12:
+                groupL_interchangeable(server);
+                break;
+            case 13:
                 cleanup(server);
                 break;
             default:
@@ -799,6 +802,106 @@ public final class VoidWarehouseCraftSelfCheck {
         check("K11 失败时库存逐项未动",
                 data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(12))
                         && data.amountOf(Items.IRON_INGOT).equals(BigInteger.valueOf(3)));
+    }
+
+    // ================================================================ L 可互换原料（同一产物两条配方）
+
+    /**
+     * 同一产物有两条已学配方（橡木木板版 / 白桦木板版）时，到底挑哪一条、扣哪一种木板。
+     *
+     * <p>钉的是 1.0.15 修掉的一处真偏差：界面上的「可合成 N 个」由 {@code collectCraftOffers}
+     * 取「各候选 maxCraftable 的<b>最大值</b>」，而「尽量给」当时按<b>学会顺序</b>取第一条 ——
+     * 于是「先学会的那条料更少」时界面写 64、右键只给 1。所以这里故意把<b>料少的那条先学</b>，
+     * 再断言「实际拿到的 == 界面写的」。</p>
+     *
+     * <p>用 DISPENSER / DROPPER 而不是 PISTON，是为了拿到干净的学会顺序：前面几组早就学过
+     * 橡木版活塞了，再用活塞就构造不出「先学料少的」这个前提。</p>
+     */
+    private static void groupL_interchangeable(MinecraftServer server) {
+        System.out.println("[L] 可互换原料（木板）");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        // 白桦只有 3 块（够 1 个），橡木 192 块（够 64 个）
+        data.insert(new ItemStack(Items.BIRCH_PLANKS, 3));
+        data.insert(new ItemStack(Items.OAK_PLANKS, 192));
+
+        VoidWarehouseRecipes.Recipe birch = recipe("minecraft:dispenser", 1,
+                part("minecraft:cobblestone", 4),
+                part("minecraft:birch_planks", 3),
+                part("minecraft:iron_ingot", 1),
+                part("minecraft:redstone", 1));
+        VoidWarehouseRecipes.Recipe oak = recipe("minecraft:dispenser", 1,
+                part("minecraft:cobblestone", 4),
+                part("minecraft:oak_planks", 3),
+                part("minecraft:iron_ingot", 1),
+                part("minecraft:redstone", 1));
+        // 顺序关键：先学「料少」的白桦版，再学橡木版
+        data.learn(birch);
+        data.learn(oak);
+        check("L1 同一产物两条配方都在（不按标签归组，各存一条）",
+                data.hasRecipeFor("minecraft:dispenser"));
+
+        data.insert(new ItemStack(Items.COBBLESTONE, 320));
+        data.insert(new ItemStack(Items.IRON_INGOT, 64));
+        data.insert(new ItemStack(Items.REDSTONE, 64));
+
+        // ① 界面口径：取两条里做得最多的那条 → 64
+        BigInteger shown = BigInteger.ZERO;
+        for (VoidWarehouseData.ExchangeOffer offer : data.exchangeOffers()) {
+            if ("minecraft:dispenser".equals(offer.itemId())) {
+                shown = offer.obtainable();
+            }
+        }
+        check("L2 界面『可合成』取两条的最大值 = 64", shown.equals(BigInteger.valueOf(64)));
+
+        // ② 执行口径必须与界面同一个数（这条就是本次修复的核心不变量）
+        VoidWarehouseExchange.Plan partial =
+                data.planExchangeMax(new ItemStack(Items.DISPENSER), BigInteger.valueOf(64));
+        check("L3 先学料少的那条，『尽量给』仍等于界面写的 64（旧口径只给 1）",
+                partial != null && partial.amount().equals(shown));
+
+        // ③ 扣的必须是做得多的那一侧（橡木），白桦一块不动
+        data.applyExchange(partial);
+        check("L4 橡木 192→0（扣 192 = 64 次 × 3）",
+                data.amountOf(Items.OAK_PLANKS).signum() == 0);
+        check("L5 白桦 3 块一块没动",
+                data.amountOf(Items.BIRCH_PLANKS).equals(BigInteger.valueOf(3)));
+
+        // ④ 反证：橡木抽干、只剩白桦 3 块 → 只能给 1，扣的换成白桦
+        data.clearContent();
+        data.insert(new ItemStack(Items.BIRCH_PLANKS, 3));
+        data.insert(new ItemStack(Items.COBBLESTONE, 320));
+        data.insert(new ItemStack(Items.IRON_INGOT, 64));
+        data.insert(new ItemStack(Items.REDSTONE, 64));
+        VoidWarehouseExchange.Plan onlyBirch =
+                data.planExchangeMax(new ItemStack(Items.DISPENSER), BigInteger.valueOf(64));
+        check("L6 只剩白桦时只给 1（不混搭、不凭空）",
+                onlyBirch != null && onlyBirch.amount().equals(BigInteger.ONE));
+        data.applyExchange(onlyBirch);
+        check("L7 白桦 3→0", data.amountOf(Items.BIRCH_PLANKS).signum() == 0);
+
+        // ⑤ 精确请求走「按学会顺序逐条试」：先学的白桦只够 1 个 → 自己要 3 个就落到橡木
+        data.clearContent();
+        data.insert(new ItemStack(Items.BIRCH_PLANKS, 3));
+        data.insert(new ItemStack(Items.OAK_PLANKS, 192));
+        data.insert(new ItemStack(Items.COBBLESTONE, 320));
+        data.insert(new ItemStack(Items.IRON_INGOT, 64));
+        data.insert(new ItemStack(Items.REDSTONE, 64));
+        VoidWarehouseExchange.Plan exact3 =
+                data.planExchange(new ItemStack(Items.DISPENSER), BigInteger.valueOf(3));
+        check("L8 精确取 3 个：白桦只够 1 → 落到橡木，仍给满 3",
+                exact3 != null && exact3.amount().equals(BigInteger.valueOf(3)));
+
+        // ⑥ 反证：只学过橡木版、仓库里只有白桦 → 必须做不出来（不跨木材通用）
+        //    换一件没被前面的组学过的产物，避免「橡木版早就学会了」
+        data.learn(recipe("minecraft:dropper", 1,
+                part("minecraft:cobblestone", 7),
+                part("minecraft:oak_planks", 1)));
+        data.clearContent();
+        data.insert(new ItemStack(Items.BIRCH_PLANKS, 64));
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        check("L9 只学过橡木版、仓库只有白桦 → 做不出来（原料被具体化）",
+                data.planExchange(new ItemStack(Items.DROPPER), BigInteger.ONE) == null);
     }
 
     // ================================================================ 工具

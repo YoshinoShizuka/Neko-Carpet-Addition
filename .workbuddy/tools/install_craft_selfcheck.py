@@ -28,14 +28,14 @@ TEMPLATE = os.path.join(SCRIPT_DIR, NAME + ".template")
 
 DEFAULT_TARGETS = ["modern/26.3", "modern/26.2", "modern/26.1.2", "modern/26.1.1"]
 
-HOOK_OLD = """    public void onTick(MinecraftServer server) {
-        if (VoidWarehouseSettings.voidWarehouse && VoidWarehouseSettings.voidWarehouseExchange) {"""
+HOOK_OLD = """        VoidWarehouseData.noteServerTick(server.getTickCount());
+"""
 
-HOOK_NEW = """    public void onTick(MinecraftServer server) {
+HOOK_NEW = """        VoidWarehouseData.noteServerTick(server.getTickCount());
+
         // 【临时自检】验证本轮「配方学习 + 配方扣料」，验证后删除
         VoidWarehouseCraftSelfCheck.run(server);
-
-        if (VoidWarehouseSettings.voidWarehouse && VoidWarehouseSettings.voidWarehouseExchange) {"""
+"""
 
 
 def read_lf(path):

@@ -1,0 +1,13 @@
+配方本里的两条记录（recipeId 由内容生成）：
+  A = minecraft:piston*1;minecraft:oak_planks×3,minecraft:cobblestone×4,minecraft:iron_ingot×1,minecraft:redstone×1
+  B = minecraft:piston*1;minecraft:birch_planks×3,minecraft:cobblestone×4,minecraft:iron_ingot×1,minecraft:redstone×1
+  两条 recipeId 相同吗? false
+
+[1] 学序 oak→birch，两种木板各 192，取 1 个活塞 → 扣了 {minecraft:cobblestone=4, minecraft:oak_planks=3, minecraft:iron_ingot=1, minecraft:redstone=1}
+[2] 学序 birch→oak，同样库存，取 1 个活塞 → 扣了 {minecraft:cobblestone=4, minecraft:birch_planks=3, minecraft:iron_ingot=1, minecraft:redstone=1}
+[3] 只学 oak，仓库只有 birch 木板 → 结果 = null（null = 做不出来）
+[4] 学序 oak→birch，oak 只有 1 块 → 自动落到 birch，扣了 {minecraft:cobblestone=4, minecraft:birch_planks=3, minecraft:iron_ingot=1, minecraft:redstone=1}
+[5] 库存 oak=192(64 个活塞)、birch=3(1 个活塞)
+    界面口径 maxCraftable: oak=64 birch=1 → 显示的「可合成」= 64
+    右键「取一组」实际给到 = 64 个活塞，扣料 {minecraft:cobblestone=256, minecraft:oak_planks=192, minecraft:iron_ingot=64, minecraft:redstone=64}
+    若学序反过来（birch 先）实际给到 = 64 个活塞，扣料 {minecraft:cobblestone=256, minecraft:oak_planks=192, minecraft:iron_ingot=64, minecraft:redstone=64}

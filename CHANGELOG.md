@@ -31,6 +31,7 @@
 
 - 修复「仓库里明明有原木，取活塞却说做不出来」：材料快照只取了表层的木板，没带上深一层的原木(Fixed false negatives caused by a shallow material snapshot that missed deeper ingredients.)。
 - 修复 `markChanged()` 整体置空缓存导致的高负载抖动：界面刷新是「每格都可能问一次」的路径，N 人同 tick = N 次重算线性叠加、无上界(Fixed unbounded cache invalidation amplified by concurrent GUI refreshes.)。
+- 修复同一产物有多条已学配方（如橡木版与白桦版活塞）时「界面写可合成 64、右键只给 1」：执行侧改为与界面同一口径，取做得最多的那条配方(Fixed the offer amount disagreeing with the actual take when several learned recipes share one output.)。
 
 ### 🧪 Testing / 测试
 
@@ -41,16 +42,16 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.15.jar` | 198,146 B | `a3160387adc0ce2b03a125e41011b604` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.15-sources.jar` | 209,058 B | `6d130e4abcaf75b7d45d660bf80a9e9d` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.15.jar` | 198,099 B | `504ced76273bc9b904c8a5df2bb7de8f` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.15-sources.jar` | 209,334 B | `89560ecb79eebca58312ab31b6ee7e08` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.15.jar` | 201,349 B | `0b43a0675f040db3fc017734015801eb` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.15-sources.jar` | 210,351 B | `9cb752a68c3e69a7c0c04699d60cd66d` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.15.jar` | 201,351 B | `0ca36f2dd485ff38eaa9ebc87299f235` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.15-sources.jar` | 210,351 B | `9396bef47542d5c67ee3e50ec34bfd54` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.15.jar` | 199,787 B | `41997550448f02b84342473315a83728` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.15-sources.jar` | 211,058 B | `053b353b03fa5209526137158eec9c2f` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.15.jar` | 198,495 B | `66ff87d1cff284d884551ed97eca617c` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.15-sources.jar` | 209,790 B | `a83946bc18b567c508638e152466ab9b` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.15.jar` | 198,448 B | `dae3e6cd5eeb50f4d09f57c59485b70d` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.15-sources.jar` | 209,886 B | `d473fb480f5dca2ea20bba418bf45ddd` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.15.jar` | 201,698 B | `5ec6b01f274e6ac4481a706d8764d761` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.15-sources.jar` | 210,903 B | `7809737faa7b0826c620cb4a7edc3678` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.15.jar` | 201,700 B | `38deec1579b8be5e1292c29c49ea720a` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.15-sources.jar` | 210,903 B | `571dadc569adf9b62109af7fb8fffb56` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.15.jar` | 200,156 B | `9cbab1c5ad69035c60c0b15aecf28660` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.15-sources.jar` | 211,616 B | `c62bbf0ae8bd45a4a43e541053e06f35` |
 
 > 只需要能跑的 jar：下 `-1.0.15.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 

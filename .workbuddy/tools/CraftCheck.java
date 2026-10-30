@@ -34,19 +34,29 @@ public final class CraftCheck {
         return m;
     }
 
-    /** 复刻 VoidWarehouseData#planCraft 的候选循环：按学会顺序逐条试，第一条成功就用 */
+    /**
+     * 复刻 VoidWarehouseData#planCraft 的候选挑法（1.0.15 修复后的口径）：
+     * 「尽量给」先挑 maxCraftable 最大的那条（与界面口径一致），精确请求按学会顺序逐条试。
+     */
     static Plan planCraft(List<Recipe> learnedCandidates, BigInteger need, boolean allowPartial,
                           Map<String, BigInteger> stock, Map<String, List<Recipe>> byOutput) {
-        for (Recipe recipe : learnedCandidates) {
-            BigInteger wantOut = need;
-            if (allowPartial) {
-                BigInteger maxOut = VoidWarehouseRecipes.maxCraftable(recipe, stock, byOutput);
-                if (maxOut.signum() <= 0) {
-                    continue;
+        if (allowPartial) {
+            Recipe best = null;
+            BigInteger bestOut = BigInteger.ZERO;
+            for (Recipe recipe : learnedCandidates) {
+                BigInteger out = VoidWarehouseRecipes.maxCraftable(recipe, stock, byOutput);
+                if (out.compareTo(bestOut) > 0) {
+                    bestOut = out;
+                    best = recipe;
                 }
-                wantOut = need.min(maxOut);
             }
-            Plan plan = VoidWarehouseRecipes.plan(recipe, wantOut, stock, byOutput);
+            if (best == null) {
+                return null;
+            }
+            return VoidWarehouseRecipes.plan(best, need.min(bestOut), stock, byOutput);
+        }
+        for (Recipe recipe : learnedCandidates) {
+            Plan plan = VoidWarehouseRecipes.plan(recipe, need, stock, byOutput);
             if (plan != null) {
                 return plan;
             }

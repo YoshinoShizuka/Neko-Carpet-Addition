@@ -80,7 +80,7 @@
 2. 把下面三个 jar 放进 `mods/`：
    - **Fabric API**（必需）
    - **Carpet**（版本号需 ≥ 对应的 Minecraft 版本）
-   - **本模组**，按 MC 版本选 `carpet-Neko-Addition-mc<版本>-<模组版本>.jar`
+   - **本模组**，按 MC 版本选 `carpet-Neko-Addition-mc<版本>-<模组版本>.jar`（从 [Releases](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/releases/latest) 下载）
 3. 启动后用 `/carpet <规则> true` 逐条开启
 4. 客户端可以原版直连；要用打印机补货，客户端另装 `litematica-printer`，并在服务端开 `voidWarehouseRestock`
 

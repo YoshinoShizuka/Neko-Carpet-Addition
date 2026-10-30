@@ -1,0 +1,667 @@
+package neko.voidwarehouse;
+
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.Tag;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.crafting.CraftingInput;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+
+/**
+ * 【临时自检】「配方学习 + 配方扣料」这一整条新链路。验证完删掉。
+ *
+ * <h2>要证的东西（每组都配反证）</h2>
+ * <ol>
+ *   <li><b>A 纯逻辑</b>：{@code plan} 的产出/原料/余量三条账在本例上都对；库存不足一律 null；
+ *       <b>共享候选不重复计数</b>（反证：独立取 min 的写法会算出 3，正确值是 0）；</li>
+ *   <li><b>B 口径一致</b>（fuzz）：{@code maxCraftable} 报出来的量，逐级 {@code plan} 必须条条成功 ——
+ *       这一条直接对应「界面说能合成 N 个、点下去失败」那类事故；</li>
+ *   <li><b>C 编解码</b>：往返一致、坏数据返回 null 而不抛、{@code recipeId == encode(recipe)}；</li>
+ *   <li><b>D 真实配方解析</b>：拿真实的 3×3 网格问 {@code RecipeManager}，活塞必须解析成
+ *       4 圆石 + 3 木板 + 1 铁锭 + 1 红石；<b>格里放整组 64 个圆石也只算 1 个</b>（一格算一个）；
+ *       木棍必须拿到产出 4（多产出）；空网格 / 无配方网格 / special recipe 必须返回空；</li>
+ *   <li><b>E 学习幂等</b>：同一条学两次条数不变；规则关掉时 {@code learn} 直接拒绝；</li>
+ *   <li><b>F 端到端扣料</b>：仓库里放齐原料 → {@code planExchange(活塞)} 拿到计划 → {@code applyExchange}
+ *       之后四种原料各减多少必须逐项精确，且<b>活塞不会因为合成而留在仓库里</b>；</li>
+ *   <li><b>G 多产出余量</b>：2 原木取 5 木板 → 做 2 次、给 5 个、<b>剩余 3 个必须进仓库</b>
+ *       （这一步错了就是刷物）；成品已有货时先扣库存、不再合成；</li>
+ *   <li><b>H 回滚精确性</b>：{@code withdraw} 之后 {@code returnUnplaced(0)}，仓库必须逐项还原；</li>
+ *   <li><b>I 规则关闭</b>：关掉配方扣料之后规划恒为 null、{@code learn} 恒为 false、
+ *       虚拟条目里一条「可合成」都不许有；</li>
+ *   <li><b>J 存档往返</b>：{@code CODEC} 编一遍再解一遍，配方不丢；混进一行坏数据只丢那一行、
+ *       仓库物品一条不许少。</li>
+ * </ol>
+ */
+public final class VoidWarehouseCraftSelfCheck {
+
+    /** 前几个 tick 先等配方表读好（配方跟着数据包重载，构造完成的那一刻不一定就绪） */
+    private static final int WAIT_TICKS = 5;
+
+    private static boolean done = false;
+    private static int stage = 0;
+    private static int tickIndex = 0;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    /** 自检里反复用到的那条配方（活塞） */
+    private static VoidWarehouseRecipes.Recipe pistonRecipe;
+
+    private VoidWarehouseCraftSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        // 规则必须先开着，否则 craftEnabled() 恒为假，整组断言都在空转
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        switch (stage) {
+            case 0:
+                if (++tickIndex < WAIT_TICKS) {
+                    return;
+                }
+                tickIndex = 0;
+                break;
+            case 1:
+                groupA_pureLogic();
+                break;
+            case 2:
+                groupB_boundConsistency();
+                break;
+            case 3:
+                groupC_codec();
+                break;
+            case 4:
+                groupD_realRecipe(server);
+                break;
+            case 5:
+                groupE_learn(server);
+                break;
+            case 6:
+                groupF_endToEnd(server);
+                break;
+            case 7:
+                groupG_multiOutput(server);
+                break;
+            case 8:
+                groupH_rollback(server);
+                break;
+            case 9:
+                groupI_ruleOff(server);
+                break;
+            case 10:
+                groupJ_savedData(server);
+                break;
+            case 11:
+                cleanup(server);
+                break;
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    // ================================================================ A 纯逻辑
+
+    private static void groupA_pureLogic() {
+        System.out.println("[A] 纯逻辑");
+        VoidWarehouseRecipes.Recipe planks = recipe("minecraft:oak_planks", 4, part("minecraft:oak_log", 1));
+
+        // 取 1 个木板：做 1 次，扣 1 原木，余 3 进仓库
+        VoidWarehouseRecipes.Plan p1 = VoidWarehouseRecipes.plan(planks, BigInteger.ONE, stock("minecraft:oak_log", 1));
+        check("A1 取 1 木板规划得出", p1 != null);
+        check("A1 做 1 次", p1 != null && p1.crafts().equals(BigInteger.ONE));
+        check("A1 只扣 1 原木", p1 != null && amountOf(p1.consumed(), "minecraft:oak_log").equals(BigInteger.ONE));
+        check("A1 余量 3", p1 != null && p1.surplus().equals(BigInteger.valueOf(3)));
+
+        // 取 5 个：做 2 次，扣 2 原木，余 3
+        VoidWarehouseRecipes.Plan p5 = VoidWarehouseRecipes.plan(planks, BigInteger.valueOf(5),
+                stock("minecraft:oak_log", 2));
+        check("A2 取 5 木板做 2 次", p5 != null && p5.crafts().equals(BigInteger.valueOf(2)));
+        check("A2 扣 2 原木", p5 != null && amountOf(p5.consumed(), "minecraft:oak_log").equals(BigInteger.valueOf(2)));
+        check("A2 余量 3（8 做出来 − 5 给出）", p5 != null && p5.surplus().equals(BigInteger.valueOf(3)));
+
+        // 反证：只有 1 个原木，取 5 个必须失败
+        check("A3 原木不够时返回 null", VoidWarehouseRecipes.plan(planks, BigInteger.valueOf(5),
+                stock("minecraft:oak_log", 1)) == null);
+
+        // 反证：原料一项都没有时返回 null
+        check("A4 空库存返回 null", VoidWarehouseRecipes.plan(planks, BigInteger.ONE, Map.of()) == null);
+
+        // 活塞（4 项原料，其中圆石要 4 个）
+        VoidWarehouseRecipes.Recipe piston = pistonRecipe();
+        Map<String, BigInteger> enough = new LinkedHashMap<>();
+        enough.put("minecraft:cobblestone", BigInteger.valueOf(4));
+        enough.put("minecraft:oak_planks", BigInteger.valueOf(3));
+        enough.put("minecraft:iron_ingot", BigInteger.ONE);
+        enough.put("minecraft:redstone", BigInteger.ONE);
+        VoidWarehouseRecipes.Plan pp = VoidWarehouseRecipes.plan(piston, BigInteger.ONE, enough);
+        check("A5 活塞规划得出", pp != null);
+        check("A5 圆石扣 4", pp != null && amountOf(pp.consumed(), "minecraft:cobblestone")
+                .equals(BigInteger.valueOf(4)));
+        check("A5 没有余量（产出 1 给 1）", pp != null && pp.surplus().signum() == 0);
+
+        // 反证：少 1 个红石就必须失败（不能「少一样也算做出来了」）
+        Map<String, BigInteger> noRedstone = new LinkedHashMap<>(enough);
+        noRedstone.remove("minecraft:redstone");
+        check("A6 缺红石返回 null", VoidWarehouseRecipes.plan(piston, BigInteger.ONE, noRedstone) == null);
+
+        // 共享候选：两个原料项都只认 A，库存 A=3 → 最多做 1 次（要 2 个 A），不是 3 次。
+        // 这是「逐项独立取 min」写法会算错的地方（那种写法给 3），也是这类算法最典型的刷物入口。
+        VoidWarehouseRecipes.Recipe shared = recipe("t:out", 1, part("t:a", 1), part("t:a", 1));
+        BigInteger sharedCap = VoidWarehouseRecipes.maxCraftable(shared, stock("t:a", 3));
+        check("A7 共享原料不重复计数（3 个 A 只能做 1 次）", sharedCap.equals(BigInteger.ONE));
+        check("A7 反证：plan(3) 必须失败", VoidWarehouseRecipes.plan(shared, BigInteger.valueOf(3),
+                stock("t:a", 3)) == null);
+        check("A7 plan(1) 成功且共扣 2 个 A", sharedCap.equals(BigInteger.ONE)
+                && amountOf(VoidWarehouseRecipes.plan(shared, BigInteger.ONE, stock("t:a", 3)).consumed(),
+                "t:a").equals(BigInteger.valueOf(2)));
+    }
+
+    // ================================================================ B 口径一致（fuzz）
+
+    /**
+     * 「界面说能合成多少个」与「真点下去能不能拿到」必须同源。
+     *
+     * <p>9 合 1 在 1.0.7 栽过的形态就是这两个数各算各的：tooltip 写 64、实际给 63。
+     * 配方扣料这边两个数来自<b>同一次贪心</b>，所以这条 fuzz 应当全绿；
+     * 一旦有人把 {@code maxCraftable} 改回「逐项独立取 min」，这里立刻会红。</p>
+     */
+    private static void groupB_boundConsistency() {
+        System.out.println("[B] maxCraftable 与 plan 口径一致（fuzz 200 轮）");
+        Random random = new Random(20261030L);
+        String[] ids = {"t:a", "t:b", "t:c"};
+        int bad = 0;
+        int cases = 0;
+        for (int round = 0; round < 200; round++) {
+            Map<String, BigInteger> stock = new LinkedHashMap<>();
+            for (String id : ids) {
+                stock.put(id, BigInteger.valueOf(random.nextInt(21)));
+            }
+            // 随机一条 1~3 项、每项 1~2 个的配方，候选随机是两项的组合（制造共享库存）
+            List<VoidWarehouseRecipes.Part> parts = new ArrayList<>();
+            int n = 1 + random.nextInt(3);
+            for (int i = 0; i < n; i++) {
+                int pick = random.nextInt(4);
+                List<String> cands = switch (pick) {
+                    case 0 -> List.of("t:a");
+                    case 1 -> List.of("t:b");
+                    case 2 -> List.of("t:c");
+                    default -> List.of("t:a", "t:b");
+                };
+                parts.add(new VoidWarehouseRecipes.Part(cands, 1 + random.nextInt(2)));
+            }
+            VoidWarehouseRecipes.Recipe r = new VoidWarehouseRecipes.Recipe("", "t:out",
+                    1 + random.nextInt(4), parts);
+            BigInteger cap = VoidWarehouseRecipes.maxCraftable(r, stock);
+            BigInteger maxOut = cap;   // cap 已经是成品个数
+            if (maxOut.signum() <= 0) {
+                continue;
+            }
+            // 上限以内的每一个量都必须真能规划出来，且账目自洽
+            for (long k = 1; k <= Math.min(maxOut.longValueExact(), 24L); k++) {
+                cases++;
+                VoidWarehouseRecipes.Plan plan =
+                        VoidWarehouseRecipes.plan(r, BigInteger.valueOf(k), stock);
+                if (plan == null) {
+                    bad++;
+                    System.out.println("   !! 上界说能做 " + maxOut + " 个，plan(" + k + ") 却失败；库存 "
+                            + stock + " 配方 " + VoidWarehouseRecipes.encode(r));
+                    break;
+                }
+                long out = (long) r.outputCount() * plan.crafts().longValueExact();
+                if (out - plan.surplus().longValueExact() != k) {
+                    bad++;
+                    System.out.println("   !! 账不平：要 " + k + "，做 " + out + "，余 " + plan.surplus());
+                    break;
+                }
+                for (Map.Entry<String, BigInteger> e : plan.consumed().entrySet()) {
+                    if (e.getValue().compareTo(stock.getOrDefault(e.getKey(), BigInteger.ZERO)) > 0) {
+                        bad++;
+                        System.out.println("   !! 多扣了：" + e.getKey() + " 扣 " + e.getValue()
+                                + " 但库存只有 " + stock.getOrDefault(e.getKey(), BigInteger.ZERO));
+                        break;
+                    }
+                }
+            }
+        }
+        check("B1 fuzz 全部一致（" + cases + " 个量）", bad == 0);
+        check("B2 fuzz 确实跑到了用例", cases > 500);
+    }
+
+    // ================================================================ C 编解码
+
+    private static void groupC_codec() {
+        System.out.println("[C] 编解码");
+        VoidWarehouseRecipes.Recipe piston = pistonRecipe();
+        String text = VoidWarehouseRecipes.encode(piston);
+        check("C1 标识 == 编码内容", text.equals(piston.recipeId()));
+        VoidWarehouseRecipes.Recipe back = VoidWarehouseRecipes.decode(text);
+        check("C2 往返一致", back != null && VoidWarehouseRecipes.encode(back).equals(text));
+        check("C2 产物与产出数还原", back != null && "minecraft:piston".equals(back.output())
+                && back.outputCount() == 1);
+        check("C2 原料项数还原", back != null && back.parts().size() == 4);
+
+        // 反证：坏数据一律返回 null，绝不抛 —— 一条坏行不该让整个仓库读不出来
+        check("C3 坏数据返回 null（无分号）", VoidWarehouseRecipes.decode("minecraft:piston*1") == null);
+        check("C3 坏数据返回 null（无数乘号）", VoidWarehouseRecipes.decode("piston;x") == null);
+        check("C3 坏数据返回 null（数量不是数）", VoidWarehouseRecipes.decode("piston*1;a×abc") == null);
+        check("C3 null 安全", VoidWarehouseRecipes.decode(null) == null);
+        check("C3 空串安全", VoidWarehouseRecipes.decode("") == null);
+
+        List<VoidWarehouseRecipes.Recipe> mixed = VoidWarehouseRecipes.decodeAll(
+                Arrays.asList(text, "垃圾数据", "piston*0;a×1", text));
+        check("C4 decodeAll 跳过坏行且去重后保序", mixed.size() == 2
+                && mixed.get(0).recipeId().equals(text));
+    }
+
+    // ================================================================ D 真实配方解析
+
+    private static void groupD_realRecipe(MinecraftServer server) {
+        System.out.println("[D] 真实配方解析");
+        ServerLevel level = server.overworld();
+
+        // 活塞：3 木板（上一排）+ 4 圆石 + 1 铁锭 + 1 红石
+        //   木板 木板 木板
+        //   圆石 铁锭 圆石
+        //   圆石 红石 圆石
+        // 关键是「圆石那一格放<b>整组 64 个</b>」：合成一次只吃 1 个，记账必须按「一格一个」
+        List<ItemStack> grid = emptyGrid();
+        grid.set(0, new ItemStack(Items.OAK_PLANKS));
+        grid.set(1, new ItemStack(Items.OAK_PLANKS));
+        grid.set(2, new ItemStack(Items.OAK_PLANKS));
+        grid.set(3, new ItemStack(Items.COBBLESTONE, 64));
+        grid.set(4, new ItemStack(Items.IRON_INGOT));
+        grid.set(5, new ItemStack(Items.COBBLESTONE));
+        grid.set(6, new ItemStack(Items.COBBLESTONE));
+        grid.set(7, new ItemStack(Items.REDSTONE));
+        grid.set(8, new ItemStack(Items.COBBLESTONE));
+        CraftingInput input = CraftingInput.of(3, 3, grid);
+        ItemStack result = VoidWarehouseRecipeBook.resultOf(server, level, input);
+        check("D1 活塞配方被真实配方系统认出来", !result.isEmpty() && result.is(Items.PISTON));
+        check("D1 一次产出 1 个", !result.isEmpty() && result.getCount() == 1);
+
+        VoidWarehouseRecipes.Recipe parsed = VoidWarehouseRecipeBook.fromGrid(grid, result);
+        check("D2 解析成一条配方", parsed != null);
+        check("D2 产物是 minecraft:piston", parsed != null && "minecraft:piston".equals(parsed.output()));
+        check("D2 原料 4 项", parsed != null && parsed.parts().size() == 4);
+        check("D2 圆石 4 个（整组 64 也只算 4 个格子）",
+                parsed != null && partCount(parsed, "minecraft:cobblestone") == 4);
+        check("D2 木板 3 个", parsed != null && partCount(parsed, "minecraft:oak_planks") == 3);
+        check("D2 铁锭 1 个", parsed != null && partCount(parsed, "minecraft:iron_ingot") == 1);
+        check("D2 红石 1 个", parsed != null && partCount(parsed, "minecraft:redstone") == 1);
+        pistonRecipe = parsed;
+
+        // 木棍：2 木板竖着摆 → 一次出 4 个（多产出，outputCount 必须记成 4）
+        List<ItemStack> stickGrid = emptyGrid();
+        stickGrid.set(0, new ItemStack(Items.OAK_PLANKS));
+        stickGrid.set(3, new ItemStack(Items.OAK_PLANKS));
+        CraftingInput stickInput = CraftingInput.of(3, 3, stickGrid);
+        ItemStack stickResult = VoidWarehouseRecipeBook.resultOf(server, level, stickInput);
+        check("D3 木棍配方认出来且一次 4 个", !stickResult.isEmpty()
+                && stickResult.is(Items.STICK) && stickResult.getCount() == 4);
+        VoidWarehouseRecipes.Recipe stickRecipe =
+                VoidWarehouseRecipeBook.fromGrid(stickGrid, stickResult);
+        check("D3 产出数记成 4", stickRecipe != null && stickRecipe.outputCount() == 4);
+        check("D3 原料是 2 个木板", stickRecipe != null && stickRecipe.parts().size() == 1
+                && stickRecipe.parts().get(0).count() == 2);
+
+        // 反证：空网格 / 无配方网格都必须是「不记」
+        check("D4 空网格返回空", VoidWarehouseRecipeBook.resultOf(server, level,
+                CraftingInput.of(3, 3, emptyGrid())).isEmpty());
+        List<ItemStack> dirtGrid = emptyGrid();
+        dirtGrid.set(0, new ItemStack(Items.DIRT));
+        check("D4 没有配方的摆法返回空", VoidWarehouseRecipeBook.resultOf(server, level,
+                CraftingInput.of(3, 3, dirtGrid)).isEmpty());
+        // 反证：结果为空时 fromGrid 必须拒绝（不能记下一条「产物 ← 无需原料」）
+        check("D5 产物为空时 fromGrid 拒绝", VoidWarehouseRecipeBook.fromGrid(grid, ItemStack.EMPTY) == null);
+        // 反证：格子里有空气以外的读不出 id 的东西时 —— 用一个真实物品但产物为空的组合已覆盖；
+        // 这里再确认「无产物就没有配方」这条不变量在编码层也成立
+        check("D5 坏配方不会被编码出来",
+                VoidWarehouseRecipeBook.fromGrid(emptyGrid(), result) == null);
+    }
+
+    // ================================================================ E 学习幂等
+
+    private static void groupE_learn(MinecraftServer server) {
+        System.out.println("[E] 学习幂等与规则开关");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+
+        // ⚠️ 这一组必须写成「跨进程幂等」的形式：配方本是<b>存进存档</b>的，
+        // 第二遍跑自检时活塞配方已经在文件里了，learn 正确地返回 false。
+        // 所以「第一次学成功」不能断言成 true（那是「只看第一遍」的写法），
+        // 只能断言成「要么这次学成功、要么它本来就在」——两者都说明它现在是可用的。
+        boolean learnedNow = data.learn(pistonRecipe);
+        int after = data.learnedRecipeCount();
+        check("E1 学一条（首次 true / 读档回放后 false，两者都算过）",
+                learnedNow || data.hasRecipeFor("minecraft:piston"));
+        check("E1 条数至少 1", after >= 1);
+        check("E2 同一条再学一次返回 false", !data.learn(pistonRecipe));
+        check("E2 条数不变", data.learnedRecipeCount() == after);
+        check("E3 学到的配方能被查到", data.hasRecipeFor("minecraft:piston"));
+
+        VoidWarehouseSettings.voidWarehouseCraft = false;
+        try {
+            check("E4 规则关掉时 learn 拒绝", !data.learn(
+                    recipe("minecraft:oak_planks", 4, part("minecraft:oak_log", 1))));
+            check("E4 条数没变", data.learnedRecipeCount() == after);
+        } finally {
+            VoidWarehouseSettings.voidWarehouseCraft = true;
+        }
+    }
+
+    // ================================================================ F 端到端扣料
+
+    private static void groupF_endToEnd(MinecraftServer server) {
+        System.out.println("[F] 端到端扣料");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        data.insert(new ItemStack(Items.OAK_PLANKS, 64));
+        data.insert(new ItemStack(Items.IRON_INGOT, 64));
+        data.insert(new ItemStack(Items.REDSTONE, 64));
+        data.learn(pistonRecipe);
+
+        check("F1 活塞库存为 0", data.amountOf(Items.PISTON).signum() == 0);
+        VoidWarehouseExchange.Plan plan = data.planExchange(new ItemStack(Items.PISTON), BigInteger.ONE);
+        check("F1 规划得出", plan != null);
+        check("F1 数量 1", plan != null && plan.amount().equals(BigInteger.ONE));
+        // 规划是只读的：这一步仓库一个字节都不该动
+        check("F2 规划不动库存（圆石还是 64）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(64)));
+
+        data.applyExchange(plan);
+        check("F3 圆石 64→60", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(60)));
+        check("F3 木板 64→61", data.amountOf(Items.OAK_PLANKS).equals(BigInteger.valueOf(61)));
+        check("F3 铁锭 64→63", data.amountOf(Items.IRON_INGOT).equals(BigInteger.valueOf(63)));
+        check("F3 红石 64→63", data.amountOf(Items.REDSTONE).equals(BigInteger.valueOf(63)));
+        check("F4 活塞<b>没有</b>留在仓库（那是玩家的战利品）",
+                data.amountOf(Items.PISTON).signum() == 0);
+
+        // 反证：把红石抽干之后必须规划失败，且库存原样不动
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        data.insert(new ItemStack(Items.OAK_PLANKS, 64));
+        data.insert(new ItemStack(Items.IRON_INGOT, 64));
+        check("F5 缺红石时规划返回 null",
+                data.planExchange(new ItemStack(Items.PISTON), BigInteger.ONE) == null);
+        check("F5 失败时库存逐项未动",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(64))
+                        && data.amountOf(Items.OAK_PLANKS).equals(BigInteger.valueOf(64))
+                        && data.amountOf(Items.IRON_INGOT).equals(BigInteger.valueOf(64)));
+
+        // 「尽量给」：原料只够做 2 次时，planExchangeMax 要返回 2 而不是失败
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 8));
+        data.insert(new ItemStack(Items.OAK_PLANKS, 6));
+        data.insert(new ItemStack(Items.IRON_INGOT, 2));
+        data.insert(new ItemStack(Items.REDSTONE, 2));
+        VoidWarehouseExchange.Plan partial =
+                data.planExchangeMax(new ItemStack(Items.PISTON), BigInteger.valueOf(64));
+        check("F6 尽量给：只够 2 个就给 2 个", partial != null
+                && partial.amount().equals(BigInteger.valueOf(2)));
+    }
+
+    // ================================================================ G 多产出余量
+
+    private static void groupG_multiOutput(MinecraftServer server) {
+        System.out.println("[G] 多产出与余量");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.OAK_LOG, 2));
+        VoidWarehouseRecipes.Recipe planks = recipe("minecraft:oak_planks", 4, part("minecraft:oak_log", 1));
+        data.learn(planks);
+
+        check("G1 原木 2、木板 0", data.amountOf(Items.OAK_LOG).equals(BigInteger.valueOf(2))
+                && data.amountOf(Items.OAK_PLANKS).signum() == 0);
+        VoidWarehouseExchange.Plan plan = data.planExchange(new ItemStack(Items.OAK_PLANKS),
+                BigInteger.valueOf(5));
+        check("G1 取 5 个木板规划得出", plan != null && plan.amount().equals(BigInteger.valueOf(5)));
+        data.applyExchange(plan);
+        check("G2 原木 2→0（做 2 次）", data.amountOf(Items.OAK_LOG).signum() == 0);
+        check("G2 余量 3 个木板进仓库（8 做出来 − 5 给出）",
+                data.amountOf(Items.OAK_PLANKS).equals(BigInteger.valueOf(3)));
+
+        // 成品已有货时：先扣库存，绝不再合成（否则就是「有货还扣原料」）
+        VoidWarehouseExchange.Plan fromStock = data.planExchange(new ItemStack(Items.OAK_PLANKS),
+                BigInteger.valueOf(2));
+        check("G3 有货时规划得出", fromStock != null && fromStock.amount().equals(BigInteger.valueOf(2)));
+        data.applyExchange(fromStock);
+        check("G3 木板 3→1", data.amountOf(Items.OAK_PLANKS).equals(BigInteger.ONE));
+        check("G3 没有再动原木（还是 0）", data.amountOf(Items.OAK_LOG).signum() == 0);
+
+        // 反证：要 5 个但仓库只剩 1 个木板、0 原木 → 必须失败
+        check("G4 库存与原料都不够时失败", data.planExchange(new ItemStack(Items.OAK_PLANKS),
+                BigInteger.valueOf(5)) == null);
+        check("G4 失败时木板仍是 1", data.amountOf(Items.OAK_PLANKS).equals(BigInteger.ONE));
+    }
+
+    // ================================================================ H 回滚
+
+    private static void groupH_rollback(MinecraftServer server) {
+        System.out.println("[H] 回滚精确性");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 20));
+        data.insert(new ItemStack(Items.OAK_PLANKS, 20));
+        data.insert(new ItemStack(Items.IRON_INGOT, 20));
+        data.insert(new ItemStack(Items.REDSTONE, 20));
+        data.insert(new ItemStack(Items.DIRT, 7));   // 与配方无关的干扰项
+        data.learn(pistonRecipe);
+
+        VoidWarehouseData.Withdrawal w = data.withdraw(new ItemStack(Items.PISTON), BigInteger.valueOf(3));
+        check("H1 取出 3 个活塞", !w.isEmpty() && w.taken() == 3);
+        check("H1 走的是多物品账（可反向执行）", w.viaExchange());
+        check("H2 扣了：圆石 20→8", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(8)));
+        check("H2 扣了：木板 20→11", data.amountOf(Items.OAK_PLANKS).equals(BigInteger.valueOf(11)));
+
+        w.returnUnplaced(0);
+        check("H3 整笔撤销：圆石回到 20", data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(20)));
+        check("H3 整笔撤销：木板回到 20", data.amountOf(Items.OAK_PLANKS).equals(BigInteger.valueOf(20)));
+        check("H3 整笔撤销：铁锭回到 20", data.amountOf(Items.IRON_INGOT).equals(BigInteger.valueOf(20)));
+        check("H3 整笔撤销：红石回到 20", data.amountOf(Items.REDSTONE).equals(BigInteger.valueOf(20)));
+        check("H3 干扰项未受影响", data.amountOf(Items.DIRT).equals(BigInteger.valueOf(7)));
+        check("H3 活塞仍然是 0", data.amountOf(Items.PISTON).signum() == 0);
+
+        // 部分保留：只留下 1 个，其余退回
+        VoidWarehouseData.Withdrawal w2 = data.withdraw(new ItemStack(Items.PISTON), BigInteger.valueOf(3));
+        check("H4 再次取出 3 个", !w2.isEmpty() && w2.taken() == 3);
+        w2.returnUnplaced(1);
+        check("H4 只留 1 个：圆石扣 4（20→16）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(16)));
+        check("H4 只留 1 个：红石扣 1（20→19）",
+                data.amountOf(Items.REDSTONE).equals(BigInteger.valueOf(19)));
+    }
+
+    // ================================================================ I 规则关闭
+
+    private static void groupI_ruleOff(MinecraftServer server) {
+        System.out.println("[I] 规则关闭");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        data.insert(new ItemStack(Items.OAK_PLANKS, 64));
+        data.insert(new ItemStack(Items.IRON_INGOT, 64));
+        data.insert(new ItemStack(Items.REDSTONE, 64));
+        data.learn(pistonRecipe);
+
+        VoidWarehouseSettings.voidWarehouseCraft = false;
+        try {
+            check("I1 关掉后规划恒为 null",
+                    data.planExchange(new ItemStack(Items.PISTON), BigInteger.ONE) == null);
+            boolean anyCraft = false;
+            for (VoidWarehouseData.ExchangeOffer offer : data.exchangeOffers()) {
+                anyCraft |= offer.craft();
+            }
+            check("I1 关掉后没有「可合成」虚拟条目", !anyCraft);
+        } finally {
+            VoidWarehouseSettings.voidWarehouseCraft = true;
+        }
+
+        // 打开后必须真的出现「可合成」条目（活塞不在 9 合 1 表里，所以只可能来自配方扣料）
+        boolean found = false;
+        VoidWarehouseData.ExchangeOffer pistonOffer = null;
+        for (VoidWarehouseData.ExchangeOffer offer : data.exchangeOffers()) {
+            if ("minecraft:piston".equals(offer.itemId())) {
+                found = true;
+                pistonOffer = offer;
+            }
+        }
+        check("I2 打开后出现活塞的「可合成」条目", found);
+        check("I2 标记为配方扣料", found && pistonOffer.craft());
+        check("I2 可合成 16 个（64 圆石 / 4 = 16）",
+                found && pistonOffer.obtainable().equals(BigInteger.valueOf(16)));
+        check("I2 条目里没有重复（活塞只出现一格）",
+                countOffers(data, "minecraft:piston") == 1);
+
+        VoidWarehouseSettings.voidWarehouse = false;
+        try {
+            boolean anyCraft = false;
+            for (VoidWarehouseData.ExchangeOffer offer : data.exchangeOffers()) {
+                anyCraft |= offer.craft();
+            }
+            check("I3 主开关关掉后同样一条都不显示", !anyCraft);
+        } finally {
+            VoidWarehouseSettings.voidWarehouse = true;
+        }
+    }
+
+    // ================================================================ J 存档往返
+
+    private static void groupJ_savedData(MinecraftServer server) {
+        System.out.println("[J] 存档往返");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 5));
+        data.insert(new ItemStack(Items.DIRT, 9));
+        data.learn(pistonRecipe);
+        int recipesBefore = data.learnedRecipeCount();
+
+        var encoded = VoidWarehouseData.CODEC.encodeStart(NbtOps.INSTANCE, data);
+        Tag tag = encoded.result().orElse(null);
+        check("J1 编码成功", tag != null);
+        var decoded = VoidWarehouseData.CODEC.parse(NbtOps.INSTANCE, tag);
+        VoidWarehouseData back = decoded.result().orElse(null);
+        check("J2 解码成功", back != null);
+        check("J2 物品条数一致", back != null && back.entryCount() == 2);
+        check("J2 圆石 5 个", back != null && back.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(5)));
+        check("J2 配方条数一致", back != null && back.learnedRecipeCount() == recipesBefore);
+        check("J2 活塞配方活着", back != null && back.hasRecipeFor("minecraft:piston"));
+
+        // 反证：混进一行坏数据只丢那一行，仓库物品一条不许少
+        CompoundTag raw = (CompoundTag) tag;
+        String blob = raw.getStringOr("learned_recipes", "");
+        raw.putString("learned_recipes", blob + "\n这行是垃圾\n");
+        VoidWarehouseData polluted = VoidWarehouseData.CODEC.parse(NbtOps.INSTANCE, raw).result().orElse(null);
+        check("J3 坏行不牵连整表：仍然解码成功", polluted != null);
+        check("J3 物品一条不少", polluted != null && polluted.entryCount() == 2);
+        check("J3 坏行只丢它自己", polluted != null && polluted.learnedRecipeCount() == recipesBefore);
+    }
+
+    // ================================================================ 工具
+
+    private static List<ItemStack> emptyGrid() {
+        List<ItemStack> grid = new ArrayList<>(Collections.nCopies(9, ItemStack.EMPTY));
+        return grid;
+    }
+
+    private static VoidWarehouseRecipes.Recipe pistonRecipe() {
+        if (pistonRecipe == null) {
+            pistonRecipe = recipe("minecraft:piston", 1,
+                    part("minecraft:cobblestone", 4),
+                    part("minecraft:oak_planks", 3),
+                    part("minecraft:iron_ingot", 1),
+                    part("minecraft:redstone", 1));
+        }
+        return pistonRecipe;
+    }
+
+    private static VoidWarehouseRecipes.Part part(String id, int count) {
+        return new VoidWarehouseRecipes.Part(List.of(id), count);
+    }
+
+    private static VoidWarehouseRecipes.Recipe recipe(String output, int outputCount,
+                                                      VoidWarehouseRecipes.Part... parts) {
+        return new VoidWarehouseRecipes.Recipe(null, output, outputCount, Arrays.asList(parts));
+    }
+
+    private static Map<String, BigInteger> stock(Object... pairs) {
+        Map<String, BigInteger> map = new LinkedHashMap<>();
+        for (int i = 0; i + 1 < pairs.length; i += 2) {
+            map.put((String) pairs[i], BigInteger.valueOf(((Number) pairs[i + 1]).longValue()));
+        }
+        return map;
+    }
+
+    private static BigInteger amountOf(Map<String, BigInteger> map, String id) {
+        return map.getOrDefault(id, BigInteger.ZERO);
+    }
+
+    private static int partCount(VoidWarehouseRecipes.Recipe recipe, String id) {
+        if (recipe == null) {
+            return -1;
+        }
+        for (VoidWarehouseRecipes.Part part : recipe.parts()) {
+            if (part.candidates().size() == 1 && id.equals(part.candidates().get(0))) {
+                return part.count();
+            }
+        }
+        return 0;
+    }
+
+    private static int countOffers(VoidWarehouseData data, String itemId) {
+        int n = 0;
+        for (VoidWarehouseData.ExchangeOffer offer : data.exchangeOffers()) {
+            if (itemId.equals(offer.itemId())) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private static void cleanup(MinecraftServer server) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        data.insert(new ItemStack(Items.DIRT, 5678));
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        System.out.println("SMOKE RESULT vw-craft/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+        }
+        System.out.println("   " + (ok ? "ok  " : "FAIL") + " " + label);
+    }
+}

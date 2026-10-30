@@ -40,7 +40,10 @@ import java.util.Random;
  *   <li><b>I 规则关闭</b>：关掉配方扣料之后规划恒为 null、{@code learn} 恒为 false、
  *       虚拟条目里一条「可合成」都不许有；</li>
  *   <li><b>J 存档往返</b>：{@code CODEC} 编一遍再解一遍，配方不丢；混进一行坏数据只丢那一行、
- *       仓库物品一条不许少。</li>
+ *       仓库物品一条不许少；</li>
+ *   <li><b>K 往下钻</b>（1.0.16 修的玩家报障）：木板没货、原木有货时必须扣原木做木板；
+ *       同一份库存不带子配方时必须失败（反证）；先吃库存再补做；闭包含深一层的料；
+ *       深度上限 / 撞环必须保守失败且不崩；真服务端整条链路走通。</li>
  * </ol>
  */
 public final class VoidWarehouseCraftSelfCheck {
@@ -56,6 +59,14 @@ public final class VoidWarehouseCraftSelfCheck {
 
     /** 自检里反复用到的那条配方（活塞） */
     private static VoidWarehouseRecipes.Recipe pistonRecipe;
+
+    /**
+     * 「不往下钻」的配方表，专门用来做反证。
+     *
+     * <p>K 组的核心是「同一份库存，带上子配方就能做、不带上就不能做」——
+     * 少了这个反证，K1 绿也可能只是因为别的原因凑巧成功了。</p>
+     */
+    private static final Map<String, List<VoidWarehouseRecipes.Recipe>> NO_SUBS = Map.of();
 
     private VoidWarehouseCraftSelfCheck() {
     }
@@ -116,6 +127,9 @@ public final class VoidWarehouseCraftSelfCheck {
                 groupJ_savedData(server);
                 break;
             case 11:
+                groupK_recursive(server);
+                break;
+            case 12:
                 cleanup(server);
                 break;
             default:
@@ -132,25 +146,28 @@ public final class VoidWarehouseCraftSelfCheck {
         VoidWarehouseRecipes.Recipe planks = recipe("minecraft:oak_planks", 4, part("minecraft:oak_log", 1));
 
         // 取 1 个木板：做 1 次，扣 1 原木，余 3 进仓库
-        VoidWarehouseRecipes.Plan p1 = VoidWarehouseRecipes.plan(planks, BigInteger.ONE, stock("minecraft:oak_log", 1));
+        VoidWarehouseRecipes.Plan p1 = VoidWarehouseRecipes.plan(planks, BigInteger.ONE,
+                stock("minecraft:oak_log", 1), NO_SUBS);
         check("A1 取 1 木板规划得出", p1 != null);
         check("A1 做 1 次", p1 != null && p1.crafts().equals(BigInteger.ONE));
         check("A1 只扣 1 原木", p1 != null && amountOf(p1.consumed(), "minecraft:oak_log").equals(BigInteger.ONE));
-        check("A1 余量 3", p1 != null && p1.surplus().equals(BigInteger.valueOf(3)));
+        check("A1 余量 3", p1 != null && amountOf(p1.surplus(), "minecraft:oak_planks").equals(BigInteger.valueOf(3)));
 
         // 取 5 个：做 2 次，扣 2 原木，余 3
         VoidWarehouseRecipes.Plan p5 = VoidWarehouseRecipes.plan(planks, BigInteger.valueOf(5),
-                stock("minecraft:oak_log", 2));
+                stock("minecraft:oak_log", 2), NO_SUBS);
         check("A2 取 5 木板做 2 次", p5 != null && p5.crafts().equals(BigInteger.valueOf(2)));
         check("A2 扣 2 原木", p5 != null && amountOf(p5.consumed(), "minecraft:oak_log").equals(BigInteger.valueOf(2)));
-        check("A2 余量 3（8 做出来 − 5 给出）", p5 != null && p5.surplus().equals(BigInteger.valueOf(3)));
+        check("A2 余量 3（8 做出来 − 5 给出）",
+                p5 != null && amountOf(p5.surplus(), "minecraft:oak_planks").equals(BigInteger.valueOf(3)));
 
         // 反证：只有 1 个原木，取 5 个必须失败
         check("A3 原木不够时返回 null", VoidWarehouseRecipes.plan(planks, BigInteger.valueOf(5),
-                stock("minecraft:oak_log", 1)) == null);
+                stock("minecraft:oak_log", 1), NO_SUBS) == null);
 
         // 反证：原料一项都没有时返回 null
-        check("A4 空库存返回 null", VoidWarehouseRecipes.plan(planks, BigInteger.ONE, Map.of()) == null);
+        check("A4 空库存返回 null",
+                VoidWarehouseRecipes.plan(planks, BigInteger.ONE, Map.of(), NO_SUBS) == null);
 
         // 活塞（4 项原料，其中圆石要 4 个）
         VoidWarehouseRecipes.Recipe piston = pistonRecipe();
@@ -159,26 +176,27 @@ public final class VoidWarehouseCraftSelfCheck {
         enough.put("minecraft:oak_planks", BigInteger.valueOf(3));
         enough.put("minecraft:iron_ingot", BigInteger.ONE);
         enough.put("minecraft:redstone", BigInteger.ONE);
-        VoidWarehouseRecipes.Plan pp = VoidWarehouseRecipes.plan(piston, BigInteger.ONE, enough);
+        VoidWarehouseRecipes.Plan pp = VoidWarehouseRecipes.plan(piston, BigInteger.ONE, enough, NO_SUBS);
         check("A5 活塞规划得出", pp != null);
         check("A5 圆石扣 4", pp != null && amountOf(pp.consumed(), "minecraft:cobblestone")
                 .equals(BigInteger.valueOf(4)));
-        check("A5 没有余量（产出 1 给 1）", pp != null && pp.surplus().signum() == 0);
+        check("A5 没有余量（产出 1 给 1）", pp != null && total(pp.surplus()).signum() == 0);
 
         // 反证：少 1 个红石就必须失败（不能「少一样也算做出来了」）
         Map<String, BigInteger> noRedstone = new LinkedHashMap<>(enough);
         noRedstone.remove("minecraft:redstone");
-        check("A6 缺红石返回 null", VoidWarehouseRecipes.plan(piston, BigInteger.ONE, noRedstone) == null);
+        check("A6 缺红石返回 null",
+                VoidWarehouseRecipes.plan(piston, BigInteger.ONE, noRedstone, NO_SUBS) == null);
 
         // 共享候选：两个原料项都只认 A，库存 A=3 → 最多做 1 次（要 2 个 A），不是 3 次。
         // 这是「逐项独立取 min」写法会算错的地方（那种写法给 3），也是这类算法最典型的刷物入口。
         VoidWarehouseRecipes.Recipe shared = recipe("t:out", 1, part("t:a", 1), part("t:a", 1));
-        BigInteger sharedCap = VoidWarehouseRecipes.maxCraftable(shared, stock("t:a", 3));
+        BigInteger sharedCap = VoidWarehouseRecipes.maxCraftable(shared, stock("t:a", 3), NO_SUBS);
         check("A7 共享原料不重复计数（3 个 A 只能做 1 次）", sharedCap.equals(BigInteger.ONE));
         check("A7 反证：plan(3) 必须失败", VoidWarehouseRecipes.plan(shared, BigInteger.valueOf(3),
-                stock("t:a", 3)) == null);
+                stock("t:a", 3), NO_SUBS) == null);
         check("A7 plan(1) 成功且共扣 2 个 A", sharedCap.equals(BigInteger.ONE)
-                && amountOf(VoidWarehouseRecipes.plan(shared, BigInteger.ONE, stock("t:a", 3)).consumed(),
+                && amountOf(VoidWarehouseRecipes.plan(shared, BigInteger.ONE, stock("t:a", 3), NO_SUBS).consumed(),
                 "t:a").equals(BigInteger.valueOf(2)));
     }
 
@@ -217,7 +235,7 @@ public final class VoidWarehouseCraftSelfCheck {
             }
             VoidWarehouseRecipes.Recipe r = new VoidWarehouseRecipes.Recipe("", "t:out",
                     1 + random.nextInt(4), parts);
-            BigInteger cap = VoidWarehouseRecipes.maxCraftable(r, stock);
+            BigInteger cap = VoidWarehouseRecipes.maxCraftable(r, stock, NO_SUBS);
             BigInteger maxOut = cap;   // cap 已经是成品个数
             if (maxOut.signum() <= 0) {
                 continue;
@@ -226,7 +244,7 @@ public final class VoidWarehouseCraftSelfCheck {
             for (long k = 1; k <= Math.min(maxOut.longValueExact(), 24L); k++) {
                 cases++;
                 VoidWarehouseRecipes.Plan plan =
-                        VoidWarehouseRecipes.plan(r, BigInteger.valueOf(k), stock);
+                        VoidWarehouseRecipes.plan(r, BigInteger.valueOf(k), stock, NO_SUBS);
                 if (plan == null) {
                     bad++;
                     System.out.println("   !! 上界说能做 " + maxOut + " 个，plan(" + k + ") 却失败；库存 "
@@ -234,7 +252,7 @@ public final class VoidWarehouseCraftSelfCheck {
                     break;
                 }
                 long out = (long) r.outputCount() * plan.crafts().longValueExact();
-                if (out - plan.surplus().longValueExact() != k) {
+                if (out - total(plan.surplus()).longValueExact() != k) {
                     bad++;
                     System.out.println("   !! 账不平：要 " + k + "，做 " + out + "，余 " + plan.surplus());
                     break;
@@ -251,6 +269,70 @@ public final class VoidWarehouseCraftSelfCheck {
         }
         check("B1 fuzz 全部一致（" + cases + " 个量）", bad == 0);
         check("B2 fuzz 确实跑到了用例", cases > 500);
+
+        // ---- B3/B4：带子配方的 fuzz（1.0.16 的递归路径）
+        // 每个 item 都可能自己有一条「1 个 t:x → 2 个 t:y」的子配方，于是往下钻真的会发生。
+        // 这里盯的是同一件事：上界说能做 n 个，plan(1..n) 必须条条成功、账必须平、
+        // 而且扣掉的东西绝不超过库存（递归最容易在这里出错 —— 钻下去之后扣的是更深一层的料）。
+        int badRec = 0;
+        int casesRec = 0;
+        for (int round = 0; round < 200; round++) {
+            Map<String, BigInteger> stock = new LinkedHashMap<>();
+            for (String id : ids) {
+                stock.put(id, BigInteger.valueOf(random.nextInt(9)));
+            }
+            // 随机给 1~2 件物品各挂一条子配方（原料是另一件物品，产物数 1~4）
+            Map<String, List<VoidWarehouseRecipes.Recipe>> byOutput = new LinkedHashMap<>();
+            for (int i = 0; i < 2; i++) {
+                String outId = ids[random.nextInt(ids.length)];
+                String inId = ids[random.nextInt(ids.length)];
+                if (outId.equals(inId)) {
+                    continue;
+                }
+                byOutput.computeIfAbsent(outId, k -> new ArrayList<>()).add(
+                        recipe(outId, 1 + random.nextInt(4), part(inId, 1 + random.nextInt(2))));
+            }
+            List<VoidWarehouseRecipes.Part> parts = new ArrayList<>();
+            for (int i = 0; i < 1 + random.nextInt(3); i++) {
+                parts.add(new VoidWarehouseRecipes.Part(List.of(ids[random.nextInt(ids.length)]),
+                        1 + random.nextInt(2)));
+            }
+            VoidWarehouseRecipes.Recipe r = new VoidWarehouseRecipes.Recipe("", "t:out",
+                    1 + random.nextInt(3), parts);
+            BigInteger cap = VoidWarehouseRecipes.maxCraftable(r, stock, byOutput);
+            if (cap.signum() <= 0) {
+                continue;
+            }
+            for (long k = 1; k <= Math.min(cap.longValueExact(), 16L); k++) {
+                casesRec++;
+                VoidWarehouseRecipes.Plan plan =
+                        VoidWarehouseRecipes.plan(r, BigInteger.valueOf(k), stock, byOutput);
+                if (plan == null) {
+                    badRec++;
+                    System.out.println("   !! [递归] 上界 " + cap + " 个，plan(" + k + ") 失败；库存 " + stock
+                            + " 子配方 " + byOutput.keySet() + " 配方 " + VoidWarehouseRecipes.encode(r));
+                    break;
+                }
+                long out = (long) r.outputCount() * plan.crafts().longValueExact();
+                // 账平判据只能看<b>根产物</b>的余量：往下钻之后 surplus 里还躺着中间产物
+                // 多出来的部分（木板、木棍……），拿总量去比就是拿两件事对账。
+                if (out - amountOf(plan.surplus(), r.output()).longValueExact() != k) {
+                    badRec++;
+                    System.out.println("   !! [递归] 账不平：要 " + k + "，做 " + out + "，余 " + plan.surplus());
+                    break;
+                }
+                for (Map.Entry<String, BigInteger> e : plan.consumed().entrySet()) {
+                    if (e.getValue().compareTo(stock.getOrDefault(e.getKey(), BigInteger.ZERO)) > 0) {
+                        badRec++;
+                        System.out.println("   !! [递归] 多扣了：" + e.getKey() + " 扣 " + e.getValue()
+                                + " 但库存只有 " + stock.getOrDefault(e.getKey(), BigInteger.ZERO));
+                        break;
+                    }
+                }
+            }
+        }
+        check("B3 递归 fuzz 全部一致（" + casesRec + " 个量）", badRec == 0);
+        check("B4 递归 fuzz 确实跑到了用例", casesRec > 200);
     }
 
     // ================================================================ C 编解码
@@ -583,6 +665,142 @@ public final class VoidWarehouseCraftSelfCheck {
         check("J3 坏行只丢它自己", polluted != null && polluted.learnedRecipeCount() == recipesBefore);
     }
 
+    // ================================================================ K 往下钻
+
+    /**
+     * 玩家报的那个 bug：「合成过一次深色橡木木板和活塞，木板取完之后再取活塞，
+     * 不会自动扣深色橡木原木」。
+     *
+     * <p>1.0.15 只做一层（原料必须仓库里现成），所以这条在 1.0.15 上是<b>必然红</b>的 ——
+     * 这正是它值得单独成组的原因：它是玩家能看见的行为，必须有一条断言钉住。
+     * 1.0.16 起最多往下钻 {@link VoidWarehouseRecipes#MAX_DEPTH} 层。</p>
+     *
+     * <p>每组都配了反证（同一份库存、不带子配方时必须失败），否则「绿」可能只是因为别的原因凑巧成立。</p>
+     */
+    private static void groupK_recursive(MinecraftServer server) {
+        System.out.println("[K] 往下钻（原木 → 木板 → 活塞）");
+        VoidWarehouseRecipes.Recipe planks =
+                recipe("minecraft:dark_oak_planks", 4, part("minecraft:dark_oak_log", 1));
+        VoidWarehouseRecipes.Recipe piston = recipe("minecraft:piston", 1,
+                part("minecraft:dark_oak_planks", 3),
+                part("minecraft:cobblestone", 4),
+                part("minecraft:iron_ingot", 1),
+                part("minecraft:redstone", 1));
+        Map<String, List<VoidWarehouseRecipes.Recipe>> subs = new LinkedHashMap<>();
+        subs.put("minecraft:dark_oak_planks", List.of(planks));
+
+        // 木板 0 个、原木 1 个 —— 这就是玩家报的那个局面
+        Map<String, BigInteger> onlyLog = stock("minecraft:dark_oak_log", 1,
+                "minecraft:cobblestone", 4, "minecraft:iron_ingot", 1, "minecraft:redstone", 1);
+        VoidWarehouseRecipes.Plan k1 = VoidWarehouseRecipes.plan(piston, BigInteger.ONE, onlyLog, subs);
+        check("K1 木板没货、原木有货 → 取活塞必须成功", k1 != null);
+        check("K1 扣的是原木 1 个", k1 != null
+                && amountOf(k1.consumed(), "minecraft:dark_oak_log").equals(BigInteger.ONE));
+        check("K1 木板一个都没扣（它本来就是做出来的）",
+                k1 != null && amountOf(k1.consumed(), "minecraft:dark_oak_planks").signum() == 0);
+        check("K1 多做的 1 个木板入账回仓库",
+                k1 != null && amountOf(k1.surplus(), "minecraft:dark_oak_planks").equals(BigInteger.ONE));
+        check("K1 其它原料照旧", k1 != null
+                && amountOf(k1.consumed(), "minecraft:cobblestone").equals(BigInteger.valueOf(4))
+                && amountOf(k1.consumed(), "minecraft:iron_ingot").equals(BigInteger.ONE)
+                && amountOf(k1.consumed(), "minecraft:redstone").equals(BigInteger.ONE));
+
+        // 反证：同一份库存，不往下钻就必须失败（证明 K1 真的咬住了递归，不是别的原因凑巧成功）
+        check("K2 反证：不带子配方时必须失败",
+                VoidWarehouseRecipes.plan(piston, BigInteger.ONE, onlyLog, NO_SUBS) == null);
+
+        // 库存里有一半木板：先吃库存、不够的再钻（不是「一缺货就整项去做」）
+        Map<String, BigInteger> halfPlanks = stock("minecraft:dark_oak_planks", 2,
+                "minecraft:dark_oak_log", 1,
+                "minecraft:cobblestone", 4, "minecraft:iron_ingot", 1, "minecraft:redstone", 1);
+        VoidWarehouseRecipes.Plan k3 = VoidWarehouseRecipes.plan(piston, BigInteger.ONE, halfPlanks, subs);
+        check("K3 木板够一半：先扣现成的 2 个", k3 != null
+                && amountOf(k3.consumed(), "minecraft:dark_oak_planks").equals(BigInteger.valueOf(2)));
+        check("K3 只补做 1 次（扣 1 原木）", k3 != null
+                && amountOf(k3.consumed(), "minecraft:dark_oak_log").equals(BigInteger.ONE));
+        check("K3 补做多出的 3 个木板入账", k3 != null
+                && amountOf(k3.surplus(), "minecraft:dark_oak_planks").equals(BigInteger.valueOf(3)));
+
+        // 上限：3 个原木 = 12 木板 = 4 个活塞
+        BigInteger cap = VoidWarehouseRecipes.maxCraftable(piston,
+                stock("minecraft:dark_oak_log", 3, "minecraft:cobblestone", 64,
+                        "minecraft:iron_ingot", 16, "minecraft:redstone", 16), subs);
+        check("K4 3 原木 → 4 个活塞", cap.equals(BigInteger.valueOf(4)));
+
+        // 闭包：缺了「深一层」的料就是 1.0.15 那个 bug 的根因，这条直接钉住它
+        Map<String, BigInteger> closure = VoidWarehouseRecipes.stockClosure(piston, subs,
+                id -> "minecraft:dark_oak_log".equals(id) ? BigInteger.valueOf(7) : BigInteger.ZERO);
+        check("K5 闭包含深一层的原木", closure.containsKey("minecraft:dark_oak_log"));
+        check("K5 闭包里原木拿到的是真库存",
+                amountOf(closure, "minecraft:dark_oak_log").equals(BigInteger.valueOf(7)));
+        check("K5 闭包也含表层原料", closure.containsKey("minecraft:dark_oak_planks")
+                && closure.containsKey("minecraft:redstone"));
+
+        // 深度上限。
+        // 记账方式：{@code supply} 在深度 d 允许「吃库存」，但只有 {@code d < MAX_DEPTH} 才允许
+        // 「再做一层」。所以一条「根 + N 条子配方 + 最深处有料」的链，最后一次展开发生在
+        // 深度 N−2，条件 N−2 < MAX_DEPTH ⇒ 正好 MAX_DEPTH+1 段能做，再多一段必须保守失败。
+        int deepestOk = VoidWarehouseRecipes.MAX_DEPTH + 1;
+        check("K6 正好 MAX_DEPTH 层：能做出来",
+                VoidWarehouseRecipes.plan(recipe("t:l0", 1, part("t:l1", 1)), BigInteger.ONE,
+                        stock("t:l" + deepestOk, 1), chainOf(deepestOk)) != null);
+        int tooDeep = deepestOk + 1;
+        check("K7 超过 MAX_DEPTH 层：保守失败（不是无限递归）",
+                VoidWarehouseRecipes.plan(recipe("t:l0", 1, part("t:l1", 1)), BigInteger.ONE,
+                        stock("t:l" + tooDeep, 1), chainOf(tooDeep)) == null);
+
+        // 撞环：a ← b、b ← a，空库存时必须失败且不能炸（栈溢出会直接崩服）
+        Map<String, List<VoidWarehouseRecipes.Recipe>> ring = new LinkedHashMap<>();
+        VoidWarehouseRecipes.Recipe ra = recipe("t:a", 1, part("t:b", 1));
+        VoidWarehouseRecipes.Recipe rb = recipe("t:b", 1, part("t:a", 1));
+        ring.put("t:a", List.of(ra));
+        ring.put("t:b", List.of(rb));
+        check("K8 撞环：空库存返回 null 且不崩",
+                VoidWarehouseRecipes.plan(ra, BigInteger.ONE, Map.of(), ring) == null);
+        check("K8 撞环：但库存里有 b 时正常吃库存",
+                VoidWarehouseRecipes.plan(ra, BigInteger.ONE, stock("t:b", 2), ring) != null);
+
+        // ---- 真实服务端：仓库里只有原木，取活塞必须整条链路走通
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.DARK_OAK_LOG, 3));
+        data.insert(new ItemStack(Items.COBBLESTONE, 12));
+        data.insert(new ItemStack(Items.IRON_INGOT, 3));
+        data.insert(new ItemStack(Items.REDSTONE, 3));
+        data.learn(recipe("minecraft:dark_oak_planks", 4, part("minecraft:dark_oak_log", 1)));
+        data.learn(recipe("minecraft:piston", 1,
+                part("minecraft:dark_oak_planks", 3),
+                part("minecraft:cobblestone", 4),
+                part("minecraft:iron_ingot", 1),
+                part("minecraft:redstone", 1)));
+
+        check("K9 活塞库存为 0、木板库存为 0",
+                data.amountOf(Items.PISTON).signum() == 0 && data.amountOf(Items.DARK_OAK_PLANKS).signum() == 0);
+        check("K9 界面上出现「活塞（可合成）」一格", countOffers(data, "minecraft:piston") == 1);
+        VoidWarehouseExchange.Plan took = data.planExchange(new ItemStack(Items.PISTON), BigInteger.valueOf(3));
+        check("K10 只有原木也能规划出 3 个活塞", took != null);
+        data.applyExchange(took);
+        check("K10 原木 3→0（全被做成了木板）", data.amountOf(Items.DARK_OAK_LOG).signum() == 0);
+        check("K10 木板 0→3（12 做出来 − 9 用掉）",
+                data.amountOf(Items.DARK_OAK_PLANKS).equals(BigInteger.valueOf(3)));
+        check("K10 圆石 / 铁锭 / 红石各扣 12 / 3 / 3",
+                data.amountOf(Items.COBBLESTONE).signum() == 0
+                        && data.amountOf(Items.IRON_INGOT).signum() == 0
+                        && data.amountOf(Items.REDSTONE).signum() == 0);
+        check("K10 活塞没有留在仓库", data.amountOf(Items.PISTON).signum() == 0);
+
+        // 反证：把原木也抽干之后必须规划失败
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 12));
+        data.insert(new ItemStack(Items.IRON_INGOT, 3));
+        data.insert(new ItemStack(Items.REDSTONE, 3));
+        check("K11 原木也没了 → 取活塞失败",
+                data.planExchange(new ItemStack(Items.PISTON), BigInteger.ONE) == null);
+        check("K11 失败时库存逐项未动",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(12))
+                        && data.amountOf(Items.IRON_INGOT).equals(BigInteger.valueOf(3)));
+    }
+
     // ================================================================ 工具
 
     private static List<ItemStack> emptyGrid() {
@@ -610,8 +828,21 @@ public final class VoidWarehouseCraftSelfCheck {
         return new VoidWarehouseRecipes.Recipe(null, output, outputCount, Arrays.asList(parts));
     }
 
-    private static Map<String, BigInteger> stock(Object... pairs) {
-        Map<String, BigInteger> map = new LinkedHashMap<>();
+    /**
+     * 造一条 {@code t:l0 ← t:l1 ← … ← t:l{segments}} 的链（每层 1:1），用来量深度上限。
+     *
+     * <p>返回的是 {@code byOutput}；调用方自己把料放在 {@code t:l{segments}} 上。</p>
+     */
+    private static Map<String, List<VoidWarehouseRecipes.Recipe>> chainOf(int segments) {
+        Map<String, List<VoidWarehouseRecipes.Recipe>> map = new LinkedHashMap<>();
+        for (int i = 0; i < segments; i++) {
+            VoidWarehouseRecipes.Recipe r = recipe("t:l" + i, 1, part("t:l" + (i + 1), 1));
+            map.put(r.output(), List.of(r));
+        }
+        return map;
+    }
+
+    private static Map<String, BigInteger> stock(Object... pairs) {        Map<String, BigInteger> map = new LinkedHashMap<>();
         for (int i = 0; i + 1 < pairs.length; i += 2) {
             map.put((String) pairs[i], BigInteger.valueOf(((Number) pairs[i + 1]).longValue()));
         }
@@ -620,6 +851,15 @@ public final class VoidWarehouseCraftSelfCheck {
 
     private static BigInteger amountOf(Map<String, BigInteger> map, String id) {
         return map.getOrDefault(id, BigInteger.ZERO);
+    }
+
+    /** 一张账的总量（{@code surplus} 从单个数字变成 map 之后，判「没有余量」要这么写） */
+    private static BigInteger total(Map<String, BigInteger> map) {
+        BigInteger sum = BigInteger.ZERO;
+        for (BigInteger value : map.values()) {
+            sum = sum.add(value);
+        }
+        return sum;
     }
 
     private static int partCount(VoidWarehouseRecipes.Recipe recipe, String id) {

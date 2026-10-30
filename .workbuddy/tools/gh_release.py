@@ -77,6 +77,8 @@ def main():
     ap.add_argument("--assets", action="append", required=True)
     ap.add_argument("--target", default="main")
     ap.add_argument("--prerelease", action="store_true")
+    ap.add_argument("--update", action="store_true",
+                    help="tag 已有 release：删旧资产、重传、刷新正文（同一版本号原地重发）")
     args = ap.parse_args()
 
     token = os.environ.get("GH_TOKEN")
@@ -96,16 +98,28 @@ def main():
     for f in files:
         print(f"  {f}  ({os.path.getsize(f)} B)")
 
-    st, rel = call("POST", f"{API}/repos/{args.repo}/releases", token, {
-        "tag_name": args.tag,
-        "target_commitish": args.target,
-        "name": args.name,
-        "body": body,
-        "draft": True,
-        "prerelease": bool(args.prerelease),
-    })
-    rid = rel["id"]
-    print(f"[ok] draft 已建：id={rid}  tag={rel['tag_name']}")
+    # --update：同一个版本号原地重发（本项目「修 bug 不升版本号」的必然结果）
+    #   · 先按 tag 找到已有 release
+    #   · 删掉全部旧资产（同名 POST 会 422，必须先删）
+    #   · 重新上传 + 更新正文，最后确保 draft=false
+    if args.update:
+        st, rel = call("GET", f"{API}/repos/{args.repo}/releases/tags/{args.tag}", token)
+        rid = rel["id"]
+        print(f"[ok] 找到已有 release：id={rid}  status={rel['draft'] and 'draft' or 'published'}")
+        for a in rel.get("assets", []):
+            call("DELETE", f"{API}/repos/{args.repo}/releases/assets/{a['id']}", token)
+            print(f"[ok] 删除旧资产 {a['name']}")
+    else:
+        st, rel = call("POST", f"{API}/repos/{args.repo}/releases", token, {
+            "tag_name": args.tag,
+            "target_commitish": args.target,
+            "name": args.name,
+            "body": body,
+            "draft": True,
+            "prerelease": bool(args.prerelease),
+        })
+        rid = rel["id"]
+        print(f"[ok] draft 已建：id={rid}  tag={rel['tag_name']}")
 
     uploaded = []
     for f in files:
@@ -122,7 +136,8 @@ def main():
         uploaded.append((a["name"], a["size"]))
         print(f"[ok] 上传 {a['name']} ({a['size']} B, state={a['state']})")
 
-    st, pub = call("PATCH", f"{API}/repos/{args.repo}/releases/{rid}", token, {"draft": False})
+    patch = {"draft": False, "name": args.name, "body": body}
+    st, pub = call("PATCH", f"{API}/repos/{args.repo}/releases/{rid}", token, patch)
     print(f"[ok] 已发布：{pub['html_url']}")
     print(f"     资产 {len(pub['assets'])} 个，draft={pub['draft']} prerelease={pub['prerelease']}")
     for a in pub["assets"]:

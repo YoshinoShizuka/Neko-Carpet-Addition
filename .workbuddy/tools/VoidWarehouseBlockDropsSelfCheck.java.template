@@ -1,0 +1,404 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ServerPlayerGameMode;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.ExperienceOrb;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * 【临时自检】「方块掉落物直接进虚空仓库」。跑到结尾会 {@code server.halt(false)}，
+ * 验证完连同 {@code VoidWarehouseExtension} 里的 hook 一起删掉。
+ *
+ * <h2>为什么要真挖一个方块</h2>
+ * <p>这条规则的价值全在「接对了没有」：mixin 挂错方法、上下文没立起来、拦了却没拦住，
+ * 三种错法都能编译通过、也都能在纯逻辑测试里「看起来对」。所以这里<b>造一个真 ServerPlayer，
+ * 让它真的调 {@code ServerPlayerGameMode#destroyBlock}</b>，然后同时看三件事：
+ * 仓库里多没多、世界里有没有那个物品实体、玩家背包动没动。
+ * 少看任何一项都抓不到「既进了仓库又掉在地上」这种复制 bug。</p>
+ *
+ * <h2>A 组必须先跑</h2>
+ * <p>本项目的铁律：{@code build} 成功不等于 mixin 挂上了。所以 A 组先用反射去
+ * {@code ServerLevel} / {@code ServerPlayerGameMode} 上找<b>被 mixin 合并进去的那两个方法</b>，
+ * 找不到就直接把结论写在报告里，而不是让后面几组假装通过。</p>
+ */
+public final class VoidWarehouseBlockDropsSelfCheck {
+
+    private static final int MAX_STARTUP_TICKS = 400;
+
+    private static boolean done = false;
+    private static int stage = 0;
+    private static int tickIndex = 0;
+    private static int checks = 0;
+    private static int failures = 0;
+    private static boolean forced = false;
+
+    private static ServerPlayer bot;
+    private static ServerLevel level;
+    private static final BlockPos POS = new BlockPos(0, 200, 0);
+    private static int bBefore = 0;
+    private static boolean bDug = false;
+    private static int cBefore = 0;
+    private static boolean cDug = false;
+
+    private VoidWarehouseBlockDropsSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        switch (stage) {
+            case 0:
+                // 开局先等「POS 所在区块能 tick 实体」。不做这一步，头几个 tick 里新 spawn 的
+                // 物品实体在 getAllEntities() 里根本看不到 —— 于是「掉落物照原样进世界」变成
+                // 假阴性、而「世界里没有多出物品实体」变成恒真的空转断言。两者都是测量事故，
+                // 不是功能问题，所以这里宁可等（冷世界要几十个 tick），也不许提前开测。
+                if (!forced) {
+                    level = server.overworld();
+                    level.setChunkForced(POS.getX() >> 4, POS.getZ() >> 4, true);
+                    forced = true;
+                }
+                if (!level.isPositionEntityTicking(POS)) {
+                    if (++tickIndex > MAX_STARTUP_TICKS) {
+                        checks++;
+                        failures++;
+                        System.out.println("   FAIL E0 POS 所在区块在 " + MAX_STARTUP_TICKS
+                                + " tick 内没进入 entity-ticking —— 环境问题，后续实体断言不可信");
+                        finish(server);
+                    }
+                    return;
+                }
+                note("POS 所在区块在第 " + tickIndex + " tick 进入 entity-ticking");
+                break;
+            case 1:
+                env(server);
+                break;
+            case 2:
+                groupA_mixinMounted();
+                break;
+            case 3:
+                groupB_ruleOff(server);
+                break;
+            case 4:
+                // B 的「掉落物进世界」必须<b>隔一个 tick</b>再数：方块掉落物是这一 tick 里才
+                // addFreshEntity 进来的，实体要等 entity section 完成加入才出现在 getAllEntities 里。
+                groupB_verifyDropped();
+                break;
+            case 5:
+                groupC_ruleOn(server);
+                break;
+            case 6:
+                // C3 必须隔一个 tick 数：和 B 同一个道理，当 tick 实体还看不见，
+                // 「世界里没有多出物品实体」就会变成恒真的空转断言。
+                groupC_verifyNoDrop();
+                break;
+            case 7:
+                groupD_noFalsePositives(server);
+                break;
+            case 8:
+                groupE_shulkerBox();
+                break;
+            case 9:
+                groupF_dependencyAndGuard(server);
+                break;
+            case 10:
+                cleanup(server);
+                break;
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    // ================================================================ 环境
+
+    private static void env(MinecraftServer server) {
+        System.out.println("[ENV] 造一个真 ServerPlayer 并放到可挖方块的位置");
+        level = server.overworld();
+        GameProfile profile = new GameProfile(UUID.randomUUID(), "dropbot");
+        bot = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
+        bot.gameMode.changeGameModeForPlayer(GameType.SURVIVAL);
+        // 站远一点，避免出生点保护（blockActionRestricted）拦住这次挖掘
+        bot.setPos(8.5, 200, 8.5);
+        check("E1 玩家对象可用", bot != null && bot.level() == level);
+        check("E2 游戏模式是生存（否则不掉落）", bot.gameMode.isSurvival());
+
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        check("E3 仓库已清空", data.entryCount() == 0);
+
+        // 这块区块在第 0 阶段就已经强制加载并等到能 tick 实体；这里只是把它钉成断言，
+        // 因为后面「世界里多没多出物品实体」全靠它。
+        check("E4 该区块可 tick 实体（后面所有实体可见性断言的前提）",
+                level.isPositionEntityTicking(POS));
+    }
+
+    // ================================================================ A mixin 真的挂上了吗
+
+    private static void groupA_mixinMounted() {
+        System.out.println("[A] mixin 挂载");
+        // 按<b>名字子串</b>数，不用 getDeclaredMethod 精确匹配：Mixin 合并进来的 handler
+        // 名字可能带 handler$xxx$ 前缀、参数表也不是我们能写死的（见本项目既有自检惯例）。
+        check("A1 ServerLevel 上找到收料口方法（mixin 已合并）",
+                countHandlers(ServerLevel.class, "blockDropsIntoWarehouse") >= 1);
+        check("A2 ServerPlayerGameMode 上找到 begin 方法",
+                countHandlers(ServerPlayerGameMode.class, "beginBlockDrops") >= 1);
+        check("A3 ServerPlayerGameMode 上找到 end 方法",
+                countHandlers(ServerPlayerGameMode.class, "endBlockDrops") >= 1);
+        check("A4 规则默认关闭",
+                !VoidWarehouseSettings.voidWarehouseBlockDrops || !VoidWarehouseBlockDrops.enabled());
+        note("ServerLevel[" + handlerNames(ServerLevel.class, "carpetAutomending") + "]");
+        note("ServerPlayerGameMode[" + handlerNames(ServerPlayerGameMode.class, "carpetAutomending") + "]");
+    }
+
+    // ================================================================ B 规则关着 = 一行都不改
+
+    private static void groupB_ruleOff(MinecraftServer server) {
+        System.out.println("[B] 规则关着时完全不动");
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseBlockDrops = false;
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+
+        bBefore = countItemEntities(Items.DIRT);
+        boolean broken = dig(Blocks.DIRT);
+        bDug = true;
+        check("B1 方块被挖掉了（原版流程真的跑到了）", broken);
+        check("B3 仓库没收到任何东西", data.amountOf(Items.DIRT).signum() == 0);
+        note("挖完当 tick：dirt 实体 " + countItemEntities(Items.DIRT)
+                + " 个（before=" + bBefore + "），背包 " + bot.getInventory().countItem(Items.DIRT)
+                + "，entityTicking=" + level.isPositionEntityTicking(POS));
+    }
+
+    private static void groupB_verifyDropped() {
+        int after = countItemEntities(Items.DIRT);
+        check("B2 掉落物照原样进世界（+1 个物品实体）", bDug && after == bBefore + 1);
+        note("隔一个 tick：dirt 实体 " + after + " 个（before=" + bBefore + "），"
+                + "背包 " + bot.getInventory().countItem(Items.DIRT)
+                + "，entityTicking=" + level.isPositionEntityTicking(POS));
+        clearItemEntities();
+    }
+
+    // ================================================================ C 规则开着 = 直接入库
+
+    private static void groupC_ruleOn(MinecraftServer server) {
+        System.out.println("[C] 规则开着时直接入库");
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseBlockDrops = true;
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        bot.getInventory().clearContent();
+
+        cBefore = countItemEntities(Items.DIRT);
+        boolean broken = dig(Blocks.DIRT);
+        check("C1 方块被挖掉了", broken);
+        check("C2 仓库收到 1 个泥土", data.amountOf(Items.DIRT).equals(BigInteger.ONE));
+        check("C4 也没进玩家背包", bot.getInventory().countItem(Items.DIRT) == 0);
+
+        // 再挖一次：验证不是「只生效一次」
+        dig(Blocks.DIRT);
+        check("C5 再挖一个 → 仓库累加到 2", data.amountOf(Items.DIRT).equals(BigInteger.valueOf(2)));
+        cDug = true;
+    }
+
+    private static void groupC_verifyNoDrop() {
+        int after = countItemEntities(Items.DIRT);
+        // 先钉住前提：如果这个区块还不能 tick 实体，下面的「没有多出物品实体」恒真、等于没测。
+        check("C3 前提：该区块已 entity-ticking（否则下一条是空转）",
+                level.isPositionEntityTicking(POS));
+        check("C3 世界里<b>没有</b>多出物品实体（不是「既入库又掉地上」）",
+                cDug && after == cBefore);
+        note("挖了 2 个之后：dirt 实体 " + after + " 个（before=" + cBefore + "），"
+                + "仓库 " + VoidWarehouse.data(contextServer()).amountOf(Items.DIRT));
+    }
+
+    // ================================================================ D 不误伤别的掉落物
+
+    private static void groupD_noFalsePositives(MinecraftServer server) {
+        System.out.println("[D] 只收「玩家挖掉的方块」");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        int stones = countItemEntities(Items.STONE);
+
+        // 模拟爆炸 / 怪物掉落：上下文之外直接往世界里塞一个物品实体
+        ItemEntity loose = new ItemEntity(level, 8.5, 200.5, 8.5, new ItemStack(Items.STONE, 3));
+        boolean added = level.addFreshEntity(loose);
+        check("D1 上下文之外的物品实体照常进世界", added && countItemEntities(Items.STONE) == stones + 1);
+        check("D2 仓库没被这些掉落物污染", data.amountOf(Items.STONE).signum() == 0);
+
+        ExperienceOrb orb = new ExperienceOrb(level, 8.5, 200.5, 8.5, 7);
+        boolean orbAdded = level.addFreshEntity(orb);
+        check("D3 经验球不受影响（不是物品，照样进世界）", orbAdded && !orb.isRemoved());
+
+        // begin 之后紧接着 end —— 上下文清干净了就不该再收
+        VoidWarehouseBlockDrops.begin(bot);
+        VoidWarehouseBlockDrops.end();
+        ItemEntity afterEnd = new ItemEntity(level, 8.5, 200.5, 8.5, new ItemStack(Items.STONE, 1));
+        boolean addedAfterEnd = level.addFreshEntity(afterEnd);
+        check("D4 end() 之后不再收（上下文没有残留）", addedAfterEnd);
+
+        loose.discard();
+        orb.discard();
+        afterEnd.discard();
+        clearItemEntities();
+    }
+
+    // ================================================================ E 潜影盒走与漏斗一致的口径
+
+    private static void groupE_shulkerBox() {
+        System.out.println("[E] 潜影盒：空盒整盒入库");
+        VoidWarehouseData data = VoidWarehouse.data(contextServer());
+        data.clearContent();
+        dig(Blocks.SHULKER_BOX);
+        check("E1 空潜影盒整盒入库（占一格）",
+                data.amountOf(Items.SHULKER_BOX).equals(BigInteger.ONE));
+        check("E2 没有被拆成潜影壳 + 箱子",
+                data.amountOf(Items.SHULKER_SHELL).signum() == 0
+                        && data.amountOf(Items.CHEST).signum() == 0);
+    }
+
+    // ================================================================ F 依赖与兜底
+
+    private static void groupF_dependencyAndGuard(MinecraftServer server) {
+        System.out.println("[F] 依赖主开关 / 不吞物品");
+        // 主开关关掉：这条规则是「进仓库」，没有仓库就什么都别做
+        VoidWarehouseSettings.voidWarehouse = false;
+        VoidWarehouseSettings.voidWarehouseBlockDrops = true;
+        check("F1 主开关关着时规则整体视为关闭", !VoidWarehouseBlockDrops.enabled());
+
+        int before = countItemEntities(Items.DIRT);
+        dig(Blocks.DIRT);
+        check("F2 主开关关着时掉落物照常掉在地上", countItemEntities(Items.DIRT) == before + 1);
+        clearItemEntities();
+
+        VoidWarehouseSettings.voidWarehouse = true;
+        check("F3 空堆叠不会被收（insert 失败返回 false）",
+                !VoidWarehouseBlockDrops.collect(level, ItemStack.EMPTY));
+        check("F4 空堆叠传进去也不会炸", true);
+    }
+
+    // ================================================================ 工具
+
+    /** 在 {@link #POS} 放一个方块，然后让玩家真的把它挖掉 */
+    private static boolean dig(net.minecraft.world.level.block.Block block) {
+        level.setBlockAndUpdate(POS, block.defaultBlockState());
+        BlockState state = level.getBlockState(POS);
+        if (state.isAir()) {
+            return false;
+        }
+        return bot.gameMode.destroyBlock(POS);
+    }
+
+    /** 世界里现在有几个「装着指定物品」的物品实体 */
+    private static int countItemEntities(net.minecraft.world.item.Item item) {
+        int n = 0;
+        for (Entity entity : level.getAllEntities()) {
+            if (entity instanceof ItemEntity itemEntity
+                    && itemEntity.getItem().is(item)
+                    && !itemEntity.isRemoved()) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private static void clearItemEntities() {
+        List<Entity> doomed = new ArrayList<>();
+        for (Entity entity : level.getAllEntities()) {
+            if (entity instanceof ItemEntity) {
+                doomed.add(entity);
+            }
+        }
+        for (Entity entity : doomed) {
+            entity.discard();
+        }
+    }
+
+    private static void note(String line) {
+        System.out.println("   [diag] " + line);
+    }
+
+    /** 目标类上被 mixin 合并进来、且类名里带指定字样的方法个数 */
+    private static int countHandlers(Class<?> type, String needle) {
+        int n = 0;
+        for (java.lang.reflect.Method m : type.getDeclaredMethods()) {
+            if (m.getName().contains(needle)) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private static String handlerNames(Class<?> type, String needle) {
+        StringBuilder sb = new StringBuilder();
+        for (java.lang.reflect.Method m : type.getDeclaredMethods()) {
+            if (m.getName().contains(needle)) {
+                sb.append(m.getName()).append(' ');
+            }
+        }
+        return sb.toString().trim();
+    }
+
+    private static MinecraftServer contextServer() {
+        return level.getServer();
+    }
+
+    private static void cleanup(MinecraftServer server) {
+        clearItemEntities();
+        if (bot != null) {
+            bot.getInventory().clearContent();
+            bot.discard();
+            bot = null;
+        }
+        level.setBlockAndUpdate(POS, Blocks.AIR.defaultBlockState());
+        level.setChunkForced(POS.getX() >> 4, POS.getZ() >> 4, false);
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        VoidWarehouseSettings.voidWarehouseBlockDrops = false;
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        System.out.println("SMOKE RESULT vw-blockdrops/@VER@ checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+        }
+        System.out.println("   " + (ok ? "ok  " : "FAIL") + " " + label);
+    }
+}

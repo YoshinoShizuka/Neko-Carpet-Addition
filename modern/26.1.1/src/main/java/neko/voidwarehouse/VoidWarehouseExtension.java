@@ -44,6 +44,11 @@ public class VoidWarehouseExtension implements CarpetExtension {
      */
     @Override
     public void onTick(MinecraftServer server) {
+        // 「可兑表」的重算按 tick 合并，需要一个 tick 戳（见 VoidWarehouseData#serverTick）。
+        // 写在这里、且在任何提前返回之前：规则关着时也要推进，否则重新打开时会拿到很旧的名单。
+        // 是 static 调用，不碰 VoidWarehouse.data()，所以不会牵动「空壳闸门」那条异常路径。
+        VoidWarehouseData.noteServerTick(server.getTickCount());
+
         if (VoidWarehouseSettings.voidWarehouse && VoidWarehouseSettings.voidWarehouseExchange) {
             VoidWarehouseExchangeBootstrap.tick(server);
         }

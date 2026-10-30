@@ -558,6 +558,33 @@ public final class VoidWarehouseData extends SavedData {
     private List<ExchangeOffer> offers;
 
     /**
+     * 库存变过、{@link #offers} 可能已经不准了。
+     *
+     * <p>与「直接把 {@link #offers} 置空」的区别，就是本字段存在的唯一理由：
+     * 置空之后再读，<b>同一个 tick 内</b>就会被逼着重算一次；而一次重算约 1.6 ms
+     * （40 条可兑时要跑 40 次规划）。20 名玩家在同一个 tick 里各入库一次、各刷新一次界面，
+     * 就是 20 次重算 ≈ 30 ms ≈ 61% 的 tick 预算 —— 这是实测出来的峰值。
+     * 所以这里只标「脏」，真正的重算按 tick 合并（见 {@link #exchangeOffers()}）。</p>
+     */
+    private boolean offersStale;
+
+    /** {@link #offers} 是在哪个 tick 上算出来的（与 {@link #serverTick} 同口径） */
+    private long offersTick = Long.MIN_VALUE;
+
+    /**
+     * 当前的服务端 tick，由 {@link VoidWarehouseExtension#onTick} 每 tick 写一次。
+     *
+     * <p><b>是 static 的，故意的</b>：一来不必为了记一个 tick 戳就去 {@code VoidWarehouse.data(server)}
+     * （那个方法在读不到存档时会抛异常拒绝服务，绝不能因此打断整个服务端 tick）；
+     * 二来存档数据实例被替换（重载世界）时，缓存和 tick 戳不会各说各话。</p>
+     *
+     * <p><b>用服务端自己的 tick，而不是自己加一</b>：万一哪天 onTick 不再被调用，
+     * 自己加一的计数器会停在原地 —— 那 {@link #offers} 就<b>永远</b>不再重算（比慢更糟）。
+     * 用真 tick 则最坏退化成「每 tick 重算一次」，行为仍然正确。</p>
+     */
+    private static long serverTick;
+
+    /**
      * 统一展示序缓存（{@link #unifiedOrder()}）：真实库存格与可兑条目按创造栏顺序归并后的序列。
      *
      * <p>编码：值 {@code >= 0} = {@link #entries} 下标；值 {@code < 0} = 可兑条目 {@code -(下标 + 1)}。</p>
@@ -1252,6 +1279,11 @@ public final class VoidWarehouseData extends SavedData {
         if (this.exchangeCacheSignature != signature) {
             this.exchangeCacheSignature = signature;
             this.offers = null;
+            // 这里是「开关 / 配方本变了」，不是「库存变了」：必须真作废，不能像
+            // markChanged() 那样只标脏 —— 否则关掉规则后界面上那些「可兑」幽灵格
+            // 还要多挂一个 tick。
+            this.offersStale = false;
+            this.offersTick = Long.MIN_VALUE;
             this.unifiedOrder = null;
             this.amountOrder = null;
         }
@@ -1749,7 +1781,17 @@ public final class VoidWarehouseData extends SavedData {
      */
     public List<ExchangeOffer> exchangeOffers() {
         this.revalidateExchangeCache();
-        if (this.offers != null) {
+        if (this.offers != null && (!this.offersStale || this.offersTick == serverTick)) {
+            // 第二个条件就是「按 tick 合并」的全部内容：
+            //   · 本 tick 已经算过一次 → 这一 tick 里再怎么改库存，返回的仍是这一份；
+            //   · 界面只在 tick 边界渲染，所以同一 tick 内所有人看到的本来就是同一帧，
+            //     多算的那 N−1 次纯属浪费（每次 1.6 ms）。
+            // 下一个 tick 的第一次读会因为 offersTick != serverTick 而重算，最多旧一 tick。
+            //
+            // 这是**有意的取舍**：用「最多 1 tick 的陈旧」换「tick 时间有上界」。
+            // 拿旧名单去点击是安全的 —— 取出路径一律重新规划（VoidWarehouseMenu#withdrawFrom
+            // → data.withdraw() / #withdrawShulkerBox → planExchangeMax），凑不出来就是空操作，
+            // 不会凭空造物；名单下标也有界检查（见 displaySlotAt），不会越界。
             return this.offers;
         }
         List<ExchangeOffer> built = new ArrayList<>();
@@ -1761,7 +1803,19 @@ public final class VoidWarehouseData extends SavedData {
         }
         built.sort(Comparator.comparingInt(offer -> VoidWarehouseSort.rankOf(offer.template())));
         this.offers = List.copyOf(built);
+        this.offersStale = false;
+        this.offersTick = serverTick;
         return this.offers;
+    }
+
+    /**
+     * 由 {@link VoidWarehouseExtension#onTick} 每 tick 调用一次，记下当前的服务端 tick。
+     *
+     * <p>只服务于 {@link #exchangeOffers()} 的「按 tick 合并」：同一 tick 内不重复重算。
+     * 必须是 static（原因见 {@link #serverTick}），所以调它<b>不需要</b>先拿到数据实例。</p>
+     */
+    public static void noteServerTick(int serverTick) {
+        VoidWarehouseData.serverTick = serverTick;
     }
 
     /** 收集 9 合 1 的「可兑」条目（原 {@code exchangeOffers} 的主体） */
@@ -2347,8 +2401,17 @@ public final class VoidWarehouseData extends SavedData {
         this.cachedCount = -1;
         this.cachedTotal = null;
         this.amountOrder = null;
-        // 库存一动，「能兑出什么、能兑多少」就全变了 —— 两个缓存一起作废
-        this.offers = null;
+        // 库存一动，「能兑出什么、能兑多少」就全变了。
+        //
+        // offers 只标脏、**不置空**：置空会让「同一 tick 内的下一次读」立刻重算一次，
+        // 而一次重算约 1.6 ms。20 个玩家在同一 tick 里各做一次动作、各刷新一次界面，
+        // 就是 20 次重算 ≈ 30 ms（实测占掉 61% 的 tick 预算）。重算按 tick 合并，
+        // 见 exchangeOffers()。
+        //
+        // unifiedOrder 必须**立刻**作废：它存的是 entries 的下标，取空一格就会让后面
+        // 全部前移，留着旧数组轻则显示错格、重则数组越界。它重建只要一次 O(n) 归并
+        // （几十微秒），不是瓶颈，这里不许偷懒。
+        this.offersStale = true;
         this.unifiedOrder = null;
         this.setDirty();
     }

@@ -89,6 +89,16 @@ public final class SystemTest {
     /** 防 JIT 死代码消除 */
     private static long sink;
 
+    /**
+     * 「伪造的 tick 线」，只给测试自己用。
+     *
+     * <p>真实 tick 由 {@code onTick} 每 tick 写进 {@code VoidWarehouseData}。
+     * 但测试里经常在<b>一个 stage（= 一个 tick）内</b>要模拟「下一个 tick」——
+     * 比如量可兑表重算的成本、或者验证「跨 tick 一定会看到最新库存」。
+     * 直接推一个大数就行，与真实 tick 是不是连续不重要，重要的是<b>变没变</b>。</p>
+     */
+    private static int tickLine = 100000;
+
     /** 世界里的测试方块（收尾要拆掉） */
     private static final List<BlockPos> placed = new ArrayList<>();
 
@@ -721,6 +731,38 @@ public final class SystemTest {
         // 异常：空栈
         check("K5 空栈返回 null", data.planExchange(ItemStack.EMPTY, BigInteger.ONE) == null);
         VoidWarehouseSettings.voidWarehouseCraft = false;
+
+        // ---- O 组：「可兑表按 tick 合并」的契约（峰值修复的核心） ----
+        //
+        // 这是个**故意写出来的取舍**：同一 tick 内改库存不重算（省掉 N−1 次 1.6ms），
+        // 但下一个 tick 必须立刻反映出来。只测 O3 不测 O2 就发现不了「合并变成永不更新」，
+        // 只测 O2 不测 O3 就发现不了「省电省成了陈旧」。
+        System.out.println("[FUNC] 9b 可兑表按 tick 合并的契约");
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_NUGGET, 9));
+        VoidWarehouseData.noteServerTick(++tickLine);
+        int withNine = data.exchangeOffers().size();
+        check("O1 9 粒铁粒 → 铁锭进可兑表（" + withNine + " 条）", withNine >= 1);
+        // 同一 tick 里把料取空：不重算（否则又是每次 1.6ms）
+        data.clearContent();
+        check("O2 同 tick 内不重算，返回上一份（" + data.exchangeOffers().size() + " 条）",
+                data.exchangeOffers().size() == withNine);
+        // 进下一个 tick：必须立刻看到「已经空了」
+        VoidWarehouseData.noteServerTick(++tickLine);
+        check("O3 下一 tick 立刻反映库存变化（不会永久陈旧）",
+                data.exchangeOffers().isEmpty());
+        // 再塞回去，下一个 tick 又该出现
+        data.insert(new ItemStack(Items.IRON_NUGGET, 9));
+        VoidWarehouseData.noteServerTick(++tickLine);
+        check("O4 库存回来 → 下一个 tick 又出现在表里",
+                data.exchangeOffers().size() == withNine);
+        // 规则关掉必须**立刻**消失（这条走的是 revalidate，不是按 tick 合并）
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+        check("O5 关规则立刻清空（走指纹作废，不等 tick）", data.exchangeOffers().isEmpty());
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+        data.clearContent();
     }
 
     // ================================================================== 11 补货通道
@@ -1060,7 +1102,15 @@ public final class SystemTest {
                     }
                 }
             }
-            data.insert(new ItemStack(Items.DIRT, 1));   // 保证条目数变化 → 缓存必定失效
+            // 空仓库那轮也要真的「脏」一下，否则 offersStale 一直是 false、量到的是命中
+            if (perItem <= 0) {
+                data.insert(new ItemStack(Items.DIRT, 1));
+                data.withdraw(new ItemStack(Items.DIRT), BigInteger.ONE);
+            }
+            // 必须推进 tick 戳：修好之后「同一 tick 内只重算一次」，
+            // 不推进的话第 2~5 轮量到的是缓存命中（0.02ms），量不到真东西。
+            // 推进 tick 就等于「这是下一个 tick 的第一次读」—— 也就是玩家真实的处境。
+            VoidWarehouseData.noteServerTick(++tickLine);
             long t0 = System.nanoTime();
             offers = data.exchangeOffers().size();
             best = Math.min(best, System.nanoTime() - t0);
@@ -1295,17 +1345,39 @@ public final class SystemTest {
         }
         check("MP 峰值前提：可兑表已拉到最坏形态", data.exchangeOffers().size() >= 30);
         int worstGroup = bots.size();
+        // A) 一个 tick 的**完整**成本：先推 tick（下一个 tick 的第一次读必然重算），
+        //    再让 20 个人在这个 tick 里交替「入库 + 刷新」。这才是「每 tick 一次重算」的真价。
         t0 = System.nanoTime();
         for (int round = 0; round < 4; round++) {
+            VoidWarehouseData.noteServerTick(++tickLine);            // 进入下一个 tick
             for (ServerPlayer ignored : bots) {
-                data.insert(new ItemStack(Items.IRON_NUGGET, 64));   // 入库 → 缓存失效
-                sink += data.exchangeOffers().size();                // 界面刷新 → 必须重算
+                data.insert(new ItemStack(Items.IRON_NUGGET, 64));   // 入库 → 只标脏
+                sink += data.exchangeOffers().size();                // 界面刷新
             }
         }
-        double worstMs = (System.nanoTime() - t0) / 1_000_000.0 / 4.0;
-        System.out.printf("[MP] %-8s 入库+界面刷新 %.3f ms/次（折合 %.1f%% 的 50ms tick）%n",
-                worstGroup + " 人峰值", worstMs, worstMs / 50.0 * 100.0);
-        check("MP 峰值：20 人同 tick 各自入库+刷新仍 < 50ms（不丢 tick）", worstMs < 50.0);
+        double perTickMs = (System.nanoTime() - t0) / 1_000_000.0 / 4.0;
+
+        // B) 同一 tick 内的第 2~21 个人：缓存已经算过了，应该只剩命中的钱
+        long sameTickNs = 0;
+        for (int round = 0; round < 4; round++) {
+            VoidWarehouseData.noteServerTick(++tickLine);
+            data.insert(new ItemStack(Items.IRON_NUGGET, 64));
+            sink += data.exchangeOffers().size();            // 第 1 个人：付一次重算（不计时）
+            long t1 = System.nanoTime();
+            for (ServerPlayer ignored : bots) {             // 第 2~21 个人
+                data.insert(new ItemStack(Items.IRON_NUGGET, 64));
+                sink += data.exchangeOffers().size();
+            }
+            sameTickNs += System.nanoTime() - t1;
+        }
+        double sameTickMs = sameTickNs / 1_000_000.0 / 4.0;
+
+        System.out.printf("[MP] %-8s 整 tick（含 1 次重算）%.3f ms | 同 tick 后续 20 人 %.4f ms%n",
+                worstGroup + " 人峰值", perTickMs, sameTickMs);
+        System.out.printf("[MP] %-8s 占 50ms tick %.1f%%（修复前 61.1%%）%n",
+                worstGroup + " 人峰值", perTickMs / 50.0 * 100.0);
+        check("MP 峰值：20 人同 tick 各自入库+刷新 ≤ 5ms（实测 "
+                + String.format("%.2f", perTickMs) + " ms）", perTickMs < 5.0);
     }
 
     // ================================================================== 收尾

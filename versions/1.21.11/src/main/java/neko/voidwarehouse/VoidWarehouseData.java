@@ -132,6 +132,22 @@ public final class VoidWarehouseData extends SavedData {
     /** 旧格式字段名，只用于解码，不再写出 */
     private static final String LEGACY_STACK_FIELD = "stack";
 
+    /**
+     * 配方本在存档里的字段名。内容是一整条用 {@code '\n'} 拼起来的文本，一条配方一行。
+     *
+     * <p><b>为什么是一个字符串而不是字符串列表</b>：这里必须留神
+     * {@link #ITEMS_CODEC} 那段注释讲的同一个坑 —— {@code Codec.listOf()} 的语义是
+     * 「全成或全不成」，只要有一条读不懂，整个 {@code VoidWarehouseData} 就解码失败，
+     * 上层会把它当成「文件不存在」，<b>静默造一个空仓库</b>并把旧文件覆盖掉。
+     * 而一个 {@code Codec.STRING} 字段永远不会失败，坏掉的只可能是里面某一<b>行</b>，
+     * 由 {@link VoidWarehouseRecipes#decodeAll} 逐行静默跳过。
+     * 用字段失败换行失败 —— 这个交换在仓库这件事上是唯一可接受的方向。</p>
+     */
+    private static final String RECIPES_KEY = "learned_recipes";
+
+    /** 配方行的分隔符（配方文本本身不会含换行） */
+    private static final char RECIPE_SEPARATOR = '\n';
+
     // ------------------------------------------------------------------ 一格
 
     /**
@@ -464,7 +480,12 @@ public final class VoidWarehouseData extends SavedData {
     public static final Codec<VoidWarehouseData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
             ITEMS_CODEC
                     .optionalFieldOf(ITEMS_KEY, List.of())
-                    .forGetter(VoidWarehouseData::decodedEntries)
+                    .forGetter(VoidWarehouseData::decodedEntries),
+            // 见 RECIPES_KEY 的注释：这里刻意用「一个字符串」而不是「字符串列表」，
+            // 让坏数据只影响它自己那一行，不至于把整个仓库拖成空壳。
+            Codec.STRING
+                    .optionalFieldOf(RECIPES_KEY, "")
+                    .forGetter(VoidWarehouseData::recipeTextsBlob)
     ).apply(instance, VoidWarehouseData::new));
 
     public static final SavedDataType<VoidWarehouseData> TYPE = new SavedDataType<>(
@@ -544,15 +565,41 @@ public final class VoidWarehouseData extends SavedData {
     private int[] unifiedOrder;
 
     /**
-     * 上面两个缓存是在「9 合 1 兑换规则开着还是关着」的哪种状态下算出来的。
+     * 上面这些缓存是在「哪些开关开着、配方本第几版」的哪种状态下算出来的。
      *
      * <p>规则开关是 Carpet 的 {@code /carpet} 命令改的，<b>不会经过 {@link #markChanged()}</b>，
-     * 所以缓存不能只认库存改动。这里的做法是每次取缓存前对一下当前开关：
-     * 开关一变就把两个缓存整体作废（见 {@link #revalidateExchangeCache()}）。
-     * 少了这一下，玩家把规则关掉之后那些「可兑」幽灵格会一直留在界面上，
-     * 点下去却什么都不发生 —— 与 {@link #exchangeEnabled()} 的承诺正好相反。</p>
+     * 配方本的变化也不经过它，所以缓存不能只认库存改动。做法是每次取缓存前对一下
+     * {@link #virtualEntrySignature()}：指纹一变就把几个缓存整体作废
+     * （见 {@link #revalidateExchangeCache()}）。</p>
      */
-    private boolean exchangeCacheEnabled;
+    private int exchangeCacheSignature;
+
+    /**
+     * 配方本：一条配方 = 一行文本（{@link VoidWarehouseRecipes#encode}）。
+     *
+     * <p>用 {@link java.util.LinkedHashSet} 而不是 {@code List}：<b>文本本身就是这一条配方的标识</b>
+     * （见 {@link VoidWarehouseRecipes.Recipe#recipeId()}），所以「去重」和「存储」是同一件事，
+     * 不需要额外维护一份键。保序是为了「同一件物品有多条配方时，先试先学到的那条」——
+     * 顺序稳定，算出来的账才稳定。</p>
+     *
+     * <p>这是全服共用的一份（见 {@link VoidWarehouseSettings#voidWarehouseCraft} 的注释）。</p>
+     */
+    private final java.util.LinkedHashSet<String> recipeTexts = new java.util.LinkedHashSet<>();
+
+    /** {@link #recipeTexts} 解码后的对象形式（派生缓存，任何增删都整体重建） */
+    private List<VoidWarehouseRecipes.Recipe> recipes = List.of();
+
+    /** 产物 id → 该产物的所有已学配方（派生缓存，与 {@link #recipes} 同步重建） */
+    private Map<String, List<VoidWarehouseRecipes.Recipe>> recipesByOutput = Map.of();
+
+    /**
+     * 配方本被改过几次。数字一变，{@link #offers} 与 {@link #unifiedOrder} 就整体作废。
+     *
+     * <p>为什么不复用 {@link #markChanged()}：那条路会连带 {@code setDirty()} 与统计缓存，
+     * 语义是「库存变了」；配方本变了但库存没变，用同一个开关会让「学一条配方」看起来
+     * 像一次库存改动。分开记更省事，也更好解释。</p>
+     */
+    private int recipeGeneration;
 
     public VoidWarehouseData() {
     }
@@ -565,7 +612,15 @@ public final class VoidWarehouseData extends SavedData {
      * 抛异常会让上层把整个仓库当成读取失败，那才是真正会丢数据的路径。
      * 「读到空」这种情况由 {@link VoidWarehouse#data} 那一层的指纹校验负责拦截。</p>
      */
-    VoidWarehouseData(List<Decoded> loaded) {
+    /**
+     * 从解码结果建仓库。
+     *
+     * <p>好条目进仓库（同物品合并）；坏条目原文留在 {@link #brokenEntries} 里，
+     * 下次写盘时原样写回。<b>注意这里绝不能因为「一条都读不出来」就抛异常</b> ——
+     * 抛异常会让上层把整个仓库当成读取失败，那才是真正会丢数据的路径。
+     * 「读到空」这种情况由 {@link VoidWarehouse#data} 那一层的指纹校验负责拦截。</p>
+     */
+    VoidWarehouseData(List<Decoded> loaded, String recipeBlob) {
         for (Decoded decoded : loaded) {
             if (decoded instanceof Decoded.Ok ok) {
                 ok.entry().toEntry().ifPresent(this::absorb);
@@ -579,8 +634,109 @@ public final class VoidWarehouseData extends SavedData {
         // 那一半判据必须就地冻结。全是坏条目（一条都读不懂）不算空壳：
         // 那是 ITEMS_CODEC 有意保留下来的原文，会在下次写盘时原样写回。
         this.loadedSuspicious = !loaded.isEmpty() && this.entries.isEmpty() && this.brokenEntries.isEmpty();
+        // 配方本逐行解码：坏行静默跳过（只可能来自手工改档），绝不牵连仓库本身。
+        // 回填时用的是<b>解码后的规范文本</b>而不是原始行 —— 于是坏行当场丢掉，
+        // 不会再出现「数得出 5 条、实际只有 4 条能用」这种幽灵计数。
+        if (recipeBlob != null && !recipeBlob.isEmpty()) {
+            List<String> lines = new ArrayList<>();
+            for (String line : recipeBlob.split(String.valueOf(RECIPE_SEPARATOR))) {
+                if (!line.isEmpty()) {
+                    lines.add(line);
+                }
+            }
+            this.recipes = List.copyOf(VoidWarehouseRecipes.decodeAll(lines));
+            for (VoidWarehouseRecipes.Recipe recipe : this.recipes) {
+                this.recipeTexts.add(recipe.recipeId());
+            }
+            this.recipesByOutput = VoidWarehouseRecipes.byOutput(this.recipes);
+        }
         // 这里不排序：载入进来的顺序可能是旧文件的乱序，但第一次读之前
         // ensureSorted() 一定会把它整成创造栏顺序（见 sortedGeneration 的初值 -1）。
+    }
+
+    /** 把 {@link #recipeTexts} 重新解成对象与分组（学一条、读档各调一次；条数很少，代价可忽略） */
+    private void rebuildRecipes() {
+        this.recipes = List.copyOf(VoidWarehouseRecipes.decodeAll(this.recipeTexts));
+        this.recipesByOutput = VoidWarehouseRecipes.byOutput(this.recipes);
+    }
+
+    /** 配方本在存档里怎么写的（{@link #CODEC} 的 getter）：一条一行 */
+    private String recipeTextsBlob() {
+        if (this.recipeTexts.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String line : this.recipeTexts) {
+            if (sb.length() > 0) {
+                sb.append(RECIPE_SEPARATOR);
+            }
+            sb.append(line);
+        }
+        return sb.toString();
+    }
+
+    // ------------------------------------------------------------------ 配方本
+
+    /**
+     * 「配方扣料」规则开着吗。
+     *
+     * <p>与 {@link #exchangeEnabled()} 同一形状：主开关 {@link VoidWarehouseSettings#voidWarehouse}
+     * 与专用开关都要开。主开关关了界面都打不开，这里一并视为关闭。</p>
+     */
+    public static boolean craftEnabled() {
+        return VoidWarehouseSettings.voidWarehouse && VoidWarehouseSettings.voidWarehouseCraft;
+    }
+
+    /**
+     * 记下一条配方（玩家刚刚在合成台上真的做出来的那一条）。
+     *
+     * <p>规则没开时<b>直接返回 {@code false} 且什么都不做</b> —— 关着的规则不该悄悄
+     * 往存档里长东西。同一个道理，配方本满了也不再记（见
+     * {@link VoidWarehouseRecipeBook#MAX_RECIPES}）。</p>
+     *
+     * <p>返回 {@code true} 表示这是一条<b>新</b>配方；已经记过的返回 {@code false}
+     * （重复合成同一件东西是常态，不该每合一次都写一次盘）。</p>
+     */
+    public boolean learn(VoidWarehouseRecipes.Recipe recipe) {
+        if (!craftEnabled() || recipe == null) {
+            return false;
+        }
+        if (this.recipeTexts.contains(recipe.recipeId())) {
+            return false;
+        }
+        if (this.recipeTexts.size() >= VoidWarehouseRecipeBook.MAX_RECIPES) {
+            return false;
+        }
+        this.recipeTexts.add(recipe.recipeId());
+        this.rebuildRecipes();
+        this.recipeGeneration++;
+        // 新配方可能多出一格「可合成」虚拟条目 → 展示序与条目缓存都要重算
+        this.offers = null;
+        this.unifiedOrder = null;
+        this.amountOrder = null;
+        this.setDirty();
+        return true;
+    }
+
+    /** 配方本里现在有几条<b>能用的</b>（自检与界面提示用；读不出来的那种不算，见构造函数） */
+    public int learnedRecipeCount() {
+        return this.recipes.size();
+    }
+
+    /** 这个产物有没有已学会的配方（界面判断「这一格该不该显示成可合成」用） */
+    public boolean hasRecipeFor(String itemId) {
+        return itemId != null && this.recipesByOutput.containsKey(itemId);
+    }
+
+    /**
+     * 带命名空间的物品 id → 仓库里有多少个<b>纯净</b>物品（口径同 {@link #amountOf(Item)}）。
+     *
+     * <p>配方本的 id 是完整命名空间的（见 {@link VoidWarehouseRecipeBook#idOf(Item)}），
+     * 与 9 合 1 那套只留 path 的 id 不是一回事，所以这里单独走
+     * {@link VoidWarehouseRecipeBook#itemOf(String)} 解析。</p>
+     */
+    public BigInteger amountOfId(String itemId) {
+        return this.amountOf(VoidWarehouseRecipeBook.itemOf(itemId));
     }
 
     /**
@@ -1062,18 +1218,39 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * 规则开关变过就把「可兑条目」与「统一展示序」两个缓存整体作废。
+     * 影响「虚拟条目」内容的全部开关的指纹：两个规则开关 + 配方本修订号。
+     *
+     * <p>为什么要合成一个 int 而不是分别比较：三个开关任意一个变了，{@link #offers} 与
+     * {@link #unifiedOrder} 都必须整体作废，而 {@link #amountOrder} 的<b>长度</b>依赖
+     * {@code unifiedOrder}，忘了清哪个都会留下幽灵格或者下标越界。
+     * 合成一个「只要变了就整体清空」的指纹，漏清的可能性从「三处」降成「一处」。</p>
+     */
+    private int virtualEntrySignature() {
+        int signature = this.recipeGeneration << 2;
+        if (VoidWarehouseSettings.voidWarehouse) {
+            if (VoidWarehouseSettings.voidWarehouseExchange) {
+                signature |= 1;
+            }
+            if (VoidWarehouseSettings.voidWarehouseCraft) {
+                signature |= 2;
+            }
+        }
+        return signature;
+    }
+
+    /**
+     * 开关或配方本变过就把「虚拟条目」与「统一展示序」几个缓存整体作废。
      *
      * <p>库存改动走 {@link #markChanged()} 已经清过一次，但<b>规则开关不走那条路</b> ——
      * 它是 {@code /carpet voidWarehouseExchange false} 直接改的静态字段。
      * 少了这一下，关掉规则后界面上那些「可兑」幽灵格会一直留着。</p>
      *
-     * <p>开销就是一次布尔比较，所以可以放在每次取缓存之前。</p>
+     * <p>开销就是一次 int 比较（外加两次布尔读），所以可以放在每次取缓存之前。</p>
      */
     private void revalidateExchangeCache() {
-        boolean enabled = exchangeEnabled();
-        if (this.exchangeCacheEnabled != enabled) {
-            this.exchangeCacheEnabled = enabled;
+        int signature = this.virtualEntrySignature();
+        if (this.exchangeCacheSignature != signature) {
+            this.exchangeCacheSignature = signature;
             this.offers = null;
             this.unifiedOrder = null;
             this.amountOrder = null;
@@ -1081,18 +1258,31 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * 一个「可兑」条目：仓库里<b>一件都没有</b>这种物品，但靠 9 合 1 兑换能拿出来。
+     * 一个「虚拟条目」：仓库里<b>一件都没有</b>这种物品，但能靠换算/合成拿出来。
      *
-     * @param itemId     物品 id（如 {@code "iron_ingot"}）
+     * <p>两种来源共用这一个类型（{@link #craft} 区分）：</p>
+     * <ul>
+     *   <li><b>9 合 1 兑换</b>：原版那 47 条 9:1 / 4:1 的换算，有完整的价值体系防刷；</li>
+     *   <li><b>配方扣料</b>：照玩家亲手合成过的那条配方扣原料，只做一层、不做换算。</li>
+     * </ul>
+     * <p>打平成一个类型，是因为界面层对两者的处理<b>逐字相同</b>（同一套分页、同一个
+     * {@code -(下标+1)} 编码、同一条点击路径）。分成两个列表会让「第几格是谁」出现第二个真相，
+     * 而那正是历史上最容易出错的地方。</p>
+     *
+     * @param itemId     物品 id（9 合 1 是 {@code "iron_ingot"} 这种只留 path 的口径；
+     *                   配方扣料是 {@code "minecraft:iron_ingot"} 这种全命名空间的口径 ——
+     *                   两者只在各自内部使用，不互相查表，所以不必统一）
      * @param template   这一件物品的样板（数量恒 1，无数据组件）
-     * @param obtainable 现在最多能兑出多少个
+     * @param obtainable 现在最多能拿出多少个
      * @param bulk       普通模式右键「取一组」实际能取到的量。<b>不等于
      *                   {@code min(堆叠上限, obtainable)}</b> —— 仓库里只有铜块时那个算式给 64，
      *                   而真值是 63（7 块 = 63；要 64 就得拆 8 块、在仓库里留下 8 个零头）。
      *                   tooltip 必须写这个数，否则又变成「数字对不上」
      * @param boxed      潜影盒模式左键「交出 1 盒」实际能装进去的量，同理必须问规划器
-     * @param totalCost  把这 {@code obtainable} 个<b>一次性全兑出来</b>的账目：
-     *                   负数 = 要从仓库扣走的，正数 = 找零退回仓库的
+     * @param totalCost  把这 {@code obtainable} 个<b>一次性全拿出来</b>的账目：
+     *                   负数 = 要从仓库扣走的，正数 = 退回仓库的
+     * @param craft      这是「配方扣料」的条目吗（{@code false} = 9 合 1 兑换）。<b>只影响文案</b>，
+     *                   取货路径两者完全共用
      *
      * <p><b>为什么是总量而不是单价</b>：拆零场景下每一步的边际成本都不一样，
      * 「单价 × 个数」会算出仓库里根本不存在的账。手上只有 1 个铁块时兑 9 个铁锭，
@@ -1101,7 +1291,8 @@ public final class VoidWarehouseData extends SavedData {
      * 拿它去显示，玩家一眼就看出数字对不上。所以这里直接存规划器给出的那一份真账。</p>
      */
     public record ExchangeOffer(String itemId, ItemStack template, BigInteger obtainable, BigInteger bulk,
-                                BigInteger boxed, List<VoidWarehouseExchange.Delta> totalCost) {
+                                BigInteger boxed, List<VoidWarehouseExchange.Delta> totalCost,
+                                boolean craft) {
         public ExchangeOffer {
             totalCost = List.copyOf(totalCost);
         }
@@ -1206,10 +1397,28 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     private VoidWarehouseExchange.Plan planExchange(ItemStack sample, BigInteger amount, boolean allowPartial) {
-        if (!exchangeEnabled() || sample == null || sample.isEmpty()
-                || amount == null || amount.signum() <= 0) {
+        if (sample == null || sample.isEmpty() || amount == null || amount.signum() <= 0) {
             return null;
         }
+        // ① 9 合 1 兑换（原版换算，有完整价值体系）
+        if (exchangeEnabled()) {
+            VoidWarehouseExchange.Plan plan = this.planNineInOne(sample, amount, allowPartial);
+            if (plan != null) {
+                return plan;
+            }
+        }
+        // ② 配方扣料（玩家亲手合成过的配方，只做一层）
+        //    排在 9 合 1 之后：9 合 1 是「原版真有这条换算」，口径最硬、谁也改不了；
+        //    配方扣料是「玩家自己做过的那一次」，灵活但没有价值体系。
+        //    两者都命中时按更硬的走，这样「铁粒换铁锭」永远不会被某条奇怪的玩家配方挤掉。
+        if (craftEnabled()) {
+            return this.planCraft(sample, amount, allowPartial);
+        }
+        return null;
+    }
+
+    /** 9 合 1 的规划（原来 {@code planExchange} 的全部内容，抽出来给上面那两级用） */
+    private VoidWarehouseExchange.Plan planNineInOne(ItemStack sample, BigInteger amount, boolean allowPartial) {
         String itemId = VoidWarehouseExchangeBootstrap.idOf(sample.getItem());
         if (itemId == null) {
             return null;
@@ -1222,6 +1431,138 @@ public final class VoidWarehouseData extends SavedData {
         return allowPartial
                 ? VoidWarehouseExchange.planMax(table, itemId, amount, stock)
                 : VoidWarehouseExchange.plan(table, itemId, amount, stock);
+    }
+
+    /**
+     * 规划「按已学配方扣料拿到 {@code amount} 个 {@code sample}」。
+     *
+     * <p>返回的是一份 {@link VoidWarehouseExchange.Plan} —— 这是本功能最省事的一点：
+     * <b>计划只是一串「谁加多少、谁减多少」</b>，它的来源（9 合 1 换算出来的，还是照配方扣出来的）
+     * 对执行层完全不可见。于是 {@code applyExchange} / {@code Withdrawal} / 回滚 / 漏斗 /
+     * 打印机这<b>五条既有链路一行都不用改</b>，配方扣料天然接在它们身上。</p>
+     *
+     * <h2>成品已有库存时必须先扣库存</h2>
+     * <p>这里最容易出错的地方：{@code amount} 是「一共要给玩家多少」，其中<b>已经躺在仓库里</b>
+     * 的那部分不该再做一遍 —— 否则「仓库里有 5 个活塞、取 10 个」会变成扣 10 份原料
+     * 却只拿走 5 个新做的，多出来的 5 个凭空蒸发（或者反过来凭空出现，取决于账怎么写）。
+     * 所以三笔账分开记：</p>
+     * <ul>
+     *   <li>仓库现成的 {@code fromStock} 个 → <b>扣掉</b>（产物那一项负 {@code fromStock}）；</li>
+     *   <li>剩下 {@code need} 个，按配方做 {@code crafts} 次 → 原料负扣；</li>
+     *   <li>做出来的比要的多（木板这种一次 4 个）→ 多出来的 {@code surplus} <b>入账</b>回仓库。</li>
+     * </ul>
+     * <p>三笔合起来净值恰好是「仓库少了原料、多了余量，玩家拿到 amount 个」，一个字节不差。</p>
+     */
+    private VoidWarehouseExchange.Plan planCraft(ItemStack sample, BigInteger amount, boolean allowPartial) {
+        String itemId = VoidWarehouseRecipeBook.idOf(sample.getItem());
+        if (itemId == null) {
+            return null;
+        }
+        List<VoidWarehouseRecipes.Recipe> candidates = this.recipesByOutput.get(itemId);
+        if (candidates == null || candidates.isEmpty()) {
+            return null;
+        }
+        Item product = VoidWarehouseRecipeBook.itemOf(itemId);
+        if (product == null) {
+            return null;
+        }
+        BigInteger have = this.amountOf(product);
+        BigInteger fromStock = have.min(amount);
+        BigInteger need = amount.subtract(fromStock);
+
+        // 成品本身已经够（或刚好够）—— 不需要做任何合成，只把库存这几笔记进账里。
+        // 这条路正常走不到（调用方都是「成品没货」才来问），但留着它是为了「账永远完整」：
+        // 缺了这段，那些调用方一旦改成「不管有没有货都先问一句」，就会扣了原料还留着成品。
+        if (need.signum() <= 0) {
+            if (fromStock.signum() <= 0) {
+                return null;
+            }
+            Map<String, BigInteger> deltas = new java.util.LinkedHashMap<>();
+            deltas.merge(itemId, fromStock.negate(), BigInteger::add);
+            return this.toExchangePlan(itemId, fromStock, deltas);
+        }
+
+        // 同一件物品可能有多条已学配方（用橡木木板做过一次、用云杉木板又做过一次）。
+        // 按学会的顺序逐条试，第一条做得出来的就用它 —— 顺序稳定，账才稳定。
+        for (VoidWarehouseRecipes.Recipe recipe : candidates) {
+            Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(this, recipe);
+            // 已经划给玩家的 fromStock 个必须从配方可用的料里<b>先扣掉</b>。
+            // 否则「产物自己就是原料」的配方（地图缩放：1 地图 + 8 纸 → 1 地图；地图复制：
+            // 1 地图 + 1 空地图 → 2 地图；潜影盒染色同理）会把同一份库存数两遍 ——
+            // 一份算给玩家、一份算进配方，那就是凭空造物。
+            // 扣掉之后这类配方的结果是「做不出来」（保守失败），而不是「做出来了但账对不上」。
+            if (fromStock.signum() > 0 && stock.containsKey(itemId)) {
+                stock.put(itemId, stock.get(itemId).subtract(fromStock).max(BigInteger.ZERO));
+            }
+            BigInteger wantOut = need;
+            if (allowPartial) {
+                // 「尽量给」：做得少就少给，不整次失败（右键取一组要的就是这个语义）
+                BigInteger maxOut = VoidWarehouseRecipes.maxCraftable(recipe, stock);
+                if (maxOut.signum() <= 0) {
+                    continue;
+                }
+                wantOut = need.min(maxOut);
+            }
+            VoidWarehouseRecipes.Plan plan = VoidWarehouseRecipes.plan(recipe, wantOut, stock);
+            if (plan == null) {
+                continue;
+            }
+            BigInteger produced = plan.crafts().multiply(BigInteger.valueOf(recipe.outputCount()));
+            // 真正给到玩家手上的新做出来的数量 = 做出来的 − 退回仓库的余量
+            BigInteger gained = produced.subtract(plan.surplus());
+            Map<String, BigInteger> deltas = new java.util.LinkedHashMap<>();
+            for (Map.Entry<String, BigInteger> entry : plan.consumed().entrySet()) {
+                deltas.merge(entry.getKey(), entry.getValue().negate(), BigInteger::add);
+            }
+            if (plan.surplus().signum() > 0) {
+                deltas.merge(itemId, plan.surplus(), BigInteger::add);
+            }
+            deltas.merge(itemId, fromStock.negate(), BigInteger::add);
+            return this.toExchangePlan(itemId, fromStock.add(gained), deltas);
+        }
+        return null;
+    }
+
+    /**
+     * 把一份「物品 → 增减」的账收成 {@link VoidWarehouseExchange.Plan}。
+     *
+     * <p>顺手做两件事，都是为了让 {@code applyExchange} 那边一行不用改：</p>
+     * <ol>
+     *   <li><b>合并同 id</b>：配方扣料里产物可能同时出现在「扣库存」和「收余量」两笔里
+     *       （比如拿木板取木板），合并之后每件物品最多出现一次，账目和 tooltip 都不会重复列；</li>
+     *   <li><b>丢掉净零</b>：{@code 0} 的增减没有任何意义，留着只会让 {@code isEmpty()} 判错。</li>
+     * </ol>
+     */
+    private VoidWarehouseExchange.Plan toExchangePlan(String itemId, BigInteger amount,
+                                                      Map<String, BigInteger> deltas) {
+        List<VoidWarehouseExchange.Delta> out = new ArrayList<>(deltas.size());
+        for (Map.Entry<String, BigInteger> entry : deltas.entrySet()) {
+            if (entry.getValue().signum() != 0) {
+                out.add(new VoidWarehouseExchange.Delta(entry.getKey(), entry.getValue()));
+            }
+        }
+        return new VoidWarehouseExchange.Plan(itemId, amount, out);
+    }
+
+    /**
+     * 计划里的物品 id → {@link Item}。<b>两套 id 口径的分岔只在这一处收口。</b>
+     *
+     * <p>9 合 1 那套 id 只有 path（{@code "iron_ingot"}），配方本那套带命名空间
+     * （{@code "minecraft:iron_ingot"}）。差别不在风格上，而在解析函数上：
+     * {@code VoidWarehouseExchangeBootstrap.itemOf} 会把整个字符串当成 path 拼到
+     * {@code minecraft:} 后面，喂给它一个带冒号的 id 会拼出
+     * {@code minecraft:minecraft:iron_ingot} 这种非法标识并抛异常。</p>
+     *
+     * <p>判据就是「有没有冒号」—— 9 合 1 的表里<b>从来没有</b>冒号，配方本写出去的时候
+     * <b>永远带</b>冒号，所以这个判据不是猜，是两边格式的硬事实。</p>
+     */
+    private static Item resolveItem(String itemId) {
+        if (itemId == null || itemId.isEmpty()) {
+            return null;
+        }
+        return itemId.indexOf(':') < 0
+                ? VoidWarehouseExchangeBootstrap.itemOf(itemId)
+                : VoidWarehouseRecipeBook.itemOf(itemId);
     }
 
     /**
@@ -1239,7 +1580,7 @@ public final class VoidWarehouseData extends SavedData {
             return;
         }
         for (VoidWarehouseExchange.Delta delta : plan.deltas()) {
-            Item item = VoidWarehouseExchangeBootstrap.itemOf(delta.itemId());
+            Item item = resolveItem(delta.itemId());
             if (item == null) {
                 // 启动时已经复核过表，这里正常到不了；真到了也只是跳过这一笔（绝不清零）
                 continue;
@@ -1384,28 +1725,43 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * 当前所有「可兑」条目，按创造模式物品栏顺序排好（缓存，任何改动即失效）。
+     * 当前所有「虚拟条目」（9 合 1 可兑 + 已学配方可合成），按创造模式物品栏顺序排好
+     * （缓存，任何改动即失效）。
      *
      * <p>入选条件两条，缺一不可：</p>
      * <ol>
-     *   <li>这件物品<b>仓库里一件都没有</b> —— 有货就不该出现「可兑」格，
+     *   <li>这件物品<b>仓库里一件都没有</b> —— 有货就不该出现虚拟格，
      *       否则玩家会看到一个假的库存量，而且点下去会意外消耗别的东西；</li>
-     *   <li>现有库存<b>真的能兑出至少 1 个</b> —— 只列「理论上能兑」会把
-     *       兑换表里 54 个物品全列出来，其中绝大多数当前兑不动，纯属噪音。</li>
+     *   <li>现有库存<b>真的能拿出至少 1 个</b> —— 只列「理论上能」会把兑换表里几十个物品
+     *       加配方本里几百条全列出来，其中绝大多数当前做不动，纯属噪音。</li>
      * </ol>
+     *
+     * <p><b>两类的先后与去重</b>：9 合 1 先算，配方扣料后算，且<b>已有 9 合 1 条目的物品
+     * 不再生成配方条目</b> —— 同一件东西在界面上出现两格（一格写「可兑」一格写「可合成」）
+     * 会让玩家以为能拿两份。优先级给 9 合 1，因为它是「原版真有这条换算」，
+     * 有完整价值体系防刷，口径比玩家自选配方更硬。</p>
      */
     public List<ExchangeOffer> exchangeOffers() {
         this.revalidateExchangeCache();
         if (this.offers != null) {
             return this.offers;
         }
-        if (!exchangeEnabled()) {
-            this.offers = List.of();
-            return this.offers;
+        List<ExchangeOffer> built = new ArrayList<>();
+        if (exchangeEnabled()) {
+            this.collectNineInOneOffers(built);
         }
+        if (craftEnabled()) {
+            this.collectCraftOffers(built);
+        }
+        built.sort(Comparator.comparingInt(offer -> VoidWarehouseSort.rankOf(offer.template())));
+        this.offers = List.copyOf(built);
+        return this.offers;
+    }
+
+    /** 收集 9 合 1 的「可兑」条目（原 {@code exchangeOffers} 的主体） */
+    private void collectNineInOneOffers(List<ExchangeOffer> built) {
         VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
         VoidWarehouseExchange.Stock stock = VoidWarehouseExchange.Stock.of(this.exchangeStock());
-        List<ExchangeOffer> built = new ArrayList<>();
         for (String itemId : table.items()) {
             Item item = VoidWarehouseExchangeBootstrap.itemOf(itemId);
             if (item == null || this.amountOf(item).signum() > 0) {
@@ -1433,11 +1789,79 @@ public final class VoidWarehouseData extends SavedData {
                     Math.max(1, sample.getMaxStackSize()), stock);
             BigInteger boxed = takeAmount(table, itemId, plan.amount(),
                     VoidWarehouseShulker.capacity(sample), stock);
-            built.add(new ExchangeOffer(itemId, sample, plan.amount(), bulk, boxed, plan.deltas()));
+            built.add(new ExchangeOffer(itemId, sample, plan.amount(), bulk, boxed, plan.deltas(), false));
         }
-        built.sort(Comparator.comparingInt(offer -> VoidWarehouseSort.rankOf(offer.template())));
-        this.offers = List.copyOf(built);
-        return this.offers;
+    }
+
+    /**
+     * 收集「可合成」条目：仓库里没货、但有已学配方、且<b>此刻真的做得出来</b>的产物。
+     *
+     * <h2>为什么这里不用「探针」那一套</h2>
+     * <p>9 合 1 的 {@code planMax} 要从上界往下逐个试，因为「能拿 5 个不一定能拿 4 个」（拆整块会跳档）。
+     * 配方扣料<b>没有这个问题</b>：能做 {@code n} 次就一定能做 {@code 1..n} 次
+     * （原料按倍数扣，没有任何取整陷阱），所以上限直接由 {@link VoidWarehouseRecipes#maxCraftable}
+     * 一次算出来，<b>零次试探</b>。这就是这条路径在界面上几乎不花钱的原因。</p>
+     *
+     * <p>也因此这里<b>不会</b>出现 1.0.13 那种「打开界面卡死」的形态 ——
+     * 那个事故的根因是「上界虚高 × 逐个试探」，而这里两个乘数之一（试探次数）恒等于 0。</p>
+     */
+    private void collectCraftOffers(List<ExchangeOffer> built) {
+        if (this.recipesByOutput.isEmpty()) {
+            return;
+        }
+        // 已经有 9 合 1 条目的物品不重复出现（见 exchangeOffers 的注释）
+        java.util.Set<String> taken = new java.util.HashSet<>(built.size());
+        for (ExchangeOffer offer : built) {
+            taken.add(offer.itemId());
+        }
+        for (Map.Entry<String, List<VoidWarehouseRecipes.Recipe>> group : this.recipesByOutput.entrySet()) {
+            String itemId = group.getKey();
+            if (taken.contains(itemId)) {
+                continue;
+            }
+            Item item = VoidWarehouseRecipeBook.itemOf(itemId);
+            if (item == null || this.amountOf(item).signum() > 0) {
+                continue;
+            }
+            // 同一产物可能有多条配方：取「做得最多」的那一条来算上限与账单，
+            // 与 planCraft 的「逐条试、第一条能做的就用」不冲突 —— 那边保证能给出至少这么多个。
+            VoidWarehouseRecipes.Recipe best = null;
+            BigInteger maxOut = BigInteger.ZERO;
+            Map<String, BigInteger> bestStock = Map.of();
+            for (VoidWarehouseRecipes.Recipe recipe : group.getValue()) {
+                Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(this, recipe);
+                BigInteger out = VoidWarehouseRecipes.maxCraftable(recipe, stock);
+                if (out.compareTo(maxOut) > 0) {
+                    maxOut = out;
+                    best = recipe;
+                    bestStock = stock;
+                }
+            }
+            if (best == null || maxOut.signum() <= 0) {
+                continue;
+            }
+            // 账单 = 做满 maxOut 个要扣的原料（全部是负数）。余量不入账目：
+            // tooltip 的「用 X 12 个」说的是成本，「找回」那一段对配方扣料是噪音
+            // （产物多出来的部分会静静回到仓库，玩家不需要为此读一行字）。
+            VoidWarehouseRecipes.Plan plan = VoidWarehouseRecipes.plan(best, maxOut, bestStock);
+            if (plan == null) {
+                continue;
+            }
+            List<VoidWarehouseExchange.Delta> cost = new ArrayList<>(plan.consumed().size());
+            for (Map.Entry<String, BigInteger> entry : plan.consumed().entrySet()) {
+                if (entry.getValue().signum() > 0) {
+                    cost.add(new VoidWarehouseExchange.Delta(entry.getKey(), entry.getValue().negate()));
+                }
+            }
+            ItemStack sample = new ItemStack(item);
+            // 一次动作实际能拿多少：配方扣料是「做 n 次就给 n 份」，没有拆整块的跳档，
+            // 所以这里就是「上限与可做数量的较小者」—— 这个算式在<b>这条路径上</b>是精确的，
+            // 与 9 合 1 那边必须问规划器的情况不同（理由见 takeAmount 的注释）。
+            long maxStack = Math.max(1, sample.getMaxStackSize());
+            BigInteger bulk = maxOut.min(BigInteger.valueOf(maxStack));
+            BigInteger boxed = maxOut.min(BigInteger.valueOf(Math.max(1, VoidWarehouseShulker.capacity(sample))));
+            built.add(new ExchangeOffer(itemId, sample, maxOut, bulk, boxed, cost, true));
+        }
     }
 
     /**
@@ -1613,10 +2037,17 @@ public final class VoidWarehouseData extends SavedData {
      * @param boxMode 潜影盒模式（操作行换成「交出盒子」那一套，与普通格的口径保持一致）
      */
     public static ItemStack buildExchangeDisplay(ExchangeOffer offer, boolean boxMode) {
+        // 两类虚拟条目共用这一套渲染，只有「动词」和「角标」不同 —— 其余（数量、账单、
+        // 一次能拿多少、盒模式那一套）逐字相同，所以不复制一份方法，只把词换掉。
+        // 「兑换」说的是仓库替你做了一次换算，「合成」说的是仓库替你摆了合成格，
+        // 对玩家来说这一步的差别就在于「用的是哪套规则」，角标承担这个信息。
+        String verb = offer.craft() ? "合成" : "兑换";
+        String tag = offer.craft() ? "（可合成）" : "（可兑）";
+
         ItemStack stack = offer.template().copyWithCount(1);
         stack.set(DataComponents.CUSTOM_NAME,
                 VoidWarehouseText.tinted(offer.template().getHoverName(), VoidWarehouseText.FACT)
-                        .append(VoidWarehouseText.line("（可兑）", VoidWarehouseText.FACT)));
+                        .append(VoidWarehouseText.line(tag, VoidWarehouseText.FACT)));
 
         List<Component> lore = new ArrayList<>(4);
         lore.add(exchangeSummary(offer));
@@ -1638,23 +2069,25 @@ public final class VoidWarehouseData extends SavedData {
             // 照抄那个算式就是在数量后面又写一个跟仓库无关的常数。
             long bulk = offer.bulk().longValue();
             if (bulk <= 1) {
-                lore.add(VoidWarehouseText.line("左键 / 右键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("左键 / 右键：" + verb + " 1 个", VoidWarehouseText.ACTION_RGB));
             } else if (bulk >= max) {
-                lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line("右键：兑换 " + max + " 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("左键：" + verb + " 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：" + verb + " " + max + " 个", VoidWarehouseText.ACTION_RGB));
             } else if (bulk >= offer.obtainable().longValue()) {
                 // 仓库里一共就这么多可兑 —— 一次就能全拿走
-                lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line("右键：兑换 " + VoidWarehouseText.count(bulk)
-                        + " 个（最多兑出这么多）", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("左键：" + verb + " 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：" + verb + " " + VoidWarehouseText.count(bulk)
+                        + " 个（最多" + (offer.craft() ? "做得出" : "兑得出") + "这么多）", VoidWarehouseText.ACTION_RGB));
             } else {
                 // 仓库里能兑更多，但一次取不到一组 —— 因为上级只能按整块拆
-                lore.add(VoidWarehouseText.line("左键：兑换 1 个", VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line("右键：兑换 " + VoidWarehouseText.count(bulk)
+                lore.add(VoidWarehouseText.line("左键：" + verb + " 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line("右键：" + verb + " " + VoidWarehouseText.count(bulk)
                         + " 个（按整块拆，不留零头）", VoidWarehouseText.ACTION_RGB));
             }
         }
-        lore.add(VoidWarehouseText.line("仓库里没有这种物品，靠合成兑换取出", VoidWarehouseText.NOTE));
+        lore.add(VoidWarehouseText.line(offer.craft()
+                ? "仓库里没有这种物品，靠已学会的配方扣原料取出"
+                : "仓库里没有这种物品，靠合成兑换取出", VoidWarehouseText.NOTE));
 
         stack.set(DataComponents.LORE, new ItemLore(lore));
         return stack;
@@ -1689,7 +2122,9 @@ public final class VoidWarehouseData extends SavedData {
             if (negatives != (delta.change().signum() < 0)) {
                 continue;
             }
-            Item item = VoidWarehouseExchangeBootstrap.itemOf(delta.itemId());
+            // 必须走 resolveItem：账单里可能混着配方本那套「带命名空间的 id」
+            // （配方扣料的条目就是这样），直接喂给 9 合 1 的解析器会拼出非法标识。
+            Item item = resolveItem(delta.itemId());
             if (item == null) {
                 continue;
             }
@@ -1716,6 +2151,12 @@ public final class VoidWarehouseData extends SavedData {
      * 层级分不出谁大谁小，价值才分得出。</p>
      */
     private static boolean splitsFromAbove(ExchangeOffer offer) {
+        // 配方扣料的条目一律算「可合成」：它扣的全是配方原料，不存在「拆上级」这回事。
+        // 不加这一句的话，产物恰好也在兑换表里时（比如铁锭），会被拿去做价值比较，
+        // 万一某个原料比它值钱，界面就会把「扣 4 个圆石合成活塞」写成「可拆出」。
+        if (offer.craft()) {
+            return false;
+        }
         VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
         if (!table.contains(offer.itemId())) {
             return false;

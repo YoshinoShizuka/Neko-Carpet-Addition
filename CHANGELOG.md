@@ -20,27 +20,41 @@
 - 默认 `false`，**依赖** `voidWarehouse`：没有仓库就什么都不做(Disabled by default and requires `voidWarehouse`.)。
 - 规则名**故意**不同于上游 [Carpet-Org-Addition](https://github.com/fcsailboat/Carpet-Org-Addition) 的 `blockDropsDirectlyEnterInventory`：`SettingsManager#addCarpetRule` 遇重名直接抛异常，同名意味着两个附加包同装就起不来(Named differently from the upstream rule to avoid a carpet rule-name clash.)。
 
+#### 打印机余料退回虚空仓库（`printer_return` 通道）
+
+打印机从仓库补到的是**一整组**材料，用不完的一直占着格子 —— 投影材料超过三十种时背包会被这些零头塞满，之后就再也装不下新材料，只能卡在缺料上(Printer leftovers now go back to the warehouse, so a schematic with dozens of material types no longer fills the inventory with partly used stacks.)。
+
+- **方向与取货对称**：`printer_return`（C2S）/ `printer_return_result`（S2C），一次往返退一整批槽位，不再一格一个包(Symmetric with restocking, and one round trip returns a whole batch of slots.)。
+- 🔴 **只收槽位号，不收物品**：客户端说「第 12 格不要了」，服务端**自己去读**第 12 格，读到什么就把什么入库。客户端从头到尾没有机会描述物品内容，所以一条被改过的包最多只能「把玩家自己的东西挪进玩家自己的仓库」，**不可能凭空刷物资** —— 这条能力与漏斗、拆潜影盒完全同一量级(The server reads its own inventory slot instead of trusting client-supplied stacks, so this channel cannot create items.)。
+- 🔴 **潜影盒整类挡掉**：`insert` 遇到非空盒子会拆成「壳 + 箱子 + 内容物」。放在自动返还路径上就等于「发一个槽位号就把玩家的盒子不可逆地拆了」，所以这里与取货的拒绝清单保持同一口径(Shulker boxes are refused outright: inserting one would unpack it irreversibly.)。
+- **不需要回滚**：`insert` 收下时清零传入堆叠、拒收时原样不动，所以每一格只能按「先入库、拿到 `true` 才清空槽位」走，不存在「仓库收了、背包还留着」的中间态(No rollback path is needed: insert either takes the stack or leaves it untouched.)。
+- **限流与取货分开记账**：返还紧跟着取货发生，共用一张 50ms 表会让两件事互相拖后腿。返还本身**不发聊天提示** —— 它是后台清理，一次建造可能退几十批，每条都发会把聊天栏刷爆(Separate throttle tables per direction, and returns stay silent in chat.)。
+- 复用 `voidWarehouse` + `voidWarehouseRestock` 两条规则，**没有新增 Carpet 规则**，所以版本号不变；客户端那侧另有开关 `voidWarehouseReturn`（默认开）(Reuses the two existing rules; a client-side toggle can disable it entirely.)。
+- 客户端策略（详见 `docs/打印机余料退回虚空仓库.md`）：收工（工作总开关关掉）时整批退回；打印中空槽 ≤ 4 退到回到 8；空槽 ≤ 1 时连「正在使用」也不再保护。只退**仓库给的那部分**，玩家自己背包里的材料一律不动(The client only returns what the warehouse itself delivered, and skips the material currently being requested.)。
+
 ### 🧪 Testing / 测试
 
 - 真服务端自检 **44 条断言 / 7 组**，五个版本全绿(44 assertions in 7 groups, green on all five targets.)：26.3 / 26.2 / 26.1.2 / 26.1.1 / 1.21.11 均 `checks=44 failures=0`。
 - 聊天提示单独成组（G 组 17 条）：累计关系（同物品相加 / 不同物品并列 / 超 4 种折算）、限流判据、拼出来的文本本身（前缀、顿号、数量），以及**库存数字是否等于 `amountExact`**、潜影盒与折算情形是否**故意不报**库存、`null` 数据时是否照发。文本断言一律避开物品名 —— 专用服务器上 `getHoverName()` 按 `en_us` 解析，咬名字等于咬环境(A dedicated group pins the chat coalescing rules and the warehouse-count reporting, and avoids asserting on localized item names.)。
 - 用真 `ServerPlayer` **真挖方块**，同时看三件事：仓库 +1、世界里**没有**多出物品实体、玩家背包也没多 —— 少看任何一项都抓不到「既入库又掉地上」这种复制 bug(The test digs for real and checks all three outcomes, which is the only way to catch dupe bugs.)。
 - **反证**：把两条 mixin 从 `mixins.json` 里临时摘掉，同一套自检 `failures=7`，其中「世界里没有多出物品实体」打出「dirt 实体 2 个，仓库 0」—— 证明这些断言咬的是真代码(Negative control: removing the mixins makes 7 assertions fail.).
+- 返还通道真服务端自检 **22 条断言 / 6 组**，26.3 上 `checks=22 failures=0`(22 assertions in 6 groups against a real dedicated server.)：单槽与多槽的「仓库 +N / 槽位清空 / 回执数量」、潜影盒**一格不动**、越界与空槽逐个跳过、规则关闭时 `RULE_OFF` 且仓库零变化、空清单 `BAD_REQUEST`。每组都成对咬「该发生的」与「不该发生的」—— 只咬前者的话，「既入库又清槽」和「既入库又留着」这两种相反的错误里总有一种会漏掉(Every group asserts both the intended effect and the absence of the wrong one.)。
+- 自检用的是**真 `ServerPlayer` + 真仓库存档**，测试前后把塞进仓库的量原样取回，开发存档不会被动过(The check uses a real player and real warehouse data, and restores the warehouse afterwards.)。
 
 ### 📦 Builds / 构建产物
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 206,725 B | `f562b11abd09b9dbe80d3a6ab7a9a78f` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 220,118 B | `dee8258a8e1a328a34d5600c44580071` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 206,673 B | `e4d97b1766df65c2e2c462b0f7106fec` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 220,209 B | `e6ea11ea0a7ceef97581510dd79a6e77` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 209,923 B | `90de7cb47692f83bebf9b281483132c3` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 221,226 B | `e3fa7e6b26ea613142bcb03c466b299b` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 209,925 B | `5349d6b841d61e720fd47c031367e596` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 221,226 B | `07a97a60bf2aaf7c814ef5b4af3bd720` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 208,428 B | `6e2e185accebb1b45626e34ab1c421c9` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 222,006 B | `108beb80495e14ace05b3e38f1c7aed7` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 216,215 B | `e4a7e75a3ef2b5cc8d2f4bd48c0eb29a` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 230,619 B | `fe4128531bbc21b32cf38d237ffce66d` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 216,163 B | `1e282ece57e4ca3967231f433b499e81` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 230,710 B | `fe577e3d127222692a77df43114931c3` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 219,413 B | `f78c99ddea6e7ee6095724f9ad4e3523` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 231,727 B | `93a78ae67fec4180856a6f6b483f143f` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 219,415 B | `3be489f61c217a96a7e3bb7fafc0b2bb` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 231,727 B | `14c788e6b47dee5473dffc476328f329` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 217,757 B | `228de4a44ef6c8da9d3cec90780adc5c` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 232,015 B | `6d822e1b32075994d96cde77a48494f1` |
 
 > 只需要能跑的 jar：下 `-1.0.16.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 
@@ -50,6 +64,7 @@
 - 新规则默认关闭：`/carpet voidWarehouseBlockDrops true`，且 `voidWarehouse` 也要开着。
 - **同版本号原地更新**：这条规则的聊天提示在 1.0.16 首次发布之后改过两次（先加提示，再去掉「已直接入库」、改成报仓库现有数量），所以 1.0.16 的 jar 变过几次 —— 以文件名旁的 md5 为准（本表已刷新）(This release was updated in place; compare the md5 next to the file name.)。
 - 反方向提醒：开这条规则之后**挖掘产出不再落在地上**。靠「挖掉 → 掉落物被水流冲走」的生电收集结构会失效，开之前先确认你的收集系统不依赖世界里的掉落物。
+- 新增两条通道 `printer_return` / `printer_return_result`（服务端注册；客户端幂等补位）。**没有新增 Carpet 规则**，规则集、配置键与存档格式都没变，直接替换 jar 即可；老版本打印机不认识这两条通道也不会受影响（服务端发送前会 `canSend`）(Two new channels, no new rule, no config or data-format change.)。
 
 * * *
 

@@ -5,6 +5,7 @@ import neko.cooking.CookingExtension;
 import neko.voidwarehouse.VoidWarehouseExtension;
 import neko.voidwarehouse.restock.PrinterQueryNetwork;
 import neko.voidwarehouse.restock.PrinterRestockNetwork;
+import neko.voidwarehouse.restock.PrinterReturnNetwork;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.loader.api.FabricLoader;
 
@@ -29,5 +30,8 @@ public class AutoMendingMod implements ModInitializer {
         PrinterRestockNetwork.init();
         // ② 库存查询（只读，供材料列表显示；200ms 限流）
         PrinterQueryNetwork.init();
+        // ③ 返还（有副作用，50ms 限流）：打印机用不完的材料退回仓库。
+        // 与 ① 是两个方向、两张限流表 —— 返还紧跟着取货发生，共用一张会互相拖后腿。
+        PrinterReturnNetwork.init();
     }
 }

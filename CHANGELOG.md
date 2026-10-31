@@ -29,9 +29,10 @@
 - 🔴 **潜影盒整类挡掉**：`insert` 遇到非空盒子会拆成「壳 + 箱子 + 内容物」。放在自动返还路径上就等于「发一个槽位号就把玩家的盒子不可逆地拆了」，所以这里与取货的拒绝清单保持同一口径(Shulker boxes are refused outright: inserting one would unpack it irreversibly.)。
 - **不需要回滚**：`insert` 收下时清零传入堆叠、拒收时原样不动，所以每一格只能按「先入库、拿到 `true` 才清空槽位」走，不存在「仓库收了、背包还留着」的中间态(No rollback path is needed: insert either takes the stack or leaves it untouched.)。
 - **限流与取货分开记账**：返还紧跟着取货发生，共用一张 50ms 表会让两件事互相拖后腿(Separate throttle tables per direction.)。
-- **回执带逐物品明细**：`printer_return_result` 除了「实收总量」，还给出每个物品的**件数**与**入库做完之后的仓库剩余量**（`itemIds` / `counts` / `remainings` 三份平行清单，最多 36 条）。剩余量只有服务端知道 —— 客户端看不到仓库，靠背包件数推算会在玩家手动存取之后立刻错掉(The receipt now carries per-item counts plus the warehouse stock after the insert, which only the server can know.)。
+- **明细走独立通道**：`printer_return_result` 仍然只回「状态码 + 实收总量」，逐物品明细另开一条 `printer_return_detail` —— 每个物品的**件数**与**入库做完之后的仓库剩余量**（`itemIds` / `counts` / `remainings` 三份平行清单，最多 36 条）。剩余量只有服务端知道 —— 客户端看不到仓库，靠背包件数推算会在玩家手动存取之后立刻错掉(Per-item counts and the post-insert warehouse stock travel on their own channel, because only the server can know the stock.)。
 - **退完在聊天栏说一句**：`[虚空仓库] 余料已退回 64 个 泥土（仓库共 128 个）、32 个 圆石（仓库共 256 个）` —— 与补货/收料提示同一套配色。只报成功的那一批（`RULE_OFF`/`THROTTLED`/`NOTHING` 不发，那些情况玩家没有「东西去哪了」的疑问）；超过 4 种折成「N 种共 M 个」；剩余量取不到时只丢括号(A chat notice per successful batch, showing what went back and what the warehouse now holds.)。
-- 🔴 **两端必须同版本**：这是「加字段」的协议改动，服务端原件与客户端镜像的 `CODEC`、状态码、`record` 字段顺序必须逐行一致；判据是脚本 `python .workbuddy/tools/check_return_protocol_parity.py --printer ../litematica-printer`，不是人眼比对(The wire format changed, so client and server must be upgraded together; parity is checked by a script.)。
+- 🔴 **明细为什么单独一条通道**：把清单**追加**到 `printer_return_result` 末尾最省事，但那样**新客户端配旧服务端会解码失败**（旧服务端只发三个数，新客户端读清单读到一半没字节）。拆开之后两边各自 `canSend` 判定，四种新旧组合里**没有一种会解错包**：新+新有完整提示，新服务端+旧客户端只发回执，旧服务端+新客户端只销账不报提示(Kept as a separate payload so any client/server version pairing stays wire-compatible.)。
+- 🔴 **两端要逐行一致**：服务端原件与客户端镜像的 `CODEC`、状态码、`record` 字段顺序必须一致；判据是脚本 `python .workbuddy/tools/check_return_protocol_parity.py --printer ../litematica-printer`，不是人眼比对(The mirror classes must stay byte-equivalent; parity is checked by a script.)。
 - 复用 `voidWarehouse` + `voidWarehouseRestock` 两条规则，**没有新增 Carpet 规则**，所以版本号不变；客户端那侧另有开关 `voidWarehouseReturn`（默认开）(Reuses the two existing rules; a client-side toggle can disable it entirely.)。
 - 客户端策略（详见 `docs/打印机余料退回虚空仓库.md`）：收工（工作总开关关掉）时整批退回；打印中空槽 ≤ 4 退到回到 8；空槽 ≤ 1 时连「正在使用」也不再保护。只退**仓库给的那部分**，玩家自己背包里的材料一律不动(The client only returns what the warehouse itself delivered, and skips the material currently being requested.)。
 
@@ -41,9 +42,9 @@
 - 聊天提示单独成组（G 组 17 条）：累计关系（同物品相加 / 不同物品并列 / 超 4 种折算）、限流判据、拼出来的文本本身（前缀、顿号、数量），以及**库存数字是否等于 `amountExact`**、潜影盒与折算情形是否**故意不报**库存、`null` 数据时是否照发。文本断言一律避开物品名 —— 专用服务器上 `getHoverName()` 按 `en_us` 解析，咬名字等于咬环境(A dedicated group pins the chat coalescing rules and the warehouse-count reporting, and avoids asserting on localized item names.)。
 - 用真 `ServerPlayer` **真挖方块**，同时看三件事：仓库 +1、世界里**没有**多出物品实体、玩家背包也没多 —— 少看任何一项都抓不到「既入库又掉地上」这种复制 bug(The test digs for real and checks all three outcomes, which is the only way to catch dupe bugs.)。
 - **反证**：把两条 mixin 从 `mixins.json` 里临时摘掉，同一套自检 `failures=7`，其中「世界里没有多出物品实体」打出「dirt 实体 2 个，仓库 0」—— 证明这些断言咬的是真代码(Negative control: removing the mixins makes 7 assertions fail.).
-- 返还回执真服务端自检 **21 条断言**，**五个版本**全绿(21 assertions, green on all five targets.)：单槽与多槽的「仓库 +N / 槽位清空 / 件数」、潜影盒**一格不动**、越界与空槽逐个跳过、规则关闭时 `RULE_OFF` 且仓库零变化、空清单 `BAD_REQUEST`。三条新口径各有专组：
+- 返还回执真服务端自检 **23 条断言**，**五个版本**全绿(23 assertions, green on all five targets.)：单槽与多槽的「仓库 +N / 槽位清空 / 件数」、潜影盒**一格不动**、越界与空槽逐个跳过、规则关闭时 `RULE_OFF` 且仓库零变化、空清单 `BAD_REQUEST`。三条新口径各有专组：
   - **同一种跨两格**（泥土 64 + 泥土 32）必须合成一条明细、件数 96，且剩余量是 **96 而不是 64** —— 「边退边读」会报中间值，这是这个特性最容易错的地方(Reading the stock while inserting would report a mid-batch value; a dedicated case pins it to the final 96.)；
-  - **编解码往返**：回执扩成「三个数 + 三份清单」后，编码再解码必须逐项相同（含 `1,234,567,890` 这种大数，确认 `VAR_LONG` 没被截断）(Codec round trip, including a large long, proves the wire format is symmetric.)；
+  - **编解码往返**：明细包（`nonce` + 三份清单）编码再解码必须逐项相同（含 `1,234,567,890` 这种大数，确认 `VAR_LONG` 没被截断）；回执包也验往返，并**用反射钉住它只有 3 个字段** —— 明细一旦被人塞回去，新客户端配旧服务端就会解错包(Codec round trip for both payloads, plus a reflection guard that the receipt stays three fields.)；
   - **剩余量与仓库自己的账一致**：拿 `amountExact` 当外部标准比对回执里的数，避免「客户端和提示互相对得上、却都和仓库对不上」(The reported stock is compared against the warehouse's own ledger as an external oracle.)。
 - 客户端提示另有 **8 条单测**（`VoidWarehouseReturnNoticeTest`）：单种/多种的分隔、千分位、超过 4 种折算、剩余量缺失（`-1`）时只丢括号。文本断言一律用解析不出来的 id 当物品名，绕开注册表 —— JUnit 里没有客户端语言表(The client-side wording is pinned by 8 unit tests that avoid the item registry.)。
 - 自检用的是**真 `ServerPlayer` + 真仓库存档**，测试前后把塞进仓库的量原样取回，开发存档不会被动过(The check uses a real player and real warehouse data, and restores the warehouse afterwards.)。
@@ -52,16 +53,16 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 219,752 B | `e399149022c83b938cb9ece88c73d776` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 233,028 B | `064186884624d4481177edc46b105290` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 219,700 B | `e72eb7a5a67d5e8fd90a681e60f52ae4` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 233,119 B | `b735ab6e63f3c538786db92ea1593e6c` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 222,950 B | `b82baddb2c55a2ba25e6034c898b7f44` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 234,136 B | `93ff47382f29626cd48108534259ff2b` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 222,952 B | `a1ed1b1162d251e78968d268125b12a9` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 234,136 B | `9d502d2920f222b252a73eba95f364a6` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 221,237 B | `147c1487dfc0db668f2143574d4d44ef` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 234,414 B | `60f75ffca75d1fdae4cf1aa9275d9cf0` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 221,425 B | `3e45413643c0afc7dd43e8ea2a2b414b` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 235,107 B | `bdb1552372116e39f79717d768098bab` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 221,373 B | `1b446a7c599b4d7d956b6226365f6d8d` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 235,192 B | `3893f2db0bd04aa2cce9563118a87dd2` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 224,623 B | `33a85905b8193958af3ea44b8a981dc1` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 236,209 B | `ff0c8af7cbd15a70ed6b6eb7b7f6a505` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 224,625 B | `e2e2a700ea54d8489f7b37f3d28f31bb` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 236,209 B | `2dd68d523b84d2ec7608de4c14103c62` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 222,844 B | `f75a707160760f63df8e9d9745246b0c` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 236,424 B | `d329cefd937cf0621f194af31b1b408f` |
 
 > 只需要能跑的 jar：下 `-1.0.16.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 

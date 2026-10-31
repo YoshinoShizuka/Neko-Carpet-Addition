@@ -1,5 +1,6 @@
 package neko.voidwarehouse.restock;
 
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Inventory;
@@ -7,6 +8,7 @@ import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.ShulkerBoxBlock;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import neko.voidwarehouse.VoidWarehouse;
@@ -54,11 +56,13 @@ public final class PrinterReturnService {
      * @param returnedCount 真正收进仓库的物品总数（失败时为 0）
      * @param clearedSlots  被清空的背包槽数（用于「退了几堆」这种口径）
      * @param sample        这批里最先退回去的物品样板（数量恒 1）；一格都没退时是 {@link ItemStack#EMPTY}
+     * @param moved         逐物品明细（见 {@link Moved}）；失败路径为空清单
      */
-    public record ReturnOutcome(int status, int returnedCount, int clearedSlots, ItemStack sample) {
+    public record ReturnOutcome(int status, int returnedCount, int clearedSlots, ItemStack sample,
+                                List<Moved> moved) {
 
         static ReturnOutcome of(int status) {
-            return new ReturnOutcome(status, 0, 0, ItemStack.EMPTY);
+            return new ReturnOutcome(status, 0, 0, ItemStack.EMPTY, List.of());
         }
 
         /** 真的往仓库里放进了东西 */
@@ -68,12 +72,22 @@ public final class PrinterReturnService {
     }
 
     /**
+     * 一种物品在这一批里退了多少、入完之后仓库里还剩多少。
+     *
+     * @param itemId    注册名（如 {@code minecraft:dirt}）；客户端拿它还原物品与译名
+     * @param count     本批退回去的件数
+     * @param remaining 本批入库<b>做完之后</b>仓库里这种物品的总数（口径 = 物品 + 数据组件）
+     */
+    public record Moved(String itemId, int count, long remaining) {
+    }
+
+    /**
      * 执行一次返还。
      *
      * @param server 服务端实例（取仓库用）
      * @param player 交出物品的玩家
      * @param slots  主背包 / 快捷栏的槽位号（0–35），越界与空槽会被逐个跳过
-     * @return 结果（状态码 + 实收数量 + 清空的槽数）
+     * @return 结果（状态码 + 实收数量 + 清空的槽数 + 逐物品明细）
      */
     public static ReturnOutcome returnSlots(MinecraftServer server, ServerPlayer player, List<Integer> slots) {
         if (server == null || player == null) {
@@ -96,6 +110,10 @@ public final class PrinterReturnService {
         int returned = 0;
         int cleared = 0;
         ItemStack sample = ItemStack.EMPTY;
+        // 逐物品记账：样板（数量恒 1，带数据组件）→ 件数。用 List 而不是 Map 是为了保住
+        // 「先退的排前面」这个顺序 —— 提示里的次序跟玩家背包里被拿走的次序对得上。
+        List<ItemStack> templates = new ArrayList<>();
+        List<Integer> tallies = new ArrayList<>();
 
         for (Integer raw : slots) {
             if (raw == null) {
@@ -109,8 +127,9 @@ public final class PrinterReturnService {
             if (current.isEmpty() || isBlacklisted(current)) {
                 continue;
             }
-            // 数量必须在 insert 之前取：insert 成功时会把传进去的那份清零
+            // 数量与样板都必须在 insert 之前取：insert 成功时会把传进去的那份清零
             int count = current.getCount();
+            ItemStack template = current.copyWithCount(1);
             ItemStack moving = current.copy();
             if (!data.insert(moving)) {
                 // 拒收（理论上只剩空堆叠这一种）→ 格子原样留着，绝不清空
@@ -120,8 +139,9 @@ public final class PrinterReturnService {
             returned += count;
             cleared++;
             if (sample.isEmpty()) {
-                sample = current.copyWithCount(1);
+                sample = template;
             }
+            tally(templates, tallies, template, count);
         }
 
         if (returned <= 0) {
@@ -132,7 +152,45 @@ public final class PrinterReturnService {
         if (player.inventoryMenu != player.containerMenu) {
             player.inventoryMenu.broadcastChanges();
         }
-        return new ReturnOutcome(PrinterReturnResultPayload.OK, returned, cleared, sample);
+        return new ReturnOutcome(PrinterReturnResultPayload.OK, returned, cleared, sample,
+                describe(data, templates, tallies));
+    }
+
+    /** 把一份「样板 + 件数」累加进记账单（物品 + 数据组件相同就合并）。 */
+    private static void tally(List<ItemStack> templates, List<Integer> tallies, ItemStack template, int count) {
+        for (int i = 0; i < templates.size(); i++) {
+            if (ItemStack.isSameItemSameComponents(templates.get(i), template)) {
+                tallies.set(i, tallies.get(i) + count);
+                return;
+            }
+        }
+        templates.add(template);
+        tallies.add(count);
+    }
+
+    /**
+     * 把记账单变成回执明细：补上注册名与<b>入库做完之后</b>的仓库剩余量。
+     *
+     * <p>剩余量必须在<b>全部 insert 之后</b>统一读 —— 一批里同一种物品可能横跨好几格
+     * （快捷栏一份、主背包一份），边退边读会报出「退完第一格时的中间值」，
+     * 那不是玩家想看的数。口径用 {@link VoidWarehouseData#amountExact}（物品 + 数据组件），
+     * 与入库归并、与客户端那本账完全一致。</p>
+     */
+    private static List<Moved> describe(VoidWarehouseData data, List<ItemStack> templates, List<Integer> tallies) {
+        List<Moved> moved = new ArrayList<>(templates.size());
+        for (int i = 0; i < templates.size(); i++) {
+            ItemStack template = templates.get(i);
+            long remaining;
+            try {
+                remaining = data.amountExact(template).longValue();
+            } catch (RuntimeException ex) {
+                // 读剩余量出问题只丢这个数字，绝不让整批返还（已经进仓库了）判成失败
+                remaining = -1L;
+            }
+            moved.add(new Moved(BuiltInRegistries.ITEM.getKey(template.getItem()).toString(),
+                    tallies.get(i), remaining));
+        }
+        return moved;
     }
 
     /**

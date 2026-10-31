@@ -1,0 +1,327 @@
+package neko.voidwarehouse.restock;
+
+import com.mojang.authlib.GameProfile;
+import io.netty.buffer.Unpooled;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.GameType;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+import neko.voidwarehouse.VoidWarehouse;
+import neko.voidwarehouse.VoidWarehouseData;
+import neko.voidwarehouse.VoidWarehouseSettings;
+import neko.voidwarehouse.VoidWarehouseShulker;
+
+/**
+ * 【临时自检】打印机余料返还：<b>回执里那两个数到底对不对</b>。
+ *
+ * <p>这条通道的聊天提示会告诉玩家「退了 64 个泥土，仓库里现在有 128 个」。
+ * 那句话里的两个数都由服务端算，所以真正要盯的是三件事：</p>
+ * <ol>
+ *   <li><b>件数</b>是不是真按「入库成功的那几格」累计（被拒收、被跳过的格子不许算）；</li>
+ *   <li><b>仓库剩余量</b>是不是「这一批全部入库做完之后」的值（同种跨两格时最容易报成中间值）；</li>
+ *   <li><b>包能不能解回来</b> —— 回执从「三个数」扩成「三个数 + 三份清单」，
+ *       编解码一旦不对称，客户端收到的就是垃圾（或直接断连）。</li>
+ * </ol>
+ *
+ * <p>所以这里造一个真 {@link ServerPlayer}，把东西真放进他的背包，真调
+ * {@link PrinterReturnService#returnSlots}，然后用<b>仓库自己的账</b>
+ * （{@link VoidWarehouseData#amountExact}）当外部标准去比对返回的明细。
+ * 再加一条 CODEC 往返：编码再解码，三份清单必须逐项相同。</p>
+ */
+public final class PrinterReturnSelfCheck {
+
+    private static boolean done = false;
+    private static int stage = 0;
+    private static int tickIndex = 0;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private static ServerPlayer bot;
+    private static ServerLevel level;
+
+    private PrinterReturnSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        switch (stage) {
+            case 0:
+                // 等几 tick 再动手：存档与仓库数据在这个阶段才稳定下来
+                if (++tickIndex < 5) {
+                    return;
+                }
+                break;
+            case 1:
+                env(server);
+                break;
+            case 2:
+                groupA_guards(server);
+                break;
+            case 3:
+                groupB_singleBatch(server);
+                break;
+            case 4:
+                groupC_sameItemTwoSlots(server);
+                break;
+            case 5:
+                groupD_shulkerSkipped(server);
+                break;
+            case 6:
+                groupE_nothingToReturn(server);
+                break;
+            case 7:
+                groupF_codecRoundTrip(server);
+                break;
+            case 8:
+                cleanup(server);
+                break;
+            case 9:
+                finish(server);
+                break;
+            default:
+                return;
+        }
+        stage++;
+    }
+
+    // ================================================================ ENV
+
+    private static void env(MinecraftServer server) {
+        System.out.println("[ENV] 造一个真 ServerPlayer，清空仓库与背包");
+        level = server.overworld();
+        GameProfile profile = new GameProfile(UUID.randomUUID(), "returnbot");
+        bot = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
+        bot.gameMode.changeGameModeForPlayer(GameType.SURVIVAL);
+        bot.setPos(8.5, 200, 8.5);
+        check("E1 玩家对象可用", bot != null && bot.level() == level);
+        bot.getInventory().clearContent();
+
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        check("E2 仓库已清空（后面「剩余量」才有确定值）", data.entryCount() == 0);
+    }
+
+    // ================================================================ A 两道门
+
+    private static void groupA_guards(MinecraftServer server) {
+        System.out.println("[A] 两道门：规则关 / 空清单");
+        VoidWarehouseSettings.voidWarehouse = false;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = false;
+        PrinterReturnService.ReturnOutcome off =
+                PrinterReturnService.returnSlots(server, bot, List.of(0));
+        check("A1 主开关关着 → RULE_OFF",
+                off.status() == PrinterReturnResultPayload.RULE_OFF
+                        && off.returnedCount() == 0 && off.moved().isEmpty());
+
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = false;
+        PrinterReturnService.ReturnOutcome off2 =
+                PrinterReturnService.returnSlots(server, bot, List.of(0));
+        check("A2 补货规则关着 → 也 RULE_OFF", off2.status() == PrinterReturnResultPayload.RULE_OFF);
+
+        VoidWarehouseRestockSettings.voidWarehouseRestock = true;
+        PrinterReturnService.ReturnOutcome empty =
+                PrinterReturnService.returnSlots(server, bot, List.of());
+        check("A3 空清单 → BAD_REQUEST",
+                empty.status() == PrinterReturnResultPayload.BAD_REQUEST && empty.moved().isEmpty());
+    }
+
+    // ================================================================ B 一批两种
+
+    private static void groupB_singleBatch(MinecraftServer server) {
+        System.out.println("[B] 一批两种：件数与剩余量都要对得上");
+        bot.getInventory().clearContent();
+        bot.getInventory().setItem(0, new ItemStack(Items.DIRT, 64));
+        bot.getInventory().setItem(1, new ItemStack(Items.COBBLESTONE, 32));
+
+        PrinterReturnService.ReturnOutcome outcome =
+                PrinterReturnService.returnSlots(server, bot, List.of(0, 1));
+        VoidWarehouseData data = VoidWarehouse.data(server);
+
+        check("B1 状态 OK、总件数 96、清空 2 格",
+                outcome.status() == PrinterReturnResultPayload.OK
+                        && outcome.returnedCount() == 96 && outcome.clearedSlots() == 2);
+        check("B2 明细两条（两种物品）", outcome.moved().size() == 2);
+        note("明细：" + describe(outcome.moved()));
+
+        check("B3 泥土这件是 64、剩余 64（仓库原本是空的）",
+                hasMoved(outcome.moved(), Items.DIRT, 64, 64L));
+        check("B4 圆石这件是 32、剩余 32",
+                hasMoved(outcome.moved(), Items.COBBLESTONE, 32, 32L));
+        check("B5 剩余量与仓库自己的账一致（外部标准）",
+                outcome.moved().stream().allMatch(m -> m.remaining() == amountOf(data, m.itemId())));
+        check("B6 背包两格真的空了",
+                bot.getInventory().getItem(0).isEmpty() && bot.getInventory().getItem(1).isEmpty());
+    }
+
+    // ================================================================ C 同种跨两格
+
+    private static void groupC_sameItemTwoSlots(MinecraftServer server) {
+        System.out.println("[C] 同一种跨两格：必须合成一条，剩余量取「全部入库之后」的值");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        bot.getInventory().clearContent();
+        bot.getInventory().setItem(0, new ItemStack(Items.DIRT, 64));
+        bot.getInventory().setItem(1, new ItemStack(Items.DIRT, 32));
+
+        PrinterReturnService.ReturnOutcome outcome =
+                PrinterReturnService.returnSlots(server, bot, List.of(0, 1));
+        check("C1 同种合并成一条明细", outcome.moved().size() == 1);
+        check("C2 件数 96（64 + 32）", outcome.returnedCount() == 96
+                && outcome.moved().get(0).count() == 96);
+        // 关键：不是「退完第一格时的 64」，而是这一批全做完之后的 96
+        check("C3 剩余 96，不是中间值 64",
+                outcome.moved().get(0).remaining() == 96L);
+        note("明细：" + describe(outcome.moved()));
+    }
+
+    // ================================================================ D 潜影盒被跳过
+
+    private static void groupD_shulkerSkipped(MinecraftServer server) {
+        System.out.println("[D] 非空潜影盒不收（自动路径不能拆玩家的盒）");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        bot.getInventory().clearContent();
+        bot.getInventory().setItem(0, VoidWarehouseShulker.pack(new ItemStack(Items.DIRT), 5));
+        bot.getInventory().setItem(1, new ItemStack(Items.SAND, 16));
+
+        PrinterReturnService.ReturnOutcome outcome =
+                PrinterReturnService.returnSlots(server, bot, List.of(0, 1));
+        check("D1 只收了沙子那 16 个", outcome.returnedCount() == 16 && outcome.clearedSlots() == 1);
+        check("D2 明细里没有潜影盒",
+                outcome.moved().size() == 1 && !outcome.moved().get(0).itemId().contains("shulker_box"));
+        check("D3 潜影盒还在背包第 0 格", !bot.getInventory().getItem(0).isEmpty());
+    }
+
+    // ================================================================ E 一格都没退成
+
+    private static void groupE_nothingToReturn(MinecraftServer server) {
+        System.out.println("[E] 一格都没退成 → NOTHING，明细为空");
+        bot.getInventory().clearContent();
+        PrinterReturnService.ReturnOutcome outcome =
+                PrinterReturnService.returnSlots(server, bot, List.of(0, 1, 2));
+        check("E1 状态 NOTHING、件数 0、明细空",
+                outcome.status() == PrinterReturnResultPayload.NOTHING
+                        && outcome.returnedCount() == 0 && outcome.moved().isEmpty());
+    }
+
+    // ================================================================ F 包能解回来
+
+    private static void groupF_codecRoundTrip(MinecraftServer server) {
+        System.out.println("[F] 回执编解码往返：三个清单必须原样回来");
+        List<String> ids = new ArrayList<>(List.of("minecraft:dirt", "minecraft:cobblestone"));
+        List<Integer> counts = new ArrayList<>(List.of(64, 32));
+        List<Long> remainings = new ArrayList<>(List.of(128L, 1_234_567_890L));
+        PrinterReturnResultPayload original =
+                new PrinterReturnResultPayload(7, PrinterReturnResultPayload.OK, 96, ids, counts, remainings);
+
+        FriendlyByteBuf buffer = new FriendlyByteBuf(Unpooled.buffer());
+        PrinterReturnResultPayload.CODEC.encode(buffer, original);
+        PrinterReturnResultPayload decoded = PrinterReturnResultPayload.CODEC.decode(buffer);
+        check("F1 三个标量原样回来", decoded.nonce() == 7
+                && decoded.status() == PrinterReturnResultPayload.OK && decoded.returned() == 96);
+        check("F2 三个清单逐项相同", decoded.itemIds().equals(ids)
+                && decoded.counts().equals(counts) && decoded.remainings().equals(remainings));
+        note("往返后：" + decoded.itemIds() + " / " + decoded.counts() + " / " + decoded.remainings());
+
+        // 失败路径的简写构造也要能编码（三个清单为空）
+        FriendlyByteBuf empty = new FriendlyByteBuf(Unpooled.buffer());
+        PrinterReturnResultPayload.CODEC.encode(empty, PrinterReturnResultPayload.of(9, PrinterReturnResultPayload.RULE_OFF));
+        PrinterReturnResultPayload decodedEmpty = PrinterReturnResultPayload.CODEC.decode(empty);
+        check("F3 失败回执（空明细）也能往返", decodedEmpty.status() == PrinterReturnResultPayload.RULE_OFF
+                && decodedEmpty.itemIds().isEmpty() && decodedEmpty.remainings().isEmpty());
+    }
+
+    // ================================================================ 工具
+
+    private static String describe(List<PrinterReturnService.Moved> moved) {
+        StringBuilder sb = new StringBuilder();
+        for (PrinterReturnService.Moved entry : moved) {
+            if (sb.length() > 0) {
+                sb.append("、");
+            }
+            sb.append(entry.itemId()).append("×").append(entry.count())
+                    .append("（剩 ").append(entry.remaining()).append("）");
+        }
+        return sb.toString();
+    }
+
+    private static boolean hasMoved(List<PrinterReturnService.Moved> moved, net.minecraft.world.item.Item item,
+                                    int count, long remaining) {
+        String id = BuiltInRegistries.ITEM.getKey(item).toString();
+        for (PrinterReturnService.Moved entry : moved) {
+            if (entry.itemId().equals(id) && entry.count() == count && entry.remaining() == remaining) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static long amountOf(VoidWarehouseData data, String itemId) {
+        net.minecraft.resources.Identifier id = net.minecraft.resources.Identifier.tryParse(itemId);
+        if (id == null) {
+            return -1L;
+        }
+        net.minecraft.world.item.Item item = BuiltInRegistries.ITEM.getValue(id);
+        if (item == null) {
+            return -1L;
+        }
+        BigInteger amount = data.amountExact(new ItemStack(item));
+        return amount.longValue();
+    }
+
+    private static void cleanup(MinecraftServer server) {
+        if (bot != null) {
+            bot.getInventory().clearContent();
+            bot.discard();
+            bot = null;
+        }
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        VoidWarehouseRestockSettings.voidWarehouseRestock = false;
+        VoidWarehouseSettings.voidWarehouse = false;
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        System.out.println("SMOKE RESULT printer-return/@VER@ checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+        }
+        System.out.println("   " + (ok ? "ok  " : "FAIL") + " " + label);
+    }
+
+    private static void note(String line) {
+        System.out.println("   [diag] " + line);
+    }
+}

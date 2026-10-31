@@ -5,6 +5,8 @@ import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.server.level.ServerPlayer;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -21,9 +23,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>取货那条路已经在现网跑过；返还是新能力，独立成类就不会在改动时牵连到已验证的路径。
  * 通道名、限流表也都分开：返还紧跟着取货发生，共用一张限流表会让两件事互相拖后腿。</p>
  *
- * <h2>为什么不发聊天提示</h2>
- * <p>返还是后台清理，一次建造可能退几十批，每条都发会把聊天栏刷爆。
- * 仓库数量玩家随时可以开界面看。</p>
+ * <h2>为什么服务端自己不发聊天提示</h2>
+ * <p>返还是后台清理，一次建造可能退几十批 —— 服务端这边不知道玩家此刻在不在看聊天栏，
+ * 也不该替客户端决定节奏。所以服务端只把<b>事实</b>放进回执
+ * （{@code PrinterReturnResultPayload} 里的逐物品明细 + 仓库剩余量），提示由客户端自己拼。</p>
  */
 public final class PrinterReturnNetwork {
 
@@ -80,13 +83,35 @@ public final class PrinterReturnNetwork {
         int nonce = payload.nonce();
 
         if (isThrottled(player)) {
-            reply(player, nonce, PrinterReturnResultPayload.THROTTLED, 0);
+            reply(player, PrinterReturnResultPayload.of(nonce, PrinterReturnResultPayload.THROTTLED));
             return;
         }
 
         PrinterReturnService.ReturnOutcome outcome =
                 PrinterReturnService.returnSlots(context.server(), player, payload.slots());
-        reply(player, nonce, outcome.status(), outcome.returnedCount());
+        reply(player, outcome.status() == PrinterReturnResultPayload.OK
+                ? toPayload(nonce, outcome)
+                : PrinterReturnResultPayload.of(nonce, outcome.status()));
+    }
+
+    /**
+     * 成功路径：把逐物品明细也带上。
+     *
+     * <p>三个清单在这里一次性从 {@code moved} 摊平 —— 服务端算好、客户端只负责显示，
+     * 谁都不用在客户端重算「仓库还剩多少」。</p>
+     */
+    private static PrinterReturnResultPayload toPayload(int nonce, PrinterReturnService.ReturnOutcome outcome) {
+        List<PrinterReturnService.Moved> moved = outcome.moved();
+        List<String> itemIds = new ArrayList<>(moved.size());
+        List<Integer> counts = new ArrayList<>(moved.size());
+        List<Long> remainings = new ArrayList<>(moved.size());
+        for (PrinterReturnService.Moved entry : moved) {
+            itemIds.add(entry.itemId());
+            counts.add(entry.count());
+            remainings.add(entry.remaining());
+        }
+        return new PrinterReturnResultPayload(nonce, outcome.status(), outcome.returnedCount(),
+                itemIds, counts, remainings);
     }
 
     /**
@@ -114,13 +139,13 @@ public final class PrinterReturnNetwork {
      * <p>{@code canSend} 查的是对端上报的可接收集合 —— 对面是很旧、还没有这条通道的
      * 打印机版本就别发：老客户端收到不认识的包会直接断连。</p>
      */
-    private static void reply(ServerPlayer player, int nonce, int status, int returned) {
+    private static void reply(ServerPlayer player, PrinterReturnResultPayload payload) {
         if (player == null) {
             return;
         }
         if (!ServerPlayNetworking.canSend(player, PrinterReturnResultPayload.TYPE)) {
             return;
         }
-        ServerPlayNetworking.send(player, new PrinterReturnResultPayload(nonce, status, returned));
+        ServerPlayNetworking.send(player, payload);
     }
 }

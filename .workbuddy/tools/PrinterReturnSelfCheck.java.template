@@ -30,14 +30,15 @@ import neko.voidwarehouse.VoidWarehouseShulker;
  * <ol>
  *   <li><b>件数</b>是不是真按「入库成功的那几格」累计（被拒收、被跳过的格子不许算）；</li>
  *   <li><b>仓库剩余量</b>是不是「这一批全部入库做完之后」的值（同种跨两格时最容易报成中间值）；</li>
- *   <li><b>包能不能解回来</b> —— 回执从「三个数」扩成「三个数 + 三份清单」，
- *       编解码一旦不对称，客户端收到的就是垃圾（或直接断连）。</li>
+ *   <li><b>包能不能解回来</b> —— 明细走独立通道 {@code PrinterReturnDetailPayload}，
+ *       编解码一旦不对称，客户端收到的就是垃圾（或直接断连）；同时还要钉住
+ *       「回执包没有被人偷偷加字段」，否则新客户端配旧服务端会解错包。</li>
  * </ol>
  *
  * <p>所以这里造一个真 {@link ServerPlayer}，把东西真放进他的背包，真调
  * {@link PrinterReturnService#returnSlots}，然后用<b>仓库自己的账</b>
  * （{@link VoidWarehouseData#amountExact}）当外部标准去比对返回的明细。
- * 再加一条 CODEC 往返：编码再解码，三份清单必须逐项相同。</p>
+ * 再加一组 CODEC 往返：明细包的三份清单必须逐项相同，回执包必须仍是三个数。</p>
  */
 public final class PrinterReturnSelfCheck {
 
@@ -232,27 +233,37 @@ public final class PrinterReturnSelfCheck {
     // ================================================================ F 包能解回来
 
     private static void groupF_codecRoundTrip(MinecraftServer server) {
-        System.out.println("[F] 回执编解码往返：三个清单必须原样回来");
+        System.out.println("[F] 编解码往返：明细包三份清单原样回来，回执包仍是三个数");
         List<String> ids = new ArrayList<>(List.of("minecraft:dirt", "minecraft:cobblestone"));
         List<Integer> counts = new ArrayList<>(List.of(64, 32));
         List<Long> remainings = new ArrayList<>(List.of(128L, 1_234_567_890L));
-        PrinterReturnResultPayload original =
-                new PrinterReturnResultPayload(7, PrinterReturnResultPayload.OK, 96, ids, counts, remainings);
+        PrinterReturnDetailPayload detail =
+                new PrinterReturnDetailPayload(7, ids, counts, remainings);
 
         FriendlyByteBuf buffer = new FriendlyByteBuf(Unpooled.buffer());
-        PrinterReturnResultPayload.CODEC.encode(buffer, original);
-        PrinterReturnResultPayload decoded = PrinterReturnResultPayload.CODEC.decode(buffer);
-        check("F1 三个标量原样回来", decoded.nonce() == 7
-                && decoded.status() == PrinterReturnResultPayload.OK && decoded.returned() == 96);
-        check("F2 三个清单逐项相同", decoded.itemIds().equals(ids)
+        PrinterReturnDetailPayload.CODEC.encode(buffer, detail);
+        PrinterReturnDetailPayload decoded = PrinterReturnDetailPayload.CODEC.decode(buffer);
+        check("F1 明细包 nonce 原样回来", decoded.nonce() == 7);
+        check("F2 明细包三个清单逐项相同", decoded.itemIds().equals(ids)
                 && decoded.counts().equals(counts) && decoded.remainings().equals(remainings));
         note("往返后：" + decoded.itemIds() + " / " + decoded.counts() + " / " + decoded.remainings());
 
-        // 失败路径的简写构造也要能编码（三个清单为空）
+        // 🔴 回执包必须仍然是三个数：明细一旦被塞回这里，新客户端配旧服务端就会解错包
+        check("F3 回执包的 record 仍然只有 3 个字段（明细不许塞回来）",
+                PrinterReturnResultPayload.class.getRecordComponents().length == 3);
+        PrinterReturnResultPayload result =
+                new PrinterReturnResultPayload(9, PrinterReturnResultPayload.OK, 96);
+        FriendlyByteBuf resultBuf = new FriendlyByteBuf(Unpooled.buffer());
+        PrinterReturnResultPayload.CODEC.encode(resultBuf, result);
+        PrinterReturnResultPayload resultOut = PrinterReturnResultPayload.CODEC.decode(resultBuf);
+        check("F4 回执包三个标量原样回来", resultOut.nonce() == 9
+                && resultOut.status() == PrinterReturnResultPayload.OK && resultOut.returned() == 96);
+
+        // 空明细的简写构造也要能编码
         FriendlyByteBuf empty = new FriendlyByteBuf(Unpooled.buffer());
-        PrinterReturnResultPayload.CODEC.encode(empty, PrinterReturnResultPayload.of(9, PrinterReturnResultPayload.RULE_OFF));
-        PrinterReturnResultPayload decodedEmpty = PrinterReturnResultPayload.CODEC.decode(empty);
-        check("F3 失败回执（空明细）也能往返", decodedEmpty.status() == PrinterReturnResultPayload.RULE_OFF
+        PrinterReturnDetailPayload.CODEC.encode(empty, PrinterReturnDetailPayload.of(11));
+        PrinterReturnDetailPayload decodedEmpty = PrinterReturnDetailPayload.CODEC.decode(empty);
+        check("F5 空明细也能往返", decodedEmpty.nonce() == 11
                 && decodedEmpty.itemIds().isEmpty() && decodedEmpty.remainings().isEmpty());
     }
 

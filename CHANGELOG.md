@@ -20,7 +20,7 @@
 - **顺带把潜影盒纳入出料范围**：它本来就是 `maxStackSize = 1`，之前同样卡在这条限制上(Shulker boxes now work as output classifiers too.)。
 - 不新增 Carpet 规则，**版本号不变**，直接替换 jar 即可(No new rule; drop-in replacement.)。
 - **验证**：26.3 真服务端 **22 条断言全绿**，含「圆石对照组行为一字不变」与「连做 3 轮每轮结果完全一致」；反证只回滚标本分支，A/B/E 主组翻红 10 条、对照组仍绿（详见 `docs/出料漏斗支持不可堆叠物品.md`）(22 assertions on a real server, plus a roll-back counter-experiment where exactly the main group flips red.)。
-- **入库端仍不支持**：入库的物品必须真的进仓库、格子必然被搬空 —— 那一侧还没做(Hopper *intake* still cannot use unstackable classifiers.)
+- **入库端暂不支持「拿不可堆叠物当分类物」**：真服务端实测（14 条断言）—— **不带分类物**的入库漏斗照常收这类物品（20 个在同一 tick 进完），卡的**只有**「当分类物」这一种组合（格子物理上只能装 1 个，标本占住就腾不出位置给货，上游每 tick 白跑一轮取放）。三条路线（直取旁路 / 客户端叠加 / 余量归零）的改动点、风险与验收见 `docs/入库漏斗支持不可堆叠物品-路线对照.md`(Hopper intake still cannot *use* unstackable items as classifiers — measured on a real server; plain intake of such items works fine. Three candidate approaches are documented with their exact change points and risks.)
 
 #### 方块掉落物直接进虚空仓库（`voidWarehouseBlockDrops`）
 

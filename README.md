@@ -7,6 +7,8 @@
 
 纯服务端 Carpet 扩展，面向技术生存与生电场景。共七条规则：**自动经验修补**、**虚空仓库**（全服共享、跨维度的分页仓库，配漏斗双向自动化）、**虚空仓库补货**、**虚空仓库 9 合 1 兑换**、**虚空仓库配方扣料**、**方块掉落物直接进虚空仓库**、**混凝土粉末烧制染色玻璃**。全部默认关闭，用 `/carpet` 逐条开启。客户端可以是原版。
 
+另有配套**纯客户端模组** [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search)：在虚空仓库界面上叠加搜索框，支持中文 / 拼音 / 注册名筛选物品，详见下文「[虚空仓库搜索框](#虚空仓库搜索框配套客户端-mod)」。
+
 ## 规则
 
 | 规则 | 默认 | 一句话 |
@@ -73,6 +75,15 @@
 
 规则名**故意**与 Carpet DDS Addition 的 `smeltConcretePowderToGlass` 不同：Carpet 的 `SettingsManager#addCarpetRule` 遇重名会直接抛异常，沿用原名意味着「两个模组同装 = 服务端起不来」。
 
+### 虚空仓库搜索框（配套客户端 mod）
+
+[neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search) 是独立的**纯客户端** Fabric mod：在虚空仓库界面（一个 6 行原版大箱子）上方叠加一个搜索框，输入**中文名 / 拼音全拼 / 拼音首字母 / 注册名**都能筛选物品——`铁锭`、`tieding`、`td`、`iron_ingot` 均可命中，清空输入框即恢复完整列表。
+
+- **服务端界面零改动**：GUI 布局、导航行、点击语义与原版完全一致，只是「第 n 页装谁」按过滤结果变了；不装它时一切照旧，纯原版玩家零感知
+- **匹配在客户端做**（只有客户端有中文语言文件），服务端只按物品身份集合求交；过滤是会话级状态，关掉界面即消失，不写存档
+- 物品种类超过一页时最有用：不用翻页找，一个 `td` 直达全部铁质物品
+- 五个 MC 版本齐备（26.3 / 26.2 / 26.1.2 / 26.1.1 / 1.21.11），按客户端版本从其 [Releases](https://github.com/YoshinoShizuka/neko-voidwarehouse-search/releases/latest) 下载；旧服务端上搜索框自动隐藏，纯原版客户端零影响
+
 ## 文档
 
 - [更新日志](CHANGELOG.md)
@@ -95,6 +106,7 @@
    - **本模组**，按 MC 版本选 `carpet-Neko-Addition-mc<版本>-<模组版本>.jar`（从 [Releases](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/releases/latest) 下载）
 3. 启动后用 `/carpet <规则> true` 逐条开启
 4. 客户端可以原版直连；要用打印机补货，客户端另装 `litematica-printer`，并在服务端开 `voidWarehouseRestock`
+5. 想要搜索框，客户端另装 [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search)（按客户端 MC 版本选 jar）；不装也不影响任何服务端功能
 
 > 旧版 `carpet-automending`（包 `carpetaddition`）的仓库数据不兼容，升级相当于换一个新仓库。
 

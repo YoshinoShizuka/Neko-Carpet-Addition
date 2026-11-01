@@ -62,6 +62,19 @@
 - **服务器日志与启动自检说明保持中文**：那是给服务器管理员看的，不跟玩家语言走(Server logs stay Chinese — they are for admins, not players.)。
 - **不新增 Carpet 规则**：规则集、配置键与存档格式都没变，直接替换 jar 即可(No new rule, no config or data-format change; just swap the jar.)。
 
+### 🐛 Fixed / 修复
+
+#### 盒模式取「潜影盒」那一格会造出「盒子套盒子」，送回仓库后越刷越多（`voidWarehouse`）
+
+盒模式打开后点仓库里的**潜影盒**格子，交出的是一个**装着 N 个潜影盒的潜影盒**；把它送回仓库，拆出来是 `N 个空盒 + 2 个潜影壳 + 1 个箱子` —— 可这一格原本只有 N 个盒子。来回一遍就凭空多出价值一整盒的材料，反复来回可无限增长(In box mode, taking a shulker-box cell produced a box full of shulker boxes; sending it back yielded a free box worth of materials on every round trip.)。
+
+- 🔴 **根因一：`pack` 不认「不能装盒的东西」**。潜影盒在 `VoidWarehouseShulker#pack` 眼里只是一件普通物品，而它是直接 `set(CONTAINER, ...)` 造盒子，**绕过了**原版 `ShulkerBoxBlock#canFitInsideContainerItems` 那道「潜影盒不能装进潜影盒」的检查。取 5 个空盒就交出一个装着 5 个空盒的盒子（实收 6 个）(Pack bypassed the vanilla no-nesting check and built an illegal box-in-box.)。
+- 🔴 **根因二：外盒的材料账与「取出」同源，取货先把它扣空**。外盒要 1 个空盒（`planBoxMaterials` 空盒优先），可当目标格**就是那个空盒格**时，`take()` 会先把这一格取空、连格子一起移除，随后 `consumeBoxMaterials` 的 `takeEmptyBoxes` 只能扣到 0 —— 返回值没人看，注释还写着「少扣了说明被并发抢走了，不必在意」。于是外盒一分钱不付(The outer box's material came from the very cell being taken, so once take() emptied that cell the charge silently became zero.)。
+- **修法：盒子本来就是盒子，不再装一道盒**。新增 `VoidWarehouseShulker#isBoxable`，两条取货口（界面盒模式 `withdrawShulkerBox`、聊天按数量取货 `execute`）遇到目标格本身是潜影盒时改走「散盒取出」—— 不 `pack`、不扣盒材料，与普通模式同一口径（每次 1 个）(A new isBoxable gate makes both withdraw paths hand out loose boxes instead of packing them.)。
+- **材料账不再「少扣就算」**：`consumeBoxMaterials` 把少扣的空盒按原版配方折算成 `2 潜影壳 + 1 箱子` 补扣，真补不上才留 WARN —— 同类漏账将来即使从别的路径冒出来，也只会表现为「玩家多花壳箱」，不会再凭空多出盒子(The material charge now tops up any shortfall at crafting value, so this class of leak cannot reappear as free boxes.)。
+- **两条路都修，五版本同步**：`VoidWarehouseShulker` / `VoidWarehouseMenu` / `VoidWarehouseData` / `VoidWarehouseWithdraw` 各打一处补丁（26.2 的潜影盒类与 26.3 逐字节一致，整文件复制）(Both paths fixed in all five versions.)。
+- 未新增 Carpet 规则、未改存档格式与网络协议：直接替换 jar 即可(No new rule, no save-format or protocol change; just swap the jar.)。
+
 ### 🧪 Testing / 测试
 
 - 真服务端系统验收 **209 条断言**全绿(209 assertions on a real dedicated server, all green.)，其中双语组 **17 条**：`zh_cn` / `en_us` 的语言检测、触发别名五连（中文精确 / 英文忽略大小写 / 首尾空白 / 中文名带空格不触发 / 未改名不触发）、GUI 标题跟随触发名、同一份仓库在两种语言菜单下的导航行与 tooltip（`上一页` ↔ `Prev Page`、`数量：` ↔ `Count:`）、取货与挖到提示的两套前缀与措辞（`[虚空仓库] 已取出` ↔ `[Void Warehouse] Withdrew`）。⚠️ 自检假玩家的 `ClientInformation` 从 `createDefault()`（`en_us`）改为显式 `zh_cn` —— 不改的话语言检测会把全部自检玩家判成英文、17 条中文文案断言当场翻车(Test bots now explicitly report `zh_cn`; the default `createDefault()` is `en_us` and would flip every chat assertion.)。
@@ -74,22 +87,25 @@
   - **剩余量与仓库自己的账一致**：拿 `amountExact` 当外部标准比对回执里的数，避免「客户端和提示互相对得上、却都和仓库对不上」(The reported stock is compared against the warehouse's own ledger as an external oracle.)。
 - 客户端提示另有 **8 条单测**（`VoidWarehouseReturnNoticeTest`）：单种/多种的分隔、千分位、超过 4 种折算、剩余量缺失（`-1`）时只丢括号。文本断言一律用解析不出来的 id 当物品名，绕开注册表 —— JUnit 里没有客户端语言表(The client-side wording is pinned by 8 unit tests that avoid the item registry.)。
 - 自检用的是**真 `ServerPlayer` + 真仓库存档**，测试前后把塞进仓库的量原样取回，开发存档不会被动过(The check uses a real player and real warehouse data, and restores the warehouse afterwards.)。
+- 盒模式刷盒子事故的**复现 + 回归自检 25 条**（`BoxNestingSelfCheck`，真 26.3 服务端）：修复前 `checks=25 failures=4` —— 打出「交出盒子 1 个，里面套着潜影盒 5 个；仓库空盒 5→0」「送回后空盒=5，壳=2，箱=1」「来回 3 轮后壳=8，箱=4」；修复后 `failures=0`，来回 3 轮空盒稳定在 5 个、壳箱一个不多(The dupe is reproduced and pinned by 25 assertions: 4 failures before the fix, 0 after, with the box count stable across round trips.)。
+- 该组自带**对照组**：盒模式点**圆石**格 → 交出装满 1728 个的盒子 → 送回 1000 个余料，断言「圆石 3456→1728→2728、盒子拆成 2 壳 1 箱」—— 修复前后都是绿的，证明红只出在「目标格本身是潜影盒」这一条路，不是断言写歪(A control group on a normal material cell stays green both before and after, proving the failure is specific to the shulker-box cell.)。
+- **反证**：只把聊天取货口那一处改回旧代码重跑，A/B 两组仍是绿的，C 组 3 条当场翻红（`套着 27 个盒子`、背包只有 4 个盒堆、送回后多出 2 壳 1 箱）—— 证明断言咬的是两条路各自的代码(Negative control: reverting only the chat path flips exactly its three assertions.)
 - 搜索功能的验证：服务端 **26.3 真机冒烟**（`Done` 正常启动、与 TIS / Org / FGA 等其它 carpet 附加包同装无冲突、零 ERROR）+ 三个 payload 与客户端模组的**逐字节 parity**；拼音匹配 **11 条单测**在客户端模组仓库（`SearchIndexTest`：中文名 / 全拼 / 首字母 / 注册名 / 空查询 = 清除过滤 / 未知 id 静默跳过，`铁锭=td`、`铁块=tk` 这类词典事实直接咬死）。客户端吞键与渲染接线需真机客户端验证(Server smoke on 26.3, byte-level payload parity, and 11 client-side unit tests; key-swallowing needs in-game verification.)。
 
 ### 📦 Builds / 构建产物
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 391,243 B | `5b4474ed2dec1be027da05837ec9ea13` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 408,496 B | `8b98790a669b504cf44428dfc23cb653` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 380,851 B | `46728c35372f8f0efe04fa957d3197b0` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 395,702 B | `8ae45895692d84c90957bf85586aa8f6` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 384,113 B | `2b9aa0d3329db34c1880bb0877231e4c` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 396,718 B | `29df8e3e237a1593bb10388a6b91bc6b` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 384,115 B | `1275c3621386cac32bcc3d81e8b2669d` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 396,717 B | `9827c7a3a4abf3db98a1e2319dddf1f3` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 382,376 B | `50a6ec9fa595e6483d37d4757a4e07a0` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 396,859 B | `1f9a155e92463fcd793df38207f4700a` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 391,807 B | `5a784f514c9fd13a7691474e8018316f` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 410,571 B | `023984fd2d31166b31f8ca84c615ee2d` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 381,423 B | `ac2df5c3ca6857a3066369d15c832d98` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 397,797 B | `b2036bb6b6ac995f9afc9254af0d2dbe` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 384,692 B | `76795923a5e16bdcf4d4ebd1b46f85db` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 398,814 B | `66efeefb15fda4d819bbafb80a195d34` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 384,694 B | `1bae5d0745e4e9daa971f3e48da58b91` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 398,813 B | `15ba048cc40cb8e46c225dff0a98dd31` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 382,931 B | `4186118879a978c90d41ffec0a33701b` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 398,982 B | `6f4d9845bd7fae2d3469645ea8920c49` |
 
 > 只需要能跑的 jar：下 `-1.0.16.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 
@@ -97,7 +113,8 @@
 
 - mixin 从 13 条增到 15 条（新增 `ServerLevelAddEntityMixin`、`ServerPlayerGameModeDestroyMixin`），规则名、配置键与存档格式均未变，**直接替换 jar 即可**(Two new mixins; no config or data-format change, just swap the jar.)。
 - 新规则默认关闭：`/carpet voidWarehouseBlockDrops true`，且 `voidWarehouse` 也要开着。
-- **同版本号原地更新**：这条规则的聊天提示在 1.0.16 首次发布之后改过两次（先加提示，再去掉「已直接入库」、改成报仓库现有数量），所以 1.0.16 的 jar 变过几次 —— 以文件名旁的 md5 为准（本表已刷新）(This release was updated in place; compare the md5 next to the file name.)。
+- **同版本号原地更新**：这条规则的聊天提示在 1.0.16 首次发布之后改过两次（先加提示，再去掉「已直接入库」、改成报仓库现有数量），加上这次的盒模式刷盒子修复，1.0.16 的 jar 已经变过几次 —— 以文件名旁的 md5 为准（本表已刷新）(This release was updated in place several times; compare the md5 next to the file name.)。
+- **盒模式取潜影盒的行为变了**：以前（错得）交出一个「装着 N 个潜影盒的潜影盒」，现在直接交出 1 个潜影盒（与普通模式一致），且不消耗额外的空盒 / 壳 / 箱。已经刷出来的嵌套盒、已经攒多的壳与箱不会自动回收(In box mode, taking a shulker-box cell now hands out one plain box instead of a box full of boxes.)。
 - 反方向提醒：开这条规则之后**挖掘产出不再落在地上**。靠「挖掉 → 掉落物被水流冲走」的生电收集结构会失效，开之前先确认你的收集系统不依赖世界里的掉落物。
 - 新增两条通道 `printer_return` / `printer_return_result`（服务端注册；客户端幂等补位）。**没有新增 Carpet 规则**，规则集、配置键与存档格式都没变，直接替换 jar 即可；老版本打印机不认识这两条通道也不会受影响（服务端发送前会 `canSend`）(Two new channels, no new rule, no config or data-format change.)。
 - 新增三条搜索通道 `search_hello` / `search_catalog` / `search_apply`。**没有新增 Carpet 规则**，规则集、配置键与存档格式都没变，直接替换 jar 即可；不装客户端模组时这三条通道没有任何人使用(Three new search channels, no new rule; harmless without the client mod.)。

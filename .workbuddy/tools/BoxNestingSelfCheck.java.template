@@ -1,0 +1,375 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.lang.reflect.Field;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * 【临时自检】「盒模式取出内部有物品的潜影盒 ⇒ 送回仓库后刷盒子」的复现 + 回归。
+ *
+ * <h2>要复现的两件事</h2>
+ * <ol>
+ *   <li><b>盒子套盒子</b>：盒模式下点「潜影盒」那一格，{@code VoidWarehouseShulker#pack}
+ *       会拿<b>盒子当模板</b>再装一次盒 —— 交出去的是一个「装着 N 个潜影盒的潜影盒」。
+ *       原版是靠 {@code ShulkerBoxBlock#canFitInsideContainerItems} 挡住这件事的，
+ *       而这里直接 {@code set(CONTAINER, ...)}，绕过了原版检查。</li>
+ *   <li><b>外盒白送</b>：外盒的材料来自 {@code planBoxMaterials}（空盒优先）。可当目标格
+ *       <b>就是那个空盒格</b>时，{@code take()} 先把这一格取空、格子被移除，
+ *       随后 {@code consumeBoxMaterials} 的 {@code takeEmptyBoxes} 只能扣到 0 ——
+ *       返回值没人看，于是「外盒」一分钱没付。</li>
+ * </ol>
+ *
+ * <p>两件事叠在一起：拿 5 个空盒 → 交出一个装着 5 个空盒的盒子（实收 6 个盒子，账上只扣 5 个）
+ * → 把这个盒子存回仓库 → 拆成 5 个空盒 + 2 个潜影壳 + 1 个箱子。空盒回到 5，
+ * <b>却凭空多了价值一整盒的壳 + 箱</b>。反复来回即可无限刷。</p>
+ *
+ * <h2>断言口径</h2>
+ * <p>全部断言写的是<b>修复后应有的行为</b>（盒子不套盒子、取出与送回严格守恒），
+ * 所以修复前这些断言必须红，修复后必须全绿 —— 这样才能证明断言真的咬住了代码。</p>
+ */
+public final class BoxNestingSelfCheck {
+    private static int checks;
+    private static int failures;
+    private static boolean done;
+
+    private BoxNestingSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        VoidWarehouseSettings.voidWarehouse = true;
+        // 可兑条目会往列表里插虚拟格子，测试里一律关掉，保证点到的就是真实格
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+        try {
+            boxCellChecks(server);
+            materialCellChecks(server);
+            chatWithdrawChecks(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT vw-boxnest/26.3 checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ---------------------------------------------------------------- 断言
+
+    private static void check(String name, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("FAIL: " + name);
+        }
+    }
+
+    // ---------------------------------------------------------------- 场景 1：目标格本身是潜影盒
+
+    /**
+     * 盒模式下点「潜影盒」那一格。
+     *
+     * <p>期望：这一格已经是盒子，再装盒没有任何意义 —— 直接交出 1 个空盒，仓库扣 1。
+     * <br>修复前：交出一个「装着 5 个空盒的盒子」，仓库 5 个全扣光，外盒没付钱。</p>
+     */
+    private static void boxCellChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        if (player == null) {
+            check("A0 假玩家可构造", false);
+            return;
+        }
+        check("A0 假玩家可构造", true);
+
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        clearInv(player);
+        stock(data, Items.SHULKER_BOX, 5);
+
+        BigInteger beforeBoxes = data.emptyBoxCount();
+        VoidWarehouseViews.viewFor(player).setShulkerMode(true);
+        VoidWarehouseMenu menu = new VoidWarehouseMenu(1, player.getInventory(), data, player);
+        int slot = slotOf(menu, Items.SHULKER_BOX);
+        check("A1 仓库界面里能找到潜影盒那一格", slot >= 0);
+        if (slot < 0) {
+            return;
+        }
+        menu.clicked(slot, 0, ContainerInput.PICKUP, player);
+
+        List<ItemStack> got = boxesIn(player);
+        int innerBoxes = 0;
+        for (ItemStack box : got) {
+            for (ItemStack inside : VoidWarehouseShulker.contentsOf(box)) {
+                if (VoidWarehouseShulker.isShulkerBox(inside)) {
+                    innerBoxes += inside.getCount();
+                }
+            }
+        }
+        System.out.println("   [A1] 交出盒子 " + got.size() + " 个，里面套着潜影盒 " + innerBoxes
+                + " 个；仓库空盒 " + beforeBoxes + "→" + data.emptyBoxCount()
+                + "，壳 " + data.amountOf(Items.SHULKER_SHELL) + "，箱 " + data.amountOf(Items.CHEST));
+
+        check("A1 盒模式点潜影盒格：不交出「盒子套盒子」（里层潜影盒 = 0）", innerBoxes == 0);
+        check("A1 盒模式点潜影盒格：只交出 1 个空盒", got.size() == 1);
+        check("A1 仓库恰好扣 1 个空盒（5→4）",
+                data.emptyBoxCount().equals(BigInteger.valueOf(4)));
+
+        // ---- 把它送回仓库：盒子总账必须原封不动地回到 5
+        putAllBack(data, player);
+        System.out.println("   [A2] 送回后 空盒=" + data.emptyBoxCount()
+                + "，壳=" + data.amountOf(Items.SHULKER_SHELL)
+                + "，箱=" + data.amountOf(Items.CHEST));
+        check("A2 送回后空盒回到 5 个", data.emptyBoxCount().equals(BigInteger.valueOf(5)));
+        check("A2 送回后没有凭空多出潜影壳", data.amountOf(Items.SHULKER_SHELL).signum() == 0);
+        check("A2 送回后没有凭空多出箱子", data.amountOf(Items.CHEST).signum() == 0);
+
+        // ---- 连做 3 轮：只要有一轮收支不平，这里就会滚出 3 个盒子的差额
+        for (int round = 0; round < 3; round++) {
+            VoidWarehouseMenu m = new VoidWarehouseMenu(1, player.getInventory(), data, player);
+            int s = slotOf(m, Items.SHULKER_BOX);
+            if (s >= 0) {
+                m.clicked(s, 0, ContainerInput.PICKUP, player);
+            }
+            putAllBack(data, player);
+        }
+        System.out.println("   [A3] 来回 3 轮后 空盒=" + data.emptyBoxCount()
+                + "，壳=" + data.amountOf(Items.SHULKER_SHELL)
+                + "，箱=" + data.amountOf(Items.CHEST));
+        check("A3 来回 3 轮后空盒仍是 5 个（没有越刷越多）",
+                data.emptyBoxCount().equals(BigInteger.valueOf(5)));
+
+        data.clearContent();
+        clearInv(player);
+    }
+
+    // ---------------------------------------------------------------- 场景 2：目标格是普通物品（对照组）
+
+    /**
+     * 对照组：盒模式点「圆石」格应当照常交出满盒，并且和「送回仓库」严格守恒。
+     *
+     * <p>这条断言修复前就应该是绿的 —— 它证明上面的红不是因为断言写错，
+     * 而是真的只有「目标格是潜影盒」这一条路会漏账。</p>
+     */
+    private static void materialCellChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        if (player == null) {
+            return;
+        }
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        clearInv(player);
+        stock(data, Items.COBBLESTONE, 3456);
+        stock(data, Items.SHULKER_BOX, 1);
+
+        VoidWarehouseViews.viewFor(player).setShulkerMode(true);
+        VoidWarehouseMenu menu = new VoidWarehouseMenu(1, player.getInventory(), data, player);
+        int slot = slotOf(menu, Items.COBBLESTONE);
+        check("B1 仓库界面里能找到圆石那一格", slot >= 0);
+        if (slot < 0) {
+            return;
+        }
+        menu.clicked(slot, 0, ContainerInput.PICKUP, player);
+
+        int inBox = 0;
+        for (ItemStack box : boxesIn(player)) {
+            for (ItemStack inside : VoidWarehouseShulker.contentsOf(box)) {
+                if (inside.getItem() == Items.COBBLESTONE) {
+                    inBox += inside.getCount();
+                }
+            }
+        }
+        System.out.println("   [B1] 盒内圆石 " + inBox + "；仓库圆石 " + data.amountOf(Items.COBBLESTONE)
+                + "，空盒 " + data.emptyBoxCount());
+        check("B1 照常交出装满 1728 个圆石的盒子", inBox == 1728);
+        check("B1 圆石扣 1728（3456→1728）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(1728)));
+        check("B1 空盒扣 1 个（1→0）", data.emptyBoxCount().signum() == 0);
+
+        // 用掉 728 个，把装着 1000 个的盒子送回仓库
+        clearInv(player);
+        ItemStack returned = VoidWarehouseShulker.pack(new ItemStack(Items.COBBLESTONE), 1000);
+        check("B2 盒子能存回仓库", data.insert(returned));
+        System.out.println("   [B2] 送回后 圆石=" + data.amountOf(Items.COBBLESTONE)
+                + "，空盒=" + data.emptyBoxCount()
+                + "，壳=" + data.amountOf(Items.SHULKER_SHELL)
+                + "，箱=" + data.amountOf(Items.CHEST));
+        check("B2 圆石回到 2728（1728 + 退回的 1000）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(2728)));
+        check("B2 盒子拆成 2 个潜影壳",
+                data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(2)));
+        check("B2 盒子拆成 1 个箱子",
+                data.amountOf(Items.CHEST).equals(BigInteger.valueOf(1)));
+        check("B2 送回的盒子没有变回「空盒」一格", data.emptyBoxCount().signum() == 0);
+
+        data.clearContent();
+        clearInv(player);
+    }
+
+    // ---------------------------------------------------------------- 场景 3：聊天按数量取货（第二个取货口）
+
+    /**
+     * 盒模式下右键格子 → 聊天栏输入数量（{@code VoidWarehouseWithdraw}）。
+     *
+     * <p>这条路的产物是「满盒 + 散货」，同样会 {@code pack}。点潜影盒那一格时说「取 5 个」，
+     * 修复前会给出「1 个装着 5 个盒子的盒子」，还多扣一个外盒材料（扣不到就免单）。</p>
+     *
+     * <p>⚠️ 数量必须<b>大于一盒容量（27）</b>才会真的走到 {@code pack} —— 取 5 个时
+     * {@code fullBoxes = 0}、散货也没到「顺手装盒」的阈值，压根不装盒，
+     * 修复前也是对的。所以这里取 30（= 1 满盒 + 3 散货）。</p>
+     */
+    private static void chatWithdrawChecks(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        ServerPlayer player = player(server, level);
+        if (player == null) {
+            return;
+        }
+        try {
+            VoidWarehouseData data = VoidWarehouse.data(server);
+            data.clearContent();
+            clearInv(player);
+            stock(data, Items.SHULKER_BOX, 30);
+
+            VoidWarehouseWithdraw.request(player, new ItemStack(Items.SHULKER_BOX));
+            check("C1 待处理请求已记下", VoidWarehouseWithdraw.hasPending(player));
+            VoidWarehouseWithdraw.onChat(player, "30");
+
+            List<ItemStack> got = boxesIn(player);
+            int innerBoxes = 0;
+            for (ItemStack box : got) {
+                for (ItemStack inside : VoidWarehouseShulker.contentsOf(box)) {
+                    if (VoidWarehouseShulker.isShulkerBox(inside)) {
+                        innerBoxes += inside.getCount();
+                    }
+                }
+            }
+            System.out.println("   [C1] 交出盒子有内容物的件数 " + innerBoxes
+                    + "，背包里潜影盒 " + got.size()
+                    + "；仓库空盒 " + data.emptyBoxCount()
+                    + "，壳 " + data.amountOf(Items.SHULKER_SHELL)
+                    + "，箱 " + data.amountOf(Items.CHEST));
+            check("C1 聊天取 30 个盒子：不交出「盒子套盒子」", innerBoxes == 0);
+            check("C1 聊天取 30 个盒子：背包里正好 30 个盒子", got.size() == 30);
+            check("C1 仓库空盒扣到 0", data.emptyBoxCount().signum() == 0);
+            check("C1 没有动壳 / 箱", data.amountOf(Items.SHULKER_SHELL).signum() == 0
+                    && data.amountOf(Items.CHEST).signum() == 0);
+
+            putAllBack(data, player);
+            System.out.println("   [C2] 送回后 空盒=" + data.emptyBoxCount()
+                    + "，壳=" + data.amountOf(Items.SHULKER_SHELL)
+                    + "，箱=" + data.amountOf(Items.CHEST));
+            check("C2 送回后回到 30 个空盒", data.emptyBoxCount().equals(BigInteger.valueOf(30)));
+            check("C2 送回后没有凭空多出壳 / 箱",
+                    data.amountOf(Items.SHULKER_SHELL).signum() == 0
+                            && data.amountOf(Items.CHEST).signum() == 0);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! C 组抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+    }
+
+    // ---------------------------------------------------------------- 工具
+
+    /** 把玩家背包里所有潜影盒逐个存回仓库（等价于玩家手动存 / 漏斗吸走） */
+    private static void putAllBack(VoidWarehouseData data, ServerPlayer player) {
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (!stack.isEmpty() && VoidWarehouseShulker.isShulkerBox(stack)) {
+                data.insert(stack.copy());
+                player.getInventory().setItem(i, ItemStack.EMPTY);
+            }
+        }
+    }
+
+    /** 背包里的所有潜影盒 */
+    private static List<ItemStack> boxesIn(ServerPlayer player) {
+        List<ItemStack> out = new ArrayList<>();
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (!stack.isEmpty() && VoidWarehouseShulker.isShulkerBox(stack)) {
+                out.add(stack);
+            }
+        }
+        return out;
+    }
+
+    private static void clearInv(ServerPlayer p) {
+        p.getInventory().clearContent();
+        p.containerMenu = p.inventoryMenu;
+    }
+
+    /** 往仓库里放 {@code n} 个某物品（走 insert，等价于玩家把东西存进去） */
+    private static void stock(VoidWarehouseData data, Item item, long n) {
+        if (n > 0) {
+            data.insert(new ItemStack(item, (int) Math.min(n, Integer.MAX_VALUE)));
+        }
+    }
+
+    /** 找到界面里某物品那一格的槽位号（仓库排序后的实际位置） */
+    private static int slotOf(VoidWarehouseMenu menu, Item looking) {
+        for (int i = 0; i < VoidWarehouseData.TOTAL_SLOTS; i++) {
+            ItemStack stack = menu.getSlot(i).getItem();
+            if (!stack.isEmpty() && stack.getItem() == looking) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 手工造的连接没有走完真实握手，{@code waitingForRespawn / clientLoadedTimeoutTimer}
+     * 会让 {@code hasClientLoaded()} 返回 false，于是服务端在第一步就 return。
+     * 真机上这两个值是正常的，所以这里用反射把它们摁成「已加载」。
+     */
+    private static void forceClientLoaded(ServerGamePacketListenerImpl conn) {
+        for (String name : new String[]{"waitingForRespawn", "clientLoadedTimeoutTimer"}) {
+            try {
+                Field f = ServerGamePacketListenerImpl.class.getDeclaredField(name);
+                f.setAccessible(true);
+                if (f.getType() == boolean.class) {
+                    f.setBoolean(conn, false);
+                } else {
+                    f.setInt(conn, 0);
+                }
+            } catch (Throwable t) {
+                System.out.println("   [diag] 强制已加载失败(" + name + "): " + t);
+            }
+        }
+    }
+
+    private static ServerPlayer player(MinecraftServer server, ServerLevel level) {
+        try {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "NekoBoxNestCheck");
+            ClientInformation info = ClientInformation.createDefault();
+            ServerPlayer p = new ServerPlayer(server, level, profile, info);
+            ServerGamePacketListenerImpl listener = new ServerGamePacketListenerImpl(
+                    server, new Connection(PacketFlow.SERVERBOUND), p,
+                    CommonListenerCookie.createInitial(profile, false));
+            p.connection = listener;
+            forceClientLoaded(listener);
+            return p;
+        } catch (Throwable t) {
+            System.out.println("   假玩家构造失败: " + t);
+            return null;
+        }
+    }
+}

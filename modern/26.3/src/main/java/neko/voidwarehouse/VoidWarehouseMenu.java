@@ -109,40 +109,13 @@ import java.util.Set;
  * </ol>
  */
 public class VoidWarehouseMenu extends ChestMenu {
-    // 聊天提示统一走 VoidWarehouseText.info()：亮金色 [虚空仓库] 前缀 + 灰色正文，
-    // 一眼能和普通聊天分开；正文里的关键数字用 VoidWarehouseText.key() 标亮绿。
-    private static final Component MSG_FULL = VoidWarehouseText.info("虚空仓库已满，放不进去了");
-    private static final Component MSG_RESCUED =
-            VoidWarehouseText.info("背包已满，手上的物品已存入虚空仓库");
-    private static final Component MSG_INV_FULL =
-            VoidWarehouseText.info("背包已满，放不下的留在虚空仓库");
-    private static final Component MSG_REJECTED =
-            VoidWarehouseText.info("带额外数据的物品（耐久 / 附魔 / 改名）拒收");
-    private static final Component MSG_BOX_REJECTED =
-            VoidWarehouseText.info("盒内有带额外数据的物品，整盒拒收");
-    private static final Component MSG_SHULKER_ON = switchMessage("潜影盒模式", "开");
-    private static final Component MSG_SHULKER_OFF = switchMessage("潜影盒模式", "关");
-    private static final Component MSG_NO_BOX_PARTS = VoidWarehouseText.info(
-            VoidWarehouseText.body("潜影壳或箱子不足，无法装盒（每盒需 潜影壳 ×")
-                    .append(VoidWarehouseText.key(String.valueOf(VoidWarehouseShulker.SHELL_COST)))
-                    .append(VoidWarehouseText.body(" + 箱子 ×"))
-                    .append(VoidWarehouseText.key(String.valueOf(VoidWarehouseShulker.CHEST_COST)))
-                    .append(VoidWarehouseText.body("）")));
-    private static final Component MSG_BOX_INV_FULL =
-            VoidWarehouseText.info("背包放不下盒子，本次取消（仓库未扣减）");
-    private static final Component MSG_SORT_ON = switchMessage("数量排序", "开");
-    private static final Component MSG_SORT_OFF = switchMessage("数量排序", "关");
+    // 聊天提示统一走 VoidWarehouseText.info()：亮金前缀 + 灰色正文，一眼能和普通聊天分开；
+    // 正文里的关键数字用 VoidWarehouseText.key() 标亮绿。
+    // 双语版（方案 B）：消息一律在发送时按玩家语言构造（msgXxx() 实例方法），
+    // 不再是静态常量 —— 前缀与正文都跟着打开者的语言走。
 
-    /**
-     * 「xxx：开 / 关」这种模式开关提示。
-     *
-     * <p>名称用正文灰、<b>状态用亮绿</b>：玩家点开关时真正要读的是「现在开还是关」，
-     * 让这两个字自己跳出来，不用把整句读完再回头找结论。</p>
-     */
-    private static Component switchMessage(String name, String state) {
-        return VoidWarehouseText.info(VoidWarehouseText.body(name + "：")
-                .append(VoidWarehouseText.key(state)));
-    }
+    /** 打开这个界面的玩家客户端语言是不是英语（构造时定死；界面交互只来自打开者本人） */
+    private final boolean en;
 
     private final VoidWarehouseData data;
     private final VoidWarehousePageContainer pageContainer;
@@ -154,13 +127,82 @@ public class VoidWarehouseMenu extends ChestMenu {
         // 页码 + 两个开关是「开界面这个玩家自己的」，所以按 opener 取他那份持久化的视图状态
         // （VoidWarehouseViews.viewFor 是静态调用，可以在 super(...) 的参数里用）。
         super(MenuType.GENERIC_9x6, syncId, playerInventory,
-                new VoidWarehousePageContainer(data, VoidWarehouseViews.viewFor(opener)), 6);
+                new VoidWarehousePageContainer(data, VoidWarehouseViews.viewFor(opener),
+                        VoidWarehouseText.isEnglish(opener instanceof ServerPlayer serverPlayer ? serverPlayer : null)),
+                6);
 
+        this.en = VoidWarehouseText.isEnglish(opener instanceof ServerPlayer serverPlayer ? serverPlayer : null);
         this.data = data;
         this.pageContainer = (VoidWarehousePageContainer) this.getContainer();
         this.openDimension = opener.level().dimension();
 
         this.installNavSlots();
+    }
+
+    // ------------------------------------------------------------------ 消息（双语）
+
+    private Component msgFull() {
+        return VoidWarehouseText.info(this.en, "虚空仓库已满，放不进去了", "Void Warehouse is full");
+    }
+
+    private Component msgRescued() {
+        return VoidWarehouseText.info(this.en,
+                "背包已满，手上的物品已存入虚空仓库",
+                "Inventory full — carried items went into the Void Warehouse");
+    }
+
+    private Component msgInvFull() {
+        return VoidWarehouseText.info(this.en,
+                "背包已满，放不下的留在虚空仓库",
+                "Inventory full — what didn't fit stays in the Void Warehouse");
+    }
+
+    private Component msgRejected() {
+        return VoidWarehouseText.info(this.en,
+                "带额外数据的物品（耐久 / 附魔 / 改名）拒收",
+                "Rejected: items with extra data (durability / enchantments / custom names)");
+    }
+
+    private Component msgBoxRejected() {
+        return VoidWarehouseText.info(this.en,
+                "盒内有带额外数据的物品，整盒拒收",
+                "Rejected: the box contains items with extra data");
+    }
+
+    private Component msgNoBoxParts() {
+        return VoidWarehouseText.info(this.en,
+                VoidWarehouseText.body("潜影壳或箱子不足，无法装盒（每盒需 潜影壳 ×")
+                        .append(VoidWarehouseText.key(String.valueOf(VoidWarehouseShulker.SHELL_COST)))
+                        .append(VoidWarehouseText.body(" + 箱子 ×"))
+                        .append(VoidWarehouseText.key(String.valueOf(VoidWarehouseShulker.CHEST_COST)))
+                        .append(VoidWarehouseText.body("）")),
+                VoidWarehouseText.body("Not enough shells or chests to pack a box (per box: Shell ×")
+                        .append(VoidWarehouseText.key(String.valueOf(VoidWarehouseShulker.SHELL_COST)))
+                        .append(VoidWarehouseText.body(" + Chest ×"))
+                        .append(VoidWarehouseText.key(String.valueOf(VoidWarehouseShulker.CHEST_COST)))
+                        .append(VoidWarehouseText.body(")")));
+    }
+
+    private Component msgBoxInvFull() {
+        return VoidWarehouseText.info(this.en,
+                "背包放不下盒子，本次取消（仓库未扣减）",
+                "No room for the box — cancelled (nothing was deducted)");
+    }
+
+    private Component switchMessage(String zhName, String zhState, String enName, String enState) {
+        return VoidWarehouseText.info(this.en, VoidWarehouseText.body(
+                        VoidWarehouseText.tr(this.en, zhName, enName) + "：")
+                .append(VoidWarehouseText.key(VoidWarehouseText.tr(this.en, zhState, enState))));
+    }
+
+    private Component msgShulker(boolean on) {
+        return this.switchMessage("潜影盒模式", on ? "开" : "关",
+                "Shulker Mode", on ? "On" : "Off");
+    }
+
+    private Component msgSort(boolean on) {
+        return this.switchMessage("数量排序", on ? "开" : "关",
+                "Sort by Amount", on ? "On" : "Off");
     }
 
     /**
@@ -294,7 +336,7 @@ public class VoidWarehouseMenu extends ChestMenu {
         if (this.data.insert(rest)) {
             // 背包塞不下：仓库无上限，一定装得下，比丢到地上安全
             if (player instanceof ServerPlayer serverPlayer) {
-                serverPlayer.sendSystemMessage(MSG_RESCUED);
+                serverPlayer.sendSystemMessage(this.msgRescued());
             }
             return;
         }
@@ -460,7 +502,7 @@ public class VoidWarehouseMenu extends ChestMenu {
         this.pageContainer.setShulkerMode(enabled);
         this.sendAllDataToRemote();
         if (player instanceof ServerPlayer serverPlayer) {
-            serverPlayer.sendSystemMessage(enabled ? MSG_SHULKER_ON : MSG_SHULKER_OFF);
+            serverPlayer.sendSystemMessage(this.msgShulker(enabled));
         }
     }
 
@@ -479,7 +521,7 @@ public class VoidWarehouseMenu extends ChestMenu {
         boolean enabled = !this.pageContainer.amountSort();
         this.pageContainer.setAmountSort(enabled);
         this.sendAllDataToRemote();
-        this.message(player, enabled ? MSG_SORT_ON : MSG_SORT_OFF);
+        this.message(player, this.msgSort(enabled));
     }
 
     /**
@@ -533,7 +575,7 @@ public class VoidWarehouseMenu extends ChestMenu {
         //    否则玩家会遇到「库里有空盒，却在界面里被要求补潜影壳」的分裂行为。
         VoidWarehouseData.BoxMaterials plan = this.data.planBoxMaterials(1);
         if (!this.data.hasBoxMaterials(plan)) {
-            this.message(player, MSG_NO_BOX_PARTS);
+            this.message(player, this.msgNoBoxParts());
             return;
         }
 
@@ -548,7 +590,7 @@ public class VoidWarehouseMenu extends ChestMenu {
         ItemStack box = VoidWarehouseShulker.pack(template, (int) available);
         this.moveItemStackTo(box, VoidWarehouseData.TOTAL_SLOTS, this.slots.size(), true);
         if (!box.isEmpty()) {
-            this.message(player, MSG_BOX_INV_FULL);
+            this.message(player, this.msgBoxInvFull());
             return;
         }
 
@@ -613,7 +655,7 @@ public class VoidWarehouseMenu extends ChestMenu {
         // 背包塞不下：把没放下的那部分还回仓库（走 returnUnplaced，不受筛选规则影响，绝不丢东西）
         withdrawal.returnUnplaced(withdrawal.taken() - moved.getCount());
         if (player instanceof ServerPlayer serverPlayer) {
-            serverPlayer.sendSystemMessage(MSG_INV_FULL);
+            serverPlayer.sendSystemMessage(this.msgInvFull());
         }
     }
 
@@ -729,11 +771,11 @@ public class VoidWarehouseMenu extends ChestMenu {
     private void reportReject(ItemStack stack, Player player) {
         Component text;
         if (VoidWarehouseShulker.isShulkerBox(stack)) {
-            text = MSG_BOX_REJECTED;
+            text = this.msgBoxRejected();
         } else if (!VoidWarehouseData.isStorable(stack)) {
-            text = MSG_REJECTED;
+            text = this.msgRejected();
         } else {
-            text = MSG_FULL;
+            text = this.msgFull();
         }
         this.message(player, text);
     }

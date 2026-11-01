@@ -210,7 +210,8 @@ public final class VoidWarehouseBlockDrops {
                 }
             }
             try {
-                pending.player.sendSystemMessage(summary(kinds, data));
+                pending.player.sendSystemMessage(summary(kinds, data,
+                        VoidWarehouseText.isEnglish(pending.player)));
             } catch (RuntimeException ignored) {
                 // 发不出去（玩家正在断开、别的模组接管了聊天通道）不能反过来影响挖掘
             }
@@ -280,41 +281,42 @@ public final class VoidWarehouseBlockDrops {
      *
      * @param kinds 这一轮要报的物品
      * @param data  仓库数据，用来现读库存；{@code null} = 读不到，此时只报挖到的数量
+     * @param en    接收玩家的客户端语言是不是英语（双语版新增；自检默认按中文传 {@code false}）
      */
-    static Component summary(List<Kind> kinds, VoidWarehouseData data) {
-        MutableComponent body = VoidWarehouseText.body("挖到 ");
+    static Component summary(List<Kind> kinds, VoidWarehouseData data, boolean en) {
+        MutableComponent body = VoidWarehouseText.body(en ? "Mined " : "挖到 ");
         if (kinds.size() > MAX_LISTED_KINDS) {
             long total = 0L;
             for (Kind kind : kinds) {
                 total += kind.total;
             }
-            return VoidWarehouseText.info(body
+            return VoidWarehouseText.info(en, body
                     .append(VoidWarehouseText.key(VoidWarehouseText.count(kinds.size())))
-                    .append(VoidWarehouseText.body(" 种共 "))
+                    .append(VoidWarehouseText.body(en ? " kinds, " : " 种共 "))
                     .append(VoidWarehouseText.key(VoidWarehouseText.count(total)))
-                    .append(VoidWarehouseText.body(" 个")));
+                    .append(VoidWarehouseText.body(en ? " items" : " 个")));
         }
         for (int i = 0; i < kinds.size(); i++) {
             Kind kind = kinds.get(i);
             if (i > 0) {
-                body.append(VoidWarehouseText.body("、"));
+                body.append(VoidWarehouseText.body(en ? "; " : "、"));
             }
             body.append(VoidWarehouseText.key(VoidWarehouseText.count(kind.total)))
-                    .append(VoidWarehouseText.body(" 个 "))
+                    .append(VoidWarehouseText.body(en ? " " : " 个 "))
                     // 物品名保持可翻译组件原样，本地化交给客户端（与服务端 getString() 的区别见 VoidWarehouseText#body(Component)）
                     .append(VoidWarehouseText.body(kind.sample.getHoverName()));
             if (kind.unpacked) {
-                body.append(VoidWarehouseText.body("（已拆开）"));
+                body.append(VoidWarehouseText.body(en ? " (unpacked)" : "（已拆开）"));
                 continue;
             }
             BigInteger after = afterCount(data, kind);
             if (after != null) {
-                body.append(VoidWarehouseText.body("（仓库共 "))
+                body.append(VoidWarehouseText.body(en ? " (stock: " : "（仓库共 "))
                         .append(VoidWarehouseText.key(VoidWarehouseText.count(after)))
-                        .append(VoidWarehouseText.body(" 个）"));
+                        .append(VoidWarehouseText.body(en ? " items)" : " 个）"));
             }
         }
-        return VoidWarehouseText.info(body);
+        return VoidWarehouseText.info(en, body);
     }
 
     /**

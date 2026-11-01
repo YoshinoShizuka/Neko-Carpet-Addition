@@ -4,6 +4,7 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -115,13 +116,23 @@ public final class VoidWarehouse {
         return data;
     }
 
-    /** 给玩家打开虚空仓库界面，成功返回 true */
+    /** 给玩家打开虚空仓库界面（中文标题），成功返回 true */
     public static boolean open(ServerPlayer player) {
+        return open(player, VoidWarehouseProvider.DEFAULT_TITLE);
+    }
+
+    /**
+     * 给玩家打开虚空仓库界面，标题由调用方给（跟随触发名），成功返回 true。
+     *
+     * <p>双语版：触发入口传玩家改名时敲的名字（{@code getHoverName()}），
+     * 按数量取货结束重开时按玩家语言传对应标题。</p>
+     */
+    public static boolean open(ServerPlayer player, Component title) {
         MinecraftServer server = player.level().getServer();
         if (server == null) {
             return false;
         }
-        player.openMenu(new VoidWarehouseProvider(data(server)));
+        player.openMenu(new VoidWarehouseProvider(data(server), title));
         return true;
     }
 

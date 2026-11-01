@@ -155,8 +155,17 @@ public final class PrinterRestockNetwork {
         // 玩家得一眼看出是谁在补货。
         //
         // 物品名必须保持「可翻译组件」原样发出去，绝不能在服务端 getString()，理由见上。
-        player.sendSystemMessage(VoidWarehouseText.info(
-                VoidWarehouseText.body("取走 ")
+        // 双语版：按接收玩家的客户端语言发对应文本。
+        boolean en = VoidWarehouseText.isEnglish(player);
+        player.sendSystemMessage(VoidWarehouseText.info(en,
+                en ? VoidWarehouseText.body("Took ")
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(outcome.takenCount())))
+                        .append(VoidWarehouseText.body(" "))
+                        .append(VoidWarehouseText.body(outcome.sample().getHoverName()))
+                        .append(VoidWarehouseText.body(", stock remaining "))
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(outcome.remaining())))
+                        .append(VoidWarehouseText.body(" items"))
+                        : VoidWarehouseText.body("取走 ")
                         .append(VoidWarehouseText.key(VoidWarehouseText.count(outcome.takenCount())))
                         .append(VoidWarehouseText.body(" 个 "))
                         .append(VoidWarehouseText.body(outcome.sample().getHoverName()))

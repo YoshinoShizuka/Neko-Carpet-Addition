@@ -90,27 +90,39 @@ final class VoidWarehouseNav {
      * @param offerCount  当前有几个「可兑」条目（0 = 没开规则 / 没得兑）
      * @param shulkerMode 潜影盒模式是否开启（每个玩家各自的状态）
      * @param amountSort  数量排序是否开启（每个玩家各自的状态）
+     * @param en          看这个界面的玩家客户端语言是不是英语（双语版新增；
+     *                    导航行由 {@link VoidWarehousePageContainer#getItem} 按菜单打开者的语言生成）
      */
     static ItemStack build(int rowIndex, int page, int pageCount, int entryCount, BigInteger totalAmount,
-                           int offerCount, boolean shulkerMode, boolean amountSort) {
+                           int offerCount, boolean shulkerMode, boolean amountSort, boolean en) {
         return switch (rowIndex) {
-            case SLOT_SHULKER -> shulkerToggle(shulkerMode);
-            case SLOT_PREV -> button(Items.ARROW, "◀  上一页", "往前翻一页",
-                    page > 0, "已经在第一页");
-            case SLOT_INDICATOR -> indicator(page, pageCount, entryCount, totalAmount, offerCount, amountSort);
-            case SLOT_NEXT -> button(Items.ARROW, "下一页  ▶", "往后翻一页",
-                    page < pageCount - 1, "已经在最后一页");
-            case SLOT_SORT -> amountSortToggle(amountSort);
-            default -> filler();
+            case SLOT_SHULKER -> shulkerToggle(shulkerMode, en);
+            case SLOT_PREV -> button(Items.ARROW,
+                    VoidWarehouseText.tr(en, "◀  上一页", "◀  Prev Page"),
+                    VoidWarehouseText.tr(en, "往前翻一页", "Go back one page"),
+                    page > 0,
+                    VoidWarehouseText.tr(en, "已经在第一页", "Already on the first page"),
+                    en);
+            case SLOT_INDICATOR -> indicator(page, pageCount, entryCount, totalAmount, offerCount, amountSort, en);
+            case SLOT_NEXT -> button(Items.ARROW,
+                    VoidWarehouseText.tr(en, "下一页  ▶", "Next Page  ▶"),
+                    VoidWarehouseText.tr(en, "往后翻一页", "Go forward one page"),
+                    page < pageCount - 1,
+                    VoidWarehouseText.tr(en, "已经在最后一页", "Already on the last page"),
+                    en);
+            case SLOT_SORT -> amountSortToggle(amountSort, en);
+            default -> filler(en);
         };
     }
 
     /** 占位格：红色染色玻璃片，带一行说明，点了什么都不会发生 */
-    private static ItemStack filler() {
+    private static ItemStack filler(boolean en) {
         ItemStack stack = new ItemStack(Items.STAINED_GLASS_PANE.red());
-        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.line("占位符", VoidWarehouseText.OFF));
+        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.line(
+                VoidWarehouseText.tr(en, "占位符", "Placeholder"), VoidWarehouseText.OFF));
         stack.set(DataComponents.LORE, new ItemLore(List.of(
-                VoidWarehouseText.line("点击无任何作用", VoidWarehouseText.NOTE))));
+                VoidWarehouseText.line(VoidWarehouseText.tr(en, "点击无任何作用", "Does nothing"),
+                        VoidWarehouseText.NOTE))));
         return stack;
     }
 
@@ -120,14 +132,17 @@ final class VoidWarehouseNav {
      * <p>颜色按 {@link VoidWarehouseText} 的语义走：可用时名字是金（{@code VALUE} 一类的亮色），
      * 不可用时整个灰掉；底部「怎么用」统一深灰。</p>
      */
-    private static ItemStack button(Item icon, String label, String hint, boolean enabled, String disabledHint) {
+    private static ItemStack button(Item icon, String label, String hint, boolean enabled, String disabledHint,
+                                    boolean en) {
         ItemStack stack = new ItemStack(icon);
         stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.line(label,
                 enabled ? VoidWarehouseText.VALUE : VoidWarehouseText.OFF));
         stack.set(DataComponents.LORE, new ItemLore(List.of(
                 VoidWarehouseText.line(enabled ? hint : disabledHint,
                         enabled ? VoidWarehouseText.VALUE : VoidWarehouseText.NOTE),
-                VoidWarehouseText.line("左键翻页，不可取出", VoidWarehouseText.NOTE))));
+                VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "左键翻页，不可取出", "Left-click to flip; cannot be taken"),
+                        VoidWarehouseText.NOTE))));
         return stack;
     }
 
@@ -143,23 +158,36 @@ final class VoidWarehouseNav {
      * 又容易让人以为「这个数字是这个模式特有的规矩」。想知道具体能装多少，看物品格
      * 上那行换算（{@code VoidWarehouseData#buildDisplay} 的 {@code 「N 盒 M 组 K 个」}）就够。</p>
      */
-    private static ItemStack shulkerToggle(boolean on) {
+    private static ItemStack shulkerToggle(boolean on, boolean en) {
         ItemStack stack = new ItemStack(Items.SHULKER_BOX);
-        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.name("潜影盒模式：" + (on ? "开" : "关"), on));
+        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.name(
+                VoidWarehouseText.tr(en, "潜影盒模式：", "Shulker Mode: ") + VoidWarehouseText.tr(en, on ? "开" : "关", on ? "On" : "Off"),
+                on));
         List<Component> lore = new ArrayList<>(4);
         // 当前模式
         lore.add(VoidWarehouseText.line(
-                on ? "取出改为交出「装满的潜影盒」" : "当前：按普通方式取出", VoidWarehouseText.FACT));
+                on ? VoidWarehouseText.tr(en, "取出改为交出「装满的潜影盒」", "Withdrawals now hand out packed shulker boxes")
+                        : VoidWarehouseText.tr(en, "当前：按普通方式取出", "Currently: withdraw items normally"),
+                VoidWarehouseText.FACT));
         // 一盒多大的换算行按玩家要求去掉了（见方法 javadoc）
         // 代价
-        lore.add(VoidWarehouseText.line("消耗：潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
-                + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST + "（优先用空盒）", VoidWarehouseText.COST));
+        lore.add(VoidWarehouseText.line(en
+                        ? "Cost per box: Shell ×" + VoidWarehouseShulker.SHELL_COST
+                        + " + Chest ×" + VoidWarehouseShulker.CHEST_COST + " (empty boxes first)"
+                        : "消耗：潜影壳 ×" + VoidWarehouseShulker.SHELL_COST
+                        + " + 箱子 ×" + VoidWarehouseShulker.CHEST_COST + "（优先用空盒）",
+                VoidWarehouseText.COST));
         // 开了才需要知道的边界（什么时候拿不到满盒、什么时候整个被拒）；关着时不写，省一行
         if (on) {
-            lore.add(VoidWarehouseText.line("不足一盒 → 给装不满的盒；材料不够 → 整次拒绝",
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en,
+                            "不足一盒 → 给装不满的盒；材料不够 → 整次拒绝",
+                            "Short of a full box → under-filled box; short of materials → refused entirely"),
                     VoidWarehouseText.COST));
         }
-        lore.add(VoidWarehouseText.line("左键切换，不可取出", VoidWarehouseText.NOTE));
+        lore.add(VoidWarehouseText.line(
+                VoidWarehouseText.tr(en, "左键切换，不可取出", "Left-click to toggle; cannot be taken"),
+                VoidWarehouseText.NOTE));
         stack.set(DataComponents.LORE, new ItemLore(lore));
         return stack;
     }
@@ -170,36 +198,58 @@ final class VoidWarehouseNav {
      * <p>关着的时候仓库按<b>创造模式物品栏顺序</b>排（与存取历史无关，铁砧永远在它该在的地方）；
      * 打开之后改成<b>数量从大到小</b>，一眼就能看出仓库里什么最多。</p>
      */
-    private static ItemStack amountSortToggle(boolean on) {
+    private static ItemStack amountSortToggle(boolean on, boolean en) {
         ItemStack stack = new ItemStack(Items.COMPASS);
-        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.name("数量排序：" + (on ? "开" : "关"), on));
+        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.name(
+                VoidWarehouseText.tr(en, "数量排序：", "Sort by Amount: ")
+                        + VoidWarehouseText.tr(en, on ? "开" : "关", on ? "On" : "Off"),
+                on));
         stack.set(DataComponents.LORE, new ItemLore(List.of(
                 // 当前排列
-                VoidWarehouseText.line(on ? "当前：数量从大到小" : "当前：创造模式物品栏顺序",
+                VoidWarehouseText.line(on
+                                ? VoidWarehouseText.tr(en, "当前：数量从大到小", "Current: amount, high to low")
+                                : VoidWarehouseText.tr(en, "当前：创造模式物品栏顺序", "Current: creative inventory order"),
                         VoidWarehouseText.FACT),
                 // 只改显示不改存放（玩家最容易误会的一点，单独一行说清）
-                VoidWarehouseText.line("只改显示顺序，不改仓库里的存放", VoidWarehouseText.NOTE),
-                VoidWarehouseText.line("左键切换，不可取出", VoidWarehouseText.NOTE))));
+                VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "只改显示顺序，不改仓库里的存放",
+                                "Changes display order only, not storage"),
+                        VoidWarehouseText.NOTE),
+                VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "左键切换，不可取出", "Left-click to toggle; cannot be taken"),
+                        VoidWarehouseText.NOTE))));
         return stack;
     }
 
     private static ItemStack indicator(int page, int pageCount, int entryCount, BigInteger totalAmount,
-                                       int offerCount, boolean amountSort) {
+                                       int offerCount, boolean amountSort, boolean en) {
         ItemStack stack = new ItemStack(Items.PAPER);
         stack.set(DataComponents.CUSTOM_NAME,
-                VoidWarehouseText.name("第 " + (page + 1) + " / " + pageCount + " 页", null));
+                VoidWarehouseText.name(VoidWarehouseText.tr(en, "第 ", "Page ")
+                        + (page + 1) + " / " + pageCount
+                        + VoidWarehouseText.tr(en, " 页", ""), null));
         List<Component> lore = new ArrayList<>(4);
         // 最关心的两个数字合并成一行：多少种 + 多少个
-        lore.add(VoidWarehouseText.line("已存 " + entryCount + " 种 · 合计 "
-                + VoidWarehouseText.count(totalAmount) + " 个", VoidWarehouseText.VALUE));
+        lore.add(VoidWarehouseText.line(en
+                        ? "Stored " + entryCount + " kinds · "
+                        + VoidWarehouseText.count(totalAmount) + " items total"
+                        : "已存 " + entryCount + " 种 · 合计 "
+                        + VoidWarehouseText.count(totalAmount) + " 个",
+                VoidWarehouseText.VALUE));
         // 有「可兑」条目时补一行：不写的话玩家会以为那些灰格子是仓库里真有的东西
         if (offerCount > 0) {
-            lore.add(VoidWarehouseText.line("其中 " + offerCount + " 种可用合成兑换取出"
-                    + "（格子上标着「可兑」）", VoidWarehouseText.FACT));
+            lore.add(VoidWarehouseText.line(en
+                            ? offerCount + " of them are exchange-craftable (marked as exch.)"
+                            : "其中 " + offerCount + " 种可用合成兑换取出（格子上标着「可兑」）",
+                    VoidWarehouseText.FACT));
         }
-        lore.add(VoidWarehouseText.line("每种物品一格，数量无上限", VoidWarehouseText.NOTE));
+        lore.add(VoidWarehouseText.line(
+                VoidWarehouseText.tr(en, "每种物品一格，数量无上限", "One kind per slot, no cap"),
+                VoidWarehouseText.NOTE));
         // 当前排列，与排序开关呼应
-        lore.add(VoidWarehouseText.line("排列：" + (amountSort ? "数量从大到小" : "创造模式物品栏顺序"),
+        lore.add(VoidWarehouseText.line(en
+                        ? "Order: " + (amountSort ? "amount, high to low" : "creative inventory order")
+                        : "排列：" + (amountSort ? "数量从大到小" : "创造模式物品栏顺序"),
                 VoidWarehouseText.FACT));
         stack.set(DataComponents.LORE, new ItemLore(lore));
         return stack;

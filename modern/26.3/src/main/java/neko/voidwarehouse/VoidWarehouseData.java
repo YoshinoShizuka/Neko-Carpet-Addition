@@ -155,15 +155,17 @@ public final class VoidWarehouseData extends SavedData {
      * 仓库里的一格 = 一种物品 + 一个无上限的数量。
      *
      * <p>{@code template} 的数量恒为 1，只当「长什么样」的样板；真品数量在 {@code amount}。
-     * {@code display} / {@code boxDisplay} 是两种模式下各自的展示堆叠缓存（带 lore），
-     * 数量一变就一起失效重建。</p>
+     * 展示堆叠缓存（带 lore）<b>按语言各存一份</b>（双语版：中文 / 英文玩家看同一个格，
+     * tooltip 各是各的语言），数量一变四份一起失效重建。</p>
      */
     public static final class Entry {
         private final ItemStack template;
         private BigInteger amount;
-        private ItemStack display;
+        private ItemStack displayZh;
+        private ItemStack displayEn;
         /** 潜影盒模式下的展示堆叠（操作说明是「交出盒子」那套，与普通模式不是一回事） */
-        private ItemStack boxDisplay;
+        private ItemStack boxDisplayZh;
+        private ItemStack boxDisplayEn;
 
         Entry(ItemStack template, BigInteger amount) {
             // 只留一份数量为 1 的样板，彻底切断与原堆叠的实例关联（防复制）
@@ -192,8 +194,7 @@ public final class VoidWarehouseData extends SavedData {
                 return;
             }
             this.amount = this.amount.add(delta);
-            this.display = null;
-            this.boxDisplay = null;
+            this.invalidateDisplays();
         }
 
         void subtract(BigInteger delta) {
@@ -204,38 +205,64 @@ public final class VoidWarehouseData extends SavedData {
             if (this.amount.signum() < 0) {
                 this.amount = BigInteger.ZERO;
             }
-            this.display = null;
-            this.boxDisplay = null;
-        }
-
-        /** 普通模式的展示堆叠（带数量与操作提示），缓存复用 */
-        public ItemStack display() {
-            if (this.display == null) {
-                this.display = buildDisplay(this.template, this.amount, false);
-            }
-            return this.display;
+            this.invalidateDisplays();
         }
 
         /**
-         * 潜影盒模式的展示堆叠，缓存复用。
+         * 展示缓存全部作废。
+         *
+         * <p>双语版（方案 B）：缓存按语言各存一份（中文玩家与英文玩家看同一个格，
+         * tooltip 各是各的语言），所以一作废就是四份全废 —— 数量一变，
+         * 「数量：」行本来就要重写，留着旧语言的也没有意义。</p>
+         */
+        private void invalidateDisplays() {
+            this.displayZh = null;
+            this.displayEn = null;
+            this.boxDisplayZh = null;
+            this.boxDisplayEn = null;
+        }
+
+        /** 普通模式的展示堆叠（带数量与操作提示），<b>按语言各缓存一份</b>，复用 */
+        public ItemStack display(boolean en) {
+            ItemStack cached = en ? this.displayEn : this.displayZh;
+            if (cached == null) {
+                cached = buildDisplay(this.template, this.amount, false, en);
+                if (en) {
+                    this.displayEn = cached;
+                } else {
+                    this.displayZh = cached;
+                }
+            }
+            return cached;
+        }
+
+        /**
+         * 潜影盒模式的展示堆叠，<b>按语言各缓存一份</b>，复用。
          *
          * <p>这里<b>不是</b>在普通说明后面追加几行 —— 而是换一套说明：盒模式下
          * 「左键取出 1 个 / 右键取出一整组」<b>根本不成立</b>（左键交出的是一整盒），
          * 留着它们既占地方又误导人。两套说明各自精简，行数都控制在 5 行以内。</p>
          */
-        public ItemStack displayInBoxMode() {
-            if (this.boxDisplay == null) {
-                this.boxDisplay = buildDisplay(this.template, this.amount, true);
+        public ItemStack displayInBoxMode(boolean en) {
+            ItemStack cached = en ? this.boxDisplayEn : this.boxDisplayZh;
+            if (cached == null) {
+                cached = buildDisplay(this.template, this.amount, true, en);
+                if (en) {
+                    this.boxDisplayEn = cached;
+                } else {
+                    this.boxDisplayZh = cached;
+                }
             }
-            return this.boxDisplay;
+            return cached;
         }
 
         /**
          * 造展示堆叠：两种模式共用「数据行」，各自接自己的「操作行」。
          *
          * @param boxMode 潜影盒模式？决定操作行说的是「取出」还是「交出盒子」
+         * @param en      看这个格子的玩家客户端语言是不是英语（tooltip 按它取词）
          */
-        private static ItemStack buildDisplay(ItemStack template, BigInteger amount, boolean boxMode) {
+        private static ItemStack buildDisplay(ItemStack template, BigInteger amount, boolean boxMode, boolean en) {
             int max = Math.max(1, template.getMaxStackSize());
             // 格子里永远只画一个：count = 1 时原版不会渲染右下角的数字。
             // 真实数量往往远超一组、甚至到亿级，画在格子里既不合理也会糊到隔壁格，
@@ -247,9 +274,9 @@ public final class VoidWarehouseData extends SavedData {
             // 「数量：」标签用浅灰、数字用亮金 —— 分段着色。玩家扫 tooltip 找的是「有多少」，
             // 让数字跳出来、标签退到背景里；整行一个颜色时两者会互相抢视线。
             // 亮金 #FFD700 不在原版 16 色枚举里（GOLD 偏橙），所以走 RGB 重载。
-            lore.add(VoidWarehouseText.pair("数量：", VoidWarehouseText.LABEL_RGB,
+            lore.add(VoidWarehouseText.pair(VoidWarehouseText.tr(en, "数量：", "Count: "), VoidWarehouseText.LABEL_RGB,
                     format(amount), VoidWarehouseText.VALUE_RGB));
-            String packing = describePacking(amount, max);
+            String packing = describePacking(amount, max, en);
             if (packing != null) {
                 lore.add(VoidWarehouseText.line(packing, VoidWarehouseText.VALUE_RGB));
             }
@@ -260,21 +287,32 @@ public final class VoidWarehouseData extends SavedData {
             if (boxMode) {
                 int capacity = VoidWarehouseShulker.capacity(template);
                 lore.add(VoidWarehouseText.line(
-                        "左键：交出 1 盒（" + VoidWarehouseText.count(capacity) + " 个）",
+                        VoidWarehouseText.tr(en,
+                                "左键：交出 1 盒（" + VoidWarehouseText.count(capacity) + " 个）",
+                                "Left-click: hand out 1 box (" + VoidWarehouseText.count(capacity) + " items)"),
                         VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "右键：按数量取货", "Right-click: withdraw by amount"),
+                        VoidWarehouseText.ACTION_RGB));
                 // 这里原先还有一行，写明装盒要额外消耗多少个潜影壳与箱子（红色）。玩家要求去掉：
                 // 物品格是「拿东西」的地方，代价那行挤进来只会让人以为「取这一份要额外掏材料」。
                 // 材料账本身没变，说明留在「潜影盒模式」开关那个图标的 tooltip 上（VoidWarehouseNav）。
             } else if (max > 1) {
-                lore.add(VoidWarehouseText.line("左键：取出 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "左键：取出 1 个", "Left-click: take 1"),
+                        VoidWarehouseText.ACTION_RGB));
                 // 直接写数字而不是「1 组（64 个）」：玩家真正要读的是「右键给我多少个」，
                 // 括号里那个数字和「组」说的是同一件事，绕一道反而更慢。
                 lore.add(VoidWarehouseText.line(
-                        "右键：取出 " + max + " 个", VoidWarehouseText.ACTION_RGB));
+                        VoidWarehouseText.tr(en,
+                                "右键：取出 " + max + " 个",
+                                "Right-click: take " + max),
+                        VoidWarehouseText.ACTION_RGB));
             } else {
                 // 不可堆叠物品（剑、工具…）左右键都是取 1 个，合成一行说，不重复两遍
-                lore.add(VoidWarehouseText.line("左键 / 右键：取出 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "左键 / 右键：取出 1 个", "Left-click / Right-click: take 1"),
+                        VoidWarehouseText.ACTION_RGB));
             }
 
             stack.set(DataComponents.LORE, new ItemLore(lore));
@@ -301,7 +339,7 @@ public final class VoidWarehouseData extends SavedData {
          * <p>全程用 {@link BigInteger} 做除法（{@code divideAndRemainder}），
          * 亿级数量也不会溢出 —— 数量本身是任意精度的，换算不能先把它降级成 long。</p>
          */
-        private static String describePacking(BigInteger amount, int max) {
+        private static String describePacking(BigInteger amount, int max, boolean en) {
             // 门槛：够「一组」才值得换算。不可堆叠物品一组 = 1 个，此时只有「盒」有意义，
             // 所以门槛抬到「一盒」（27 个）。
             BigInteger threshold = BigInteger.valueOf(
@@ -319,15 +357,20 @@ public final class VoidWarehouseData extends SavedData {
                 stacks = byStack[0];
                 loose = byStack[1];
             }
+            // 中文「X 盒 Y 组 Z 个」三段连排；英文对应用 "X box(es) Y stacks Z pc"，
+            // 单位词用复数含糊化（box(es)/stack(s)）避免为单复数再做一次 BigInteger 比较
+            String boxUnit = en ? " box(es) " : " 盒 ";
+            String stackUnit = en ? " stack(s) " : " 组 ";
+            String looseUnit = en ? " pc" : " 个";
             StringBuilder text = new StringBuilder();
             if (boxes.signum() > 0) {
-                text.append(format(boxes)).append(" 盒 ");
+                text.append(format(boxes)).append(boxUnit);
             }
             if (max > 1 && stacks.signum() > 0) {
-                text.append(format(stacks)).append(" 组 ");
+                text.append(format(stacks)).append(stackUnit);
             }
             if (loose.signum() > 0) {
-                text.append(format(loose)).append(" 个");
+                text.append(format(loose)).append(looseUnit);
             }
             return text.toString().trim();
         }
@@ -906,10 +949,10 @@ public final class VoidWarehouseData extends SavedData {
         return this.entries.get(index);
     }
 
-    /** 按格号取展示堆叠（带 lore），空格返回 {@link ItemStack#EMPTY} */
+    /** 按格号取展示堆叠（带 lore，中文），空格返回 {@link ItemStack#EMPTY}（诊断 / 自检用） */
     public ItemStack displayAt(int index) {
         Entry entry = this.entryAt(index);
-        return entry == null ? ItemStack.EMPTY : entry.display();
+        return entry == null ? ItemStack.EMPTY : entry.display(false);
     }
 
     // ------------------------------------------------------------------ 写
@@ -2149,13 +2192,15 @@ public final class VoidWarehouseData extends SavedData {
      *
      * @param boxMode 潜影盒模式（操作行换成「交出盒子」那一套，与普通格的口径保持一致）
      */
-    public static ItemStack buildExchangeDisplay(ExchangeOffer offer, boolean boxMode) {
+    public static ItemStack buildExchangeDisplay(ExchangeOffer offer, boolean boxMode, boolean en) {
         // 两类虚拟条目共用这一套渲染，只有「动词」和「角标」不同 —— 其余（数量、账单、
         // 一次能拿多少、盒模式那一套）逐字相同，所以不复制一份方法，只把词换掉。
         // 「兑换」说的是仓库替你做了一次换算，「合成」说的是仓库替你摆了合成格，
         // 对玩家来说这一步的差别就在于「用的是哪套规则」，角标承担这个信息。
-        String verb = offer.craft() ? "合成" : "兑换";
-        String tag = offer.craft() ? "（可合成）" : "（可兑）";
+        String verb = offer.craft() ? VoidWarehouseText.tr(en, "合成", "craft")
+                : VoidWarehouseText.tr(en, "兑换", "exchange");
+        String tag = offer.craft() ? VoidWarehouseText.tr(en, "（可合成）", " (craftable)")
+                : VoidWarehouseText.tr(en, "（可兑）", " (exch.)");
 
         ItemStack stack = offer.template().copyWithCount(1);
         stack.set(DataComponents.CUSTOM_NAME,
@@ -2163,7 +2208,7 @@ public final class VoidWarehouseData extends SavedData {
                         .append(VoidWarehouseText.line(tag, VoidWarehouseText.FACT)));
 
         List<Component> lore = new ArrayList<>(4);
-        lore.add(exchangeSummary(offer));
+        lore.add(exchangeSummary(offer, en));
 
         // 操作行：与普通格一样的说法，口径统一（盒模式下就换成盒模式那一套）
         int max = Math.max(1, offer.template().getMaxStackSize());
@@ -2172,9 +2217,13 @@ public final class VoidWarehouseData extends SavedData {
             // 「min(可兑数量, 容量)」。可兑数量可能远超一盒（上限由库存推出来，不是固定值），
             // 所以这里必须写「实际装进去的个数」。
             long packed = offer.boxed().longValue();
-            lore.add(VoidWarehouseText.line("左键：交出 1 盒（"
-                    + VoidWarehouseText.count(packed) + " 个）", VoidWarehouseText.ACTION_RGB));
-            lore.add(VoidWarehouseText.line("右键：按数量取货", VoidWarehouseText.ACTION_RGB));
+            lore.add(VoidWarehouseText.line(en
+                    ? "Left-click: hand out 1 box (" + VoidWarehouseText.count(packed) + " items)"
+                    : "左键：交出 1 盒（" + VoidWarehouseText.count(packed) + " 个）",
+                    VoidWarehouseText.ACTION_RGB));
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en, "右键：按数量取货", "Right-click: withdraw by amount"),
+                    VoidWarehouseText.ACTION_RGB));
         } else {
             // 右键一次「取一组」，但一次实际能拿走多少必须问规划器（offer.bulk），
             // 不能写 min(一组, 可兑数量)：仓库里只有铜块时那个算式给 64，
@@ -2182,25 +2231,51 @@ public final class VoidWarehouseData extends SavedData {
             // 照抄那个算式就是在数量后面又写一个跟仓库无关的常数。
             long bulk = offer.bulk().longValue();
             if (bulk <= 1) {
-                lore.add(VoidWarehouseText.line("左键 / 右键：" + verb + " 1 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "左键 / 右键：" + verb + " 1 个",
+                                "Left-click / Right-click: " + verb + " 1"),
+                        VoidWarehouseText.ACTION_RGB));
             } else if (bulk >= max) {
-                lore.add(VoidWarehouseText.line("左键：" + verb + " 1 个", VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line("右键：" + verb + " " + max + " 个", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "左键：" + verb + " 1 个",
+                                "Left-click: " + verb + " 1"),
+                        VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "右键：" + verb + " " + max + " 个",
+                                "Right-click: " + verb + " " + max),
+                        VoidWarehouseText.ACTION_RGB));
             } else if (bulk >= offer.obtainable().longValue()) {
                 // 仓库里一共就这么多可兑 —— 一次就能全拿走
-                lore.add(VoidWarehouseText.line("左键：" + verb + " 1 个", VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line("右键：" + verb + " " + VoidWarehouseText.count(bulk)
-                        + " 个（最多" + (offer.craft() ? "做得出" : "兑得出") + "这么多）", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "左键：" + verb + " 1 个",
+                                "Left-click: " + verb + " 1"),
+                        VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line(en
+                        ? "Right-click: " + verb + " " + VoidWarehouseText.count(bulk)
+                        + " (as many as " + (offer.craft() ? "craftable" : "available") + ")"
+                        : "右键：" + verb + " " + VoidWarehouseText.count(bulk)
+                        + " 个（最多" + (offer.craft() ? "做得出" : "兑得出") + "这么多）",
+                        VoidWarehouseText.ACTION_RGB));
             } else {
                 // 仓库里能兑更多，但一次取不到一组 —— 因为上级只能按整块拆
-                lore.add(VoidWarehouseText.line("左键：" + verb + " 1 个", VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line("右键：" + verb + " " + VoidWarehouseText.count(bulk)
-                        + " 个（按整块拆，不留零头）", VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "左键：" + verb + " 1 个",
+                                "Left-click: " + verb + " 1"),
+                        VoidWarehouseText.ACTION_RGB));
+                lore.add(VoidWarehouseText.line(en
+                        ? "Right-click: " + verb + " " + VoidWarehouseText.count(bulk)
+                        + " (whole blocks only, no leftovers)"
+                        : "右键：" + verb + " " + VoidWarehouseText.count(bulk)
+                        + " 个（按整块拆，不留零头）",
+                        VoidWarehouseText.ACTION_RGB));
             }
         }
         lore.add(VoidWarehouseText.line(offer.craft()
-                ? "仓库里没有这种物品，靠已学会的配方扣原料取出"
-                : "仓库里没有这种物品，靠合成兑换取出", VoidWarehouseText.NOTE));
+                ? VoidWarehouseText.tr(en, "仓库里没有这种物品，靠已学会的配方扣原料取出",
+                "Not in stock: taken by consuming ingredients of a known recipe")
+                : VoidWarehouseText.tr(en, "仓库里没有这种物品，靠合成兑换取出",
+                "Not in stock: taken via crafting exchange"),
+                VoidWarehouseText.NOTE));
 
         stack.set(DataComponents.LORE, new ItemLore(lore));
         return stack;
@@ -2212,13 +2287,16 @@ public final class VoidWarehouseData extends SavedData {
      * <p>配色与聊天提示同一套：<b>无关紧要的文字灰、关键数字亮绿</b>。
      * 整行只有两个数字，所以「哪个是要拿的量、哪个是要付的量」靠紧挨着的词就能读出来。</p>
      */
-    private static Component exchangeSummary(ExchangeOffer offer) {
+    private static Component exchangeSummary(ExchangeOffer offer, boolean en) {
         boolean split = splitsFromAbove(offer);
-        MutableComponent line = VoidWarehouseText.body(split ? "可拆出 " : "可合成 ");
+        MutableComponent line = VoidWarehouseText.body(split
+                ? VoidWarehouseText.tr(en, "可拆出 ", "Uncraftable now: ")
+                : VoidWarehouseText.tr(en, "可合成 ", "Craftable now: "));
         line.append(VoidWarehouseText.key(VoidWarehouseText.count(offer.obtainable())));
-        line.append(VoidWarehouseText.body(" 个"));
-        line.append(ledgerSegment(offer, true, split ? "，拆 " : "，用 "));
-        line.append(ledgerSegment(offer, false, "，找回 "));
+        line.append(VoidWarehouseText.body(en ? " pc" : " 个"));
+        line.append(ledgerSegment(offer, true, en,
+                split ? VoidWarehouseText.tr(en, "，拆 ", ", uncraft ") : VoidWarehouseText.tr(en, "，用 ", ", using ")));
+        line.append(ledgerSegment(offer, false, en, VoidWarehouseText.tr(en, "，找回 ", ", refunds ")));
         return line;
     }
 
@@ -2228,7 +2306,7 @@ public final class VoidWarehouseData extends SavedData {
      * <p>一段里一个物品都解析不出来时返回<b>空组件</b>（那一小段就整体不出现）——
      * 免得只留下一个孤零零的「，找回 」。</p>
      */
-    private static MutableComponent ledgerSegment(ExchangeOffer offer, boolean negatives, String prefix) {
+    private static MutableComponent ledgerSegment(ExchangeOffer offer, boolean negatives, boolean en, String prefix) {
         MutableComponent segment = Component.empty();
         boolean first = true;
         for (VoidWarehouseExchange.Delta delta : offer.totalCost()) {
@@ -2241,11 +2319,11 @@ public final class VoidWarehouseData extends SavedData {
             if (item == null) {
                 continue;
             }
-            segment.append(VoidWarehouseText.body(first ? prefix : " ＋ "));
+            segment.append(VoidWarehouseText.body(first ? prefix : (en ? " + " : " ＋ ")));
             segment.append(VoidWarehouseText.body(new ItemStack(item).getHoverName()));
             segment.append(VoidWarehouseText.body(" "));
             segment.append(VoidWarehouseText.key(VoidWarehouseText.count(delta.change().abs())));
-            segment.append(VoidWarehouseText.body(" 个"));
+            segment.append(VoidWarehouseText.body(en ? " pc" : " 个"));
             first = false;
         }
         return segment;

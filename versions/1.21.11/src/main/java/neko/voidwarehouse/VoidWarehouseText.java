@@ -4,6 +4,7 @@ import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.chat.Style;
+import net.minecraft.server.level.ServerPlayer;
 
 import java.math.BigInteger;
 import java.util.Locale;
@@ -102,6 +103,66 @@ public final class VoidWarehouseText {
      */
     public static final String INFO_PREFIX = "[虚空仓库] ";
 
+    /**
+     * 英文客户端的聊天前缀：{@code [Void Warehouse] }。
+     *
+     * <p>双语版（方案 B）：聊天提示按<b>玩家客户端语言</b>发对应文本，
+     * 英文玩家看到的前缀与中文玩家对应（{@link #INFO_PREFIX}）。</p>
+     */
+    public static final String INFO_PREFIX_EN = "[Void Warehouse] ";
+
+    /**
+     * 英文侧的界面标题 / 触发别名：{@code Void Warehouse}。
+     *
+     * <p>与中文 {@code VoidWarehouseProvider.TITLE_TEXT}（「虚空仓库」）对应：
+     * 触发判定接受它（忽略大小写，见 {@code VoidWarehouseTrigger}），
+     * 英文玩家按-数量取货后重开界面也用它当标题。</p>
+     */
+    public static final String TITLE_TEXT_EN = "Void Warehouse";
+
+    // ------------------------------------------------------------------ 语言检测
+
+    /**
+     * 玩家客户端语言是不是英语。
+     *
+     * <p>语言来源：客户端登录时在 {@code ClientInformation} 里上报的 {@code language}
+     * 字段（形如 {@code zh_cn} / {@code en_us}），服务端随时可经
+     * {@code ServerPlayer#clientInformation()} 读到，玩家改语言重进后自动更新。
+     * 判定口径：<b>以 {@code en} 开头即英语</b>（en_us / en_gb 都算），
+     * 其余一律按中文发。</p>
+     *
+     * <p><b>为什么只做中英两套</b>：本 mod 的全部文案只有中英两份；
+     * 其他语言（日语、西语…）的玩家按英文发 —— 英文是通用兜底，总好过看不懂的中文。</p>
+     *
+     * <p><b>null / 异常一律按中文兜底</b>：自检里手工构造的 {@code ServerPlayer}
+     * 没有真实连接（{@code SERVERBOUND} 空连接），其 {@code ClientInformation} 是
+     * 默认值 {@code en_us} —— 但自检断言全部按中文写，所以这里不能信默认值，
+     * 凡是拿不到真实客户端上报的场合统一按中文。真实玩家永远有上报，不受影响。</p>
+     */
+    public static boolean isEnglish(ServerPlayer player) {
+        if (player == null) {
+            return false;
+        }
+        try {
+            String language = player.clientInformation().language();
+            // 语言码形如 en_us；null 或异常按中文兜底（见方法说明）
+            return language != null && language.toLowerCase(Locale.ROOT).startsWith("en");
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 按语言取词：{@code tr(en, "中文", "English")}。
+     *
+     * <p>所有双语文案点的统一出口 —— 调用方拿着手上已有的 {@code en} 布尔
+     * （来源见各入口：菜单按打开者、聊天提示按接收玩家），
+     * 在拼字符串的地方就地取词。</p>
+     */
+    public static String tr(boolean en, String zh, String enText) {
+        return en ? enText : zh;
+    }
+
     private VoidWarehouseText() {
     }
 
@@ -193,12 +254,33 @@ public final class VoidWarehouseText {
      * 而且前缀本身已经靠颜色区分开了，不需要再加一层强调。</p>
      */
     public static Component info(MutableComponent body) {
-        return Component.literal(INFO_PREFIX)
+        return info(false, body);
+    }
+
+    /**
+     * {@link #info(MutableComponent)} 的<b>双语版</b>：前缀按 {@code en} 选
+     * {@code [虚空仓库] } / {@code [Void Warehouse] }，样式与配色完全一致。
+     *
+     * <p>{@code en} 来源见 {@link #isEnglish(ServerPlayer)}；各消息发送点
+     * 用「接收玩家的语言」调用这个重载。</p>
+     */
+    public static Component info(boolean en, MutableComponent body) {
+        return Component.literal(tr(en, INFO_PREFIX, INFO_PREFIX_EN))
                 .withStyle(Style.EMPTY
                         .withColor(INFO_PREFIX_RGB)
                         .withItalic(false)
                         .withBold(false))
                 .append(body);
+    }
+
+    /** {@link #info(boolean, MutableComponent)} 的纯文字正文版 */
+    public static Component info(boolean en, String zh, String enText) {
+        return info(en, body(tr(en, zh, enText)));
+    }
+
+    /** {@link #info(boolean, String, String)} 的<b>已组装正文</b>版：中英两个正文都造好了，按语言挑一份 */
+    public static Component info(boolean en, MutableComponent zhBody, MutableComponent enBody) {
+        return info(en, en ? enBody : zhBody);
     }
 
     /** 正文里没有关键数字的纯文字提示（「仓库已满」「已取消」这类） */

@@ -77,21 +77,43 @@ public final class VoidWarehouseWithdraw {
      */
     private static final int LOOSE_PACK_STACKS = 9;
 
-    private static final Component MSG_PROMPT =
-            VoidWarehouseText.info("请输入要取走的数量（其他内容 = 取消）");
-    private static final Component MSG_CANCELLED = VoidWarehouseText.info("已取消本次取货");
-    private static final Component MSG_INVALID =
-            VoidWarehouseText.info("不是有效数量，已取消本次取货");
-    private static final Component MSG_TOO_LARGE = VoidWarehouseText.info(
-            VoidWarehouseText.body("数量过大（最多 ")
-                    .append(VoidWarehouseText.key(VoidWarehouseText.count(MAX_REQUEST)))
-                    .append(VoidWarehouseText.body("），已取消本次取货")));
-    private static final Component MSG_NO_STOCK =
-            VoidWarehouseText.info("仓库里这种物品不够，本次取消");
-    private static final Component MSG_NO_PARTS =
-            VoidWarehouseText.info("空盒 / 潜影壳 / 箱子不足，无法装盒，本次取消");
-    private static final Component MSG_INV_FULL =
-            VoidWarehouseText.info("背包放不下这么多，本次取消");
+    // 聊天提示双语版（方案 B）：不再是静态常量，而是按接收玩家语言构造的实例消息 ——
+    // 每个发送点用 VoidWarehouseText.isEnglish(player) 现取现发。
+
+    private static Component msgPrompt(boolean en) {
+        return VoidWarehouseText.info(en, "请输入要取走的数量（其他内容 = 取消）",
+                "Type the amount to withdraw (anything else = cancel)");
+    }
+
+    private static Component msgInvalid(boolean en) {
+        return VoidWarehouseText.info(en, "不是有效数量，已取消本次取货",
+                "Not a valid amount — withdrawal cancelled");
+    }
+
+    private static Component msgTooLarge(boolean en) {
+        return VoidWarehouseText.info(en,
+                VoidWarehouseText.body("数量过大（最多 ")
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(MAX_REQUEST)))
+                        .append(VoidWarehouseText.body("），已取消本次取货")),
+                VoidWarehouseText.body("Amount too large (max ")
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(MAX_REQUEST)))
+                        .append(VoidWarehouseText.body(") — withdrawal cancelled")));
+    }
+
+    private static Component msgNoStock(boolean en) {
+        return VoidWarehouseText.info(en, "仓库里这种物品不够，本次取消",
+                "Not enough of that item in the warehouse — cancelled");
+    }
+
+    private static Component msgNoParts(boolean en) {
+        return VoidWarehouseText.info(en, "空盒 / 潜影壳 / 箱子不足，无法装盒，本次取消",
+                "Not enough empty boxes / shells / chests to pack — cancelled");
+    }
+
+    private static Component msgInvFull(boolean en) {
+        return VoidWarehouseText.info(en, "背包放不下这么多，本次取消",
+                "Not enough inventory space — cancelled");
+    }
 
     /** 一条待处理请求：记录要取的是哪种物品（样板，数量恒 1）+ 发起时间 */
     private record Pending(ItemStack sample, long createdMs) {
@@ -119,7 +141,7 @@ public final class VoidWarehouseWithdraw {
         // 先关掉仓库界面：聊天栏被界面盖着，输入时看不见自己打了什么。
         // 取完货（或取消）会由 onChat 统一开回来，见 reopenWarehouse。
         player.closeContainer();
-        player.sendSystemMessage(MSG_PROMPT);
+        player.sendSystemMessage(msgPrompt(VoidWarehouseText.isEnglish(player)));
     }
 
     /**
@@ -130,7 +152,11 @@ public final class VoidWarehouseWithdraw {
      * 玩家不会丢失自己翻到的那一页。</p>
      */
     private static void reopenWarehouse(ServerPlayer player) {
-        VoidWarehouse.open(player);
+        // 标题跟随玩家语言：英文玩家重开的界面也该是英文标题（与触发名对应）
+        boolean en = VoidWarehouseText.isEnglish(player);
+        VoidWarehouse.open(player, Component.literal(
+                VoidWarehouseText.tr(en,
+                        VoidWarehouseProvider.TITLE_TEXT, VoidWarehouseText.TITLE_TEXT_EN)));
     }
 
     /** 玩家有没有一条待处理请求 */
@@ -156,18 +182,19 @@ public final class VoidWarehouseWithdraw {
             // 过期（玩家磨蹭太久）：直接作废，消息交还原版聊天
             consumed = false;
         } else {
+            boolean en = VoidWarehouseText.isEnglish(player);
             long requested;
             try {
                 requested = Long.parseLong(message.trim());
             } catch (NumberFormatException e) {
                 // 非数字：取消请求，但让这条消息照常发出去（玩家可能只是想说话）
-                player.sendSystemMessage(MSG_INVALID);
+                player.sendSystemMessage(msgInvalid(en));
                 requested = -1;
             }
             if (requested < 0) {
                 consumed = false;
             } else if (requested == 0 || requested > MAX_REQUEST) {
-                player.sendSystemMessage(MSG_TOO_LARGE);
+                player.sendSystemMessage(msgTooLarge(en));
                 consumed = true;
             } else {
                 execute(player, pending.sample(), requested);
@@ -187,6 +214,7 @@ public final class VoidWarehouseWithdraw {
      * <p>顺序与 {@code withdrawShulkerBox} 一致：先校验 → 生成产物 → 检查背包 → 放成功才扣账。</p>
      */
     private static void execute(ServerPlayer player, ItemStack sample, long requested) {
+        boolean en = VoidWarehouseText.isEnglish(player);
         VoidWarehouseData data = VoidWarehouse.data(player.level().getServer());
         if (data == null) {
             return;
@@ -208,7 +236,7 @@ public final class VoidWarehouseWithdraw {
         if (data.amountExact(sample).compareTo(want) < 0) {
             exchange = data.planExchange(sample, want);
             if (exchange == null) {
-                player.sendSystemMessage(MSG_NO_STOCK);
+                player.sendSystemMessage(msgNoStock(en));
                 return;
             }
         }
@@ -217,7 +245,7 @@ public final class VoidWarehouseWithdraw {
         //    与界面里「点击取一盒」共用同一份算法，两边行为必须一致。
         VoidWarehouseData.BoxMaterials plan = data.planBoxMaterials(totalBoxes);
         if (!data.hasBoxMaterials(plan)) {
-            player.sendSystemMessage(MSG_NO_PARTS);
+            player.sendSystemMessage(msgNoParts(en));
             return;
         }
 
@@ -238,7 +266,7 @@ public final class VoidWarehouseWithdraw {
 
         // ④ 检查背包能否全部放下（纯模拟，不污染真实背包）
         if (!canFitAll(player, outputs)) {
-            player.sendSystemMessage(MSG_INV_FULL);
+            player.sendSystemMessage(msgInvFull(en));
             return;
         }
 
@@ -255,7 +283,7 @@ public final class VoidWarehouseWithdraw {
             data.takeExact(sample, (int) requested);
         }
         data.consumeBoxMaterials(plan);
-        player.sendSystemMessage(successMessage(sample, requested, fullBoxes, loose, packLoose));
+        player.sendSystemMessage(successMessage(en, sample, requested, fullBoxes, loose, packLoose));
     }
 
     /**
@@ -273,36 +301,39 @@ public final class VoidWarehouseWithdraw {
      *   <li>「取了多少个」是这条消息里唯一的关键信息 → 亮绿；物品名与装盒明细是补充 → 灰。</li>
      * </ul>
      *
+     * @param en        接收玩家的客户端语言是不是英语（双语版新增；自检默认按中文传 {@code false}）
      * @param fullBoxes 装出来的满盒数
      * @param loose     余下的散货数
      * @param packLoose 散货是否已顺手装成一个盒子（那一盒没装满）
      */
-    static Component successMessage(ItemStack sample, long requested,
+    static Component successMessage(boolean en, ItemStack sample, long requested,
                                     long fullBoxes, long loose, boolean packLoose) {
         StringBuilder detail = new StringBuilder();
         if (fullBoxes > 0) {
-            detail.append(VoidWarehouseText.count(fullBoxes)).append(" 满盒");
+            detail.append(VoidWarehouseText.count(fullBoxes))
+                    .append(en ? " full box(es)" : " 满盒");
         }
         if (packLoose) {
             if (detail.length() > 0) {
                 detail.append(" + ");
             }
-            detail.append("散货 ").append(VoidWarehouseText.count(loose)).append(" 已装盒");
+            detail.append(en ? "loose " : "散货 ").append(VoidWarehouseText.count(loose))
+                    .append(en ? " boxed up" : " 已装盒");
         } else if (fullBoxes > 0 && loose > 0) {
             // 有满盒时「散货数」不等于总数，括号里的数字是真信息，保留
-            detail.append(" + 散货 ").append(VoidWarehouseText.count(loose));
+            detail.append(en ? " + loose " : " + 散货 ").append(VoidWarehouseText.count(loose));
         }
-        MutableComponent message = VoidWarehouseText.body("已取出 ")
+        MutableComponent message = VoidWarehouseText.body(en ? "Withdrew " : "已取出 ")
                 .append(VoidWarehouseText.key(VoidWarehouseText.count(requested)))
-                .append(VoidWarehouseText.body(" 个 "))
+                .append(VoidWarehouseText.body(en ? " " : " 个 "))
                 // 物品名保持「可翻译组件」原样，交给客户端本地化（理由见 PrinterRestockNetwork）
                 .append(VoidWarehouseText.body(sample.getHoverName()));
         if (detail.length() > 0) {
-            message.append(VoidWarehouseText.body("（" + detail + "）"));
+            message.append(VoidWarehouseText.body(en ? " (" + detail + ")" : "（" + detail + "）"));
         }
         // 前缀在这里就套上：调用方只需「发出去」，不用记得再包一层 info()
         // （本轮重构时就漏过一次 —— 自检里那条「以 [虚空仓库] 开头」把它抓了出来）
-        return VoidWarehouseText.info(message);
+        return VoidWarehouseText.info(en, message);
     }
 
     // ------------------------------------------------------------------ 背包

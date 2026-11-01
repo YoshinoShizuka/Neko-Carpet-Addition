@@ -61,7 +61,7 @@ import java.util.Set;
  */
 final class VoidWarehousePageContainer implements Container {
     /**
-     * 仓库空格子的占位图标（屏障方块）。
+     * 空格子的占位图标（屏障方块），<b>按语言各缓存一份</b>（「空位」提示要跟着玩家语言走）。
      *
      * <p>只在<b>展示层</b>出现：{@link #getItem(int)} 对「本页该位置没有物品」的内容格返回它，
      * 客户端（纯原版大箱子）就会画一个屏障图标。它<b>永不被读 / 写 / 取</b>——
@@ -72,18 +72,34 @@ final class VoidWarehousePageContainer implements Container {
      * {@code CUSTOM_NAME} / {@code LORE} 覆盖成可见的「空位（占位符）」提示，
      * 鼠标移上去能一眼看出这是占位、点击无意义。</p>
      */
-    private static final ItemStack PLACEHOLDER;
+    private static final ItemStack PLACEHOLDER_ZH = buildPlaceholder(false);
+    private static final ItemStack PLACEHOLDER_EN = buildPlaceholder(true);
 
-    static {
+    private static ItemStack buildPlaceholder(boolean en) {
         ItemStack placeholder = new ItemStack(Items.BARRIER);
         placeholder.set(DataComponents.CUSTOM_NAME,
-                VoidWarehouseText.line("空位", VoidWarehouseText.OFF));
+                VoidWarehouseText.line(VoidWarehouseText.tr(en, "空位", "Empty"), VoidWarehouseText.OFF));
         placeholder.set(DataComponents.LORE, new ItemLore(List.of(
-                VoidWarehouseText.line("物品入库后这里会显示真实物品", VoidWarehouseText.NOTE))));
-        PLACEHOLDER = placeholder;
+                VoidWarehouseText.line(
+                        VoidWarehouseText.tr(en, "物品入库后这里会显示真实物品",
+                                "Shows the real item once stored"),
+                        VoidWarehouseText.NOTE))));
+        return placeholder;
     }
 
     private final VoidWarehouseData data;
+
+    /**
+     * 打开这个界面的玩家客户端语言是不是英语。
+     *
+     * <p>双语版（方案 B）新增：本容器是<b>每个菜单一份</b>（= 每个看界面的玩家一份），
+     * 所以「这份视图该发哪种语言的 tooltip」在这里定死一次就够了 ——
+     * 导航行、占位符、物品格 tooltip 的构建都按它取词。
+     * 共享的 {@link VoidWarehouseData} 里的 tooltip 缓存按语言各存一份
+     * （见 {@code VoidWarehouseData.Entry#display(boolean)}），
+     * 中文玩家与英文玩家看同一个仓库格互不干扰。</p>
+     */
+    private final boolean en;
 
     /**
      * 这个玩家自己的视图状态（页码 + 两个开关）。
@@ -118,9 +134,10 @@ final class VoidWarehousePageContainer implements Container {
     private Set<Item> filteredFor;
     private boolean filteredSort;
 
-    VoidWarehousePageContainer(VoidWarehouseData data, VoidWarehouseViews.View view) {
+    VoidWarehousePageContainer(VoidWarehouseData data, VoidWarehouseViews.View view, boolean english) {
         this.data = data;
         this.view = view;
+        this.en = english;
     }
 
     /**
@@ -309,19 +326,22 @@ final class VoidWarehousePageContainer implements Container {
                     this.data.totalAmount(),
                     this.data.exchangeOfferCount(),
                     this.view.shulkerMode(),
-                    this.view.amountSort());
+                    this.view.amountSort(),
+                    this.en);
         }
         VoidWarehouseData.DisplaySlot target = this.slotAt(slot);
         if (target.isEmpty()) {
             // 空格子用屏障方块作临时占位图标：纯展示、不可交互，有东西之后由本方法换成真物品
-            return PLACEHOLDER;
+            return this.en ? PLACEHOLDER_EN : PLACEHOLDER_ZH;
         }
         if (target.isExchange()) {
             // 「可兑」虚拟条目：仓库里没有这种物品，但能靠 9 合 1 兑换拿出来。
             // 两种模式各给一套说明，与真实格的显示口径保持一致。
-            return VoidWarehouseData.buildExchangeDisplay(target.offer(), this.view.shulkerMode());
+            return VoidWarehouseData.buildExchangeDisplay(target.offer(), this.view.shulkerMode(), this.en);
         }
-        return this.view.shulkerMode() ? target.entry().displayInBoxMode() : target.entry().display();
+        return this.view.shulkerMode()
+                ? target.entry().displayInBoxMode(this.en)
+                : target.entry().display(this.en);
     }
 
     /** 取出若干（真正扣减仓库数量）；返回的是一份崭新的堆叠，与仓库里的样板无关 */

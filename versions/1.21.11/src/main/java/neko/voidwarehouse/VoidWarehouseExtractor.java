@@ -59,7 +59,8 @@ import java.math.BigInteger;
  *   <li>仓库的该物品<b>被抽空</b>时：格子停在那 1 个上（这就是「余量」），
  *       下游再也拿不走它 —— 于是<b>分类不会丢</b>，玩家也不用重新摆一遍。</li>
  * </ul>
- * <p>换句话说：<b>仓库的账可以归零，漏斗的分类物一定还剩 1 个</b>。</p>
+ * <p>换句话说：<b>仓库的账可以归零，漏斗的分类物一定还剩 1 个</b>。
+ * 不可堆叠物更彻底 —— 那唯一的一个也永远留着（见下面「不可堆叠物：标本 + 旁路」）。</p>
  *
  * <h2>不丢东西 / 不多东西</h2>
  * <p>取料走的是仓库自己的 {@link VoidWarehouseData#takeExact}：仓库扣多少，漏斗就加多少，
@@ -71,10 +72,23 @@ import java.math.BigInteger;
  * 原版整个漏斗停摆，本功能也不会「无视红石往外倒料」。
  * 只有漏斗被原版激活时，它才会「从上方抽料」——这一条和原版漏斗的语义一致。</p>
  *
- * <h2>已知限制</h2>
- * <p>堆叠上限为 1 的物品（水桶、床、被拆过的工具…）当分类物时，格子本来就只能装 1 个，
- * 「补满」无从谈起，而最后 1 个又是分类物不能外流 —— 所以这类物品<b>出不了料</b>。
- * 需要它们时直接在界面上取，或改用能堆叠的物品当分类物。</p>
+ * <h2>不可堆叠物：标本 + 旁路（本轮新增）</h2>
+ * <p>堆叠上限为 1 的物品（水桶、潜影盒、床、船、被拆过的工具、药水…）有个天然矛盾：
+ * 格子只能装 1 个，而这 1 个既是「货」又是「分类物」——
+ * <b>搬走就没分类、不搬就没货</b>。本轮之前这类物品<b>出不了料</b>（旧版这里写的是一条「已知限制」）。</p>
+ * <p>现在改成「<b>标本 + 旁路</b>」：格子里那 1 个<b>永不搬走</b>
+ * （它同时是分类声明和玩家在界面上看到的图标），出货则走「仓库 → 下游」直连 ——
+ * {@link #ejectSpecimen} 每 tick 从仓库取 1 个、直接塞给下游容器。</p>
+ * <ul>
+ *   <li><b>玩家看得见</b>：标本永远在格子里，原版漏斗界面直接画得出来 ——
+ *       不需要额外渲染、不需要网络通道、不需要客户端模组；</li>
+ *   <li>{@link #pull} <b>一个字都不用改</b>：格子恒为 1/1，{@code room} 天然是 0；</li>
+ *   <li>速率 = <b>每 tick 1 个</b>（20 个/秒），是原版漏斗 2.5 个/秒的 8 倍，
+ *       也是「一次只能搬一件」的物品在物理上的上限；</li>
+ *   <li>下游不收就<b>整笔撤回仓库</b>，不丢不复制。</li>
+ * </ul>
+ * <p>顺带也把<b>潜影盒</b>纳入了出料范围 —— 它本来就是堆叠上限 1 的物品，
+ * 本轮之前同样卡在这条限制上。</p>
  */
 public final class VoidWarehouseExtractor {
     /**
@@ -210,8 +224,21 @@ public final class VoidWarehouseExtractor {
         int slots = hopper.getContainerSize();
         for (int i = 0; i < slots; i++) {
             ItemStack stack = hopper.getItem(i);
-            if (stack.isEmpty() || stack.getCount() <= KEEP_AS_CLASSIFIER) {
-                // 空格子没东西可搬；只剩分类物的格子**不许搬** —— 下游容器不能吸收分类物
+            if (stack.isEmpty()) {
+                // 空格子没东西可搬
+                continue;
+            }
+            // 不可堆叠物（堆叠上限 1）：这一格那 1 个是「标本」，<b>永不搬走</b> ——
+            // 它既是分类声明，也是玩家在漏斗界面里看到的那个图标。
+            // 出货走「仓库 → 下游」直连（见 ejectSpecimen），标本一动不动。
+            if (stack.getMaxStackSize() <= 1) {
+                if (ejectSpecimen(level, hopper, target, side, stack)) {
+                    moved = true;
+                }
+                continue;
+            }
+            if (stack.getCount() <= KEEP_AS_CLASSIFIER) {
+                // 只剩分类物的格子**不许搬** —— 下游容器不能吸收分类物
                 continue;
             }
             // 整格搬：留下 KEEP_AS_CLASSIFIER 个当分类物，其余全部推下去
@@ -232,6 +259,67 @@ public final class VoidWarehouseExtractor {
             hopper.setChanged();
         }
         return moved;
+    }
+
+    /**
+     * <b>不可堆叠物的出料：标本留在漏斗里，货从仓库直连下游。</b>
+     *
+     * <h2>为什么不能沿用「留 1 个当余量」那一套</h2>
+     * <p>堆叠上限为 1 的物品（水桶、潜影盒、床、被拆过的工具…），一格<b>最多就装 1 个</b>，
+     * 而这 1 个同时扮演两个角色：它是「货」，也是「分类物」。
+     * {@link #eject} 的老规矩是「每格只搬走 {@link #KEEP_AS_CLASSIFIER} 个以外的部分」，
+     * 于是这类物品的 {@code 数量 - KEEP} 恒为 0 —— <b>永远搬不动</b>，
+     * 本轮之前它们确实出不了料（旧版类注释里那条「已知限制」）。</p>
+     * <p>把余量改成 0 也不行：搬空之后 {@link #pull} 就不知道该往这一格补什么了
+     * （仓库不替玩家挑品类），于是出 1 个就断供，分类也跟着丢。</p>
+     *
+     * <h2>标本 + 旁路</h2>
+     * <p>所以这一格那 1 个<b>干脆不动</b>：它从此只当「标本」（分类声明 + 界面上的图标），
+     * 出货改走<b>仓库 → 下游</b>的直连 —— 每 tick 从仓库取 1 个，
+     * 用原版 {@link HopperBlockEntity#addItem} 塞进下游容器，<b>完全不碰漏斗格子</b>。</p>
+     * <ul>
+     *   <li><b>看得见</b>：标本永远在格子里，原版漏斗界面直接就能画出这个物品，
+     *       不需要额外渲染、不需要网络通道、不需要客户端模组；</li>
+     *   <li><b>{@link #pull} 一个字不用改</b>：格子恒为 1/1，{@code room} 天然是 0；</li>
+     *   <li><b>速率</b>：每 tick 1 个 = 20 个/秒，是原版漏斗（2.5 个/秒）的 8 倍；
+     *       这也是「一次只能搬一件」的物品在物理上的上限；</li>
+     *   <li><b>不丢不复制</b>：下游不收就整笔撤回仓库（{@link VoidWarehouseData.Withdrawal#returnUnplaced}），
+     *       取货走 {@link VoidWarehouseData#withdraw}，仓库扣多少下游就收多少。</li>
+     * </ul>
+     *
+     * <h2>为什么给 {@code addItem} 的是副本</h2>
+     * <p>{@code addItem} 会<b>就地 shrink</b> 传进去的那个堆叠。而
+     * {@link VoidWarehouseData.Withdrawal#returnUnplaced} 是拿它自己保存的那个堆叠的
+     * <b>当前数量</b>去算「该退多少」的 —— 直接喂原件，撤销量会算成 0，下游一拒收就丢东西。
+     * 所以这里先 {@code copy()} 一份给 {@code addItem}，撤销时仍以「原本要送几个」为准。</p>
+     *
+     * @param sample 漏斗这一格里的标本（只读，绝不修改）
+     * @return 是否真的送出去了东西（下游收下了至少 1 个）
+     */
+    private static boolean ejectSpecimen(ServerLevel level, HopperBlockEntity hopper, Container target,
+                                         Direction side, ItemStack sample) {
+        VoidWarehouseData data = VoidWarehouse.data(level.getServer());
+        // 取 1 个：不可堆叠物一次也只能搬 1 个，多取没有意义
+        VoidWarehouseData.Withdrawal withdrawal = data.withdraw(sample, BigInteger.ONE);
+        if (withdrawal.isEmpty()) {
+            // 仓库这件没货了（或者换不出来）→ 什么都不做，标本原样留着
+            return false;
+        }
+        ItemStack cargo = withdrawal.stack();
+        int want = cargo.getCount();
+        // 给副本：addItem 会就地 shrink 参数，而撤销要按「原本要送几个」算
+        ItemStack leftover = HopperBlockEntity.addItem(hopper, target, cargo.copy(), side);
+        int accepted = want - leftover.getCount();
+        if (accepted <= 0) {
+            // 下游一个都收不下（满了 / 不是它收的品类）→ 整笔撤回仓库，绝不丢东西
+            withdrawal.returnUnplaced(0);
+            return false;
+        }
+        if (!leftover.isEmpty()) {
+            // 部分收下（理论上不可堆叠物只会是 0 或全部，这里按实际收下的数量记账）
+            withdrawal.returnUnplaced(accepted);
+        }
+        return true;
     }
 
     /**

@@ -50,9 +50,21 @@
 - 🔴 **两个 jar 的 payload 类逐字节镜像**：`neko.voidwarehouse.search` 三个 payload 在服务端与客户端模组各一份（同 FQCN 双份、Fabric knot 只加载一份），内容不一致 = 一边编的包另一边解不开 —— 本次以 md5 逐字节比对通过(The three payload classes are byte-identical mirrors in both jars.)。
 - 客户端侧细节（吞键位置、渲染接线、尾随防抖）见客户端模组仓库；本侧改动集中在 `neko/voidwarehouse/search/`（5 个文件）与 `VoidWarehousePageContainer` 的过滤视图(Server-side changes are contained in the search package plus a filter view in the page container.)。
 
+#### 完整英文适配（双语版，方案 B）
+
+英文玩家从「完全无法使用」变成「全套可用」：此前触发名只认「虚空仓库」精确匹配，英文玩家连界面都打不开(Complete English localisation: English players can now trigger, read and use everything.)。
+
+- **语言检测**：客户端登录时上报的 `ClientInformation.language()`（`zh_cn` / `en_us`…）随时可从 `ServerPlayer` 读到，玩家改语言重进后自动生效。判定口径 = 以 `en` 开头即英语；拿不到真实上报的场合（自检假玩家）一律按中文兜底(Language detection reads the locale the client reports at login; anything starting with `en` gets English.)。
+- **触发名接受英文别名**：工作台改名为 "void warehouse"（忽略大小写、容忍首尾空白）也能触发；中文名「虚空仓库」维持原判 —— 精确、区分大小写、不做 trim。规则名与判定逻辑都不变(The trigger also accepts "void warehouse", case-insensitive and trimmed; the Chinese name keeps its exact-match rule.)。
+- **GUI 标题跟随触发名**：玩家把工作台改成什么名字，打开的界面就叫什么；按-数量取货结束重开界面时按玩家语言给对应标题(The GUI title follows the name the player typed on the anvil.)。
+- **全部玩家可见文案双语化**：物品格 tooltip（数量 / 操作行 / 盒组换算）、「可兑」条目的账单与操作行、导航行（翻页 / 潜影盒模式 / 数量排序 / 页码统计）、空位占位符、界面与取货的全部聊天提示、挖到提示、打印机补货提示 —— 英文玩家看到完整的英文界面与 `[Void Warehouse]` 前缀，中文玩家看到的和从前逐字节相同(All player-visible text — tooltips, nav icons, placeholders, chat notices, printer restock notices — now has an English set with a `[Void Warehouse]` prefix; Chinese output is byte-identical to before.)。
+- 🔴 **展示缓存按语言分键**：仓库格的 tooltip 缓存在共享的 `Entry` 上，多玩家共享 —— 缓存按语言各存一份（中 / 英两份），数量一变四份全废；物品名保持可翻译组件原样，永远由客户端本地化(Per-entry display caches are keyed by language, so two players sharing one warehouse each get their own locale.)。
+- **服务器日志与启动自检说明保持中文**：那是给服务器管理员看的，不跟玩家语言走(Server logs stay Chinese — they are for admins, not players.)。
+- **不新增 Carpet 规则**：规则集、配置键与存档格式都没变，直接替换 jar 即可(No new rule, no config or data-format change; just swap the jar.)。
+
 ### 🧪 Testing / 测试
 
-- 真服务端自检 **44 条断言 / 7 组**，五个版本全绿(44 assertions in 7 groups, green on all five targets.)：26.3 / 26.2 / 26.1.2 / 26.1.1 / 1.21.11 均 `checks=44 failures=0`。
+- 真服务端系统验收 **209 条断言**全绿(209 assertions on a real dedicated server, all green.)，其中双语组 **17 条**：`zh_cn` / `en_us` 的语言检测、触发别名五连（中文精确 / 英文忽略大小写 / 首尾空白 / 中文名带空格不触发 / 未改名不触发）、GUI 标题跟随触发名、同一份仓库在两种语言菜单下的导航行与 tooltip（`上一页` ↔ `Prev Page`、`数量：` ↔ `Count:`）、取货与挖到提示的两套前缀与措辞（`[虚空仓库] 已取出` ↔ `[Void Warehouse] Withdrew`）。⚠️ 自检假玩家的 `ClientInformation` 从 `createDefault()`（`en_us`）改为显式 `zh_cn` —— 不改的话语言检测会把全部自检玩家判成英文、17 条中文文案断言当场翻车(Test bots now explicitly report `zh_cn`; the default `createDefault()` is `en_us` and would flip every chat assertion.)。
 - 聊天提示单独成组（G 组 17 条）：累计关系（同物品相加 / 不同物品并列 / 超 4 种折算）、限流判据、拼出来的文本本身（前缀、顿号、数量），以及**库存数字是否等于 `amountExact`**、潜影盒与折算情形是否**故意不报**库存、`null` 数据时是否照发。文本断言一律避开物品名 —— 专用服务器上 `getHoverName()` 按 `en_us` 解析，咬名字等于咬环境(A dedicated group pins the chat coalescing rules and the warehouse-count reporting, and avoids asserting on localized item names.)。
 - 用真 `ServerPlayer` **真挖方块**，同时看三件事：仓库 +1、世界里**没有**多出物品实体、玩家背包也没多 —— 少看任何一项都抓不到「既入库又掉地上」这种复制 bug(The test digs for real and checks all three outcomes, which is the only way to catch dupe bugs.)。
 - **反证**：把两条 mixin 从 `mixins.json` 里临时摘掉，同一套自检 `failures=7`，其中「世界里没有多出物品实体」打出「dirt 实体 2 个，仓库 0」—— 证明这些断言咬的是真代码(Negative control: removing the mixins makes 7 assertions fail.).
@@ -68,16 +80,16 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 386,406 B | `a38dd9ecf21f719656d6885cd953e276` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 248,405 B | `95036f92bad66d1277bfc3114994f716` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 375,830 B | `ade3f77711c9c481b4e9f09ee3dd43aa` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 235,192 B | `3893f2db0bd04aa2cce9563118a87dd2` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 379,081 B | `840d8e178a3bb3d0e37fec62b1088d05` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 236,209 B | `ff0c8af7cbd15a70ed6b6eb7b7f6a505` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 379,083 B | `fc4289d99e117fe90eb997435bff38e9` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 236,209 B | `2dd68d523b84d2ec7608de4c14103c62` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 377,312 B | `eb9f09d9c3694874e400551ab0c7aa07` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 236,424 B | `d329cefd937cf0621f194af31b1b408f` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 391,243 B | `5b4474ed2dec1be027da05837ec9ea13` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 408,496 B | `8b98790a669b504cf44428dfc23cb653` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 380,851 B | `46728c35372f8f0efe04fa957d3197b0` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 395,702 B | `8ae45895692d84c90957bf85586aa8f6` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 384,113 B | `2b9aa0d3329db34c1880bb0877231e4c` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 396,718 B | `29df8e3e237a1593bb10388a6b91bc6b` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 384,115 B | `1275c3621386cac32bcc3d81e8b2669d` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 396,717 B | `9827c7a3a4abf3db98a1e2319dddf1f3` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 382,376 B | `50a6ec9fa595e6483d37d4757a4e07a0` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 396,859 B | `1f9a155e92463fcd793df38207f4700a` |
 
 > 只需要能跑的 jar：下 `-1.0.16.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 

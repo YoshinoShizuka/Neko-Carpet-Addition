@@ -16,6 +16,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
 import net.minecraft.network.Connection;
+import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
@@ -85,6 +86,8 @@ public final class SystemTest {
     private static ServerLevel level;
     private static final List<ServerPlayer> bots = new ArrayList<>();
     private static boolean fakeConnection = false;
+    /** 双语组专用：客户端语言报 en_us 的玩家（与 bots 里 zh_cn 的玩家对照） */
+    private static ServerPlayer enBot;
 
     /** 防 JIT 死代码消除 */
     private static long sink;
@@ -174,7 +177,8 @@ public final class SystemTest {
             case 21 -> perfGuiOpen(server);
             case 22 -> perfMemory(server);
             case 23 -> multiplayer(server);
-            case 24 -> cleanup(server);
+            case 24 -> bilingual(server);
+            case 25 -> cleanup(server);
             default -> {
                 finish(server);
                 return;
@@ -945,7 +949,10 @@ public final class SystemTest {
         System.out.println("[ENV] 造 " + BOT_COUNT + " 个真实 ServerPlayer（无客户端）");
         for (int i = 0; i < BOT_COUNT; i++) {
             GameProfile profile = new GameProfile(UUID.randomUUID(), "sysbot" + i);
-            ServerPlayer p = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
+            // 双语版：测试断言全部按中文写，假玩家的客户端语言必须显式报 zh_cn ——
+            // 不能用 ClientInformation.createDefault()（它的 language 是 en_us，
+            // 会让 VoidWarehouseText.isEnglish 把自检玩家判成英文、发出英文提示。
+            ServerPlayer p = new ServerPlayer(server, level, profile, zhInfo());
             try {
                 Connection conn = new Connection(PacketFlow.SERVERBOUND);
                 p.connection = new ServerGamePacketListenerImpl(server, conn, p,
@@ -958,6 +965,32 @@ public final class SystemTest {
             bots.add(p);
         }
         System.out.println("[ENV] 假连接可用 = " + fakeConnection);
+        // 双语组用的英文玩家（不计入 BOT_COUNT，多人压力的口径不变）
+        GameProfile enProfile = new GameProfile(UUID.randomUUID(), "sysbot-en");
+        enBot = new ServerPlayer(server, level, enProfile, enInfo());
+        try {
+            Connection conn = new Connection(PacketFlow.SERVERBOUND);
+            enBot.connection = new ServerGamePacketListenerImpl(server, conn, enBot,
+                    CommonListenerCookie.createInitial(enProfile, false));
+        } catch (Throwable ignored) {
+            // 双语组只断言 isEnglish 的返回值，不需要连接
+        }
+    }
+
+    /** 与 {@code ClientInformation.createDefault()} 逐字段相同，只有 language 换成 zh_cn */
+    private static ClientInformation zhInfo() {
+        return new ClientInformation("zh_cn", 2,
+                net.minecraft.world.entity.player.ChatVisiblity.FULL, true, 0,
+                net.minecraft.world.entity.player.Player.DEFAULT_MAIN_HAND, false, false,
+                net.minecraft.server.level.ParticleStatus.ALL);
+    }
+
+    /** 英文玩家：language = en_us（与 createDefault 相同，这里显式写出以免语义漂移） */
+    private static ClientInformation enInfo() {
+        return new ClientInformation("en_us", 2,
+                net.minecraft.world.entity.player.ChatVisiblity.FULL, true, 0,
+                net.minecraft.world.entity.player.Player.DEFAULT_MAIN_HAND, false, false,
+                net.minecraft.server.level.ParticleStatus.ALL);
     }
 
     /** 玩家对象本身的自检：数量、假连接、背包可写。放在功能组之前跑，后面才敢依赖它。 */
@@ -978,6 +1011,107 @@ public final class SystemTest {
     }
 
     private static final int BOT_COUNT = 20;
+
+    // ================================================================== 16 双语（方案 B）
+
+    /**
+     * 双语适配验收：语言检测、触发别名、GUI 标题跟随、聊天提示与界面 tooltip 的中英两套。
+     *
+     * <p>判据三条线：</p>
+     * <ol>
+     *   <li><b>语言检测</b>：{@code zh_cn} 玩家判中文、{@code en_us} 玩家判英文 ——
+     *       这是整个双语机制的源头，判错了后面全歪；</li>
+     *   <li><b>触发与标题</b>：英文别名 "void warehouse" 忽略大小写、容忍首尾空白；
+     *       中文名维持原判（精确、不 trim）；GUI 标题跟随触发名；</li>
+     *   <li><b>文案两套</b>：同一份仓库数据，zh 菜单的导航行是中文、en 菜单是英文；
+     *       聊天提示前缀与措辞跟着语言走（纯函数直接断言，不必真发消息）。</li>
+     * </ol>
+     */
+    private static void bilingual(MinecraftServer server) {
+        System.out.println("===== 16 双语（方案 B） =====");
+        ServerPlayer zhBot = bots.get(0);
+
+        // ---- 语言检测 ----
+        check("B1 zh_cn 玩家判为中文", !VoidWarehouseText.isEnglish(zhBot));
+        check("B2 en_us 玩家判为英文", VoidWarehouseText.isEnglish(enBot));
+
+        // ---- 触发别名（工作台 + 自定义名）----
+        ItemStack zhTable = new ItemStack(Items.CRAFTING_TABLE);
+        zhTable.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, Component.literal("虚空仓库"));
+        ItemStack enLower = new ItemStack(Items.CRAFTING_TABLE);
+        enLower.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, Component.literal("void warehouse"));
+        ItemStack enMixed = new ItemStack(Items.CRAFTING_TABLE);
+        enMixed.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, Component.literal(" Void Warehouse "));
+        ItemStack zhSpaced = new ItemStack(Items.CRAFTING_TABLE);
+        zhSpaced.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, Component.literal(" 虚空仓库"));
+        ItemStack plainTable = new ItemStack(Items.CRAFTING_TABLE);
+        check("B3 中文名「虚空仓库」精确触发", VoidWarehouseTrigger.isVoidWarehouse(zhTable));
+        check("B4 英文小写 void warehouse 触发（忽略大小写）", VoidWarehouseTrigger.isVoidWarehouse(enLower));
+        check("B5 英文带首尾空白触发（trim）", VoidWarehouseTrigger.isVoidWarehouse(enMixed));
+        check("B6 中文名带空格不触发（中文维持原判）", !VoidWarehouseTrigger.isVoidWarehouse(zhSpaced));
+        check("B7 未改名工作台不触发", !VoidWarehouseTrigger.isVoidWarehouse(plainTable));
+
+        // ---- GUI 标题跟随触发名 ----
+        Component enTitle = Component.literal("Void Warehouse");
+        check("B8 open(en, 标题) 走通", VoidWarehouse.open(enBot, enTitle));
+        check("B9 打开的菜单是 VoidWarehouseMenu", enBot.containerMenu instanceof VoidWarehouseMenu);
+        enBot.closeContainer();
+        VoidWarehouseProvider provider = new VoidWarehouseProvider(data, enTitle);
+        check("B10 Provider 标题 = 触发名", enTitle.getString()
+                .equals(provider.getDisplayName().getString()));
+
+        // ---- 界面文案两套（同一份 data，两个不同语言的菜单）----
+        data.insert(new ItemStack(Items.DIRT, 128));
+        VoidWarehouseMenu zhMenu = new VoidWarehouseMenu(901, zhBot.getInventory(), data, zhBot);
+        VoidWarehouseMenu enMenu = new VoidWarehouseMenu(902, enBot.getInventory(), data, enBot);
+        String zhPrev = zhMenu.getSlot(48).getItem().getHoverName().getString();
+        String enPrev = enMenu.getSlot(48).getItem().getHoverName().getString();
+        check("B11 zh 菜单导航行是中文（上一页）", zhPrev.contains("上一页"));
+        check("B12 en 菜单导航行是英文（Prev Page）", enPrev.contains("Prev Page"));
+        // 物品格 tooltip 的「数量：」标签也要分语言（Entry 展示缓存按语言各一份）。
+        // 不盯死第 0 格 —— 排序与「可兑」条目会让任意一格变成虚拟条目或空位，
+        // 扫整页 45 格、只要两种语言各自的关键词都出现就说明 tooltip 是分语言的。
+        StringBuilder zhTips = new StringBuilder();
+        StringBuilder enTips = new StringBuilder();
+        for (int i = 0; i < 45; i++) {
+            zhTips.append(zhMenu.getSlot(i).getItem().getHoverName().getString())
+                    .append(loreOf(zhMenu.getSlot(i).getItem()));
+            enTips.append(enMenu.getSlot(i).getItem().getHoverName().getString())
+                    .append(loreOf(enMenu.getSlot(i).getItem()));
+        }
+        check("B13 zh 物品格 tooltip 是中文（数量：）", zhTips.toString().contains("数量："));
+        check("B14 en 物品格 tooltip 是英文（Count:）", enTips.toString().contains("Count:"));
+        zhMenu.removed(zhBot);
+        enMenu.removed(enBot);
+
+        // ---- 聊天提示两套（纯函数，直接断言文案）----
+        Component zhMsg = VoidWarehouseWithdraw.successMessage(false,
+                new ItemStack(Items.DIRT), 200, 0, 200, false);
+        Component enMsg = VoidWarehouseWithdraw.successMessage(true,
+                new ItemStack(Items.DIRT), 200, 0, 200, false);
+        check("B15 zh 取货提示：[虚空仓库] 前缀 + 已取出", zhMsg.getString().startsWith("[虚空仓库] ")
+                && zhMsg.getString().contains("已取出"));
+        check("B16 en 取货提示：[Void Warehouse] 前缀 + Withdrew", enMsg.getString().startsWith("[Void Warehouse] ")
+                && enMsg.getString().contains("Withdrew"));
+        // 挖到提示（走 record/takePending 真实攒批路径）
+        VoidWarehouseBlockDrops.record(enBot, new ItemStack(Items.DIRT, 3));
+        List<VoidWarehouseBlockDrops.Kind> kinds = VoidWarehouseBlockDrops.takePending(enBot);
+        check("B17 en 挖到提示：Mined", kinds != null
+                && VoidWarehouseBlockDrops.summary(kinds, data, true).getString().contains("Mined"));
+    }
+
+    /** 把一叠物品的 lore 拼成一个字符串（tooltip 断言用） */
+    private static String loreOf(ItemStack stack) {
+        var lore = stack.get(net.minecraft.core.component.DataComponents.LORE);
+        if (lore == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Component line : lore.lines()) {
+            sb.append(line.getString());
+        }
+        return sb.toString();
+    }
 
     // ================================================================== 性能
 

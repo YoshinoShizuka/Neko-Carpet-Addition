@@ -7,6 +7,21 @@
 
 ### ✨ Added & Improved / 新增与优化
 
+#### 出料漏斗支持不可堆叠物品（标本 + 旁路）
+
+矿车、水桶、**潜影盒**、床、破损工具这类「堆叠上限 1」的物品，以前当出料分类物时**一个都出不来** —— 格子里那 1 个既是「货」又是「分类物」，搬走就没分类、不搬就没货(Hopper output now supports unstackable items such as minecarts, buckets and shulker boxes.)。
+
+- **标本 + 旁路**：格子里那 1 个**永不搬走**（它同时是分类声明和玩家看到的图标），出货改由仓库**直连下游** —— 每 tick 从仓库取 1 个、用原版 `addItem` 直接塞给下游容器，完全不碰漏斗格子(The slot item becomes a specimen that is never moved; goods travel straight from the warehouse to the target container.)。
+- **「分类物看不见」顺带解决**：标本永远在格子里，原版漏斗界面直接就能画出这个物品，**不需要额外渲染、网络通道或客户端模组**(The specimen stays visible in the vanilla hopper GUI with no client mod.)。
+- **速率 1 个/tick（20 个/秒）**：是「一次只能搬一件」的物品在物理上的上限，仍是原版漏斗（2.5 个/秒）的 8 倍(One item per tick, 8× faster than vanilla hoppers.)。
+- 🔴 **给 `addItem` 的必须是副本**：它会就地 shrink 传入的堆叠，而撤销是按「原本要送几个」算的 —— 直接喂原件，下游一拒收就把这 1 个蒸发了(A copy must be passed to `addItem`, otherwise a refused delivery silently loses the item.)。
+- **下游不收就整笔撤回仓库**（`Withdrawal#returnUnplaced`）：9 合 1 兑换那条路也一并反向执行，不丢不复制(Refused deliveries are rolled back into the warehouse, exchange-based withdrawals included.)。
+- **`pull` 一个字没改**：格子恒为 1/1，`room` 天然是 0(`pull` is untouched.)。
+- **顺带把潜影盒纳入出料范围**：它本来就是 `maxStackSize = 1`，之前同样卡在这条限制上(Shulker boxes now work as output classifiers too.)。
+- 不新增 Carpet 规则，**版本号不变**，直接替换 jar 即可(No new rule; drop-in replacement.)。
+- **验证**：26.3 真服务端 **22 条断言全绿**，含「圆石对照组行为一字不变」与「连做 3 轮每轮结果完全一致」；反证只回滚标本分支，A/B/E 主组翻红 10 条、对照组仍绿（详见 `docs/出料漏斗支持不可堆叠物品.md`）(22 assertions on a real server, plus a roll-back counter-experiment where exactly the main group flips red.)。
+- **入库端仍不支持**：入库的物品必须真的进仓库、格子必然被搬空 —— 那一侧还没做(Hopper *intake* still cannot use unstackable classifiers.)
+
 #### 方块掉落物直接进虚空仓库（`voidWarehouseBlockDrops`）
 
 玩家**挖掉**的方块，掉落物不进世界、直接进共享仓库(Block drops go straight into the shared warehouse instead of landing on the ground.)。
@@ -96,16 +111,16 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 391,807 B | `5a784f514c9fd13a7691474e8018316f` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 410,571 B | `023984fd2d31166b31f8ca84c615ee2d` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 381,423 B | `ac2df5c3ca6857a3066369d15c832d98` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 397,797 B | `b2036bb6b6ac995f9afc9254af0d2dbe` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 384,692 B | `76795923a5e16bdcf4d4ebd1b46f85db` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 398,814 B | `66efeefb15fda4d819bbafb80a195d34` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 384,694 B | `1bae5d0745e4e9daa971f3e48da58b91` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 398,813 B | `15ba048cc40cb8e46c225dff0a98dd31` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 382,931 B | `4186118879a978c90d41ffec0a33701b` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 398,982 B | `6f4d9845bd7fae2d3469645ea8920c49` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 392,177 B | `42e5c303250e7f25e90fa59ccde6c8de` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 412,363 B | `7f2df66b52d4c3172670622ef86b2323` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 381,793 B | `d1d80d4c99d3d6a6b1ff71acac1b58cb` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 399,506 B | `b2f762724db979000b856448aff5f34b` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 385,062 B | `857ed151b3f6e0853439f31a3af27e69` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 400,523 B | `f8956da39b575bb1e17587ca7aa90638` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 385,064 B | `f532e6d57fec8e49da170fafae3c2680` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 400,522 B | `06a1850a47b95a83d5e78358c6c8f40e` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 383,310 B | `b1a8e2fa2ca4c7605b2f270063534e96` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 400,690 B | `aa8f7f00c8a03db7e5f201bd6b7cfcf1` |
 
 > 只需要能跑的 jar：下 `-1.0.16.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 
@@ -113,7 +128,7 @@
 
 - mixin 从 13 条增到 15 条（新增 `ServerLevelAddEntityMixin`、`ServerPlayerGameModeDestroyMixin`），规则名、配置键与存档格式均未变，**直接替换 jar 即可**(Two new mixins; no config or data-format change, just swap the jar.)。
 - 新规则默认关闭：`/carpet voidWarehouseBlockDrops true`，且 `voidWarehouse` 也要开着。
-- **同版本号原地更新**：这条规则的聊天提示在 1.0.16 首次发布之后改过两次（先加提示，再去掉「已直接入库」、改成报仓库现有数量），加上这次的盒模式刷盒子修复，1.0.16 的 jar 已经变过几次 —— 以文件名旁的 md5 为准（本表已刷新）(This release was updated in place several times; compare the md5 next to the file name.)。
+- **同版本号原地更新**：这条规则的聊天提示在 1.0.16 首次发布之后改过两次（先加提示，再去掉「已直接入库」、改成报仓库现有数量），加上盒模式刷盒子修复、以及这次的不可堆叠物出料，1.0.16 的 jar 已经变过几次 —— 以文件名旁的 md5 为准（本表已刷新）(This release was updated in place several times; compare the md5 next to the file name.)。
 - **盒模式取潜影盒的行为变了**：以前（错得）交出一个「装着 N 个潜影盒的潜影盒」，现在直接交出 1 个潜影盒（与普通模式一致），且不消耗额外的空盒 / 壳 / 箱。已经刷出来的嵌套盒、已经攒多的壳与箱不会自动回收(In box mode, taking a shulker-box cell now hands out one plain box instead of a box full of boxes.)。
 - 反方向提醒：开这条规则之后**挖掘产出不再落在地上**。靠「挖掉 → 掉落物被水流冲走」的生电收集结构会失效，开之前先确认你的收集系统不依赖世界里的掉落物。
 - 新增两条通道 `printer_return` / `printer_return_result`（服务端注册；客户端幂等补位）。**没有新增 Carpet 规则**，规则集、配置键与存档格式都没变，直接替换 jar 即可；老版本打印机不认识这两条通道也不会受影响（服务端发送前会 `canSend`）(Two new channels, no new rule, no config or data-format change.)。

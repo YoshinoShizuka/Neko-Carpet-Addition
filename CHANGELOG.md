@@ -68,15 +68,15 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 231,948 B | `6143809a027af10e0af745da871ad1e1` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 386,406 B | `a38dd9ecf21f719656d6885cd953e276` |
 | 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 248,405 B | `95036f92bad66d1277bfc3114994f716` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 221,373 B | `1b446a7c599b4d7d956b6226365f6d8d` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 375,830 B | `ade3f77711c9c481b4e9f09ee3dd43aa` |
 | 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 235,192 B | `3893f2db0bd04aa2cce9563118a87dd2` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 224,623 B | `33a85905b8193958af3ea44b8a981dc1` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 379,081 B | `840d8e178a3bb3d0e37fec62b1088d05` |
 | 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 236,209 B | `ff0c8af7cbd15a70ed6b6eb7b7f6a505` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 224,625 B | `e2e2a700ea54d8489f7b37f3d28f31bb` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 379,083 B | `fc4289d99e117fe90eb997435bff38e9` |
 | 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 236,209 B | `2dd68d523b84d2ec7608de4c14103c62` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 222,844 B | `f75a707160760f63df8e9d9745246b0c` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 377,312 B | `eb9f09d9c3694874e400551ab0c7aa07` |
 | 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 236,424 B | `d329cefd937cf0621f194af31b1b408f` |
 
 > 只需要能跑的 jar：下 `-1.0.16.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。

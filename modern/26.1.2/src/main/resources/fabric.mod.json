@@ -9,6 +9,7 @@
     "Akirono"
   ],
   "license": "MIT",
+  "icon": "assets/carpet_neko_addition/icon.png",
 
   "environment": "*",
   "entrypoints": {

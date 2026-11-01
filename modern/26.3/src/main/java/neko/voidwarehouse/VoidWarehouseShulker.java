@@ -130,6 +130,24 @@ public final class VoidWarehouseShulker {
     }
 
     /**
+     * 这种物品能不能「装进盒子」。
+     *
+     * <p><b>潜影盒不行</b> —— 原版是靠 {@code ShulkerBoxBlock#canFitInsideContainerItems}
+     * 在放进去那一刻挡住的（{@code minecraft:shulker_boxes} 物品标签），而 {@link #pack}
+     * 是直接 {@code set(CONTAINER, ...)} 造盒子，<b>绕过</b>了那道检查。于是「盒模式点
+     * 潜影盒那一格」就会造出原版根本不允许存在的「盒子套盒子」。</p>
+     *
+     * <p>那个嵌套盒送回仓库时会被 {@code unpackShulkerBox} 拆成「里层盒子 + 2 壳 + 1 箱」，
+     * 而外盒的材料账是拿<b>同一个空盒格</b>算的（{@code planBoxMaterials}）——
+     * 取货那一步先把这一格取空，扣材料时便再也扣不到，外盒等于白送。
+     * 一来一回，每循环一次就凭空多出一个盒子的价值（2026-11 真踩到）。
+     * 所以「目标格本身是潜影盒」时<b>一律不装盒</b>，直接按散盒交出，见两个取货口。</p>
+     */
+    public static boolean isBoxable(ItemStack template) {
+        return template != null && !template.isEmpty() && !isShulkerBox(template);
+    }
+
+    /**
      * 把 {@code count} 个 {@code template} 打包成一个潜影盒。
      *
      * <p>从第 0 格开始按「每格装满」往后铺，装不下的部分留在下一格（原版潜影盒
@@ -137,6 +155,9 @@ public final class VoidWarehouseShulker {
      *
      * <p>{@code template} 只当样板用（数量无所谓），内部一律走
      * {@code copyWithCount(n)} 造新堆叠，<b>绝不把同一个实例挂在两处</b>。</p>
+     *
+     * <p>⚠️ <b>调用前必须先问 {@link #isBoxable}</b>：这个方法不做类型检查，
+     * 拿潜影盒当模板会造出原版不允许的嵌套盒（后果见 {@link #isBoxable}）。</p>
      */
     public static ItemStack pack(ItemStack template, long count) {
         int max = Math.max(1, template.getMaxStackSize());

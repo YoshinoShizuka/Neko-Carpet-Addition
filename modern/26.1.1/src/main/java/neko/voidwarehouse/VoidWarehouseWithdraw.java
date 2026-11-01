@@ -221,11 +221,17 @@ public final class VoidWarehouseWithdraw {
         }
         int max = Math.max(1, sample.getMaxStackSize());
         long capacity = VoidWarehouseShulker.capacity(sample);
-        long fullBoxes = requested / capacity;
-        long loose = requested % capacity;
+        // 这一格本身就是潜影盒 → <b>不装盒</b>：按「散盒」原样取出 requested 个。
+        //   再装一道会造出原版禁止的「盒子套盒子」，而且外盒的材料账恰好也从这一格算
+        //   （planBoxMaterials 空盒优先），takeExact 先把它扣空之后材料就扣不到了 ——
+        //   于是「取 5 个盒子出来 6 个」、送回仓库后壳和箱无限增长（2026-11 事故）。
+        //   盒子本来就是盒子，直接给。见 VoidWarehouseShulker#isBoxable。
+        boolean boxTarget = !VoidWarehouseShulker.isBoxable(sample);
+        long fullBoxes = boxTarget ? 0 : requested / capacity;
+        long loose = boxTarget ? requested : requested % capacity;
         // 散货超过 LOOSE_PACK_STACKS 组：它单独要占掉一大片背包格子，顺手装进一个盒子
         // （这个盒子同样要算材料，所以盒子总数是 fullBoxes + 1）
-        boolean packLoose = loose > (long) LOOSE_PACK_STACKS * max;
+        boolean packLoose = !boxTarget && loose > (long) LOOSE_PACK_STACKS * max;
         long totalBoxes = packLoose ? fullBoxes + 1 : fullBoxes;
 
         // ① 校验物品库存（精确口径：同物品 + 同数据组件，与 takeExact 一致）。

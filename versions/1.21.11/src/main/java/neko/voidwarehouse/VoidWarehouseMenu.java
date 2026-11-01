@@ -548,6 +548,22 @@ public class VoidWarehouseMenu extends ChestMenu {
             return;
         }
         ItemStack template = target.template();
+
+        // ⓪ 这一格<b>本身就是潜影盒</b> → 不装盒，直接按散盒交出 1 个（与普通模式同一口径）。
+        //
+        //    为什么不能照常装：pack() 是直接 set(CONTAINER, ...) 造盒子，绕过原版
+        //    「潜影盒不能装进潜影盒」的检查，于是会造出「装着 N 个潜影盒的潜影盒」——
+        //    玩家把外层打开就等于凭空多出 1 个盒子。更糟的是外盒的材料账
+        //    （planBoxMaterials 空盒优先）恰好也从这一格算，而下面的 take() 会先把这一格
+        //    取空、把格子移除，consumeBoxMaterials 便再也扣不到，于是外盒一分钱不付。
+        //    实测：仓库 5 个空盒 → 交出「1 个装着 5 个空盒的盒子」（实收 6 个）→ 送回仓库
+        //    变成 5 个空盒 + 2 壳 + 1 箱，来回几轮壳和箱就无限增长（2026-11 事故）。
+        //    盒子本来就是盒子，没有再装一道的理由。见 VoidWarehouseShulker#isBoxable。
+        if (!VoidWarehouseShulker.isBoxable(template)) {
+            this.withdrawFrom(target, 0, player);
+            return;
+        }
+
         long capacity = VoidWarehouseShulker.capacity(template);
 
         // ① 这一格现在能拿出多少个 + （可兑条目）这一笔账怎么扣。

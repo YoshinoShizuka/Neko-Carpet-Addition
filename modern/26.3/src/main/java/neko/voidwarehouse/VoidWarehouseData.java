@@ -1256,16 +1256,39 @@ public final class VoidWarehouseData extends SavedData {
     /**
      * 按 {@link #planBoxMaterials} 的结果扣账。
      *
-     * <p>返回实际扣掉的空盒数量（正常应等于 {@code plan.emptyBoxes()}）；
-     * 少扣了说明并发操作把空盒抢走了，调用方不必在意 —— 那部分材料本来就不该花出去。</p>
+     * <h2>为什么「少扣了」可以补壳箱，而不能当成没发生</h2>
+     * <p>原先这里少扣几个空盒就默默少扣了，调用方也不看返回值，注释还写着「那部分材料
+     * 本来就不该花出去」。这个说法只在「空盒被别人抢走」时成立，一旦差额来自
+     * <b>同一笔操作的取货</b>（目标格本身就是空盒格时 {@code take()} 会先把这一格取空），
+     * 就变成「外盒白送一个」—— 送回仓库拆出 2 壳 + 1 箱，来回几轮就能无限刷盒子
+     * （2026-11 事故，根因已由 {@link VoidWarehouseShulker#isBoxable} 堵掉）。</p>
+     *
+     * <p>所以这里不再「少扣就算」，而是<b>把差额换算成原版配方补扣</b>
+     * （每缺 1 个空盒补 2 潜影壳 + 1 箱子）：账永远是平的，差额只可能表现为
+     * 「玩家多花了壳箱」而不是「凭空多出一个盒子」。真补不上时留一条 WARN ——
+     * 那是异常路径，必须能在日志里看见。</p>
+     *
+     * @return 实际扣掉的空盒数量（正常等于 {@code plan.emptyBoxes()}）
      */
     public int consumeBoxMaterials(BoxMaterials plan) {
         int taken = plan.emptyBoxes() > 0 ? this.takeEmptyBoxes(plan.emptyBoxes()) : 0;
-        if (plan.shells() > 0) {
-            this.takeItem(Items.SHULKER_SHELL, plan.shells());
+        int shortfall = plan.emptyBoxes() - taken;
+        int shells = plan.shells();
+        int chests = plan.chests();
+        if (shortfall > 0) {
+            // 空盒没扣够 → 按原版配方把差额换算成壳 + 箱，绝不让外盒变成免费的
+            shells += shortfall * VoidWarehouseShulker.SHELL_COST;
+            chests += shortfall * VoidWarehouseShulker.CHEST_COST;
+            LOGGER.warn("装盒材料少了 {} 个空盒可扣，按原版配方改用 {} 潜影壳 + {} 箱子补扣（"
+                            + "若这条日志反复出现，说明取货路径与空盒材料共用了同一格）",
+                    shortfall, shortfall * VoidWarehouseShulker.SHELL_COST,
+                    shortfall * VoidWarehouseShulker.CHEST_COST);
         }
-        if (plan.chests() > 0) {
-            this.takeItem(Items.CHEST, plan.chests());
+        if (shells > 0 && !this.takeItem(Items.SHULKER_SHELL, shells)) {
+            LOGGER.warn("潜影壳不足，{} 个未能扣掉（仓库账目会少扣这点材料）", shells);
+        }
+        if (chests > 0 && !this.takeItem(Items.CHEST, chests)) {
+            LOGGER.warn("箱子不足，{} 个未能扣掉（仓库账目会少扣这点材料）", chests);
         }
         return taken;
     }

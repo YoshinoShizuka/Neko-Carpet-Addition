@@ -1,0 +1,467 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+
+import java.math.BigInteger;
+
+/**
+ * 【临时探针】<b>入库漏斗对不可堆叠物的现状</b> —— 只测不改，跑完删掉。
+ *
+ * <h2>为什么要先测</h2>
+ * <p>出料端已经用「标本 + 旁路」解决了（{@code VoidWarehouseExtractor#ejectSpecimen}，
+ * 22 条断言全绿 + 反证成立）。入库端<b>还没做</b>，而「现状到底卡在哪」不能靠推理 ——
+ * 推理有两种截然不同的可能，结论完全相反：</p>
+ * <ol>
+ *   <li>「不可堆叠物根本进不了仓库」→ 那要改的是搬运链；</li>
+ *   <li>「不可堆叠物能进仓库，只有『当分类物』时不行」→ 那要改的只是分类物语义。</li>
+ * </ol>
+ * <p>本探针就是为了把这两件事分开量出来，给「做不做、怎么做」提供实测依据。</p>
+ *
+ * <h2>组别</h2>
+ * <table border="1">
+ *   <tr><th>组</th><th>摆法</th><th>证什么</th></tr>
+ *   <tr><td>A</td><td>格 0 有 1 个矿车（<b>玩家的手</b>放进去的 = 分类物），上游 20 个矿车</td>
+ *       <td>「不可堆叠物当分类物」时到底入不入库</td></tr>
+ *   <tr><td>B</td><td>格子全空、没有分类物，上游 20 个矿车</td>
+ *       <td>不可堆叠物<b>本身</b>能不能入库（与分类物解耦）</td></tr>
+ *   <tr><td>C</td><td><b>对照组</b>：格 0 有 1 个圆石（分类物），上游 64 个圆石</td>
+ *       <td>同一套白名单对<b>可堆叠物</b>是完全正常的 ⇒ A 组若红，红的是「不可堆叠」这条，不是白名单整体</td></tr>
+ *   <tr><td>D</td><td>格 0 有 1 个矿车（分类物），上游 8 个<b>水桶</b></td>
+ *       <td>白名单对不可堆叠物是否有效（不该进的东西进不进得来）</td></tr>
+ * </table>
+ *
+ * <h2>怎么模拟「玩家的手」</h2>
+ * <p>入库白名单的唯一写入口是 {@code Slot#setByPlayer}（{@code SlotMixin} 注入在它 RETURN 处），
+ * 机器搬运走 {@code Container#setItem}，<b>永远写不进白名单</b>。
+ * 所以探针必须真的造一个 {@code Slot} 再调 {@code setByPlayer}，
+ * 直接 {@code hopper.setItem} 只会得到一个空清单（那样 A/C/D 三组全都会测成「没有白名单」）。</p>
+ */
+public final class IntakeUnstackableProbe {
+
+    private static final int BASE_X = 460;
+    private static final int BASE_Z = 460;
+    private static final int TABLE_Y = 110;      // 工作台（漏斗口朝下指向它 ⇒ isIntake 成立）
+    private static final int HOPPER_Y = 111;
+    private static final int CHEST_Y = 112;      // 上游容器
+
+    /** 每组跑多少 tick。20 tick 足够让 20 个不可堆叠物「该进的都进完」 */
+    private static final int TICKS = 20;
+
+    private static final int UPSTREAM_UNSTACKABLE = 20;   // A/B 组上游放几个矿车
+    private static final int UPSTREAM_STACKABLE = 64;     // C 组上游放几个圆石（一格）
+    private static final int UPSTREAM_WRONG = 8;          // D 组上游放几个水桶（不是白名单）
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private static int stage = 0;
+    private static int waited = 0;
+    private static int tickIndex = 0;
+
+    private static BlockPos tableA;
+    private static BlockPos hopperA;
+    private static BlockPos chestA;
+
+    private static BlockPos tableB;
+    private static BlockPos hopperB;
+    private static BlockPos chestB;
+
+    private static BlockPos tableC;
+    private static BlockPos hopperC;
+    private static BlockPos chestC;
+
+    private static BlockPos tableD;
+    private static BlockPos hopperD;
+    private static BlockPos chestD;
+
+    private IntakeUnstackableProbe() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        VoidWarehouseSettings.voidWarehouse = true;
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 探针抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        switch (stage) {
+            case 0:
+                for (int cx = BASE_X >> 4; cx <= (BASE_X + 24) >> 4; cx++) {
+                    for (int cz = BASE_Z >> 4; cz <= (BASE_Z + 24) >> 4; cz++) {
+                        level.setChunkForced(cx, cz, true);
+                    }
+                }
+                break;
+            case 1:
+                if (!level.isLoaded(new BlockPos(BASE_X, HOPPER_Y, BASE_Z))) {
+                    if (++waited > 300) {
+                        System.out.println("!! 区块 300 tick 没加载出来，放弃");
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                System.out.println("INP 区块就绪");
+                break;
+            case 2:
+                build(server);
+                break;
+            case 3:
+                if (!(level.getBlockEntity(hopperA) instanceof HopperBlockEntity)
+                        || !(level.getBlockEntity(hopperB) instanceof HopperBlockEntity)
+                        || !(level.getBlockEntity(hopperC) instanceof HopperBlockEntity)
+                        || !(level.getBlockEntity(hopperD) instanceof HopperBlockEntity)) {
+                    if (++waited > 100) {
+                        System.out.println("!! 漏斗方块实体没就位");
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                System.out.println("INP 就位：A(矿车标本) B(空漏斗) C(圆石对照) D(白名单隔离)");
+                break;
+
+            // ---------------------------------------------------------------- A
+            case 4:
+                if (++tickIndex < 4) {
+                    return;             // 热身：让漏斗/箱子链路稳定，不作断言
+                }
+                tickIndex = 0;
+                break;
+            case 5:
+                // A 起点：<b>玩家的手</b>把 1 个矿车放进格 0（= 声明分类物），上游 20 个矿车
+                seedByHand(level, hopperA, Items.MINECART);
+                fillUpstream(server, chestA, Items.MINECART, UPSTREAM_UNSTACKABLE);
+                resetWarehouse(server);
+                // 仓库先垫同样数量：这样「一个都没入库」= 仍是 20，「进了几个」= 大于 20
+                VoidWarehouse.data(server).insert(new ItemStack(Items.MINECART, UPSTREAM_UNSTACKABLE));
+                check("[A0-1] 玩家的手放进去之后，分类物清单记下了矿车",
+                        !((VoidWarehouseHopperFilter) level.getBlockEntity(hopperA))
+                                .getClassifierSeed(0).isEmpty());
+                check("[A0-2] 过滤开关被打开",
+                        ((VoidWarehouseHopperFilter) level.getBlockEntity(hopperA)).hasClassifierFilter());
+                System.out.println("INP [A0] 起点：格0=" + describeSlot(server, hopperA, 0)
+                        + "，上游=" + countItem(server, chestA, Items.MINECART) + " 个矿车"
+                        + "，仓库=" + amount(server, Items.MINECART) + " 个");
+                break;
+            case 6:
+                if (++tickIndex < TICKS) {
+                    return;
+                }
+                tickIndex = 0;
+                {
+                    long left = amount(server, Items.MINECART);
+                    int upstream = countItem(server, chestA, Items.MINECART);
+                    String slot0 = describeSlot(server, hopperA, 0);
+                    System.out.println("INP [A1] " + TICKS + " tick 后：仓库 " + left + " 个矿车"
+                            + "，上游 " + upstream + " 个，格0=" + slot0);
+                    check("[A1] 现状：不可堆叠物当分类物时<b>一个都没入库</b>（仓库仍 "
+                            + UPSTREAM_UNSTACKABLE + "，实际 " + left + "）", left == UPSTREAM_UNSTACKABLE);
+                    check("[A2] 现状：上游 20 个一个都没少（实际 " + upstream + "）",
+                            upstream == UPSTREAM_UNSTACKABLE);
+                    check("[A3] 标本还在格 0（1 个矿车）", isCount(server, hopperA, 0, 1, Items.MINECART));
+                }
+                break;
+
+            // ---------------------------------------------------------------- B
+            case 7:
+                // B 起点：格子全空、<b>没有</b>分类物声明，上游 20 个矿车
+                clearHopper(level, hopperB);
+                ((VoidWarehouseHopperFilter) level.getBlockEntity(hopperB))
+                        .setClassifierFilter(false);
+                fillUpstream(server, chestB, Items.MINECART, UPSTREAM_UNSTACKABLE);
+                resetWarehouse(server);
+                System.out.println("INP [B0] 起点：格子全空、无分类物，上游="
+                        + countItem(server, chestB, Items.MINECART) + " 个矿车");
+                break;
+            case 8:
+                if (++tickIndex < TICKS) {
+                    return;
+                }
+                tickIndex = 0;
+                {
+                    long left = amount(server, Items.MINECART);
+                    int upstream = countItem(server, chestB, Items.MINECART);
+                    int stuffed = countHopper(server, hopperB);
+                    System.out.println("INP [B1] " + TICKS + " tick 后：仓库 " + left + " 个矿车"
+                            + "，上游 " + upstream + " 个，漏斗共 " + stuffed + " 个");
+                    check("[B1] 不可堆叠物<b>本身能入库</b>：上游 20 个全进仓库（实际 " + left + "）",
+                            left == UPSTREAM_UNSTACKABLE);
+                    check("[B2] 上游清空（实际 " + upstream + "）", upstream == 0);
+                    check("[B3] 漏斗没留下存货（实际 " + stuffed + "）", stuffed == 0);
+                }
+                break;
+
+            // ---------------------------------------------------------------- C（对照组）
+            case 9:
+                // C 起点：玩家的手放 1 个圆石当分类物，上游 64 个圆石（一格）
+                seedByHand(level, hopperC, Items.COBBLESTONE);
+                fillUpstream(server, chestC, Items.COBBLESTONE, UPSTREAM_STACKABLE);
+                resetWarehouse(server);
+                System.out.println("INP [C0] 起点：格0=" + describeSlot(server, hopperC, 0)
+                        + "，上游=" + countItem(server, chestC, Items.COBBLESTONE) + " 个圆石");
+                break;
+            case 10:
+                if (++tickIndex < TICKS) {
+                    return;
+                }
+                tickIndex = 0;
+                {
+                    long left = amount(server, Items.COBBLESTONE);
+                    int upstream = countItem(server, chestC, Items.COBBLESTONE);
+                    String slot0 = describeSlot(server, hopperC, 0);
+                    System.out.println("INP [C1] " + TICKS + " tick 后：仓库 " + left + " 个圆石"
+                            + "，上游 " + upstream + " 个，格0=" + slot0);
+                    check("[C1] 对照组：可堆叠物 + 分类物，64 个全进仓库（实际 " + left + "）",
+                            left == UPSTREAM_STACKABLE);
+                    check("[C2] 对照组：上游清空（实际 " + upstream + "）", upstream == 0);
+                    check("[C3] 对照组：余量 1 个留在格 0 当分类物",
+                            isCount(server, hopperC, 0, 1, Items.COBBLESTONE));
+                }
+                break;
+
+            // ---------------------------------------------------------------- D
+            case 11:
+                // D：格 0 有矿车分类物，上游塞 8 个水桶（不是白名单）
+                seedByHand(level, hopperD, Items.MINECART);
+                fillUpstream(server, chestD, Items.WATER_BUCKET, UPSTREAM_WRONG);
+                resetWarehouse(server);
+                System.out.println("INP [D0] 起点：格0=" + describeSlot(server, hopperD, 0)
+                        + "，上游=" + countItem(server, chestD, Items.WATER_BUCKET) + " 个水桶");
+                break;
+            case 12:
+                if (++tickIndex < TICKS) {
+                    return;
+                }
+                tickIndex = 0;
+                {
+                    long bucket = amount(server, Items.WATER_BUCKET);
+                    int upstream = countItem(server, chestD, Items.WATER_BUCKET);
+                    String slot0 = describeSlot(server, hopperD, 0);
+                    System.out.println("INP [D1] " + TICKS + " tick 后：仓库 " + bucket
+                            + " 个水桶，上游 " + upstream + " 个，格0=" + slot0);
+                    check("[D1] 白名单对不可堆叠物有效：水桶一个都没进仓库（实际 " + bucket + "）",
+                            bucket == 0);
+                    check("[D2] 水桶原样留在上游、不丢（实际 " + upstream + "）",
+                            upstream == UPSTREAM_WRONG);
+                    check("[D3] 矿车标本还在格 0", isCount(server, hopperD, 0, 1, Items.MINECART));
+                }
+                break;
+
+            case 13:
+                cleanup(server);
+                break;
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    // ================================================================ 场景搭建
+
+    private static void build(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+
+        tableA = new BlockPos(BASE_X, TABLE_Y, BASE_Z);
+        hopperA = tableA.above();
+        chestA = hopperA.above();
+        placeIntake(level, tableA, hopperA, chestA);
+
+        tableB = new BlockPos(BASE_X + 6, TABLE_Y, BASE_Z);
+        hopperB = tableB.above();
+        chestB = hopperB.above();
+        placeIntake(level, tableB, hopperB, chestB);
+
+        tableC = new BlockPos(BASE_X + 12, TABLE_Y, BASE_Z);
+        hopperC = tableC.above();
+        chestC = hopperC.above();
+        placeIntake(level, tableC, hopperC, chestC);
+
+        tableD = new BlockPos(BASE_X + 18, TABLE_Y, BASE_Z);
+        hopperD = tableD.above();
+        chestD = hopperD.above();
+        placeIntake(level, tableD, hopperD, chestD);
+
+        resetWarehouse(server);
+    }
+
+    /** 工作台在下、漏斗口朝下指向它（{@code isIntake} 成立）、上游箱子压在漏斗上 */
+    private static void placeIntake(ServerLevel level, BlockPos table, BlockPos hopper, BlockPos upstream) {
+        level.setBlock(table, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        level.setBlock(hopper, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+        level.setBlock(upstream, Blocks.CHEST.defaultBlockState(), 3);
+    }
+
+    /**
+     * <b>模拟玩家的手</b>：真的造一个 {@link Slot} 再调 {@code setByPlayer}。
+     *
+     * <p>这是入库白名单的<b>唯一写入口</b>（{@code SlotMixin} 注入在它的 RETURN 上）。
+     * 直接 {@code hopper.setItem} 只会得到一个空清单 —— 那样四组都会退化成「没有白名单」，
+     * A/C/D 的结论就全错了。</p>
+     */
+    private static void seedByHand(ServerLevel level, BlockPos pos, Item item) {
+        if (!(level.getBlockEntity(pos) instanceof HopperBlockEntity hopper)) {
+            return;
+        }
+        clearHopper(level, pos);
+        Slot slot = new Slot(hopper, 0, 0, 0);
+        slot.setByPlayer(new ItemStack(item, 1));
+    }
+
+    private static void clearHopper(ServerLevel level, BlockPos pos) {
+        if (!(level.getBlockEntity(pos) instanceof HopperBlockEntity hopper)) {
+            return;
+        }
+        for (int i = 0; i < hopper.getContainerSize(); i++) {
+            hopper.setItem(i, ItemStack.EMPTY);
+        }
+        hopper.setChanged();
+    }
+
+    /**
+     * 上游箱子装货：<b>按格装</b>。
+     *
+     * <p>不可堆叠物一格只能装 1 个（{@code maxStackSize = 1}），
+     * 所以「20 个矿车」必须占 20 格 —— 一次性 {@code setItem(0, 20个)} 会被箱子
+     * 截到 1 个，探针就变成测「1 个矿车」了。</p>
+     */
+    private static void fillUpstream(MinecraftServer server, BlockPos pos, Item item, int total) {
+        if (!(server.overworld().getBlockEntity(pos) instanceof Container chest)) {
+            return;
+        }
+        for (int i = 0; i < chest.getContainerSize(); i++) {
+            chest.setItem(i, ItemStack.EMPTY);
+        }
+        int perSlot = Math.max(1, new ItemStack(item, 1).getMaxStackSize());
+        int remaining = total;
+        int slot = 0;
+        while (remaining > 0 && slot < chest.getContainerSize()) {
+            int put = Math.min(perSlot, remaining);
+            chest.setItem(slot, new ItemStack(item, put));
+            remaining -= put;
+            slot++;
+        }
+        if (remaining > 0) {
+            System.out.println("!! 上游箱子装不下，还剩 " + remaining + " 个 " + item);
+        }
+        chest.setChanged();
+    }
+
+    /**
+     * 仓库清零。
+     *
+     * <p><b>不能顺手垫货</b>：B 组要证的正是「上游 20 个矿车进了仓库」，
+     * 若起点就垫了 20 个，跑完仍是 20 个 —— 「入库了 20」和「一个都没进」在数字上无法区分，
+     * 断言就废了。需要垫货的组（A）自己单独 insert。</p>
+     */
+    private static void resetWarehouse(MinecraftServer server) {
+        VoidWarehouse.data(server).clearContent();
+    }
+
+    // ================================================================ 观察
+
+    private static String describeSlot(MinecraftServer server, BlockPos pos, int slot) {
+        if (!(server.overworld().getBlockEntity(pos) instanceof HopperBlockEntity hopper)) {
+            return "<无方块实体>";
+        }
+        ItemStack stack = hopper.getItem(slot);
+        if (stack.isEmpty()) {
+            return "<空>";
+        }
+        return stack.getCount() + " x " + stack.getItem().getDescriptionId();
+    }
+
+    private static boolean isCount(MinecraftServer server, BlockPos pos, int slot, int count, Item item) {
+        if (!(server.overworld().getBlockEntity(pos) instanceof HopperBlockEntity hopper)) {
+            return false;
+        }
+        ItemStack stack = hopper.getItem(slot);
+        return !stack.isEmpty() && stack.is(item) && stack.getCount() == count;
+    }
+
+    private static int countItem(MinecraftServer server, BlockPos pos, Item item) {
+        if (!(server.overworld().getBlockEntity(pos) instanceof Container c)) {
+            return -1;
+        }
+        int n = 0;
+        for (int i = 0; i < c.getContainerSize(); i++) {
+            ItemStack stack = c.getItem(i);
+            if (!stack.isEmpty() && stack.is(item)) {
+                n += stack.getCount();
+            }
+        }
+        return n;
+    }
+
+    private static int countHopper(MinecraftServer server, BlockPos pos) {
+        if (!(server.overworld().getBlockEntity(pos) instanceof HopperBlockEntity hopper)) {
+            return -1;
+        }
+        int n = 0;
+        for (int i = 0; i < hopper.getContainerSize(); i++) {
+            n += hopper.getItem(i).getCount();
+        }
+        return n;
+    }
+
+    private static long amount(MinecraftServer server, Item item) {
+        BigInteger n = VoidWarehouse.data(server).amountOf(item);
+        return n == null ? -1 : n.longValue();
+    }
+
+    private static void cleanup(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        BlockPos[] all = {tableA, hopperA, chestA, tableB, hopperB, chestB,
+                tableC, hopperC, chestC, tableD, hopperD, chestD};
+        for (BlockPos p : all) {
+            if (p != null) {
+                level.setBlock(p, Blocks.AIR.defaultBlockState(), 3);
+            }
+        }
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        data.insert(new ItemStack(Items.DIRT, 5678));
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        System.out.println("SMOKE RESULT vw-intake-unstackable-probe/26.3 checks=" + checks
+                + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + label);
+        }
+    }
+}

@@ -1,0 +1,48 @@
+name: Publish CurseForge
+
+# 手动触发：把最新成功 Build run 的主 jar 上传到 CurseForge。
+# 为什么走 CI：CF 作者 API 对本机/脚本 IP 有 Cloudflare 盾，对 GitHub Actions 放行。
+# 前置：仓库 Secrets 里配 CURSEFORGE_TOKEN；项目须先在 CF 网页创建并过审。
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'CurseForge project ID (数字，网页项目页可见)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find latest successful build run
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/build.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
+          echo "找到最新成功构建 run: $RUN_ID"
+          echo "id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.run.outputs.id }}
+          path: artifacts
+          merge-multiple: true
+          github-token: ${{ github.token }}
+
+      - name: Upload main jars to CurseForge
+        env:
+          CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+        run: |
+          ls -la artifacts
+          python3 .github/scripts/cf_upload.py \
+            "${{ inputs.project_id }}" artifacts .github/publish/CHANGELOG-CF.md \
+            "carpet,fabric-api"

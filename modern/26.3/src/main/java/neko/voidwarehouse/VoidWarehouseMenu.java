@@ -14,9 +14,11 @@ import net.minecraft.world.inventory.MenuType;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.level.Level;
 
 import java.math.BigInteger;
+import java.util.Set;
 
 /**
  * 虚空仓库的容器界面（分页 + 每种物品一格）。
@@ -429,7 +431,7 @@ public class VoidWarehouseMenu extends ChestMenu {
      */
     private void flipPage(int slotId) {
         int rowIndex = slotId - VoidWarehouseData.NAV_START;
-        int pageCount = this.data.pageCount();
+        int pageCount = this.pageContainer.pageCount();
         int current = this.pageContainer.page();
 
         // 只剩「上一页 / 下一页」两种翻页（首页 / 末页按钮已去掉，见 VoidWarehouseNav）
@@ -777,6 +779,29 @@ public class VoidWarehouseMenu extends ChestMenu {
      */
     private VoidWarehouseData.DisplaySlot slotAt(int slotId) {
         return this.pageContainer.slotAt(slotId);
+    }
+
+    // ------------------------------------------------------------------ 搜索过滤（客户端搜索框的落点）
+
+    /**
+     * 挂上 / 清除本玩家的搜索过滤并全量重发（{@code neko.voidwarehouse.search} 通道调到这里）。
+     *
+     * <p>客户端模组把「中文 / 拼音命中」的物品 id 集合发上来（中文匹配只能在客户端做），
+     * 这里解析出的 {@code Item} 集合交给页面容器；<b>空集合 = 清除过滤</b>。
+     * 过滤只改「这一页装谁」，布局、导航行、点击语义一个字节不动 ——
+     * 与创造模式物品栏搜索同构。纯原版客户端永远不发这条通道，此方法永不生效。</p>
+     *
+     * <p>之后走 {@link #sendAllDataToRemote()} 全量重发，与翻页 / 排序切换同一条路：
+     * 过滤可能让整页 45 格整体换人（甚至页数变小），差异包不足以表达。</p>
+     */
+    public void applySearchFilter(Set<Item> filter) {
+        this.pageContainer.setSearchFilter(filter);
+        this.sendAllDataToRemote();
+    }
+
+    /** 搜索通道建目录用：当前菜单背后那份仓库数据（{@code SearchNetwork} 调用） */
+    public VoidWarehouseData data() {
+        return this.data;
     }
 
     /**

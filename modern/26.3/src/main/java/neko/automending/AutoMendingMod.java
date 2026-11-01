@@ -6,6 +6,7 @@ import neko.voidwarehouse.VoidWarehouseExtension;
 import neko.voidwarehouse.restock.PrinterQueryNetwork;
 import neko.voidwarehouse.restock.PrinterRestockNetwork;
 import neko.voidwarehouse.restock.PrinterReturnNetwork;
+import neko.voidwarehouse.search.SearchNetwork;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.loader.api.FabricLoader;
 
@@ -33,5 +34,8 @@ public class AutoMendingMod implements ModInitializer {
         // ③ 返还（有副作用，50ms 限流）：打印机用不完的材料退回仓库。
         // 与 ① 是两个方向、两张限流表 —— 返还紧跟着取货发生，共用一张会互相拖后腿。
         PrinterReturnNetwork.init();
+        // ④ 搜索（只读 + 视图过滤）：客户端搜索框的目录下发与匹配集合回传。
+        // 三条独立通道（hello / catalog / apply），限流各一张表；纯原版客户端不发不收，零影响。
+        SearchNetwork.init();
     }
 }

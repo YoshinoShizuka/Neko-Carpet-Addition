@@ -105,7 +105,7 @@
 
 中键 pick block 从仓库取到的物品，被客户端的**余料返还账本**记成了一笔「打印耗材」；玩家一关掉容器界面，`tick()` 恢复发货，这一笔就被当成余料退回仓库 —— 手上一空，看起来像「刚拿到的东西凭空没了」。**本修复全在客户端模组侧，本仓库的 jar 无改动**(Middle-click pick-block deliveries were booked as printer leftovers and got swept back into the warehouse the moment the menu closed. The fix is entirely client-side.)
 
-- **根因：三个补货适配器里只有这一个没按来源分流**。`TakeItOutAdapter` / `ChestTrackerAdapter` 都已有 `Source.PICK_BLOCK` 分支，`VoidWarehouseRestockAdapter#status()` 却无条件 `recordDelivery(...)` —— 同一个中键在三条补货路线上有三种语义(Only this adapter ignored the request source; the other two already branched on it.)
+- **根因：三个补货适配器里只有这一个没按来源分流**。`TakeItOutAdapter` / `ChestTrackerAdapter` 都已有 `Source.PICK_BLOCK` 分支，`VoidWarehouseRestockAdapter#status()` 却一到货就 `recordDelivery(...)`（判据只有「回执 OK」，没问来源）—— 同一个中键在三条补货路线上有三种语义(Only this adapter ignored the request source; the other two already branched on it.)
 - **为什么恰好是「打开 / 关闭界面」那一刻**：`VoidWarehouseReturnController#tick()` 在 `player.containerMenu != player.inventoryMenu`（有界面开着）时**直接 `return` 不发货**。所以界面一开就不退、一关就退，现象与玩家描述逐字对上(The return controller deliberately never ships while a container is open, which is why the loss showed up exactly when the menu closed.)
 - **修法**：`recordDelivery` 改为接收 `request`，`PICK_BLOCK` 只推进基线、不记账(The signature now takes the request; pick-block deliveries only advance the baseline.)
 - **基线仍然必须推进**：它记的是「这一批到货了多少」的参照。不推进的话，下一批真打印会把这一批 pick block 的增量一起算成自己的到货量，变成另一笔错账(The baseline must still advance, otherwise the next printing batch would claim this delivery as its own.)

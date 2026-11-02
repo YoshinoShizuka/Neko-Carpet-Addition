@@ -1,0 +1,308 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+
+import java.math.BigInteger;
+
+/**
+ * 【临时自检】仓库终端（改名为 虚空仓库 / void warehouse 的工作台）不再能存进仓库。
+ *
+ * <h2>要证的那一条</h2>
+ * <p>终端是<b>打开仓库的钥匙</b>，不是货物。它能被存进来，就等于仓库里多了一格
+ * 「取出来又能当终端用」的东西，而它本身只是改过名的工作台 —— 没有任何收益，
+ * 只会让玩家困惑「为什么这个能取出来却存不回去」。</p>
+ *
+ * <h2>为什么必须在 {@code insert} 这一层拦</h2>
+ * <p>入库有<b>四条</b>独立路径：菜单存入 / 漏斗进货 / 方块掉落 / 打印机返还。
+ * 它们唯一的共同出口就是 {@link VoidWarehouseData#insert(ItemStack)}。
+ * 只在菜单里拦，漏斗和掉落物照样能把它送进去 —— 所以本自检专门跑一遍漏斗路径。</p>
+ *
+ * <h2>组别</h2>
+ * <table border="1">
+ *   <tr><th>组</th><th>证什么</th></tr>
+ *   <tr><td>A</td><td>三种写法（中文 / 首字母大写 / 全小写）都拒收；<b>对照</b>：无名字、改了别的名的工作台照收</td></tr>
+ *   <tr><td>B</td><td><b>绕过口</b>：潜影盒里装着终端 → 整笔拒收，且一格都没被拆开（壳/箱数量为 0）</td></tr>
+ *   <tr><td>C</td><td>漏斗路径同口径：终端搬不进仓库、原样留在漏斗里；<b>对照</b>：普通工作台照搬</td></tr>
+ * </table>
+ */
+public final class TerminalNotStorableSelfCheck {
+
+    private static final int BASE_X = 500;
+    private static final int BASE_Z = 500;
+    private static final int HOPPER_Y = 110;
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+    private static int stage = 0;
+    private static int waited = 0;
+
+    private static BlockPos hopperTerminal;
+    private static BlockPos hopperPlain;
+
+    private TerminalNotStorableSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        VoidWarehouseSettings.voidWarehouse = true;
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        switch (stage) {
+            case 0:
+                for (int cx = BASE_X >> 4; cx <= (BASE_X + 16) >> 4; cx++) {
+                    for (int cz = BASE_Z >> 4; cz <= (BASE_Z + 16) >> 4; cz++) {
+                        level.setChunkForced(cx, cz, true);
+                    }
+                }
+                break;
+            case 1:
+                if (!level.isLoaded(new BlockPos(BASE_X, HOPPER_Y, BASE_Z))) {
+                    if (++waited > 300) {
+                        System.out.println("!! 区块 300 tick 没加载出来，放弃");
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                System.out.println("TNS 区块就绪");
+                break;
+            case 2:
+                build(level);
+                break;
+            case 3:
+                if (!(level.getBlockEntity(hopperTerminal) instanceof HopperBlockEntity)
+                        || !(level.getBlockEntity(hopperPlain) instanceof HopperBlockEntity)) {
+                    if (++waited > 100) {
+                        System.out.println("!! 漏斗方块实体没就位");
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                System.out.println("TNS 就位");
+                break;
+
+            // ---------------------------------------------------------- A 组
+            case 4:
+                groupA(server);
+                break;
+            // ---------------------------------------------------------- B 组
+            case 5:
+                groupB(server);
+                break;
+            // ---------------------------------------------------------- C 组
+            case 6:
+                groupC(server);
+                break;
+
+            case 7:
+                cleanup(server);
+                break;
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    // ================================================================ A：三种写法 + 对照
+
+    private static void groupA(MinecraftServer server) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+
+        boolean zh = data.insert(terminal("虚空仓库"));
+        boolean title = data.insert(terminal("Void Warehouse"));
+        boolean lower = data.insert(terminal("void warehouse"));
+        check("[A1] 改名「虚空仓库」的工作台被拒收", !zh);
+        check("[A2] 改名「Void Warehouse」的工作台被拒收", !title);
+        check("[A3] 改名「void warehouse」（全小写）的工作台被拒收", !lower);
+        check("[A4] 三笔都拒收之后，三种写法在仓库里都是 0", zeroForAllThree(server));
+
+        // 对照：不该被误伤的三件
+        boolean trailing = data.insert(terminal("虚空仓库 "));    // 中文是精确匹配，带空格不算终端
+        boolean plain = data.insert(new ItemStack(Items.CRAFTING_TABLE, 1));
+        boolean other = data.insert(terminal("我的工作台"));
+        check("[A5] 对照：「虚空仓库 」带尾空格不算终端（中文精确匹配），照收", trailing);
+        check("[A6] 对照：无名字的普通工作台照收", plain);
+        check("[A7] 对照：改了别的名（我的工作台）照收", other);
+        // 🔴 这里不能用 amountOf(Item)：它内部是 find(new ItemStack(item))，
+        //    只认「无组件」那一格。三笔带不同的自定义名，各自占一格，它一个都数不到
+        //    —— 第一版就是这么写的，于是「三笔全收」被误报成「只进了 1 个」。
+        //    按「物品 + 组件」逐笔核对才是对的。
+        check("[A8] 对照三笔各自入账（按物品 + 组件核对，不是按 Item 汇总）",
+                amountExact(server, terminal("虚空仓库 ")) == 1
+                        && amountExact(server, new ItemStack(Items.CRAFTING_TABLE, 1)) == 1
+                        && amountExact(server, terminal("我的工作台")) == 1);
+        System.out.println("TNS [A] 三种写法拒收、三种对照照收，仓库工作台="
+                + amount(server, Items.CRAFTING_TABLE));
+    }
+
+    // ================================================================ B：潜影盒里装着终端
+
+    private static void groupB(MinecraftServer server) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+
+        // 绕过口：把终端装进潜影盒再存 —— 拆盒那条路是 put() 直接写，不走 insert 的判定，
+        // 所以必须在 unpackShulkerBox 里单独挡一道。
+        ItemStack boxWithTerminal = VoidWarehouseShulker.pack(terminal("虚空仓库"), 1);
+        boolean boxed = data.insert(boxWithTerminal);
+        check("[B1] 装着终端的潜影盒被整笔拒收", !boxed);
+        check("[B2] 没有拆出任何潜影壳（实际 " + amount(server, Items.SHULKER_SHELL) + "）",
+                amount(server, Items.SHULKER_SHELL) == 0);
+        check("[B3] 没有拆出箱子（实际 " + amount(server, Items.CHEST) + "）",
+                amount(server, Items.CHEST) == 0);
+        check("[B4] 也没有把终端收进去", zeroForAllThree(server));
+
+        // 对照：普通盒子照拆
+        ItemStack boxWithCobble = VoidWarehouseShulker.pack(new ItemStack(Items.COBBLESTONE, 64), 64);
+        boolean boxedOk = data.insert(boxWithCobble);
+        check("[B5] 对照：装圆石的潜影盒照常拆开入库", boxedOk);
+        check("[B6] 对照：拆出来的圆石 = 64（实际 " + amount(server, Items.COBBLESTONE) + "）",
+                amount(server, Items.COBBLESTONE) == 64);
+        System.out.println("TNS [B] 装终端的盒子拒收、装圆石的盒子照拆");
+    }
+
+    // ================================================================ C：漏斗路径
+
+    private static void groupC(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+
+        // 终端：drain 应当一格都不搬
+        setSlot(level, hopperTerminal, terminal("虚空仓库"));
+        VoidWarehouseHopper.drain(level, asHopper(level, hopperTerminal), false);
+        check("[C1] 漏斗里的终端搬不进仓库", zeroForAllThree(server));
+        check("[C2] 终端原样留在漏斗格 0（不是被丢掉）", !getSlot(level, hopperTerminal).isEmpty());
+
+        // 对照：普通工作台照搬
+        setSlot(level, hopperPlain, new ItemStack(Items.CRAFTING_TABLE, 1));
+        VoidWarehouseHopper.drain(level, asHopper(level, hopperPlain), false);
+        check("[C3] 对照：普通工作台照搬进仓库（实际 "
+                + amount(server, Items.CRAFTING_TABLE) + "）",
+                amount(server, Items.CRAFTING_TABLE) == 1);
+        check("[C4] 对照：搬完之后漏斗格 0 空了", getSlot(level, hopperPlain).isEmpty());
+        System.out.println("TNS [C] 漏斗路径：终端不搬、普通工作台照搬");
+    }
+
+    // ================================================================ 场景
+
+    private static void build(ServerLevel level) {
+        hopperTerminal = new BlockPos(BASE_X, HOPPER_Y, BASE_Z);
+        hopperPlain = new BlockPos(BASE_X + 6, HOPPER_Y, BASE_Z);
+        placeHopper(level, hopperTerminal);
+        placeHopper(level, hopperPlain);
+    }
+
+    private static void placeHopper(ServerLevel level, BlockPos pos) {
+        level.setBlock(pos, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+    }
+
+    /** 造一个「仓库终端」：工作台 + 自定义名（与玩家用铁砧改名同一条路） */
+    private static ItemStack terminal(String name) {
+        ItemStack stack = new ItemStack(Items.CRAFTING_TABLE, 1);
+        stack.set(DataComponents.CUSTOM_NAME, Component.literal(name));
+        return stack;
+    }
+
+    private static HopperBlockEntity asHopper(ServerLevel level, BlockPos pos) {
+        return level.getBlockEntity(pos) instanceof HopperBlockEntity hopper ? hopper : null;
+    }
+
+    private static void setSlot(ServerLevel level, BlockPos pos, ItemStack stack) {
+        if (level.getBlockEntity(pos) instanceof HopperBlockEntity hopper) {
+            for (int i = 0; i < hopper.getContainerSize(); i++) {
+                hopper.setItem(i, ItemStack.EMPTY);
+            }
+            hopper.setItem(0, stack);
+            hopper.setChanged();
+        }
+    }
+
+    private static ItemStack getSlot(ServerLevel level, BlockPos pos) {
+        if (level.getBlockEntity(pos) instanceof HopperBlockEntity hopper) {
+            return hopper.getItem(0);
+        }
+        return ItemStack.EMPTY;
+    }
+
+    private static long amount(MinecraftServer server, net.minecraft.world.item.Item item) {
+        BigInteger n = VoidWarehouse.data(server).amountOf(item);
+        return n == null ? -1 : n.longValue();
+    }
+
+    /** 按「物品 + 数据组件」精确核对（{@code amountOf(Item)} 只认无组件那一格） */
+    private static long amountExact(MinecraftServer server, ItemStack sample) {
+        BigInteger n = VoidWarehouse.data(server).amountExact(sample);
+        return n == null ? -1 : n.longValue();
+    }
+
+    /**
+     * 三种写法的终端在仓库里是不是<b>都是 0</b>。
+     *
+     * <p>🔴 这里不能图省事用 {@code amountOf(Items.CRAFTING_TABLE)}：它内部是
+     * {@code find(new ItemStack(item))}，只认「无组件」那一格。三种写法都带自定义名，
+     * 各自占一格，它一个都数不到 —— 于是「终端全进了仓库」和「一个都没进」在数字上
+     * 完全一样，断言就是空的。反证时正是这样漏掉的（A4/B4/C1 该红没红）。</p>
+     */
+    private static boolean zeroForAllThree(MinecraftServer server) {
+        return amountExact(server, terminal("虚空仓库")) == 0
+                && amountExact(server, terminal("Void Warehouse")) == 0
+                && amountExact(server, terminal("void warehouse")) == 0;
+    }
+
+    private static void cleanup(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        for (BlockPos p : new BlockPos[]{hopperTerminal, hopperPlain}) {
+            if (p != null) {
+                level.setBlock(p, Blocks.AIR.defaultBlockState(), 3);
+            }
+        }
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        data.insert(new ItemStack(Items.DIRT, 5678));
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        System.out.println("SMOKE RESULT vw-terminal-not-storable/26.3 checks=" + checks
+                + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + label);
+        }
+    }
+}

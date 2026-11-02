@@ -976,6 +976,13 @@ public final class VoidWarehouseData extends SavedData {
         if (incoming == null || incoming.isEmpty()) {
             return false;
         }
+        // <b>仓库终端本身不是货物</b>：它是打开仓库的钥匙（见 {@link VoidWarehouseTrigger}）。
+        // 收进来的话，仓库里就多了一格「取出来又能当终端用」的东西 —— 而它本身只是
+        // 改过名的工作台，存进来没有任何收益，只会让玩家困惑「为什么能取出来却存不回去」。
+        // 所以从<b>所有</b>入库路径一起挡掉：菜单存入、漏斗进货、方块掉落、打印机返还。
+        if (VoidWarehouseTrigger.isVoidWarehouse(incoming)) {
+            return false;
+        }
         if (VoidWarehouseShulker.isShulkerBox(incoming)) {
             return this.unpackShulkerBox(incoming);
         }
@@ -1006,6 +1013,14 @@ public final class VoidWarehouseData extends SavedData {
             return true;
         }
         List<ItemStack> contents = VoidWarehouseShulker.contentsOf(box);
+        // 盒子里装着仓库终端 → 整笔拒收：拆开就等于「绕过 insert 把终端收进仓库」。
+        // 拆盒是「全成或全不成」的操作，所以必须在写任何一格之前判完 —— 判在循环里
+        // 就只能把已经拆出来的几样留下，反而更难解释。
+        for (ItemStack inside : contents) {
+            if (VoidWarehouseTrigger.isVoidWarehouse(inside)) {
+                return false;
+            }
+        }
         for (ItemStack inside : contents) {
             // contentsOf 给的是拷贝，put 会把它清空，不会影响到盒子本身
             this.put(inside);
@@ -2409,6 +2424,14 @@ public final class VoidWarehouseData extends SavedData {
      * 漏斗那类「先筛一遍再决定要不要搬」的调用方要用的是这一个，而不是 {@link #isStorable}。</p>
      */
     public static boolean isInsertable(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return false;
+        }
+        // 仓库终端不收（与 {@link #insert} 同一口径）。放在这里是为了让漏斗的 drain
+        // 少白跑一趟 insert，也让「上方容器整格搬」的循环不把终端吸进来又原样吐回去。
+        if (VoidWarehouseTrigger.isVoidWarehouse(stack)) {
+            return false;
+        }
         return VoidWarehouseShulker.isShulkerBox(stack) || isStorable(stack);
     }
 

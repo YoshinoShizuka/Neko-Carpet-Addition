@@ -164,6 +164,18 @@ public class VoidWarehouseMenu extends ChestMenu {
                 "Rejected: items with extra data (durability / enchantments / custom names)");
     }
 
+    /**
+     * 仓库终端被拒收。
+     *
+     * <p>单独一条文案，而不是复用「仓库已满」：那一句会让玩家以为清一清背包就能存进去，
+     * 于是反复尝试。终端是<b>永远</b>存不进去的 —— 它是钥匙，不是货。</p>
+     */
+    private Component msgTerminal() {
+        return VoidWarehouseText.info(this.en,
+                "仓库终端本身不能存进仓库（它是打开仓库的钥匙）",
+                "The warehouse terminal itself cannot be stored");
+    }
+
     private Component msgBoxRejected() {
         return VoidWarehouseText.info(this.en,
                 "盒内有带额外数据的物品，整盒拒收",
@@ -787,7 +799,9 @@ public class VoidWarehouseMenu extends ChestMenu {
      */
     private void reportReject(ItemStack stack, Player player) {
         Component text;
-        if (VoidWarehouseShulker.isShulkerBox(stack)) {
+        if (VoidWarehouseTrigger.isVoidWarehouse(stack)) {
+            text = this.msgTerminal();
+        } else if (VoidWarehouseShulker.isShulkerBox(stack)) {
             text = this.msgBoxRejected();
         } else if (!VoidWarehouseData.isStorable(stack)) {
             text = this.msgRejected();

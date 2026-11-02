@@ -26,7 +26,6 @@ import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.server.network.ServerGamePacketListenerImpl;
 import net.minecraft.world.Container;
 import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -904,14 +903,14 @@ public final class SystemTest {
         check("L3 沙子不是本规则的原料", !ConcretePowderToGlass.isEnabledInput(new ItemStack(Items.SAND)));
         check("L3 空栈不是原料", !ConcretePowderToGlass.isEnabledInput(ItemStack.EMPTY));
         check("L4 非熔炉类型不返回", ConcretePowderToGlass.findRecipe(RecipeType.CRAFTING,
-                new SingleRecipeInput(new ItemStack(Items.CONCRETE_POWDER.pick(DyeColor.RED)))).isEmpty());
+                new SingleRecipeInput(new ItemStack(ConcretePowderToGlass.powderOf(DyeColor.RED)))).isEmpty());
 
         // 反证：规则关掉后必须查不到
         CookingSettings.concretePowderToGlass = false;
         check("L5 规则关 → 查不到配方", ConcretePowderToGlass.findRecipe(RecipeType.SMELTING,
-                new SingleRecipeInput(new ItemStack(Items.CONCRETE_POWDER.pick(DyeColor.RED)))).isEmpty());
+                new SingleRecipeInput(new ItemStack(ConcretePowderToGlass.powderOf(DyeColor.RED)))).isEmpty());
         check("L5 规则关 → isEnabledInput=false",
-                !ConcretePowderToGlass.isEnabledInput(new ItemStack(Items.CONCRETE_POWDER.pick(DyeColor.RED))));
+                !ConcretePowderToGlass.isEnabledInput(new ItemStack(ConcretePowderToGlass.powderOf(DyeColor.RED))));
     }
 
     // ================================================================== 14 持久化

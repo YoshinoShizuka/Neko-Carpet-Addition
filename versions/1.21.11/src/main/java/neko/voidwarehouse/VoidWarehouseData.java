@@ -2116,6 +2116,17 @@ public final class VoidWarehouseData extends SavedData {
         return this.unifiedOrder().length;
     }
 
+    /**
+     * 当前统一展示序数组的<b>引用</b>（给 {@link VoidWarehousePageContainer} 的搜索过滤当失效基准）。
+     *
+     * <p>仓库任何变动都会让 {@code unifiedOrder} 整体重建（新数组），
+     * 所以调用方只需做一次引用比较就能察觉「底层变了，我那层过滤视图该重算了」——
+     * 不需要自己的失效时钟，也绝不泄漏可变状态（调用方只比对引用、不写入）。</p>
+     */
+    int[] unifiedOrderRef() {
+        return this.unifiedOrder();
+    }
+
     /** 第 {@code displayIndex} 个展示格背后是什么（越界返回空） */
     public DisplaySlot displaySlotAt(int displayIndex) {
         int[] order = this.unifiedOrder();

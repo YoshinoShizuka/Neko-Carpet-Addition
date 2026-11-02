@@ -3,11 +3,13 @@ package neko.voidwarehouse;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.Container;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemLore;
 
 import java.util.List;
+import java.util.Set;
 
 /**
  * 「某一页」的容器视图。
@@ -107,20 +109,127 @@ final class VoidWarehousePageContainer implements Container {
      */
     private final VoidWarehouseViews.View view;
 
-    VoidWarehousePageContainer(VoidWarehouseData data, VoidWarehouseViews.View view, boolean english) {
+    // ------------------------------------------------------------------ 搜索过滤
+    // 以下三个字段是「客户端搜索框」的服务端落点：搜索是会话级状态，
+    // 刻意不进 VoidWarehouseViews（不持久化）—— 关掉界面过滤自然消失，
+    // 重开界面是干净的一页，也不给存档 schema 增加任何字段。
+
+    /**
+     * 搜索过滤集合（{@code null} = 不过滤）：只展示集合内物品的那几格。
+     *
+     * <p>由客户端模组把「中文 / 拼音命中」的物品 id 集合通过
+     * {@code search_apply} 通道发上来（中文匹配只能在客户端做 —— 专用服务器
+     * 没有中文语言文件），经 {@code VoidWarehouseMenu#applySearchFilter} 写到这里。
+     * 纯原版客户端永远不发这条通道，集合恒为 {@code null}，行为与从前完全一致。</p>
+     */
+    private Set<Item> searchFilter;
+
+    /** 过滤后的展示序（展示序号数组）；{@code searchFilter == null} 时恒为 {@code null} */
+    private int[] filteredOrder;
+
+    /** 计算 {@link #filteredOrder} 时所依据的底层序列（引用比较，仓库一变就重算） */
+    private int[] filteredBase;
+
+    /** 计算 {@link #filteredOrder} 时的过滤集合与排序开关（防同引用不同语义的重算遗漏） */
+    private Set<Item> filteredFor;
+    private boolean filteredSort;
+
+    VoidWarehousePageContainer(VoidWarehouseData data, VoidWarehouseViews.View view, boolean english) {
         this.data = data;
         this.view = view;
         this.en = english;
     }
 
     /**
+     * 挂上 / 清除搜索过滤（空集合 = 清除），并把页码回到第一页。
+     *
+     * <p>调用方（菜单 → 网络 → 客户端）负责之后做全量重发；
+     * 这里只管状态本身。</p>
+     */
+    void setSearchFilter(Set<Item> filter) {
+        this.searchFilter = (filter == null || filter.isEmpty()) ? null : filter;
+        // 过滤视图整体作废；页码回第一页 —— 搜索结果从第一页看起是唯一合理的起点
+        this.filteredOrder = null;
+        this.setPage(0);
+    }
+
+    /** 当前是否挂着搜索过滤（诊断 / 自检用） */
+    boolean hasSearchFilter() {
+        return this.searchFilter != null;
+    }
+
+    /**
+     * 本页数：有过滤时按<b>过滤后</b>的格数算，否则与仓库总页数一致。
+     *
+     * <p>菜单的翻页（{@code VoidWarehouseMenu#flipPage}）与导航行页码
+     * 都改读这一个 —— 过滤生效时「第 x / y 页」说的必须是过滤后的世界。</p>
+     */
+    int pageCount() {
+        int[] filtered = this.filteredView();
+        int count = filtered != null ? filtered.length : this.data.displayCount();
+        return Math.max(1, (count + VoidWarehouseData.PAGE_SIZE - 1) / VoidWarehouseData.PAGE_SIZE);
+    }
+
+    /**
+     * 过滤后的展示序：一串<b>展示序号</b>（与 {@code displayAmountOrder} 同一编码），
+     * 只是跳过了不命中搜索集合的格子。
+     *
+     * <p>底层序列换了（仓库变了 / 排序切了 / 过滤集合换了）就整体重算 ——
+     * 与底层序列的缓存作废机制天然对齐：仓库任何变动都会让
+     * {@code VoidWarehouseData} 生成新的 {@code unifiedOrder} / {@code displayAmountOrder}
+     * 数组，引用一变这里就跟着重算，<b>没有自己的失效时钟</b>，也就没有
+     * 「数量变了顺序没变」这类漂移。重算是 O(格数) 的数组遍历，只发生在
+     * 仓库真的变动的那一帧，其余时候是一次引用比较。</p>
+     */
+    private int[] filteredView() {
+        if (this.searchFilter == null) {
+            this.filteredOrder = null;
+            this.filteredBase = null;
+            this.filteredFor = null;
+            return null;
+        }
+        boolean sort = this.view.amountSort();
+        // 无排序时底层序就是「展示序号 = 下标」的单位序，用它自己的 unifiedOrder 当失效基准；
+        // 有排序时底层序是 displayAmountOrder（元素本身就是展示序号）
+        int[] base = sort ? this.data.displayAmountOrder() : this.data.unifiedOrderRef();
+        int length = sort ? base.length : this.data.displayCount();
+        if (this.filteredOrder != null && this.filteredFor == this.searchFilter
+                && this.filteredSort == sort && this.filteredBase == base) {
+            return this.filteredOrder;
+        }
+        int[] picked = new int[length];
+        int n = 0;
+        for (int i = 0; i < length; i++) {
+            int displayIndex = sort ? base[i] : i;
+            if (this.matchesFilter(displayIndex)) {
+                picked[n++] = displayIndex;
+            }
+        }
+        this.filteredOrder = n == length ? picked : java.util.Arrays.copyOf(picked, n);
+        this.filteredBase = base;
+        this.filteredFor = this.searchFilter;
+        this.filteredSort = sort;
+        return this.filteredOrder;
+    }
+
+    /** 展示序号 {@code displayIndex} 那一格的物品是否命中搜索集合（解析不出来 = 不命中） */
+    private boolean matchesFilter(int displayIndex) {
+        VoidWarehouseData.DisplaySlot slot = this.data.displaySlotAt(displayIndex);
+        var template = slot.entry() != null ? slot.entry().template()
+                : slot.offer() != null ? slot.offer().template() : null;
+        return template != null && !template.isEmpty()
+                && this.searchFilter.contains(template.getItem());
+    }
+
+    /**
      * 当前页码：把存着的页码按<b>实际页数</b>夹一下再返回。
      *
-     * <p>仓库会被取空、页数会变小，所以不能直接相信存下来的值；
-     * 这里只在读的时候夹，不回写，免得一次无意的读取就把玩家原本的页码改掉。</p>
+     * <p>仓库会被取空、页数会变小（搜索过滤也会让可见页数变小），
+     * 所以不能直接相信存下来的值；这里只在读的时候夹，不回写，
+     * 免得一次无意的读取就把玩家原本的页码改掉。</p>
      */
     int page() {
-        return Math.max(0, Math.min(this.view.page(), this.data.pageCount() - 1));
+        return Math.max(0, Math.min(this.view.page(), this.pageCount() - 1));
     }
 
     void setPage(int page) {
@@ -144,10 +253,12 @@ final class VoidWarehousePageContainer implements Container {
     }
 
     /**
-     * 本页第 {@code slot} 格对应<b>展示序里的第几格</b>（会随页码与「数量排序」变化）。
+     * 本页第 {@code slot} 格对应<b>展示序里的第几格</b>（会随页码、「数量排序」与搜索过滤变化）。
      *
      * <p>默认排序时就是 {@code 页码 × 45 + slot}；开了数量排序则还要翻译一层
-     * {@link VoidWarehouseData#displayAmountOrder() 数量降序视图}。该位置没有东西时返回 {@code -1} ——
+     * {@link VoidWarehouseData#displayAmountOrder() 数量降序视图}；
+     * 搜索过滤生效时再走一层<b>过滤后的展示序</b>（{@code filteredView}）。
+     * 该位置没有东西时返回 {@code -1} ——
      * {@link VoidWarehouseData#displaySlotAt(int)} 认这个值（直接当「空格」处理），
      * 所以调用方不需要额外判空。</p>
      *
@@ -164,6 +275,11 @@ final class VoidWarehousePageContainer implements Container {
             return -1;
         }
         int view = this.page() * VoidWarehouseData.PAGE_SIZE + slot;
+        // 搜索过滤生效时走过滤后的展示序（含数量排序的情况，见 filteredView）
+        if (this.searchFilter != null) {
+            int[] filtered = this.filteredView();
+            return view < filtered.length ? filtered[view] : -1;
+        }
         if (!this.view.amountSort()) {
             return view < this.data.displayCount() ? view : -1;
         }
@@ -205,7 +321,7 @@ final class VoidWarehousePageContainer implements Container {
             return VoidWarehouseNav.build(
                     slot - VoidWarehouseData.NAV_START,
                     this.page(),
-                    this.data.pageCount(),
+                    this.pageCount(),
                     this.data.entryCount(),
                     this.data.totalAmount(),
                     this.data.exchangeOfferCount(),

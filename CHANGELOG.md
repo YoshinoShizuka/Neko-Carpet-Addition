@@ -136,16 +136,16 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 392,443 B | `b647f7921ea6aa274e86aa99071235c1` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 413,114 B | `16a1a00740fb984b480cdcfb39a91241` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 382,044 B | `a672cda558071f049c64b470f953ceeb` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 400,255 B | `86db48f28a351edc269e015d00273fe6` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 385,313 B | `e18ba15ee3f9dad89654877ed72695bb` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 401,272 B | `4804ad07bac878da080854c2aa208b52` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 385,315 B | `4bcf3d8af4fdd215d79b6f5601293f98` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 401,271 B | `dc715cbf2ca923115f5c94e077f5c0c5` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 383,548 B | `44c5da58433a29922e2517ffdd777f47` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 401,433 B | `09187a99338444386ee3bf0f48c3bd8f` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 392,433 B | `41c0147589b4d72e81c169a8c9a5fe04` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 412,772 B | `16296c23c4f1f06bcc2b13f06d26717e` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 392,544 B | `0ac7caf7684b6aec5fd02c057b3d9760` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 413,188 B | `6aa4bb150c3e621293e96eb8afa96448` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 395,813 B | `c42da56d949e609066aec5abb293ad7e` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 414,220 B | `eeeb04ea294bb4883e56416012a6e936` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 395,815 B | `fb1b79cc4095a1a6cf85c08c4aac3f8c` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 414,219 B | `298a951c6dbd30c70c3b853f24f4d24e` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 393,837 B | `4ba692810a41c62fe0940351426be8f1` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 414,355 B | `12d738d7c55639f1071f51d9d1e34204` |
 
 > 只需要能跑的 jar：下 `-1.0.16.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 
@@ -153,7 +153,7 @@
 
 - mixin 从 13 条增到 15 条（新增 `ServerLevelAddEntityMixin`、`ServerPlayerGameModeDestroyMixin`），规则名、配置键与存档格式均未变，**直接替换 jar 即可**(Two new mixins; no config or data-format change, just swap the jar.)。
 - 新规则默认关闭：`/carpet voidWarehouseBlockDrops true`，且 `voidWarehouse` 也要开着。
-- **同版本号原地更新**：这条规则的聊天提示在 1.0.16 首次发布之后改过两次（先加提示，再去掉「已直接入库」、改成报仓库现有数量），加上盒模式刷盒子修复、以及这次的不可堆叠物出料，1.0.16 的 jar 已经变过几次 —— 以文件名旁的 md5 为准（本表已刷新）(This release was updated in place several times; compare the md5 next to the file name.)。
+- **同版本号原地更新**：这条规则的聊天提示在 1.0.16 首次发布之后改过两次（先加提示，再去掉「已直接入库」、改成报仓库现有数量），加上盒模式刷盒子修复、这次的不可堆叠物出料、以及 2026-11-02 把搜索通道铺到 26.2 / 26.1.2 / 26.1.1 / 1.21.11（修复搜索框不显示，Issue #1），1.0.16 的 jar 已经变过几次 —— 以文件名旁的 md5 为准（本表已按最新 CI 构建整表刷新）(This release was updated in place several times, most recently shipping the search channel to 26.2 / 26.1.2 / 26.1.1 / 1.21.11 on 2026-11-02; compare the md5 next to the file name.)。
 - **盒模式取潜影盒的行为变了**：以前（错得）交出一个「装着 N 个潜影盒的潜影盒」，现在直接交出 1 个潜影盒（与普通模式一致），且不消耗额外的空盒 / 壳 / 箱。已经刷出来的嵌套盒、已经攒多的壳与箱不会自动回收(In box mode, taking a shulker-box cell now hands out one plain box instead of a box full of boxes.)。
 - 反方向提醒：开这条规则之后**挖掘产出不再落在地上**。靠「挖掉 → 掉落物被水流冲走」的生电收集结构会失效，开之前先确认你的收集系统不依赖世界里的掉落物。
 - 新增两条通道 `printer_return` / `printer_return_result`（服务端注册；客户端幂等补位）。**没有新增 Carpet 规则**，规则集、配置键与存档格式都没变，直接替换 jar 即可；老版本打印机不认识这两条通道也不会受影响（服务端发送前会 `canSend`）(Two new channels, no new rule, no config or data-format change.)。

@@ -89,6 +89,27 @@
 - **材料账不再「少扣就算」**：`consumeBoxMaterials` 把少扣的空盒按原版配方折算成 `2 潜影壳 + 1 箱子` 补扣，真补不上才留 WARN —— 同类漏账将来即使从别的路径冒出来，也只会表现为「玩家多花壳箱」，不会再凭空多出盒子(The material charge now tops up any shortfall at crafting value, so this class of leak cannot reappear as free boxes.)。
 - **两条路都修，五版本同步**：`VoidWarehouseShulker` / `VoidWarehouseMenu` / `VoidWarehouseData` / `VoidWarehouseWithdraw` 各打一处补丁（26.2 的潜影盒类与 26.3 逐字节一致，整文件复制）(Both paths fixed in all five versions.)。
 - 未新增 Carpet 规则、未改存档格式与网络协议：直接替换 jar 即可(No new rule, no save-format or protocol change; just swap the jar.)。
+#### 仓库终端本身能被当成货物存进仓库（`voidWarehouse`）
+
+把改名成「虚空仓库 / Void Warehouse」的工作台放进仓库，仓库里就多了一把钥匙 —— 它既不是货、也不该占一格分类，还能被当成普通工作台取走去合成(The warehouse terminal — a crafting table renamed 虚空仓库 / Void Warehouse — could be stored like ordinary cargo.)。
+
+- **判定与触发共用同一个谓词**：直接复用 `VoidWarehouseTrigger#isVoidWarehouse(stack)`（工作台 + 有自定义名 + 中文精确「虚空仓库」或英文忽略大小写 `Void Warehouse`）。**能被用来打开仓库的那一件，就是不能入库的那一件**，不存在第二套命名规则会漂移(The refusal reuses the exact predicate that opens the warehouse, so the two can never drift apart.)。
+- **闸门放在唯一的共同出口**：`VoidWarehouseData#insert` 开头直接 `return false`。界面存入、漏斗 `drain`、方块掉落物、打印机余料返还四条入库路径全经过这里，一处拦截四处生效(The gate sits in `insert`, the single funnel every intake path shares.)。
+- 🔴 **潜影盒是绕过口**：`insert` 遇到非空盒会拆成内容物，把终端装进盒子送来就绕过了主闸门。`unpackShulkerBox` 拆盒前先扫一遍内容物，含终端则**整笔拒收** —— 不拆开、也不退半个盒子，与「装盒前先问 `isBoxable`」是同一种防绕过的思路(A terminal hidden inside a shulker box is refused as a whole before unpacking.)。
+- **漏斗快筛同口径**：`isInsertable` 也返回 `false`，免得漏斗每 tick 白跑一轮「以为能收、其实收不进」(The hopper pre-filter uses the same predicate, so it no longer wastes a tick per item.)。
+- **界面里给一句人话**：`仓库终端本身不能存进仓库（它是打开仓库的钥匙）` / `The warehouse terminal itself cannot be stored`，走既有的 `reportReject` 分流，与潜影盒、白名单外物品同一套提示路径、同一套配色(The refusal is explained through the existing reject-notice path.)。
+- **「打开界面期间」不必单独实现**：三处判定都在 `insert` 这一层，与界面开没开无关 —— 界面里存入、漏斗灌、掉落物吸、打印机退，四种时机撞的是同一道闸门(No special case is needed for "while the menu is open": all four intake timings hit the same gate.)。
+- 五版本（26.3 / 26.2 / 26.1.2 / 26.1.1 / 1.21.11）逐处对称改动，**不动存档格式、规则集与网络协议**，直接替换 jar 即可(Symmetric change across all five targets; no save-format, rule-set or protocol change.)
+
+#### 中键取物被记成「余料」、一关仓库界面就被收回（客户端 `litematica-printer`）
+
+中键 pick block 从仓库取到的物品，被客户端的**余料返还账本**记成了一笔「打印耗材」；玩家一关掉容器界面，`tick()` 恢复发货，这一笔就被当成余料退回仓库 —— 手上一空，看起来像「刚拿到的东西凭空没了」。**本修复全在客户端模组侧，本仓库的 jar 无改动**(Middle-click pick-block deliveries were booked as printer leftovers and got swept back into the warehouse the moment the menu closed. The fix is entirely client-side.)
+
+- **根因：三个补货适配器里只有这一个没按来源分流**。`TakeItOutAdapter` / `ChestTrackerAdapter` 都已有 `Source.PICK_BLOCK` 分支，`VoidWarehouseRestockAdapter#status()` 却无条件 `recordDelivery(...)` —— 同一个中键在三条补货路线上有三种语义(Only this adapter ignored the request source; the other two already branched on it.)
+- **为什么恰好是「打开 / 关闭界面」那一刻**：`VoidWarehouseReturnController#tick()` 在 `player.containerMenu != player.inventoryMenu`（有界面开着）时**直接 `return` 不发货**。所以界面一开就不退、一关就退，现象与玩家描述逐字对上(The return controller deliberately never ships while a container is open, which is why the loss showed up exactly when the menu closed.)
+- **修法**：`recordDelivery` 改为接收 `request`，`PICK_BLOCK` 只推进基线、不记账(The signature now takes the request; pick-block deliveries only advance the baseline.)
+- **基线仍然必须推进**：它记的是「这一批到货了多少」的参照。不推进的话，下一批真打印会把这一批 pick block 的增量一起算成自己的到货量，变成另一笔错账(The baseline must still advance, otherwise the next printing batch would claim this delivery as its own.)
+- **语义统一**：中键要的是**玩家自己要用的**东西，不是打印耗材。仓库两条能力（取货 / 返还）都在，只是 pick block 不再进返还账本(All three restock paths now agree that pick-block deliveries are not printing material.)
 
 ### 🧪 Testing / 测试
 
@@ -106,21 +127,25 @@
 - 该组自带**对照组**：盒模式点**圆石**格 → 交出装满 1728 个的盒子 → 送回 1000 个余料，断言「圆石 3456→1728→2728、盒子拆成 2 壳 1 箱」—— 修复前后都是绿的，证明红只出在「目标格本身是潜影盒」这一条路，不是断言写歪(A control group on a normal material cell stays green both before and after, proving the failure is specific to the shulker-box cell.)。
 - **反证**：只把聊天取货口那一处改回旧代码重跑，A/B 两组仍是绿的，C 组 3 条当场翻红（`套着 27 个盒子`、背包只有 4 个盒堆、送回后多出 2 壳 1 箱）—— 证明断言咬的是两条路各自的代码(Negative control: reverting only the chat path flips exactly its three assertions.)
 - 搜索功能的验证：服务端 **26.3 真机冒烟**（`Done` 正常启动、与 TIS / Org / FGA 等其它 carpet 附加包同装无冲突、零 ERROR）+ 三个 payload 与客户端模组的**逐字节 parity**；拼音匹配 **11 条单测**在客户端模组仓库（`SearchIndexTest`：中文名 / 全拼 / 首字母 / 注册名 / 空查询 = 清除过滤 / 未知 id 静默跳过，`铁锭=td`、`铁块=tk` 这类词典事实直接咬死）。客户端吞键与渲染接线需真机客户端验证(Server smoke on 26.3, byte-level payload parity, and 11 client-side unit tests; key-swallowing needs in-game verification.)。
+- 仓库终端不可入库的自检 **18 条断言**（`TerminalNotStorableSelfCheck`，真 26.3 服务端）：A 组三种写法（中文 / 英文原名 / 英文小写 + 首尾空格）各配一条对照（普通工作台、带别的名字的工作台、无自定义名的工作台照常入库）；B 组潜影盒绕过（壳里装终端、箱里装终端**整笔拒收**，对照组普通盒子照常拆开入库）；C 组漏斗路径（`drain` 不吞、`isInsertable` 同步返回 `false`）(18 assertions on a real server covering the three spellings with their controls, the shulker-box bypass, and the hopper path.)
+- **反证**：把三处判定临时改成 `false &&`，同一套自检 `failures=10` —— A1–A4、B1–B4、C1–C2 全红，而 8 条对照组仍然全绿，证明这些断言咬的确实只有新路径(Negative control: disabling only the new predicate flips exactly 10 assertions while the 8 controls stay green.)
+- 顺手记一个**断言口径坑**：`amountOf(Item)` 只认**无组件**的那一格，而三个带不同名字的工作台各自占一格，所以「一笔都没进去」必须用 `amountExact(stack)` 逐笔核对。用 `amountOf` 写的断言在反证时会**该红不红** —— 第一版就是这么写出 3 条空断言的(One measurement trap worth recording: `amountOf` only sees the component-free slot, so the checks had to be rewritten against `amountExact`.)
+- 客户端侧的判据用 **3 条单测**咬死（`VoidWarehouseReturnLedgerTest`）：`PICK_BLOCK` 不记账、其余八种来源仍记账、**新增来源必须显式归类**（记账集合写成字面量，将来加一个 `Source` 会立刻翻红）。**反证**把判定改回「无条件记账」→ `3 tests completed, 2 failed`，而「其余来源仍记账」那条**仍然是绿的** —— 两组断言各咬一个方向，改错任一边都会被抓到。26.3 全量单测 **678 条全绿**（121 个测试类）(The client-side rule is pinned by 3 unit tests plus a roll-back counter-experiment; the full 678-test suite stays green.)
 
 ### 📦 Builds / 构建产物
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 392,177 B | `42e5c303250e7f25e90fa59ccde6c8de` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 412,363 B | `7f2df66b52d4c3172670622ef86b2323` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 381,793 B | `d1d80d4c99d3d6a6b1ff71acac1b58cb` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 399,506 B | `b2f762724db979000b856448aff5f34b` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 385,062 B | `857ed151b3f6e0853439f31a3af27e69` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 400,523 B | `f8956da39b575bb1e17587ca7aa90638` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 385,064 B | `f532e6d57fec8e49da170fafae3c2680` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 400,522 B | `06a1850a47b95a83d5e78358c6c8f40e` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 383,310 B | `b1a8e2fa2ca4c7605b2f270063534e96` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 400,690 B | `aa8f7f00c8a03db7e5f201bd6b7cfcf1` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16.jar` | 392,443 B | `b647f7921ea6aa274e86aa99071235c1` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.16-sources.jar` | 413,114 B | `16a1a00740fb984b480cdcfb39a91241` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16.jar` | 382,044 B | `a672cda558071f049c64b470f953ceeb` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.16-sources.jar` | 400,255 B | `86db48f28a351edc269e015d00273fe6` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16.jar` | 385,313 B | `e18ba15ee3f9dad89654877ed72695bb` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.16-sources.jar` | 401,272 B | `4804ad07bac878da080854c2aa208b52` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16.jar` | 385,315 B | `4bcf3d8af4fdd215d79b6f5601293f98` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.16-sources.jar` | 401,271 B | `dc715cbf2ca923115f5c94e077f5c0c5` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16.jar` | 383,548 B | `44c5da58433a29922e2517ffdd777f47` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.16-sources.jar` | 401,433 B | `09187a99338444386ee3bf0f48c3bd8f` |
 
 > 只需要能跑的 jar：下 `-1.0.16.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 

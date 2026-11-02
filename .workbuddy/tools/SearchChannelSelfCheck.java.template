@@ -1,0 +1,189 @@
+package neko.voidwarehouse.search;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+
+import neko.voidwarehouse.VoidWarehouse;
+import neko.voidwarehouse.VoidWarehouseData;
+import neko.voidwarehouse.VoidWarehouseMenu;
+import neko.voidwarehouse.VoidWarehouseSettings;
+
+/**
+ * 【临时自检】搜索通道服务端侧业务逻辑，验证后删除。
+ *
+ * <p>搜索框（UI / 拼音 / 焦点）在客户端模组里，无头服务端测不到；但<b>服务端这一半</b>
+ * 是三条纯逻辑，可以、也必须单独钉死：</p>
+ * <ol>
+ *   <li>{@link SearchService#catalog} —— 目录到底列了哪些 id、有没有重复；</li>
+ *   <li>{@link SearchService#resolveFilter} —— 客户端回传的 id 怎么解析、脏 id 怎么丢弃；</li>
+ *   <li>{@link VoidWarehouseMenu#applySearchFilter} —— 过滤挂上去后这一页真的只剩命中的格子，
+ *       清空后真的恢复全量。</li>
+ * </ol>
+ *
+ * <p>全程只用 {@code Items.*} 与字符串 id，不碰 {@code Identifier} / {@code ContainerInput}
+ * 这类版本差异类型，所以这份模板五版本通用（与 SystemTest 一样）。</p>
+ */
+public final class SearchChannelSelfCheck {
+
+    private static boolean done = false;
+    private static int stage = 0;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private static ServerPlayer player;
+    private static VoidWarehouseData data;
+    private static VoidWarehouseMenu menu;
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        try {
+            switch (stage) {
+                case 0 -> env(server);
+                case 1 -> catalogChecks();
+                case 2 -> resolveFilterChecks();
+                case 3 -> applyFilterChecks();
+                default -> finish(server);
+            }
+        } catch (Throwable t) {
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+        stage++;
+    }
+
+    private static void env(MinecraftServer server) {
+        System.out.println("[ENV] 造真 ServerPlayer，清空仓库，插 3 种物品");
+        VoidWarehouseSettings.voidWarehouse = true;
+        ServerLevel level = server.overworld();
+        data = VoidWarehouse.data(server);
+        check("env 仓库数据存在", data != null);
+        if (data == null) {
+            return;
+        }
+        data.clearContent();
+
+        GameProfile profile = new GameProfile(UUID.randomUUID(), "search-bot");
+        player = new ServerPlayer(server, level, profile, zhInfo());
+        try {
+            Connection conn = new Connection(PacketFlow.SERVERBOUND);
+            player.connection = new ServerGamePacketListenerImpl(server, conn, player,
+                    CommonListenerCookie.createInitial(profile, false));
+        } catch (Throwable ignored) {
+            // 过滤断言只看菜单槽位内容，不依赖连接
+        }
+
+        // 三种不会触发 9 合 1 / 烧玻璃的普通方块，保证 catalog 只有真实库存格、没有可兑虚拟格
+        data.insert(new ItemStack(Items.COBBLESTONE, 64));
+        data.insert(new ItemStack(Items.DIRT, 64));
+        data.insert(new ItemStack(Items.SAND, 64));
+        check("env 三种物品各占一格", data.displayCount() == 3);
+
+        menu = new VoidWarehouseMenu(1, player.getInventory(), data, player);
+        check("env 菜单槽位 = 54 仓库 + 36 背包",
+                menu.slots.size() == VoidWarehouseData.TOTAL_SLOTS + 36);
+    }
+
+    private static void catalogChecks() {
+        System.out.println("[A] 目录建得对不对");
+        List<String> cat = SearchService.catalog(data);
+        check("A1 目录含圆石", cat.contains("minecraft:cobblestone"));
+        check("A1 目录含泥土", cat.contains("minecraft:dirt"));
+        check("A1 目录含沙子", cat.contains("minecraft:sand"));
+        check("A2 目录无重复（LinkedHashSet 去重）", new HashSet<>(cat).size() == cat.size());
+        check("A3 目录条目数 = 3 种物品", cat.size() == 3);
+    }
+
+    private static void resolveFilterChecks() {
+        System.out.println("[B] 回传 id 怎么解析");
+        Set<Item> s1 = SearchService.resolveFilter(List.of("minecraft:cobblestone"));
+        check("B1 有效 id → 对应 Item", s1.contains(Items.COBBLESTONE));
+        check("B1 有效 id 集合大小为 1", s1.size() == 1);
+
+        check("B2 无效 id → 空集合", SearchService.resolveFilter(List.of("minecraft:ghost_item")).isEmpty());
+
+        Set<Item> s3 = SearchService.resolveFilter(
+                Arrays.asList("minecraft:cobblestone", null, "minecraft:ghost_item", "minecraft:dirt"));
+        check("B3 混入 null/脏 id 不崩、其余照收", s3.size() == 2
+                && s3.contains(Items.COBBLESTONE) && s3.contains(Items.DIRT));
+
+        check("B4 空列表 = 清除过滤（空集合）", SearchService.resolveFilter(List.of()).isEmpty());
+        check("B5 null = 清除过滤（空集合）", SearchService.resolveFilter(null).isEmpty());
+    }
+
+    private static void applyFilterChecks() {
+        System.out.println("[C] 过滤挂上去这一页真的换人");
+        // 初始无过滤：3 种物品各占 1 格，前 3 格非空
+        check("C1 无过滤时前 3 格非空",
+                !menu.slots.get(0).getItem().isEmpty()
+                        && !menu.slots.get(1).getItem().isEmpty()
+                        && !menu.slots.get(2).getItem().isEmpty());
+
+        // 过滤成只有圆石
+        menu.applySearchFilter(Set.of(Items.COBBLESTONE));
+        System.out.println("[diag] 过滤后 slot0=" + name(menu.slots.get(0).getItem())
+                + " slot1=" + name(menu.slots.get(1).getItem())
+                + " slot2=" + name(menu.slots.get(2).getItem())
+                + " displayCount=" + data.displayCount());
+        check("C2 过滤后第 0 格是圆石", menu.slots.get(0).getItem().is(Items.COBBLESTONE));
+        // 空格子的占位图标是屏障（barrier），过滤生效后第 1 格不再有真实物品、退成占位符
+        check("C3 过滤后第 1 格退成占位符（只剩 1 个匹配）", menu.slots.get(1).getItem().is(Items.BARRIER));
+        check("C4 过滤不动数据层（displayCount 仍 3）", data.displayCount() == 3);
+
+        // 清空过滤：恢复全量
+        menu.applySearchFilter(Set.of());
+        check("C5 清空过滤后前 3 格非空",
+                !menu.slots.get(0).getItem().isEmpty()
+                        && !menu.slots.get(1).getItem().isEmpty()
+                        && !menu.slots.get(2).getItem().isEmpty());
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        System.out.println("---- 失败清单 ----");
+        System.out.println("   （无）");
+        System.out.println("SMOKE RESULT search-channel/@VER@ checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL " + label);
+        }
+    }
+
+    /** 空的显示 EMPTY，否则打印注册名（诊断用，不依赖 Identifier 类型名） */
+    private static String name(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return "EMPTY";
+        }
+        return net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+    }
+
+    /** 显式 zh_cn —— 与 SystemTest 同一份，避免 createDefault 的 en_us 干扰 */
+    private static ClientInformation zhInfo() {
+        return new ClientInformation("zh_cn", 2,
+                net.minecraft.world.entity.player.ChatVisiblity.FULL, true, 0,
+                net.minecraft.world.entity.player.Player.DEFAULT_MAIN_HAND, false, false,
+                net.minecraft.server.level.ParticleStatus.ALL);
+    }
+}

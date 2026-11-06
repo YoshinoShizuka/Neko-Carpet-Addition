@@ -43,9 +43,11 @@ import java.util.List;
  * 没有 {@code Items.RED_STAINED_GLASS_PANE} 这个字段了）。点它是<b>完全的空操作</b>：
  * 它既不在 {@link #isButton(int)} 里，槽位本身也是不可拾取、不可放置的 {@code NavSlot}。</p>
  *
- * <p>按钮图标是固定的（上一页永远用同样的物品），可用与否只体现在名称颜色和
- * 说明文字上，这样位置和图形都不会跳。两个模式开关同样是「固定位置」的按钮，
- * 它们额外的状态（开 / 关）只体现在名称颜色与说明文字里，<b>槽位和图形不跳</b>。</p>
+ * <p>翻页按钮的图标是固定的（上一页永远用同样的物品），可用与否只体现在名称颜色和
+ * 说明文字上，这样位置和图形都不会跳。两个模式开关的位置同样固定，但状态画在
+ * 不同的地方：<b>潜影盒开关直接换图标颜色</b>（关 = 红盒、开 = 绿盒），
+ * <b>数量排序开关仍只改名称颜色</b>（罗盘没有对应的状态色，绿 / 灰留给文字）。
+ * 无论哪种，<b>槽位和图标轮廓都不跳</b>，变的只是颜色。</p>
  */
 final class VoidWarehouseNav {
     /** 行内下标（0..8），绝对槽位 = {@link VoidWarehouseData#NAV_START} + 该值 */
@@ -149,9 +151,21 @@ final class VoidWarehouseNav {
     /**
      * 潜影盒模式开关。
      *
-     * <p>图标固定是潜影盒，开 / 关只体现在名字颜色和说明文字里，所以位置和图形完全不跳。
-     * 说明只留「现在是什么模式 / 要点什么代价 / 什么情况会被拒」这三件事，
-     * 每件事一行，不再把边界说明和「怎么切换」重复写两遍。</p>
+     * <p>图标本身就是状态灯：<b>关着是红色潜影盒、开着是亮绿色潜影盒</b>。原先开 / 关只写在
+     * 名字颜色（绿 / 灰）里，可那是<b>鼠标悬停才看得到</b>的小字 —— 整行扫过去时玩家先看到的
+     * 是 16×16 的图标，所以状态得画在图标上。轮廓和槽位仍然不跳，变的只有颜色。
+     *
+     * <p><b>为什么是 lime 而不是 green</b>：原版 {@code green} 盒的贴图是暗橄榄绿（平均
+     * {@code #4F641F}），缩到 16×16 摆在红盒旁边就是一块发暗的深色块，起不到「一眼看出开没开」
+     * 的作用；{@code lime}（{@code #63AC17}）才是玩家嘴里那个「绿」，也和本模组表达「开」的
+     * 亮绿 {@code #55FF55} 对得上。红盒那边同理用纯 {@code red}（{@code #8C1F1E}）。
+     *
+     * <p>说明只留「现在是什么模式 / 要点什么代价 / 什么情况会被拒」这三件事，
+     * 每件事一行，不再把边界说明和「怎么切换」重复写两遍。
+     *
+     * <p>⚠️ <b>只改这里的图标</b>：真正发给玩家的盒子由 {@link VoidWarehouseShulker#pack} 用
+     * 素色 {@code Items.SHULKER_BOX} 造，与本方法无关，别顺手把那里也染了 —— 那会让玩家
+     * 取出来的盒子变成染色盒。</p>
      *
      * <p><b>不再写「1 盒 = 27 格 × 堆叠上限」那条换算</b>（玩家要求去掉）：潜影盒本来
      * 就是 27 格，玩家自己数得出来；把「圆石 1,728」这种算例摆在开关上，既占一行，
@@ -159,7 +173,10 @@ final class VoidWarehouseNav {
      * 上那行换算（{@code VoidWarehouseData#buildDisplay} 的 {@code 「N 盒 M 组 K 个」}）就够。</p>
      */
     private static ItemStack shulkerToggle(boolean on, boolean en) {
-        ItemStack stack = new ItemStack(Items.SHULKER_BOX);
+        // 状态画在图标上：红 = 关、绿 = 开（名字颜色是悬停才看得到的小字）
+        ItemStack stack = new ItemStack(on
+                ? Items.DYED_SHULKER_BOX.lime()
+                : Items.DYED_SHULKER_BOX.red());
         stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.name(
                 VoidWarehouseText.tr(en, "潜影盒模式：", "Shulker Mode: ") + VoidWarehouseText.tr(en, on ? "开" : "关", on ? "On" : "Off"),
                 on));

@@ -4,6 +4,7 @@
   "package": "neko.voidwarehouse.mixin",
   "compatibilityLevel": "JAVA_25",
   "mixins": [
+    "PrinterPlaceStateMixin",
     "ItemUseMixin",
     "BlockItemUseOnMixin",
     "ServerPlayerGameModeMixin",

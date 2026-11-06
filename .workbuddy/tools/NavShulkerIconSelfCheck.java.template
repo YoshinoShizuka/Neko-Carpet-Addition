@@ -1,0 +1,157 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.math.BigInteger;
+
+/**
+ * 【临时自检】潜影盒模式按钮的图标是不是真的「状态灯」。验证完删掉。
+ *
+ * <p>玩家报的现象：什么时候打开界面，槽位 47 都是<b>同一个颜色的潜影盒</b>，开 / 关只能靠
+ * 悬停看名字 —— 扫一眼分不出来。这一轮把它改成「关 = 红盒、开 = 亮绿盒」，本自检只咬
+ * 两件事，不重复测别的：</p>
+ *
+ * <ol>
+ *   <li><b>图标随状态变</b>，且变的是对的两种颜色；</li>
+ *   <li><b>发出去的盒还是素色</b> —— 这是最容易顺手改错的地方：{@link VoidWarehouseNav} 里
+ *       那个是<b>图标</b>，{@link VoidWarehouseShulker#pack} 里那个才是真正交到玩家手上的盒子。
+ *       把后者也染了，玩家的潜影盒会莫名其妙变成染色盒（还会牵扯拆包还染料的账）。</li>
+ * </ol>
+ *
+ * <p>另配几条反证，防止断言空转：开 / 关必须是<b>不同</b>的物品；两个状态都<b>不许</b>是默认素色盒
+ * （玩家报的就是「一直显示默认色」）；名字那行文案没被顺手改掉。</p>
+ *
+ * <p>跨版本：染色盒在 26.3 起进了 {@code ColorCollection}（{@code DYED_SHULKER_BOX.lime()}），
+ * 26.1.x / 1.21.11 还是 {@code LIME_SHULKER_BOX} 这样一个个字段 —— 本自检一律<b>按注册名取</b>，
+ * 一份源码五个版本通用。</p>
+ */
+public final class NavShulkerIconSelfCheck {
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private NavShulkerIconSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        try {
+            iconChecks();
+            packedBoxChecks();
+            neighbourChecks();
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT nav-shulker-icon/@VER@ checks=" + checks + " failures=" + failures);
+        if (failures == 0) {
+            System.out.println("   ✔ 图标：关 = 红盒、开 = 亮绿盒；发出去的盒仍是素色");
+        }
+        server.halt(false);
+    }
+
+    // ================================================================ A 组：图标随状态变
+
+    private static void iconChecks() {
+        ItemStack offZh = nav(false, false);
+        ItemStack offEn = nav(false, true);
+        ItemStack onZh = nav(true, false);
+        ItemStack onEn = nav(true, true);
+
+        Item red = mc("red_shulker_box");
+        Item lime = mc("lime_shulker_box");
+
+        System.out.println("   关(zh) = " + idOf(offZh.getItem()) + "   关(en) = " + idOf(offEn.getItem()));
+        System.out.println("   开(zh) = " + idOf(onZh.getItem()) + "   开(en) = " + idOf(onEn.getItem()));
+        System.out.println("   期望：关 = " + idOf(red) + "，开 = " + idOf(lime));
+
+        check("关 → 红色潜影盒", offZh.getItem() == red);
+        check("开 → 亮绿潜影盒", onZh.getItem() == lime);
+        // 图标是服务端按「看这个界面的人」的语言生成的，但颜色与语言无关
+        check("图标与语言无关：关(zh) == 关(en)", offZh.getItem() == offEn.getItem());
+        check("图标与语言无关：开(zh) == 开(en)", onZh.getItem() == onEn.getItem());
+
+        // 反证 1：两个状态必须真的不同，否则「会变」是空话
+        check("反证：开 / 关 的图标不是同一个物品", onZh.getItem() != offZh.getItem());
+        // 反证 2：不许还是默认素色盒 —— 玩家报的就是这个
+        check("反证：关不是默认素色盒", offZh.getItem() != Items.SHULKER_BOX);
+        check("反证：开不是默认素色盒", onZh.getItem() != Items.SHULKER_BOX);
+        // 名字那行文案别被顺手改掉（红/绿只是加了一层，文字仍是准的）
+        check("关的名字仍是「潜影盒模式：关」", nameOf(offZh).contains("潜影盒模式：关"));
+        check("开的名字仍是「潜影盒模式：开」", nameOf(onZh).contains("潜影盒模式：开"));
+        check("英文界面名字是「Shulker Mode: On」", nameOf(onEn).contains("Shulker Mode: On"));
+    }
+
+    // ================================================================ B 组：真正发出去的盒
+
+    private static void packedBoxChecks() {
+        ItemStack packed = VoidWarehouseShulker.pack(new ItemStack(Items.COBBLESTONE), 5);
+        check("发出去的盒仍是素色 SHULKER_BOX（没被图标连累）", packed.getItem() == Items.SHULKER_BOX);
+        check("发出去的盒仍然没有颜色", VoidWarehouseShulker.colorOf(packed) == null);
+        check("发出去的盒确实装了东西", packed.get(DataComponents.CONTAINER) != null);
+        check("反证：素色盒确实被认成潜影盒", VoidWarehouseShulker.isShulkerBox(packed));
+    }
+
+    // ================================================================ C 组：别把邻居改了
+
+    private static void neighbourChecks() {
+        ItemStack sort = VoidWarehouseNav.build(VoidWarehouseNav.SLOT_SORT,
+                0, 1, 0, BigInteger.ZERO, 0, false, false, false);
+        check("数量排序开关仍是罗盘", sort.getItem() == Items.COMPASS);
+
+        ItemStack filler = VoidWarehouseNav.build(0, 0, 1, 0, BigInteger.ZERO, 0, false, false, false);
+        check("占位格仍是红色染色玻璃片", filler.getItem() == mc("red_stained_glass_pane"));
+
+        ItemStack prev = VoidWarehouseNav.build(VoidWarehouseNav.SLOT_PREV,
+                0, 1, 0, BigInteger.ZERO, 0, false, false, false);
+        check("翻页按钮仍是箭", prev.getItem() == Items.ARROW);
+    }
+
+    // ================================================================ 工具
+
+    /** 直接问导航行要「潜影盒模式」那一格 —— 界面里 {@code getItem(47)} 走的就是这个方法 */
+    private static ItemStack nav(boolean on, boolean en) {
+        return VoidWarehouseNav.build(VoidWarehouseNav.SLOT_SHULKER,
+                0, 1, 0, BigInteger.ZERO, 0, on, false, en);
+    }
+
+    /**
+     * 按注册名取物品。26.3 起染色类物品收进 {@code ColorCollection}
+     * （{@code Items.DYED_SHULKER_BOX.lime()}），26.1.x / 1.21.11 还是
+     * {@code Items.LIME_SHULKER_BOX}；按名字取一份源码五个版本通用。
+     */
+    private static Item mc(String path) {
+        return BuiltInRegistries.ITEM
+                .getOptional(Identifier.fromNamespaceAndPath("minecraft", path))
+                .orElse(Items.SHULKER_BOX);
+    }
+
+    private static String idOf(Item item) {
+        return BuiltInRegistries.ITEM.getKey(item).toString();
+    }
+
+    private static String nameOf(ItemStack stack) {
+        Component name = stack.get(DataComponents.CUSTOM_NAME);
+        return name == null ? "<无名字>" : name.getString();
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + label);
+        }
+    }
+}

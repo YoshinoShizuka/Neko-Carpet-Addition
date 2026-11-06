@@ -100,7 +100,11 @@ public final class PrinterPlaceServuxBridge {
             Object context = API.context.newInstance(physical.getLevel(), physical.getClickedPos(), physical.getClickedFace(),
                     protocolHit, physical.getPlayer(), physical.getHand(), physical);
             Object result = API.decode.invoke(null, normal, context);
-            return result instanceof BlockState state && state.getBlock() == normal.getBlock() ? state : null;
+            // Servux only decodes the bit field packed above for it. If the state it hands back does
+            // not carry the properties the schematic asked for, that packed layout is out of sync
+            // with the installed Servux. Placing it anyway would look like "the printer rotated the
+            // block wrong" -- silent, and impossible to trace back to this line. Refuse instead.
+            return result instanceof BlockState state && requestedSurvived(normal, desired, state) ? state : null;
         } catch (ReflectiveOperationException failure) { throw apiFailure(failure); }
     }
 
@@ -128,6 +132,25 @@ public final class PrinterPlaceServuxBridge {
             count++;
         }
         return count == 0 ? Vec3.atLowerCornerOf(target) : new Vec3(target.getX() + 2.0 + fields, target.getY(), target.getZ());
+    }
+
+    /**
+     * Read-back check on the round trip through Servux: every property this bridge asked to change
+     * must come back exactly as asked. Properties nobody touched are deliberately not compared --
+     * Servux decodes from the same {@code normal} state, so only the encoded bits can drift.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static boolean requestedSurvived(BlockState normal, BlockState desired, BlockState actual) {
+        if (actual.getBlock() != desired.getBlock()) {
+            return false;
+        }
+        for (Property property : desired.getProperties()) {
+            Object asked = desired.getValue(property);
+            if (!asked.equals(normal.getValue(property)) && !asked.equals(actual.getValue(property))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static Property<?> firstDirection(BlockState state) {

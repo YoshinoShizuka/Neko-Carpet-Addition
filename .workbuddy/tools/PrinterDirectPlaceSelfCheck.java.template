@@ -1,0 +1,829 @@
+package neko.voidwarehouse.restock;
+
+import com.mojang.authlib.GameProfile;
+import io.netty.buffer.Unpooled;
+import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.Connection;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.context.BlockPlaceContext;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.block.state.properties.Half;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
+
+import java.lang.reflect.Method;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import neko.voidwarehouse.VoidWarehouse;
+import neko.voidwarehouse.VoidWarehouseData;
+import neko.voidwarehouse.VoidWarehouseSettings;
+
+/**
+ * 【临时自检】打印机「虚空仓库直接放置」（{@code voidWarehouseDirectPlace}）。
+ *
+ * <p>这条通道让服务端从全服共享库存里预扣<b>一件</b>方块、临时塞进主手、只调
+ * {@link BlockItem#place} 这一个原语、再在 {@code finally} 里把原手持物换回去。也就是说
+ * 它是整仓库里唯一一条「服务端代替玩家、按客户端给的坐标往世界上写方块」的路径。
+ * 所以真正要盯的不是「能不能放上去」，而是四件事：</p>
+ *
+ * <ol>
+ *   <li><b>门是不是真的三道</b>：{@code voidWarehouse} / {@code voidWarehouseRestock} /
+ *       {@code voidWarehouseDirectPlace} 任一关闭都必须 {@code RULE_OFF}，不能只关最后一道；</li>
+ *   <li><b>账是不是守恒</b>：放成了扣 1 件、没放成一分不扣；被保护插件否决、或放置过程抛异常时
+ *       仓库必须<b>原额</b>退回（这条最容易写成「吞掉一件」）；背包自始至终不许多出方块；</li>
+ *   <li><b>白名单是不是真的挡住了会开界面 / 一次放多格的物品</b>：潜影盒、床、门、双高植物、
+ *       睡莲（{@code PlaceOnWaterBlockItem} 是 {@code BlockItem} 的子类）都必须被拒；</li>
+ *   <li><b>结构化放置的回读校验（A1）与 mixin 是否真的挂上</b>：前者是纯函数，直接喂三份
+ *       {@code BlockState}；后者用「scope 内必须返回 null、scope 外必须返回非 null」当判据 ——
+ *       mixin 没挂上的话这两条会一起翻红，比数方法个数可靠。</li>
+ * </ol>
+ *
+ * <p>另外把 {@link PrinterPlaceSession} 的限流与重放直接用固定时间戳跑一遍（不碰真实 nanotime），
+ * 这样 640 令牌/秒、每 tick 64、50ms 补 32 这些数才是确定值，不会因为机器快慢而 flaky。</p>
+ */
+public final class PrinterDirectPlaceSelfCheck {
+
+    private static boolean done = false;
+    private static int stage = 0;
+    private static int tickIndex = 0;
+    private static int checks = 0;
+    private static int failures = 0;
+    private static int nextNonce = 1;
+
+    private static ServerPlayer bot;
+    private static ServerLevel level;
+
+    /** 平台顶面（被点的那一格）。玩家站在它旁边，目标格是它正上方的空气。 */
+    private static final BlockPos CLICKED = new BlockPos(102, 199, 100);
+    private static final BlockPos TARGET = new BlockPos(102, 200, 100);
+
+    /** 模拟其它模组/保护插件：只对本次自检的点击位置生效，默认完全放行。 */
+    private static boolean vetoArmed = false;
+    private static int vetoBehavior = 0; // 1 = 返回 SUCCESS（拒绝），2 = 抛异常
+    private static BlockPos vetoAt;
+    private static boolean vetoRegistered = false;
+
+    /** {@code BlockItem#getPlacementState} 是 protected，反射拿一次反复用。 */
+    private static Method PLACEMENT_STATE;
+
+    private PrinterDirectPlaceSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        switch (stage) {
+            case 0:
+                // 等几 tick 再动手：存档与仓库数据在这个阶段才稳定下来
+                if (++tickIndex < 5) {
+                    return;
+                }
+                break;
+            case 1:
+                env(server);
+                break;
+            case 2:
+                groupA_gates(server);
+                break;
+            case 3:
+                groupB_badRequest(server);
+                break;
+            case 4:
+                groupC_stale(server);
+                break;
+            case 5:
+                groupD_playerState(server);
+                break;
+            case 6:
+                groupE_whitelist(server);
+                break;
+            case 7:
+                groupF_placeAndDeduct(server);
+                break;
+            case 8:
+                groupG_outOfStock(server);
+                break;
+            case 9:
+                groupH_vetoRefund(server);
+                break;
+            case 10:
+                groupI_exceptionRefund(server);
+                break;
+            case 11:
+                groupJ_exchange(server);
+                break;
+            case 12:
+                groupK_readBack(server);
+                break;
+            case 13:
+                groupL_mixin(server);
+                break;
+            case 14:
+                groupM_session(server);
+                break;
+            case 15:
+                groupN_codec(server);
+                break;
+            case 16:
+                cleanup(server);
+                break;
+            case 17:
+                finish(server);
+                break;
+            default:
+                return;
+        }
+        stage++;
+    }
+
+    // ================================================================ ENV
+
+    private static void env(MinecraftServer server) {
+        System.out.println("[ENV] 造一个真 ServerPlayer + 假连接，铺一块平台，清空仓库与背包");
+        level = server.overworld();
+        GameProfile profile = new GameProfile(UUID.randomUUID(), "placebot");
+        bot = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
+        bot.gameMode.changeGameModeForPlayer(GameType.SURVIVAL);
+        bot.setPos(100.5, 200.0, 100.5);
+        bot.getInventory().clearContent();
+        bot.getInventory().setSelectedSlot(0);
+        bot.getInventory().setItem(0, new ItemStack(Items.DIAMOND_SWORD));
+
+        boolean connected = false;
+        try {
+            Connection conn = new Connection(PacketFlow.SERVERBOUND);
+            bot.connection = new ServerGamePacketListenerImpl(server, conn, bot,
+                    CommonListenerCookie.createInitial(profile, false));
+            connected = true;
+        } catch (Throwable ignored) {
+            // 连接只影响「发包」，本自检直接调 service，不依赖它
+        }
+
+        check("E1 玩家对象可用且在生存模式", bot != null && bot.level() == level
+                && bot.gameMode.getGameModeForPlayer() == GameType.SURVIVAL);
+        check("E2 假连接注入成功（不影响数据层断言）", connected);
+        check("E3 容器界面是背包本身（直接放置的前提）", bot.containerMenu == bot.inventoryMenu);
+
+        for (int x = 99; x <= 103; x++) {
+            for (int z = 99; z <= 101; z++) {
+                level.setBlockAndUpdate(new BlockPos(x, 199, z), Blocks.STONE.defaultBlockState());
+            }
+        }
+        level.setBlockAndUpdate(TARGET, Blocks.AIR.defaultBlockState());
+        check("E4 平台铺好、目标格是空气", level.getBlockState(CLICKED).is(Blocks.STONE)
+                && level.getBlockState(TARGET).isAir());
+        check("E5 玩家在交互距离内", bot.isWithinBlockInteractionRange(TARGET, 1.0));
+
+        voidWarehouseAll(false);
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        check("E6 仓库已清空（后面「扣了几件」才有确定值）", data.entryCount() == 0);
+
+        vetoRegistered = registerVeto();
+        check("E7 否决探针注册成功", vetoRegistered);
+    }
+
+    /**
+     * {@code UseBlockCallback} 没有反注册接口，所以监听器只注册一次、永久存在，靠
+     * {@link #vetoArmed} 在不需要时立刻放行 —— 这样它不会影响别的自检或后续 tick。
+     */
+    private static boolean registerVeto() {
+        UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
+            if (!vetoArmed || vetoAt == null || !hitResult.getBlockPos().equals(vetoAt)) {
+                return InteractionResult.PASS;
+            }
+            if (vetoBehavior == 2) {
+                throw new IllegalStateException("PrinterDirectPlaceSelfCheck: intentional veto");
+            }
+            return InteractionResult.SUCCESS;
+        });
+        return true;
+    }
+
+    // ================================================================ A 三道门
+
+    private static void groupA_gates(MinecraftServer server) {
+        System.out.println("[A] 三道门：voidWarehouse / voidWarehouseRestock / voidWarehouseDirectPlace");
+        resetTarget();
+        List<String> stone = List.of("minecraft:stone");
+
+        VoidWarehouseSettings.voidWarehouse = false;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = true;
+        VoidWarehouseRestockSettings.voidWarehouseDirectPlace = true;
+        check("A1 主开关关着 → RULE_OFF",
+                PrinterPlaceService.place(server, bot, payload(stone, airId())) == PrinterPlaceResultPayload.RULE_OFF);
+
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = false;
+        VoidWarehouseRestockSettings.voidWarehouseDirectPlace = true;
+        check("A2 补货规则关着 → RULE_OFF",
+                PrinterPlaceService.place(server, bot, payload(stone, airId())) == PrinterPlaceResultPayload.RULE_OFF);
+
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = true;
+        VoidWarehouseRestockSettings.voidWarehouseDirectPlace = false;
+        check("A3 直接放置规则关着 → RULE_OFF",
+                PrinterPlaceService.place(server, bot, payload(stone, airId())) == PrinterPlaceResultPayload.RULE_OFF);
+        check("A4 enabled() 与三道门一一对应（关着时为 false）", !PrinterPlaceService.enabled());
+
+        VoidWarehouseRestockSettings.voidWarehouseDirectPlace = true;
+        check("A5 三道全开 → enabled() 为 true", PrinterPlaceService.enabled());
+        // 用一个必然通不过 payload 校验的请求，证明闸门已经放开、拒绝理由换成了 BAD_REQUEST
+        check("A6 三道全开后拒绝理由推进到 BAD_REQUEST",
+                PrinterPlaceService.place(server, bot, payload(stone, airId(), 0)) == PrinterPlaceResultPayload.BAD_REQUEST);
+    }
+
+    // ================================================================ B payload 合法性
+
+    private static void groupB_badRequest(MinecraftServer server) {
+        System.out.println("[B] payload 合法性：一律 BAD_REQUEST，且不碰仓库");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.STONE, 5));
+        resetTarget();
+
+        List<String> stone = List.of("minecraft:stone");
+        check("B1 nonce=0 → BAD_REQUEST",
+                PrinterPlaceService.place(server, bot, payload(stone, airId(), 0)) == PrinterPlaceResultPayload.BAD_REQUEST);
+        check("B2 候选为空 → BAD_REQUEST",
+                PrinterPlaceService.place(server, bot, payload(List.of(), airId())) == PrinterPlaceResultPayload.BAD_REQUEST);
+        check("B3 候选超过 8 个 → BAD_REQUEST",
+                PrinterPlaceService.place(server, bot, payload(List.of(
+                        "minecraft:stone", "minecraft:stone", "minecraft:stone", "minecraft:stone",
+                        "minecraft:stone", "minecraft:stone", "minecraft:stone", "minecraft:stone",
+                        "minecraft:stone"), airId())) == PrinterPlaceResultPayload.BAD_REQUEST);
+
+        BlockHitResult goodHit = hitOn(CLICKED);
+        PrinterPlacePayload skewed = new PrinterPlacePayload(nextNonce++, stone, CLICKED.offset(2, 0, 0),
+                goodHit, airId(), dimension());
+        check("B4 target 与点击面不自洽 → BAD_REQUEST",
+                PrinterPlaceService.place(server, bot, skewed) == PrinterPlaceResultPayload.BAD_REQUEST);
+
+        PrinterPlacePayload far = new PrinterPlacePayload(nextNonce++, stone, TARGET,
+                new BlockHitResult(new Vec3(CLICKED.getX() + 60.5, CLICKED.getY() + 1.0, CLICKED.getZ() + 0.5),
+                        Direction.UP, CLICKED, false), airId(), dimension());
+        check("B5 命中点飞出方块 → BAD_REQUEST",
+                PrinterPlaceService.place(server, bot, far) == PrinterPlaceResultPayload.BAD_REQUEST);
+
+        PrinterPlacePayload negative = new PrinterPlacePayload(nextNonce++, stone, TARGET, goodHit, -1, dimension());
+        check("B6 expectedStateId 为负 → BAD_REQUEST",
+                PrinterPlaceService.place(server, bot, negative) == PrinterPlaceResultPayload.BAD_REQUEST);
+
+        check("B7 以上拒绝都没有动仓库（仍是 5 个）", amountOf(data, Items.STONE) == 5);
+    }
+
+    // ================================================================ C 维度 / 状态
+
+    private static void groupC_stale(MinecraftServer server) {
+        System.out.println("[C] 维度与目标状态：STALE，且不碰仓库");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.STONE, 5));
+        resetTarget();
+        List<String> stone = List.of("minecraft:stone");
+
+        PrinterPlacePayload otherDim = new PrinterPlacePayload(nextNonce++, stone, TARGET, hitOn(CLICKED),
+                airId(), "minecraft:the_nether");
+        check("C1 维度对不上 → STALE",
+                PrinterPlaceService.place(server, bot, otherDim) == PrinterPlaceResultPayload.STALE);
+        check("C2 expectedStateId 对不上 → STALE",
+                PrinterPlaceService.place(server, bot, payload(stone, airId() + 1)) == PrinterPlaceResultPayload.STALE);
+        check("C3 两次 STALE 都没有扣料（仍是 5 个）", amountOf(data, Items.STONE) == 5);
+        check("C4 世界也没被动过", level.getBlockState(TARGET).isAir());
+    }
+
+    // ================================================================ D 玩家状态
+
+    private static void groupD_playerState(MinecraftServer server) {
+        System.out.println("[D] 玩家状态：创造 / 太远 / 开着别的界面");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.STONE, 5));
+        resetTarget();
+        List<String> stone = List.of("minecraft:stone");
+
+        bot.gameMode.changeGameModeForPlayer(GameType.CREATIVE);
+        check("D1 创造模式 → REJECTED",
+                PrinterPlaceService.place(server, bot, payload(stone, airId())) == PrinterPlaceResultPayload.REJECTED);
+        bot.gameMode.changeGameModeForPlayer(GameType.SURVIVAL);
+
+        bot.setPos(220.5, 200.0, 100.5);
+        check("D2 站得太远 → REJECTED",
+                PrinterPlaceService.place(server, bot, payload(stone, airId())) == PrinterPlaceResultPayload.REJECTED);
+        bot.setPos(100.5, 200.0, 100.5);
+
+        boolean restored = false;
+        try {
+            bot.containerMenu = null;
+            check("D3 容器界面不是背包 → REJECTED",
+                    PrinterPlaceService.place(server, bot, payload(stone, airId())) == PrinterPlaceResultPayload.REJECTED);
+        } finally {
+            bot.containerMenu = bot.inventoryMenu;
+            restored = bot.containerMenu == bot.inventoryMenu;
+        }
+        check("D4 容器界面已复原（后续组别才敢继续）", restored);
+        check("D5 三次拒绝都没扣料（仍是 5 个）", amountOf(data, Items.STONE) == 5);
+    }
+
+    // ================================================================ E 候选白名单
+
+    private static void groupE_whitelist(MinecraftServer server) {
+        System.out.println("[E] 候选白名单：会开界面 / 一次放多格 / 非方块一律拒绝");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        // 每样都给 5 个，确保「拒绝」不是「缺货」造成的
+        for (Item item : List.of(Items.LILY_PAD, Items.SHULKER_BOX, bedItem(),
+                Items.OAK_DOOR, Items.SUNFLOWER, Items.DIAMOND)) {
+            data.insert(new ItemStack(item, 5));
+        }
+        data.insert(new ItemStack(Items.STONE, 5));
+        resetTarget();
+
+        check("E1 睡莲（BlockItem 子类）→ REJECTED",
+                placeItem(server, Items.LILY_PAD) == PrinterPlaceResultPayload.REJECTED);
+        check("E2 潜影盒 → REJECTED", placeItem(server, Items.SHULKER_BOX) == PrinterPlaceResultPayload.REJECTED);
+        check("E3 床 → REJECTED", placeItem(server, bedItem()) == PrinterPlaceResultPayload.REJECTED);
+        check("E4 门 → REJECTED", placeItem(server, Items.OAK_DOOR) == PrinterPlaceResultPayload.REJECTED);
+        check("E5 双高植物 → REJECTED", placeItem(server, Items.SUNFLOWER) == PrinterPlaceResultPayload.REJECTED);
+        check("E6 非方块物品 → REJECTED", placeItem(server, Items.DIAMOND) == PrinterPlaceResultPayload.REJECTED);
+
+        check("E7 全是无效 id → BAD_REQUEST",
+                PrinterPlaceService.place(server, bot, payload(List.of("neko:nope", "neko:also_nope"), airId()))
+                        == PrinterPlaceResultPayload.BAD_REQUEST);
+
+        check("E8 无效 id 只跳过、不整体拒绝（混一个石头就能成）",
+                PrinterPlaceService.place(server, bot, payload(List.of("neko:nope", "minecraft:stone"), airId()))
+                        == PrinterPlaceResultPayload.OK);
+        check("E9 那一批白名单物品一件都没动（各仍是 5 个）",
+                amountOf(data, Items.LILY_PAD) == 5 && amountOf(data, Items.SHULKER_BOX) == 5
+                        && amountOf(data, bedItem()) == 5 && amountOf(data, Items.DIAMOND) == 5);
+        check("E10 石头那批扣了 1 个（E8 真的放成了）", amountOf(data, Items.STONE) == 4);
+    }
+
+    // ================================================================ F 正常放置 + 扣减
+
+    private static void groupF_placeAndDeduct(MinecraftServer server) {
+        System.out.println("[F] 正常放置：世界多一个、仓库少一个、背包一个不多");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.STONE, 5));
+        bot.getInventory().clearContent();
+        bot.getInventory().setSelectedSlot(0);
+        bot.getInventory().setItem(0, new ItemStack(Items.DIAMOND_SWORD));
+        resetTarget();
+        int air = airId();
+
+        int status = PrinterPlaceService.place(server, bot, payload(List.of("minecraft:stone"), air));
+        check("F1 普通方块放置 → OK", status == PrinterPlaceResultPayload.OK);
+        check("F2 世界目标格真的变成石头", level.getBlockState(TARGET).is(Blocks.STONE));
+        check("F3 仓库 5→4", amountOf(data, Items.STONE) == 4);
+        check("F4 背包里没有石头（这条通道不补货）", countIn(bot, Items.STONE) == 0);
+        check("F5 选中槽恢复成原来的钻石剑", bot.getInventory().getItem(0).getItem() == Items.DIAMOND_SWORD
+                && bot.getInventory().getSelectedSlot() == 0);
+        check("F6 用旧的 expectedStateId 重发 → STALE（乐观并发真的生效）",
+                PrinterPlaceService.place(server, bot, payload(List.of("minecraft:stone"), air))
+                        == PrinterPlaceResultPayload.STALE);
+    }
+
+    // ================================================================ G 缺货
+
+    private static void groupG_outOfStock(MinecraftServer server) {
+        System.out.println("[G] 仓库缺货：EMPTY，世界与背包都不许动");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        bot.getInventory().clearContent();
+        bot.getInventory().setItem(0, new ItemStack(Items.DIAMOND_SWORD));
+        resetTarget();
+
+        check("G1 仓库没有圆石 → EMPTY",
+                PrinterPlaceService.place(server, bot, payload(List.of("minecraft:cobblestone"), airId()))
+                        == PrinterPlaceResultPayload.EMPTY);
+        check("G2 世界没变", level.getBlockState(TARGET).isAir());
+        check("G3 仓库仍是空的", amountOf(data, Items.COBBLESTONE) == 0);
+        check("G4 背包没被塞进圆石", countIn(bot, Items.COBBLESTONE) == 0);
+    }
+
+    // ================================================================ H 保护插件否决
+
+    private static void groupH_vetoRefund(MinecraftServer server) {
+        System.out.println("[H] 被保护插件否决：材料必须原额退回，一件都不许少");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.STONE, 5));
+        bot.getInventory().clearContent();
+        bot.getInventory().setItem(0, new ItemStack(Items.DIAMOND_SWORD));
+        resetTarget();
+
+        int status;
+        try {
+            vetoArmed = true;
+            vetoBehavior = 1;
+            vetoAt = CLICKED;
+            status = PrinterPlaceService.place(server, bot, payload(List.of("minecraft:stone"), airId()));
+        } finally {
+            vetoArmed = false;
+        }
+
+        check("H1 其它模组返回 SUCCESS → REJECTED", status == PrinterPlaceResultPayload.REJECTED);
+        check("H2 仓库仍是 5 个（预扣的那一件退回来了）", amountOf(data, Items.STONE) == 5);
+        check("H3 世界没变", level.getBlockState(TARGET).isAir());
+        check("H4 选中槽恢复成钻石剑", bot.getInventory().getItem(0).getItem() == Items.DIAMOND_SWORD);
+    }
+
+    // ================================================================ I 异常路径
+
+    private static void groupI_exceptionRefund(MinecraftServer server) {
+        System.out.println("[I] 放置过程抛异常：也要原额退料（异常安全边界）");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.STONE, 5));
+        bot.getInventory().clearContent();
+        bot.getInventory().setItem(0, new ItemStack(Items.DIAMOND_SWORD));
+        resetTarget();
+
+        boolean threw = false;
+        try {
+            vetoArmed = true;
+            vetoBehavior = 2;
+            vetoAt = CLICKED;
+            PrinterPlaceService.place(server, bot, payload(List.of("minecraft:stone"), airId()));
+        } catch (RuntimeException expected) {
+            threw = true;
+        } finally {
+            vetoArmed = false;
+        }
+
+        check("I1 异常真的抛出来了（说明走的是 finally 而不是正常返回）", threw);
+        check("I2 仓库仍是 5 个", amountOf(data, Items.STONE) == 5);
+        check("I3 世界没变", level.getBlockState(TARGET).isAir());
+        check("I4 选中槽恢复成钻石剑", bot.getInventory().getItem(0).getItem() == Items.DIAMOND_SWORD);
+    }
+
+    // ================================================================ J 兑换路径
+
+    private static void groupJ_exchange(MinecraftServer server) {
+        System.out.println("[J] 成品缺货走 9 合 1 兑换：吃仓库原料，不许动玩家背包");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.IRON_INGOT, 9));
+        bot.getInventory().clearContent();
+        bot.getInventory().setItem(0, new ItemStack(Items.DIAMOND_SWORD));
+        resetTarget();
+
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+        int status;
+        try {
+            status = PrinterPlaceService.place(server, bot,
+                    payload(List.of(BuiltInRegistries.ITEM.getKey(Items.IRON_BLOCK).toString()), airId()));
+        } finally {
+            VoidWarehouseSettings.voidWarehouseExchange = false;
+        }
+
+        check("J1 铁块缺货但铁锭够 9 个 → OK", status == PrinterPlaceResultPayload.OK);
+        check("J2 世界真的多了铁块", level.getBlockState(TARGET).is(Blocks.IRON_BLOCK));
+        check("J3 9 个铁锭被吃掉", amountOf(data, Items.IRON_INGOT) == 0);
+        check("J4 兑出来的铁块没有留在仓库（当场放掉了）", amountOf(data, Items.IRON_BLOCK) == 0);
+        check("J5 背包里既没有铁锭也没有铁块", countIn(bot, Items.IRON_INGOT) == 0
+                && countIn(bot, Items.IRON_BLOCK) == 0);
+    }
+
+    // ================================================================ K 回读校验（A1）
+
+    private static void groupK_readBack(MinecraftServer server) {
+        System.out.println("[K] A1 回读校验：Servux 解出来的状态必须带着我们要求的属性");
+        Method readBack;
+        try {
+            readBack = PrinterPlaceServuxBridge.class.getDeclaredMethod("requestedSurvived",
+                    BlockState.class, BlockState.class, BlockState.class);
+            readBack.setAccessible(true);
+        } catch (ReflectiveOperationException e) {
+            check("K0 找到回读校验方法 requestedSurvived", false);
+            return;
+        }
+        check("K0 找到回读校验方法 requestedSurvived", true);
+
+        BlockState normal = Blocks.OAK_STAIRS.defaultBlockState();
+        BlockState east = normal.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST);
+        BlockState west = normal.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.WEST);
+
+        check("K1 属性原样回来 → 接受", invoke(readBack, normal, east, east));
+        check("K2 解成反方向 → 拒绝", !invoke(readBack, normal, east, west));
+        check("K3 要求改了但完全没改 → 拒绝", !invoke(readBack, normal, east, normal));
+        check("K4 本来就没要求改动 → 不做额外比较", invoke(readBack, normal, normal, normal));
+        check("K5 换成别的方块 → 拒绝", !invoke(readBack, normal, east, Blocks.STONE.defaultBlockState()));
+        BlockState eastTop = east.setValue(BlockStateProperties.HALF, Half.TOP);
+        check("K6 多个属性里错一个就拒绝", !invoke(readBack, normal, eastTop, east));
+    }
+
+    private static boolean invoke(Method m, BlockState normal, BlockState desired, BlockState actual) {
+        try {
+            return (boolean) m.invoke(null, normal, desired, actual);
+        } catch (ReflectiveOperationException e) {
+            failures++;
+            System.out.println("   !! K 组反射调用失败: " + e);
+            return false;
+        }
+    }
+
+    // ================================================================ L mixin 是否挂上
+
+    private static void groupL_mixin(MinecraftServer server) {
+        System.out.println("[L] mixin 真的挂上了吗：scope 内必须被接管，scope 外必须走原版");
+        resetTarget();
+
+        try {
+            PLACEMENT_STATE = BlockItem.class.getDeclaredMethod("getPlacementState", BlockPlaceContext.class);
+            PLACEMENT_STATE.setAccessible(true);
+        } catch (NoSuchMethodException ignored) {
+            // 落到 L0 断言
+        }
+        check("L0 找到 protected 的 getPlacementState（mixin 注入的就是它）", PLACEMENT_STATE != null);
+        if (PLACEMENT_STATE == null) {
+            return;
+        }
+
+        ItemStack stairsStack = new ItemStack(Items.OAK_STAIRS);
+        BlockItem stairsItem = (BlockItem) stairsStack.getItem();
+        BlockHitResult hit = hitOn(CLICKED);
+        BlockPlaceContext context = new BlockPlaceContext(bot, InteractionHand.MAIN_HAND, stairsStack, hit);
+
+        BlockState vanilla = placementState(stairsItem, context);
+        check("L1 没有 scope 时走原版（基线必须非 null）", vanilla != null);
+
+        // 注意：BlockPlaceContext#getClickedPos() 在「点到的方块不可替换」时返回的是
+        // clicked.relative(face)，也就是真正的放置位 —— 和 payload.target() 是同一个语义。
+        // 这里必须填 TARGET；填 CLICKED 的话 scope 对不上，L2 会假红。
+        PrinterPlacePayload inner = new PrinterPlacePayload(9001, List.of("minecraft:oak_stairs"),
+                TARGET, hit, 0, dimension());
+        // 玩家站在目标西侧，原版会算出 EAST；这里故意要 WEST，这样「有没有被接管」才可判。
+        PrinterPlaceStatePayload structured = new PrinterPlaceStatePayload(inner,
+                "minecraft:oak_stairs", Map.of("facing", "west"));
+
+        boolean matched;
+        BlockState viaBridge;
+        BlockState scoped;
+        try (PrinterPlaceServuxBridge.Scope ignored = PrinterPlaceServuxBridge.enter(stairsItem, context, structured)) {
+            matched = PrinterPlaceServuxBridge.matches(stairsItem, context);
+            viaBridge = PrinterPlaceServuxBridge.scopedState(stairsItem, context);
+            scoped = placementState(stairsItem, context);
+        }
+        check("L2 scope 比对命中（getClickedPos() 就是放置位）", matched);
+
+        // 两套环境都要能跑：装没装 Servux，结论完全不同，但都必须「要么放对、要么拒绝」。
+        boolean servux = PrinterPlaceServuxBridge.available();
+        System.out.println("   [diag] Servux 结构化放置可用 = " + servux);
+        if (servux) {
+            // 这条链一旦通，就同时验证了三件事：位打包与 Servux 0.12.2 的解码布局一致、
+            // A1 的回读校验没有误拒正常情况、mixin 确实把原版结果换掉了。
+            check("L3 Servux 在场 → 结构化状态可用", viaBridge != null);
+            check("L4 朝向解出来就是我们要的 WEST（位打包与 Servux 解码一致）",
+                    viaBridge != null
+                            && viaBridge.getValue(BlockStateProperties.HORIZONTAL_FACING) == Direction.WEST);
+            check("L5 mixin 用结构化结果替换了原版结果", scoped != null && !scoped.equals(vanilla));
+            check("L6 scope 内结果与桥接层结果一致", viaBridge != null && viaBridge.equals(scoped));
+        } else {
+            check("L3 无 Servux → 桥接层拒绝（null）", viaBridge == null);
+            check("L4 无 Servux → mixin 返回 null（拒绝而不是放错）", scoped == null);
+            check("L5 无 Servux → 结构化结果与基线不同（确实被接管）", scoped != vanilla);
+        }
+
+        BlockState after = placementState(stairsItem, context);
+        check("L7 出 scope 后恢复原版行为（ThreadLocal 没泄漏）", after != null);
+        check("L8 scope 外结果与基线一致", after == vanilla);
+    }
+
+    /** 反射调 {@code getPlacementState}；mixin 改写的就是这个方法体，所以判据依然成立。 */
+    private static BlockState placementState(BlockItem item, BlockPlaceContext context) {
+        try {
+            return (BlockState) PLACEMENT_STATE.invoke(item, context);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("getPlacementState via reflection failed", e);
+        }
+    }
+
+    // ================================================================ M 会话限流
+
+    private static void groupM_session(MinecraftServer server) {
+        System.out.println("[M] 会话：nonce 重放 + 640 令牌/秒 + 每 tick 64 + 50ms 补 32");
+        PrinterPlaceSession s = new PrinterPlaceSession();
+        long t0 = 1_000_000_000L;
+
+        check("M1 nonce=0 → BAD_REQUEST",
+                s.begin(0, t0, 100) == PrinterPlaceResultPayload.BAD_REQUEST);
+        check("M2 正常 nonce → 放行(-1)", s.begin(10, t0, 100) == -1);
+        check("M3 没 complete 就重放 → STALE（执行中的重复提交挡住了）",
+                s.begin(10, t0 + 1, 100) == PrinterPlaceResultPayload.STALE);
+        s.complete(10, PrinterPlaceResultPayload.OK);
+        check("M4 complete 之后重放 → 回放同一状态",
+                s.begin(10, t0 + 2, 100) == PrinterPlaceResultPayload.OK);
+        check("M5 更小的新 nonce → STALE", s.begin(5, t0 + 3, 100) == PrinterPlaceResultPayload.STALE);
+
+        // 单 tick 64 次上限
+        PrinterPlaceSession burst = new PrinterPlaceSession();
+        int admitted = 0;
+        for (int i = 1; i <= 64; i++) {
+            if (burst.begin(i, t0, 200) == -1) {
+                admitted++;
+            }
+        }
+        check("M6 同一 tick 前 64 次全部放行", admitted == 64);
+        check("M7 第 65 次 → THROTTLED", burst.begin(65, t0, 200) == PrinterPlaceResultPayload.THROTTLED);
+
+        // 下一 tick：50ms 只补 32 个令牌（640/秒），因为上一 tick 已把 64 个花光
+        long t1 = t0 + 50_000_000L;
+        int refilled = 0;
+        for (int i = 66; i <= 100; i++) {
+            if (burst.begin(i, t1, 201) == -1) {
+                refilled++;
+            }
+        }
+        check("M8 新 tick 只补 32 个令牌（640/秒 × 50ms）", refilled == 32);
+        check("M9 第 33 个 → THROTTLED", burst.begin(101, t1, 201) == PrinterPlaceResultPayload.THROTTLED);
+
+        // 缓存上限
+        PrinterPlaceSession cache = new PrinterPlaceSession();
+        for (int i = 1; i <= 300; i++) {
+            cache.complete(i, PrinterPlaceResultPayload.OK);
+        }
+        check("M10 重放缓存上限 256（不会无限涨）", cache.retainedResults() == 256);
+
+        // 握手 / 更正节流
+        PrinterPlaceSession gate = new PrinterPlaceSession();
+        check("M11 首次 hello 放行", gate.allowHello(t0));
+        check("M12 499ms 内的第二次 hello 被挡", !gate.allowHello(t0 + 499_999_999L));
+        check("M13 满 500ms 后放行", gate.allowHello(t0 + 500_000_000L));
+        check("M14 hello 之后才算协商完成", gate.negotiated());
+        check("M15 首次更正放行", gate.allowCorrection(t0));
+        check("M16 49ms 内的第二次更正被挡", !gate.allowCorrection(t0 + 49_999_999L));
+        check("M17 满 50ms 后放行", gate.allowCorrection(t0 + 50_000_000L));
+    }
+
+    // ================================================================ N 编解码
+
+    private static void groupN_codec(MinecraftServer server) {
+        System.out.println("[N] 编解码往返：四个包都要能原样解回来");
+        PrinterPlacePayload p = payload(List.of("minecraft:stone", "minecraft:cobblestone"), 42);
+
+        FriendlyByteBuf b1 = new FriendlyByteBuf(Unpooled.buffer());
+        PrinterPlacePayload.CODEC.encode(b1, p);
+        PrinterPlacePayload pBack = PrinterPlacePayload.CODEC.decode(b1);
+        check("N1 请求包往返一致（nonce/候选/target/状态 id/维度）",
+                pBack.nonce() == p.nonce() && pBack.candidates().equals(p.candidates())
+                        && pBack.target().equals(p.target()) && pBack.expectedStateId() == 42
+                        && pBack.dimensionId().equals(p.dimensionId())
+                        && pBack.hit().getBlockPos().equals(p.hit().getBlockPos())
+                        && pBack.hit().getDirection() == p.hit().getDirection());
+
+        Map<String, String> props = new LinkedHashMap<>();
+        props.put("facing", "east");
+        props.put("half", "top");
+        PrinterPlaceStatePayload sp = new PrinterPlaceStatePayload(p, "minecraft:oak_stairs", props);
+        FriendlyByteBuf b2 = new FriendlyByteBuf(Unpooled.buffer());
+        PrinterPlaceStatePayload.CODEC.encode(b2, sp);
+        PrinterPlaceStatePayload spBack = PrinterPlaceStatePayload.CODEC.decode(b2);
+        check("N2 结构化包往返一致（blockId + 两个属性）",
+                spBack.blockId().equals("minecraft:oak_stairs") && spBack.properties().equals(props)
+                        && spBack.placement().target().equals(p.target()));
+
+        // 回执包必须仍然是「两个 varint」。7 和 3 都只占 1 字节，一旦有人偷偷加字段这条就会翻红。
+        FriendlyByteBuf b3 = new FriendlyByteBuf(Unpooled.buffer());
+        PrinterPlaceResultPayload.CODEC.encode(b3, new PrinterPlaceResultPayload(7, PrinterPlaceResultPayload.REJECTED));
+        check("N3 回执包仍是两个数（没被追加字段）", b3.readableBytes() == 2);
+
+        FriendlyByteBuf b4 = new FriendlyByteBuf(Unpooled.buffer());
+        PrinterPlaceHelloPayload.CODEC.encode(b4, new PrinterPlaceHelloPayload(11));
+        check("N4 hello 包往返一致", PrinterPlaceHelloPayload.CODEC.decode(b4).nonce() == 11);
+
+        FriendlyByteBuf b5 = new FriendlyByteBuf(Unpooled.buffer());
+        PrinterPlaceHelloResultPayload.CODEC.encode(b5, new PrinterPlaceHelloResultPayload(12, true));
+        PrinterPlaceHelloResultPayload hBack = PrinterPlaceHelloResultPayload.CODEC.decode(b5);
+        check("N5 hello 回执往返一致", hBack.nonce() == 12 && hBack.enabled());
+    }
+
+    // ================================================================ 工具
+
+    private static String dimension() {
+        return level.dimension().identifier().toString();
+    }
+
+    private static int airId() {
+        return Block.getId(level.getBlockState(TARGET));
+    }
+
+    /**
+     * 床：1.21.11 是 {@code Items.RED_BED}，26.x 换成 {@code Items.BED}（ColorCollection）。
+     * 按注册名取就对两边都成立，自检不必为此分版本。
+     */
+    private static Item bedItem() {
+        return BuiltInRegistries.ITEM.getOptional(Identifier.fromNamespaceAndPath("minecraft", "red_bed"))
+                .orElse(Items.SHULKER_BOX);
+    }
+
+    private static BlockHitResult hitOn(BlockPos clicked) {
+        return new BlockHitResult(new Vec3(clicked.getX() + 0.5, clicked.getY() + 1.0, clicked.getZ() + 0.5),
+                Direction.UP, clicked, false);
+    }
+
+    private static PrinterPlacePayload payload(List<String> candidates, int expectedStateId) {
+        return payload(candidates, expectedStateId, nextNonce++);
+    }
+
+    private static PrinterPlacePayload payload(List<String> candidates, int expectedStateId, int nonce) {
+        return new PrinterPlacePayload(nonce, candidates, TARGET, hitOn(CLICKED), expectedStateId, dimension());
+    }
+
+    private static int placeItem(MinecraftServer server, Item item) {
+        String id = BuiltInRegistries.ITEM.getKey(item).toString();
+        return PrinterPlaceService.place(server, bot, payload(List.of(id), airId()));
+    }
+
+    private static void resetTarget() {
+        level.setBlockAndUpdate(TARGET, Blocks.AIR.defaultBlockState());
+    }
+
+    private static int amountOf(VoidWarehouseData data, Item item) {
+        return data.amountExact(new ItemStack(item)).intValue();
+    }
+
+    private static int countIn(ServerPlayer player, Item item) {
+        int total = 0;
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (!stack.isEmpty() && stack.getItem() == item) {
+                total += stack.getCount();
+            }
+        }
+        return total;
+    }
+
+    private static void voidWarehouseAll(boolean on) {
+        VoidWarehouseSettings.voidWarehouse = on;
+        VoidWarehouseRestockSettings.voidWarehouseRestock = on;
+        VoidWarehouseRestockSettings.voidWarehouseDirectPlace = on;
+    }
+
+    private static void cleanup(MinecraftServer server) {
+        System.out.println("[Z] 收尾：规则全部关回去、仓库与背包清空");
+        voidWarehouseAll(false);
+        vetoArmed = false;
+        bot.containerMenu = bot.inventoryMenu;
+        bot.getInventory().clearContent();
+        VoidWarehouse.data(server).clearContent();
+        resetTarget();
+        check("Z1 三条规则都已关闭", !VoidWarehouseSettings.voidWarehouse
+                && !VoidWarehouseRestockSettings.voidWarehouseRestock
+                && !VoidWarehouseRestockSettings.voidWarehouseDirectPlace);
+        check("Z2 仓库与背包都已清空",
+                VoidWarehouse.data(server).entryCount() == 0 && countIn(bot, Items.STONE) == 0);
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        System.out.println("SMOKE RESULT printer-direct-place/@VER@ checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+        }
+        System.out.println("   " + (ok ? "ok  " : "FAIL") + " " + label);
+    }
+}

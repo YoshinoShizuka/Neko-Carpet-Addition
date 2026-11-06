@@ -6,6 +6,7 @@ import neko.voidwarehouse.VoidWarehouseExtension;
 import neko.voidwarehouse.restock.PrinterQueryNetwork;
 import neko.voidwarehouse.search.SearchNetwork;
 import neko.voidwarehouse.restock.PrinterRestockNetwork;
+import neko.voidwarehouse.restock.PrinterPlaceNetwork;
 import neko.voidwarehouse.restock.PrinterReturnNetwork;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.loader.api.FabricLoader;
@@ -29,6 +30,7 @@ public class AutoMendingMod implements ModInitializer {
         // 必须早于任何玩家连接，所以在 onInitialize 里注册。
         // ① 取货（有副作用，50ms 限流）
         PrinterRestockNetwork.init();
+        PrinterPlaceNetwork.init();
         // ② 库存查询（只读，供材料列表显示；200ms 限流）
         PrinterQueryNetwork.init();
         // ③ 返还（有副作用，50ms 限流）：打印机用不完的材料退回仓库。

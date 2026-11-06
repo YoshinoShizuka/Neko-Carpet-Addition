@@ -42,4 +42,8 @@ public class VoidWarehouseRestockSettings {
      */
     @Rule(categories = {VoidWarehouseSettings.NEKO, SURVIVAL})
     public static boolean voidWarehouseRestock = false;
+
+    /** Reserve one ordinary block, place it normally, and return any unused material. */
+    @Rule(categories = {VoidWarehouseSettings.NEKO, SURVIVAL})
+    public static boolean voidWarehouseDirectPlace = false;
 }

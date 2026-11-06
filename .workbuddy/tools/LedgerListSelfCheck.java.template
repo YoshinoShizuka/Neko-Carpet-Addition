@@ -1,0 +1,364 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemLore;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 【临时自检】账目提示的清单式排版。验证完删掉。
+ *
+ * <p>玩家报的现象：灰色地毯那种「9 合 1 / 配方扣料」的条目，账目原本一句话写完
+ * （{@code 可合成 3,708 个，用 线 9,136 个 ＋ 骨粉 2 个 ＋ … ＋ 骨头 406 个}），
+ * 原料种类一多就横向延伸出屏幕，右边被裁掉看不见。中间试过按宽度折行，
+ * 折出来的续行读起来仍旧是一句话的碎片；现在的成品是<b>清单</b>：</p>
+ *
+ * <pre>
+ * 灰色地毯（可合成）
+ * 可合成 3,708 个
+ * - 线 9,136 个
+ * - 骨粉 2 个
+ * ...
+ * 左键：合成 1 个
+ * 右键：合成 64 个
+ * </pre>
+ *
+ * <p>本自检直接走<b>真实入口</b> {@link VoidWarehouseData#buildExchangeDisplay}，
+ * 咬的是这一版排版的<b>结构</b>，不是像素：</p>
+ * <ol>
+ *   <li>首行只有「能拿多少」，<b>不许</b>再挂第一项原料（那是折行时代的形态）；</li>
+ *   <li>两项以上：<b>一项一行</b>、每行以 {@code - } 开头、每行只有一个「个」；</li>
+ *   <li>全文<b>一个「＋」都不能有</b> —— 这是「旧的内联拼接彻底退场」的反证。</li>
+ * </ol>
+ *
+ * <p>另配反证，防止断言空转：一项原料必须仍是<b>一句话</b>（不许为一项摆清单）；
+ * 拆零场景必须分成 {@code - 拆 …} / {@code - 找回 …} 两段（不是挤一行）；
+ * 英文侧（{@code en=true}）的标签必须跟着换。</p>
+ */
+public final class LedgerListSelfCheck {
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    /** 清单行的一行宽度上界（半角）。清单不该随原料种类数变宽，所以这个值恒成立 */
+    private static final int BUDGET = 44;
+
+    private LedgerListSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        try {
+            sevenIngredientChecks();
+            singleIngredientChecks();
+            splitChecks();
+            refundOnlyChecks();
+            englishChecks();
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        System.out.println("SMOKE RESULT ledger-list/@VER@ checks=" + checks + " failures=" + failures);
+        server.halt(false);
+    }
+
+    // ================================================================ A 组：截图那笔 7 种原料的账
+
+    private static void sevenIngredientChecks() {
+        String[] ids = {"string", "bone_meal", "wither_rose", "white_wool", "black_dye", "white_dye", "bone"};
+        String[] amounts = {"9,136", "2", "1,154", "188", "82", "18", "406"};
+        VoidWarehouseExchange.Delta[] deltas = new VoidWarehouseExchange.Delta[ids.length];
+        for (int i = 0; i < ids.length; i++) {
+            deltas[i] = delta(ids[i], -Long.parseLong(amounts[i].replace(",", "")));
+        }
+        VoidWarehouseData.ExchangeOffer offer = offer("gray_carpet", 3708, true, deltas);
+        List<String> texts = plain(loreOf(VoidWarehouseData.buildExchangeDisplay(offer, false, false)));
+        dump("7种原料", texts);
+
+        String head = firstContaining(texts, "可合成 ");
+        check("A1 首行写着「可合成 3,708 个」", head != null && head.contains("可合成 3,708 个"));
+        // 首行只报「能拿多少」。带着「，用 …」就是又退回了折行那一版
+        check("A2 首行不再挂第一项原料（没有「，用 」）", head != null && !head.contains("，用 "));
+
+        List<String> list = ledgerBlock(texts);
+        check("A3 账目一共 8 行 = 1 行首行 + 7 项原料", list.size() == 8);
+        List<String> items = list.size() > 1 ? list.subList(1, list.size()) : List.of();
+        check("A4 清单正好 7 行", items.size() == 7);
+
+        // 这几条都以「正好 7 行清单」为前提：清单为空时循环不跑，断言会空转成真
+        boolean prefixed = items.size() == 7;
+        for (String line : items) {
+            if (!line.startsWith("- ")) {
+                prefixed = false;
+                System.out.println("   清单行没以「- 」开头 = '" + line + "'");
+            }
+        }
+        check("A5 每一行清单都以「- 」开头", prefixed);
+
+        // 反证：旧版把 7 项用「＋」串成一句。只要还有一个「＋」，说明新排版没生效
+        String joined = String.join(" ", texts);
+        check("A6 全文一个「＋」都没有（内联拼接已退场）", !joined.contains("＋"));
+
+        boolean oneEach = items.size() == 7;
+        for (String line : items) {
+            if (countOf(line, " 个") != 1) {
+                oneEach = false;
+                System.out.println("   这一行不是恰好一项 = '" + line + "'");
+            }
+        }
+        check("A7 每行清单恰好一项（每行一个「个」）", oneEach);
+
+        boolean orderOk = items.size() == 7;
+        for (int i = 0; i < items.size() && i < amounts.length; i++) {
+            if (!items.get(i).contains(amounts[i])) {
+                orderOk = false;
+                System.out.println("   第 " + (i + 1) + " 项该是 " + amounts[i] + "，实际 = '" + items.get(i) + "'");
+            }
+        }
+        check("A8 7 项按原账目顺序一项一行，数量一个都没丢", orderOk);
+
+        boolean named = items.size() == 7;
+        for (String line : items) {
+            // 「- 线 9,136 个」：物品名解析失败会塌成「-  9,136 个」（两个空格 = 空名字）
+            if (line.startsWith("-  ")) {
+                named = false;
+                System.out.println("   物品名为空 = '" + line + "'");
+            }
+        }
+        check("A9 每一项都解析出了物品名", named);
+
+        int widest = 0;
+        for (String line : list) {
+            widest = Math.max(widest, widthOf(line));
+        }
+        check("A10 最长一行 " + widest + " ≤ " + BUDGET + " 个半角宽", widest <= BUDGET);
+    }
+
+    // ================================================================ B 组：单项原料不该被拆成清单
+
+    private static void singleIngredientChecks() {
+        VoidWarehouseData.ExchangeOffer offer = offer("emerald", 2, true, delta("diamond", -18));
+        List<String> texts = plain(loreOf(VoidWarehouseData.buildExchangeDisplay(offer, false, false)));
+        dump("单项", texts);
+        List<String> list = ledgerBlock(texts);
+        check("B1 只有一种原料时账目仍是一行", list.size() == 1);
+        String head = list.isEmpty() ? "" : list.get(0);
+        check("B2 那一行就是「可合成 2 个，用 …」的整体",
+                head.contains("可合成 2 个") && head.contains("，用 ") && head.contains("18"));
+        check("B3 单项时不摆清单（没有「- 」前缀）", !head.startsWith("- "));
+    }
+
+    // ================================================================ C 组：拆零场景的「拆 / 找回」分组
+
+    private static void splitChecks() {
+        VoidWarehouseData.ExchangeOffer offer = offer("iron_ingot", 9, false,
+                delta("iron_block", -1), delta("iron_ingot", 8));
+        List<String> texts = plain(loreOf(VoidWarehouseData.buildExchangeDisplay(offer, false, false)));
+        dump("拆零", texts);
+        List<String> list = ledgerBlock(texts);
+        String head = list.isEmpty() ? "" : list.get(0);
+        check("C1 首行写着「可拆出 9 个」", head.contains("可拆出 9 个"));
+        check("C2 拆零时账目共 3 行 = 首行 + 拆 + 找回", list.size() == 3);
+        String costLine = list.size() > 1 ? list.get(1) : "";
+        String refundLine = list.size() > 2 ? list.get(2) : "";
+        check("C3 第一项写成「- 拆 铁块 1 个」",
+                costLine.startsWith("- 拆 ") && costLine.contains(" 1 个"));
+        check("C4 第二项写成「- 找回 铁锭 8 个」",
+                refundLine.startsWith("- 找回 ") && refundLine.contains(" 8 个"));
+        // 折行时代「找回」是接在同一句里的（「，找回 」），清单里必须独立成行
+        String joined = String.join(" ", texts);
+        check("C5 不再有贴在同一句里的「，找回 」", !joined.contains("，找回 "));
+    }
+
+    // ================================================================ D 组：只有找回、没有消耗
+
+    private static void refundOnlyChecks() {
+        // 一进不出：账目里只有正数 delta，走的是 costs.isEmpty() 那条分支
+        VoidWarehouseData.ExchangeOffer one = offer("iron_ingot", 8, false, delta("iron_ingot", 8));
+        List<String> oneTexts = plain(loreOf(VoidWarehouseData.buildExchangeDisplay(one, false, false)));
+        dump("纯找回·单项", oneTexts);
+        List<String> oneList = ledgerBlock(oneTexts);
+        String oneHead = oneList.isEmpty() ? "" : oneList.get(0);
+        check("D1 单项纯找回时一句话写完「可合成 8 个，找回 …」",
+                oneList.size() == 1 && oneHead.contains("，找回 ") && oneHead.contains(" 8 个"));
+
+        VoidWarehouseData.ExchangeOffer two = offer("iron_ingot", 10, false,
+                delta("iron_ingot", 8), delta("gold_ingot", 2));
+        List<String> twoTexts = plain(loreOf(VoidWarehouseData.buildExchangeDisplay(two, false, false)));
+        dump("纯找回·多项", twoTexts);
+        List<String> twoList = ledgerBlock(twoTexts);
+        check("D2 多项纯找回时摆清单（首行 + 2 行 = 3 行）", twoList.size() == 3);
+        boolean bothRefund = twoList.size() == 3
+                && twoList.get(1).startsWith("- 找回 ") && twoList.get(2).startsWith("- 找回 ");
+        check("D3 两行都挂「找回」标签", bothRefund);
+    }
+
+    // ================================================================ E 组：英文侧
+
+    private static void englishChecks() {
+        VoidWarehouseData.ExchangeOffer offer = offer("gray_carpet", 3708, true,
+                delta("string", -9136), delta("bone_meal", -2));
+        List<String> texts = plain(loreOf(VoidWarehouseData.buildExchangeDisplay(offer, false, true)));
+        dump("英文", texts);
+        List<String> list = ledgerBlock(texts);
+        String head = list.isEmpty() ? "" : list.get(0);
+        check("E1 英文首行是「Craftable now: … pc」",
+                head.startsWith("Craftable now: ") && head.contains(" pc") && !head.contains(", using "));
+        check("E2 英文账目也是 1 + 2 行，每行以「- 」开头",
+                list.size() == 3 && list.get(1).startsWith("- ") && list.get(2).startsWith("- "));
+        boolean pcEach = true;
+        for (int i = 1; i < list.size(); i++) {
+            if (!list.get(i).endsWith(" pc")) {
+                pcEach = false;
+                System.out.println("   英文清单行没以 pc 收尾 = '" + list.get(i) + "'");
+            }
+        }
+        check("E3 英文清单行以「 pc」收尾（不是「 个」）", pcEach);
+
+        VoidWarehouseData.ExchangeOffer split = offer("iron_ingot", 9, false,
+                delta("iron_block", -1), delta("iron_ingot", 8));
+        List<String> splitTexts = plain(loreOf(VoidWarehouseData.buildExchangeDisplay(split, false, true)));
+        dump("英文·拆零", splitTexts);
+        List<String> splitList = ledgerBlock(splitTexts);
+        check("E4 英文拆零用「- uncraft 」/「- refund 」",
+                splitList.size() == 3
+                        && splitList.get(1).startsWith("- uncraft ")
+                        && splitList.get(2).startsWith("- refund "));
+    }
+
+    // ================================================================ 工具
+
+    private static VoidWarehouseData.ExchangeOffer offer(String target, long obtainable, boolean craft,
+                                                         VoidWarehouseExchange.Delta... deltas) {
+        // 账目里的 id 是<b>裸路径</b>（表和配方都这么存），带 "minecraft:" 会让
+        // splitsFromAbove 查不到表项、把拆零误判成合成 —— 自检自己就是被这个骗过
+        return new VoidWarehouseData.ExchangeOffer(
+                target, new ItemStack(mc(target)),
+                BigInteger.valueOf(obtainable), BigInteger.valueOf(64), BigInteger.ZERO,
+                List.of(deltas), craft);
+    }
+
+    private static VoidWarehouseExchange.Delta delta(String path, long change) {
+        return new VoidWarehouseExchange.Delta(path, BigInteger.valueOf(change));
+    }
+
+    /** 按注册名取物品，一份源码五个版本通用（26.3 起染色 / 部分物品收进了 ColorCollection） */
+    private static Item mc(String path) {
+        return BuiltInRegistries.ITEM
+                .getOptional(Identifier.fromNamespaceAndPath("minecraft", path))
+                .orElse(Items.STONE);
+    }
+
+    private static List<Component> loreOf(ItemStack stack) {
+        ItemLore lore = stack.get(DataComponents.LORE);
+        return lore == null ? List.of() : lore.lines();
+    }
+
+    private static List<String> plain(List<Component> lore) {
+        List<String> out = new ArrayList<>(lore.size());
+        for (Component line : lore) {
+            out.add(line.getString());
+        }
+        return out;
+    }
+
+    /**
+     * 账目那一整块：从含「可合成 / 可拆出」的首行起，往后连着取所有以 {@code - } 开头的清单行。
+     *
+     * <p>遇到第一个不是清单行的就停 —— 那已经是「左键：…」那些操作行了。</p>
+     */
+    private static List<String> ledgerBlock(List<String> texts) {
+        List<String> block = new ArrayList<>();
+        int start = -1;
+        for (int i = 0; i < texts.size(); i++) {
+            if (texts.get(i).contains("可合成 ") || texts.get(i).contains("可拆出 ")
+                    || texts.get(i).startsWith("Craftable now: ") || texts.get(i).startsWith("Uncraftable now: ")) {
+                start = i;
+                break;
+            }
+        }
+        if (start < 0) {
+            return block;
+        }
+        block.add(texts.get(start));
+        for (int i = start + 1; i < texts.size(); i++) {
+            String line = texts.get(i);
+            if (line.startsWith("- ")) {
+                block.add(line);
+            } else {
+                break;
+            }
+        }
+        return block;
+    }
+
+    private static String firstContaining(List<String> texts, String needle) {
+        for (String text : texts) {
+            if (text.contains(needle)) {
+                return text;
+            }
+        }
+        return null;
+    }
+
+    /** 半角为单位的宽度（半角 = 1，CJK / 全角 = 2）。服务端拿不到 Font，只能按字形估 */
+    private static int widthOf(String text) {
+        int width = 0;
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            boolean wide = (cp >= 0x1100 && cp <= 0x115F)
+                    || (cp >= 0x2E80 && cp <= 0xA4CF)
+                    || (cp >= 0xAC00 && cp <= 0xD7A3)
+                    || (cp >= 0xF900 && cp <= 0xFAFF)
+                    || (cp >= 0xFE30 && cp <= 0xFE6F)
+                    || (cp >= 0xFF00 && cp <= 0xFF60)
+                    || (cp >= 0xFFE0 && cp <= 0xFFE6);
+            width += wide ? 2 : 1;
+            i += Character.charCount(cp);
+        }
+        return width;
+    }
+
+    private static int countOf(String haystack, String needle) {
+        int count = 0;
+        int from = 0;
+        while (true) {
+            int at = haystack.indexOf(needle, from);
+            if (at < 0) {
+                return count;
+            }
+            count++;
+            from = at + needle.length();
+        }
+    }
+
+    private static void dump(String tag, List<String> texts) {
+        System.out.println("   --- " + tag + " ---");
+        for (int i = 0; i < texts.size(); i++) {
+            String text = texts.get(i);
+            System.out.println("   [" + i + " w=" + widthOf(text) + "] " + text);
+        }
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + label);
+        }
+    }
+}

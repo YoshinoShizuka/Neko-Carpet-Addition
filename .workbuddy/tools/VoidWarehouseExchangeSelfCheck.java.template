@@ -659,7 +659,8 @@ public final class VoidWarehouseExchangeSelfCheck {
         check("F17 虚拟格写「可合成 N 个」（被扣的是更小的东西 = 向上合成）",
                 contains(lore, "可合成 "));
         String costLine = lineContaining(lore, "可合成 ");
-        check("F18 数据行是<b>一行</b>（玩家嫌「可合成 xN」+「用 xN」两排冗余）",
+        check("F18 只有一种原料时仍是一句话（「可合成 N 个，用 …」；两种以上才转清单，"
+                        + "由 LedgerListSelfCheck 咬，玩家嫌的是两排冗余）",
                 costLine != null && costLine.contains(" 个，用 "));
         check("F18b 那一行里的消耗写的是<b>总量</b>（铁粒 90 个），不是单价 9 个 —— 玩家报的就是这条",
                 segmentAfter(costLine, "，用 ").contains("90 个")

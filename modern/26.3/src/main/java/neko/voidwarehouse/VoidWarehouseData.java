@@ -2246,7 +2246,7 @@ public final class VoidWarehouseData extends SavedData {
                         .append(VoidWarehouseText.line(tag, VoidWarehouseText.FACT)));
 
         List<Component> lore = new ArrayList<>(4);
-        lore.add(exchangeSummary(offer, en));
+        lore.addAll(exchangeSummary(offer, en));
 
         // 操作行：与普通格一样的说法，口径统一（盒模式下就换成盒模式那一套）
         int max = Math.max(1, offer.template().getMaxStackSize());
@@ -2320,51 +2320,110 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * 数据行本体：{@code 可合成 2 个，用 绿宝石 18 个} / {@code 可拆出 9 个，拆 铁块 1 个}。
+     * 账目本体。只有一项原料时是一句话 —— {@code 可合成 2 个，用 绿宝石 18 个} /
+     * {@code 可拆出 9 个，拆 铁块 1 个}；两项以上转清单，见下方「两种排法」。
      *
      * <p>配色与聊天提示同一套：<b>无关紧要的文字灰、关键数字亮绿</b>。
-     * 整行只有两个数字，所以「哪个是要拿的量、哪个是要付的量」靠紧挨着的词就能读出来。</p>
+     * 「哪个是要拿的量、哪个是要付的量」靠紧挨着的词就能读出来。</p>
+     *
+     * <h2>两种排法：一项写完，多项成清单</h2>
+     * <p>原版 tooltip <b>不会自动折行</b> —— 一行有多长，框就撑多宽，撑出屏幕的部分直接被裁掉。
+     * 配方扣料的账目动辄六七种原料（灰色地毯那种：线 / 骨粉 / 凋灵玫瑰 / 白色羊毛 / 黑色染料 /
+     * 白色染料 / 骨头），拼成一行一百多个半角宽，右边必然看不见。所以按项数分两种排法：</p>
+     * <pre>
+     *   一项：可合成 2 个，用 绿宝石 18 个          ← 一句话写完，不为一项摆个清单
+     *
+     *   多项：可合成 3,708 个                      ← 首行只写「能拿多少」
+     *         - 线 9,136 个                        ← 一项一行，横向永远不会出界
+     *         - 骨粉 2 个
+     *         - 凋灵玫瑰 1,154 个
+     * </pre>
+     *
+     * <p><b>为什么不是「能兑几个」+「消耗什么」两行</b>：玩家反馈过那是<b>双排冗余</b>
+     * —— 两行说的是同一件事，分成两行反而要来回对数字。清单不是那个东西：首行只有
+     * 「能拿多少」，下面每行是<b>一项原料</b>，逐项左对齐，扫一眼就能把账对上。</p>
+     *
+     * <p><b>拆零场景用「拆 / 找回」分组</b>（{@code - 拆 铁块 1 个} / {@code - 找回 铁锭 8 个}）：
+     * 一进一出写在同一套缩进里，不用回头读第一句就知道哪行是掏出去的、哪行是找回来的。</p>
+     *
+     * <p><b>账目里一项都解析不出来</b>时只留「可合成 N 个」，不留孤零零的「，用 」。</p>
      */
-    private static Component exchangeSummary(ExchangeOffer offer, boolean en) {
+    private static List<Component> exchangeSummary(ExchangeOffer offer, boolean en) {
         boolean split = splitsFromAbove(offer);
-        MutableComponent line = VoidWarehouseText.body(split
+        List<MutableComponent> costs = ledgerChunks(offer, true, en);
+        List<MutableComponent> refunds = ledgerChunks(offer, false, en);
+
+        MutableComponent head = VoidWarehouseText.body(split
                 ? VoidWarehouseText.tr(en, "可拆出 ", "Uncraftable now: ")
                 : VoidWarehouseText.tr(en, "可合成 ", "Craftable now: "));
-        line.append(VoidWarehouseText.key(VoidWarehouseText.count(offer.obtainable())));
-        line.append(VoidWarehouseText.body(en ? " pc" : " 个"));
-        line.append(ledgerSegment(offer, true, en,
-                split ? VoidWarehouseText.tr(en, "，拆 ", ", uncraft ") : VoidWarehouseText.tr(en, "，用 ", ", using ")));
-        line.append(ledgerSegment(offer, false, en, VoidWarehouseText.tr(en, "，找回 ", ", refunds ")));
+        head.append(VoidWarehouseText.key(VoidWarehouseText.count(offer.obtainable())));
+        head.append(VoidWarehouseText.body(en ? " pc" : " 个"));
+
+        List<Component> lines = new ArrayList<>(costs.size() + refunds.size() + 1);
+        int total = costs.size() + refunds.size();
+        if (total == 0) {
+            lines.add(head);
+            return lines;
+        }
+        if (total == 1) {
+            // 只有一项：仍然一句话写完 —— 为一项摆个清单，只是把同一句话拆成两行
+            String tag = !costs.isEmpty()
+                    ? (split ? VoidWarehouseText.tr(en, "，拆 ", ", uncraft ")
+                            : VoidWarehouseText.tr(en, "，用 ", ", using "))
+                    : VoidWarehouseText.tr(en, "，找回 ", ", refunds ");
+            head.append(VoidWarehouseText.body(tag)).append(costs.isEmpty() ? refunds.get(0) : costs.get(0));
+            lines.add(head);
+            return lines;
+        }
+        // 两项以上：一项一行
+        lines.add(head);
+        String costTag = split ? VoidWarehouseText.tr(en, "拆 ", "uncraft ") : "";
+        for (MutableComponent chunk : costs) {
+            lines.add(ledgerLine(costTag, chunk));
+        }
+        String refundTag = VoidWarehouseText.tr(en, "找回 ", "refund ");
+        for (MutableComponent chunk : refunds) {
+            lines.add(ledgerLine(refundTag, chunk));
+        }
+        return lines;
+    }
+
+    /** 清单里的一行：{@code - [标签] 物品 数量 个}（标签只有拆零场景才有） */
+    private static Component ledgerLine(String tag, MutableComponent chunk) {
+        MutableComponent line = VoidWarehouseText.body("- " + tag);
+        line.append(chunk);
         return line;
     }
 
     /**
-     * 拼一段账目：{@code prefix} + 若干「物品 数字 个」。
+     * 把账目拆成一项一块：{@code 线 9,136 个}。只拆不排，排版交给
+     * {@link #exchangeSummary(ExchangeOffer, boolean)}。
      *
-     * <p>一段里一个物品都解析不出来时返回<b>空组件</b>（那一小段就整体不出现）——
-     * 免得只留下一个孤零零的「，找回 」。</p>
+     * <p>必须走 {@link #resolveItem}：账单里可能混着配方本那套「带命名空间的 id」
+     * （配方扣料的条目就是这样），直接喂给 9 合 1 的解析器会拼出非法标识。
+     * 解析不出来的项直接跳过 —— 宁可少写一项，也不能在 tooltip 里塞一坨非法字符。</p>
+     *
+     * <p>物品名保持成组件（{@code getHoverName()}），<b>不 {@code getString()}</b> ——
+     * 否则专用服务器上会解析成英文名（见 {@link VoidWarehouseText#tinted(Component, ChatFormatting)}）。</p>
      */
-    private static MutableComponent ledgerSegment(ExchangeOffer offer, boolean negatives, boolean en, String prefix) {
-        MutableComponent segment = Component.empty();
-        boolean first = true;
+    private static List<MutableComponent> ledgerChunks(ExchangeOffer offer, boolean negatives, boolean en) {
+        List<MutableComponent> chunks = new ArrayList<>(4);
         for (VoidWarehouseExchange.Delta delta : offer.totalCost()) {
             if (negatives != (delta.change().signum() < 0)) {
                 continue;
             }
-            // 必须走 resolveItem：账单里可能混着配方本那套「带命名空间的 id」
-            // （配方扣料的条目就是这样），直接喂给 9 合 1 的解析器会拼出非法标识。
             Item item = resolveItem(delta.itemId());
             if (item == null) {
                 continue;
             }
-            segment.append(VoidWarehouseText.body(first ? prefix : (en ? " + " : " ＋ ")));
-            segment.append(VoidWarehouseText.body(new ItemStack(item).getHoverName()));
-            segment.append(VoidWarehouseText.body(" "));
-            segment.append(VoidWarehouseText.key(VoidWarehouseText.count(delta.change().abs())));
-            segment.append(VoidWarehouseText.body(en ? " pc" : " 个"));
-            first = false;
+            MutableComponent chunk = Component.empty();
+            chunk.append(VoidWarehouseText.body(new ItemStack(item).getHoverName()));
+            chunk.append(VoidWarehouseText.body(" "));
+            chunk.append(VoidWarehouseText.key(VoidWarehouseText.count(delta.change().abs())));
+            chunk.append(VoidWarehouseText.body(en ? " pc" : " 个"));
+            chunks.add(chunk);
         }
-        return segment;
+        return chunks;
     }
 
     /**

@@ -56,7 +56,7 @@ public final class PrinterPlaceService {
         if (!enabled()) {
             return PrinterPlaceResultPayload.RULE_OFF;
         }
-        if (structured != null && (!PrinterPlaceServuxBridge.available() || !PrinterPlaceServuxBridge.hasPermission(player))) {
+        if (structured != null && !PrinterPlaceServuxBridge.hasPermission(player)) {
             return PrinterPlaceResultPayload.REJECTED;
         }
         List<String> candidates = payload.candidates();

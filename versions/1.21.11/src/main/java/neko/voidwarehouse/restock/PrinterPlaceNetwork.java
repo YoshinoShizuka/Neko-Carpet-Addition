@@ -30,10 +30,8 @@ public final class PrinterPlaceNetwork {
         register(() -> PayloadTypeRegistry.playS2C().register(PrinterPlaceResultPayload.TYPE, PrinterPlaceResultPayload.CODEC));
         ServerPlayNetworking.registerGlobalReceiver(PrinterPlaceHelloPayload.TYPE, PrinterPlaceNetwork::hello);
         ServerPlayNetworking.registerGlobalReceiver(PrinterPlacePayload.TYPE, PrinterPlaceNetwork::handle);
-        if (PrinterPlaceServuxBridge.available()) {
-            register(() -> PayloadTypeRegistry.playC2S().register(PrinterPlaceStatePayload.TYPE, PrinterPlaceStatePayload.CODEC));
-            ServerPlayNetworking.registerGlobalReceiver(PrinterPlaceStatePayload.TYPE, PrinterPlaceNetwork::handleState);
-        }
+        register(() -> PayloadTypeRegistry.playC2S().register(PrinterPlaceStatePayload.TYPE, PrinterPlaceStatePayload.CODEC));
+        ServerPlayNetworking.registerGlobalReceiver(PrinterPlaceStatePayload.TYPE, PrinterPlaceNetwork::handleState);
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> SESSIONS.remove(handler));
     }
 

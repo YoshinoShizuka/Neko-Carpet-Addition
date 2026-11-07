@@ -3,6 +3,7 @@ package neko.voidwarehouse.restock;
 import com.mojang.authlib.GameProfile;
 import io.netty.buffer.Unpooled;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -29,6 +30,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.Half;
+import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 
@@ -36,6 +38,7 @@ import java.lang.reflect.Method;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import neko.voidwarehouse.VoidWarehouse;
@@ -605,27 +608,51 @@ public final class PrinterDirectPlaceSelfCheck {
         }
         check("L2 scope 比对命中（getClickedPos() 就是放置位）", matched);
 
-        // 两套环境都要能跑：装没装 Servux，结论完全不同，但都必须「要么放对、要么拒绝」。
-        boolean servux = PrinterPlaceServuxBridge.available();
-        System.out.println("   [diag] Servux 结构化放置可用 = " + servux);
-        if (servux) {
-            // 这条链一旦通，就同时验证了三件事：位打包与 Servux 0.12.2 的解码布局一致、
-            // A1 的回读校验没有误拒正常情况、mixin 确实把原版结果换掉了。
-            check("L3 Servux 在场 → 结构化状态可用", viaBridge != null);
-            check("L4 朝向解出来就是我们要的 WEST（位打包与 Servux 解码一致）",
-                    viaBridge != null
-                            && viaBridge.getValue(BlockStateProperties.HORIZONTAL_FACING) == Direction.WEST);
-            check("L5 mixin 用结构化结果替换了原版结果", scoped != null && !scoped.equals(vanilla));
-            check("L6 scope 内结果与桥接层结果一致", viaBridge != null && viaBridge.equals(scoped));
-        } else {
-            check("L3 无 Servux → 桥接层拒绝（null）", viaBridge == null);
-            check("L4 无 Servux → mixin 返回 null（拒绝而不是放错）", scoped == null);
-            check("L5 无 Servux → 结构化结果与基线不同（确实被接管）", scoped != vanilla);
-        }
+        // 两套环境必须给出同一个结构化状态：装 Servux 走它的解码器，没装走内置解析。
+        // 单人（集成服务器）永远装不上 Servux —— 它的元数据是 environment: server，
+        // Fabric 在客户端直接跳过它，而且不报错。这正是「直放只在正式服生效」的根因，
+        // 所以 L3-L6 不能分叉成「有 Servux 才成立」。
+        boolean decoder = PrinterPlaceServuxBridge.servuxDecoderPresent();
+        System.out.println("   [diag] Servux 解码器可用 = " + decoder);
+        check("L3 结构化状态可用（与是否安装 Servux 无关）", viaBridge != null);
+        check("L4 朝向解出来就是我们要的 WEST",
+                viaBridge != null
+                        && viaBridge.getValue(BlockStateProperties.HORIZONTAL_FACING) == Direction.WEST);
+        check("L5 mixin 用结构化结果替换了原版结果", scoped != null && !scoped.equals(vanilla));
+        check("L6 scope 内结果与桥接层结果一致", viaBridge != null && viaBridge.equals(scoped));
 
         BlockState after = placementState(stairsItem, context);
         check("L7 出 scope 后恢复原版行为（ThreadLocal 没泄漏）", after != null);
         check("L8 scope 外结果与基线一致", after == vanilla);
+
+        // 内置解析新写的规则必须与 Servux 一致，否则「装不装 Servux」会得到不同的方块。
+        // 双半砖：一件预扣物品放不出两个半砖，Servux 的 easy-place 也是留给第二遍去合成。
+        ItemStack slabStack = new ItemStack(Items.OAK_SLAB);
+        BlockItem slabItem = (BlockItem) slabStack.getItem();
+        BlockPlaceContext slabContext = new BlockPlaceContext(bot, InteractionHand.MAIN_HAND, slabStack, hit);
+        BlockState slabBaseline = placementState(slabItem, slabContext);
+        PrinterPlacePayload slabInner = new PrinterPlacePayload(9002, List.of("minecraft:oak_slab"),
+                TARGET, hit, 0, dimension());
+        BlockState slabState;
+        try (PrinterPlaceServuxBridge.Scope ignored = PrinterPlaceServuxBridge.enter(slabItem, slabContext,
+                new PrinterPlaceStatePayload(slabInner, "minecraft:oak_slab", Map.of("type", "double")))) {
+            slabState = PrinterPlaceServuxBridge.scopedState(slabItem, slabContext);
+        }
+        check("L9 基线本身不是双半砖（否则 L10 空转）",
+                slabBaseline != null && slabBaseline.getValue(BlockStateProperties.SLAB_TYPE) != SlabType.DOUBLE);
+        check("L10 请求双半砖也不下发（与 Servux 的 easy-place 规则一致）",
+                slabState != null && slabState.getValue(BlockStateProperties.SLAB_TYPE) != SlabType.DOUBLE);
+
+        // 本次故障的直接判据。Fabric 只把「登记了 global receiver 的通道」广播给客户端，
+        // 客户端的 ClientPlayNetworking.canSend 就是读这份集合。state 通道不在里面 = 客户端
+        // 判定 stateChannel=false，每一块都退回去「补货到背包、手上放」。
+        Set<Identifier> advertised = ServerPlayNetworking.getGlobalReceivers();
+        check("L11 state 通道进了对外广播集合（客户端 canSend 的唯一来源）",
+                advertised.contains(PrinterPlaceStatePayload.TYPE.id()));
+        check("L12 三条上行直放通道全部在广播集合里",
+                advertised.contains(PrinterPlaceHelloPayload.TYPE.id())
+                        && advertised.contains(PrinterPlacePayload.TYPE.id())
+                        && advertised.contains(PrinterPlaceStatePayload.TYPE.id()));
     }
 
     /** 反射调 {@code getPlacementState}；mixin 改写的就是这个方法体，所以判据依然成立。 */

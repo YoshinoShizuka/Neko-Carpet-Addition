@@ -5,7 +5,7 @@
 ![Minecraft](https://img.shields.io/badge/Minecraft-26.3%20%7C%2026.2%20%7C%2026.1.2%20%7C%2026.1.1%20%7C%201.21.11-2ea043)
 ![Side](https://img.shields.io/badge/side-%E7%BA%AF%E6%9C%8D%E5%8A%A1%E7%AB%AF-informational)
 
-纯服务端 Carpet 扩展，面向技术生存与生电场景。共七条规则：**自动经验修补**、**虚空仓库**（全服共享、跨维度的分页仓库，配漏斗双向自动化）、**虚空仓库补货**、**虚空仓库 9 合 1 兑换**、**虚空仓库配方扣料**、**方块掉落物直接进虚空仓库**、**混凝土粉末烧制染色玻璃**。全部默认关闭，用 `/carpet` 逐条开启。客户端可以是原版。
+纯服务端 Carpet 扩展，面向技术生存与生电场景。共八条规则：**自动经验修补**、**虚空仓库**（全服共享、跨维度的分页仓库，配漏斗双向自动化）、**虚空仓库补货**、**虚空仓库直接放置**、**虚空仓库 9 合 1 兑换**、**虚空仓库配方扣料**、**方块掉落物直接进虚空仓库**、**混凝土粉末烧制染色玻璃**。全部默认关闭，用 `/carpet` 逐条开启。客户端可以是原版。
 
 另有配套**纯客户端模组** [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search)：在虚空仓库界面上叠加搜索框，支持中文 / 拼音 / 注册名筛选物品，详见下文「[虚空仓库搜索框](#虚空仓库搜索框配套客户端-mod)」。
 
@@ -71,6 +71,19 @@
 
 **默认关是有意的** —— 开着就等于「任何装了对应打印机的玩家都能动用全服共享库存」，这个授权该由服主主动打开。
 
+### 虚空仓库直接放置
+
+补货的下一步：打印机缺料时**不再把一整组塞进背包**，而是从仓库预扣**一件**、直接放到目标位置。手上不会出现物品，打印完背包里也不会剩一堆零头。
+
+- **零净变化的预扣**：流程是「从仓库预扣 1 件 → 临时塞进当前快捷栏格 → 走原版 `BlockItem#place` → 没放成的原样还回仓库」（`Withdrawal#returnUnplaced`）。结束之后快捷栏那一格与背包跟放置前完全一致
+- **走的是原版放置原语**，不是自己往世界里写方块 —— 朝向、半砖上下、楼梯拐角、栅栏连接、含水状态、红石灯亮灭、铁轨的 `shape` / `powered` / `waterlogged` 全部按原版算
+- **半砖合并**：对着底/顶台阶点缺失的那一面，一件预扣物直接给出双台阶（与手动放完全同理）
+- **结构化状态自己算，不依赖 Servux**：方块属性由本模组按语义属性表推出，装了 Servux 就借它的解码器交叉验证。**没装 Servux 也能用** —— 之前缺了它会整条回退成「补货到背包、手上放」，一条直放都发不出去
+- **不接的方块**：床 / 门 / 双格植物 / 潜影盒（一件预扣物放不出目标状态，或会额外消耗掉玩家自己的东西）；以及任何不是「裸 `BlockItem`」的物品（水桶、船、矿车……原版放置会改容器或产出多件）
+- **和手动放一样受规矩约束**：非生存模式、`mayBuild` 为假、界面没关、手臂够不着、目标位置已被别人改过（`expectedStateId` 不符）—— 任一条不满足就整笔撤回，**仓库零消耗**
+- **扣料会报一声**：`[虚空仓库] 放置消耗 64 个 石头（仓库剩余 998213 个）`，与取货提示同一套配色（灰正文 + 亮绿数字）。同一玩家**每秒最多一条**、同一种物品合并累加、一条最多列 4 种（再多折成「N 种共 M 个」）—— 直放实测峰值 **34 次/秒**，一次一条会把聊天栏刷穿
+- 默认 `false`，**依赖** `voidWarehouse` + `voidWarehouseRestock`。客户端要装 [litematica-printer](https://github.com/Yur1Ca/litematica-printer)，并在其配置里打开 `voidWarehouseDirectPlace`（与 `voidWarehouseRestock` 配套使用）
+
 ### 混凝土粉末烧制染色玻璃
 
 16 种混凝土粉末在**普通熔炉**里烧成对应颜色的染色玻璃，数值与原版「沙子 → 玻璃」一致（0.1 经验 / 200 tick）。高炉与烟熏炉不在覆盖范围内。
@@ -111,7 +124,7 @@
    - **Carpet**（版本号需 ≥ 对应的 Minecraft 版本）
    - **本模组**，按 MC 版本选 `carpet-Neko-Addition-mc<版本>-<模组版本>.jar`（从 [Releases](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/releases/latest) 下载）
 3. 启动后用 `/carpet <规则> true` 逐条开启
-4. 客户端可以原版直连；要用打印机补货，客户端另装 `litematica-printer`，并在服务端开 `voidWarehouseRestock`
+4. 客户端可以原版直连；要用打印机补货 / 直接放置，客户端另装 `litematica-printer` 并在它的配置里打开 `voidWarehouseRestock` / `voidWarehouseDirectPlace`，服务端开对应的那几条规则
 5. 想要搜索框，客户端另装 [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search)（按客户端 MC 版本选 jar）；不装也不影响任何服务端功能
 
 > 旧版 `carpet-automending`（包 `carpetaddition`）的仓库数据不兼容，升级相当于换一个新仓库。

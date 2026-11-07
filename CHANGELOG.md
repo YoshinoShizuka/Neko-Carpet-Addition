@@ -3,6 +3,83 @@
 > **版本号只代表「规则集变了」**：只有新增一条 carpet 规则才升号；修 bug、改算法、补自检、改文档一律**原地覆盖当前版本**。
 > 所以同一个版本号下的 jar 可能比首次发布更新，靠文件名旁的 md5 区分。
 
+## Carpet Neko Addition 1.0.17
+
+> **这一版正式发布「虚空仓库直接放置」。规则来自 [Yur1Ca](https://github.com/Yur1Ca)（Hana）的 [PR #1](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/1)**，配套客户端是同一位维护的 [litematica-printer](https://github.com/Yur1Ca/litematica-printer)。
+> 1.0.16 的发布产物里**没有**这条规则 —— PR #1 在 1.0.16 发布之后才合入，所以这是唯一一次「因为新增一条 Carpet 规则」而升号，符合本文件的版本号约定。
+> **This release ships `voidWarehouseDirectPlace`**, contributed by [Yur1Ca](https://github.com/Yur1Ca) (Hana) in [PR #1](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/1), paired with their [litematica-printer](https://github.com/Yur1Ca/litematica-printer). The 1.0.16 artifacts predate that PR, hence the version bump.
+
+### ✨ Added & Improved / 新增与优化
+
+#### 虚空仓库直接放置（`voidWarehouseDirectPlace`）
+
+打印机缺料时**不再把一整组塞进背包**，而是从仓库预扣**一件**、直接放到目标位置。手上不会出现物品，打印完背包里也不会剩下成堆零头(The printer places blocks straight from the warehouse instead of restocking a full stack into the inventory.)。
+
+- **零净变化的预扣**：流程是「从仓库预扣 1 件 → 临时塞进当前快捷栏格 → 走原版 `BlockItem#place` → 没放成的原样还回仓库」（`Withdrawal#returnUnplaced`）。结束之后那一格与背包跟放置前完全一致(One item is reserved, placed through the vanilla primitive, and returned if the placement does not happen.)。
+- **走的是原版放置原语**，不是自己往世界里写方块 —— 朝向、半砖上下、楼梯拐角、栅栏连接、含水状态、红石灯亮灭、铁轨的 `shape` / `powered` / `waterlogged` 全部按原版算(Vanilla placement decides the block state, so orientation, slabs, stairs, fences and fluidlogged states all match hand-placing.)。
+- **半砖合并**：对着底/顶台阶点缺失的那一面，一件预扣物直接给出双台阶 —— 与手动放完全同理(The slab merge case is handled with the same single reserved item.)。
+- **不接的方块**：床 / 门 / 双格植物 / 潜影盒（一件预扣物放不出目标状态，或会额外消耗掉玩家自己的东西）；以及任何不是「裸 `BlockItem`」的物品（水桶、船、矿车……原版放置会改容器或产出多件）(Beds, doors, double plants, shulker boxes and non-plain `BlockItem` subclasses are refused on the server, since one reserved item cannot produce their target state.)。
+- **和手动放一样受规矩约束**：非生存模式、`mayBuild` 为假、界面没关、手臂够不着、目标位置已被别人改过（`expectedStateId` 不符）—— 任一条不满足就整笔撤回，**仓库零消耗**(Every refusal path rolls the reservation back; the warehouse is never charged.)。
+- 🔴 **回调里要重新校验**：`UseBlockCallback` 可能在放置前改世界或换手上的物品，所以进入放置原语之前会再读一次目标方块状态与主手物品，绝不拿旧快照放(World state is re-read after the interaction callback; a stale snapshot is never placed.)。
+- 默认 `false`，**依赖** `voidWarehouse` + `voidWarehouseRestock`：没有仓库、或没开补货通道，它什么都不做(Disabled by default; requires both rules.)。
+- 客户端要装 `litematica-printer`，并在其配置里打开 `voidWarehouseDirectPlace`(Enable the matching client option — the server side alone does nothing.)。
+
+#### 直接放置的扣料提示
+
+直放以前是**没有任何回执**的：方块凭空出现、背包不动，玩家能看到的唯一变化是仓库里少了东西，而那要打开界面才知道。同一条路上的「取货」会明确报一句，直放现在也报(Direct placement now reports what it took from the warehouse, in the same style as restocking.)。
+
+- **文案**：`[虚空仓库] 放置消耗 64 个 石头（仓库剩余 998213 个）` —— 与取货/收料提示同一套配色（前缀 `[虚空仓库]` 亮金 + 正文浅灰 + 数字亮绿）(Same colour scheme as the restock notice.)。
+- 🔴 **不能一放一条**：实机 26.3 日志里单个 200 tick 窗口下发过 **334 次**直放，峰值约 **34 次/秒** —— 一次一条就是每秒滚 34 行，玩家自己的聊天记录会被彻底顶掉，比不给提示还糟(A raw per-block notice would scroll 34 lines per second.)。所以：
+  - **先攒后发**：每次放置只记账（物品 + 数据组件相同就累加数量），不立刻发(Records are accumulated, not sent immediately.)；
+  - **同一玩家每秒最多一条**：窗口内新到的继续累加，下一条一并报数 —— 不是延迟通知，是把「这一秒放下去的方块」合成一句(At most one line per second per player, coalescing the whole window.)；
+  - **一条最多列 4 种**：再多折成「N 种共 M 个」，免得一条提示比聊天框还长(At most four kinds are listed; more collapse into a single total.)。
+- **库存是发消息那一刻现读的**，不是逐块快照：口径为「物品 + 数据组件」，与提示里的分组同一口径，所以报出来的数正好对得上玩家打开仓库看到的那一行(Stock is read at send time, on the same item+components basis as the grouping.)。
+- **只报真正扣掉的**：被拒、过期、没货、规则关 —— 这些情况 `consumed` 为 0（预扣物已原样还回仓库），一条提示都不发(Only real deductions are reported.)。
+- 物品名保持可翻译组件原样发出，**绝不**在服务端 `getString()`：专用服务器没人注入语言表，那样中文客户端会看到英文物品名(Item names stay as translatable components so the client localises them.)。
+
+### 🐛 Fixed / 修复
+
+#### 结构化直放不再依赖 Servux（单人存档里整条规则完全不生效）
+
+实机 26.3 单人存档里，三条规则都开着、打印机四项配置也全开，直放却**一条消息都不发**，每一块都退回「取走 64 个 … 补进背包、手上放」(On a singleplayer 26.3 world the rule looked dead: every block fell back to restocking into the inventory.)。
+
+- **根因不在协议，在模组元数据**：`servux-fabric-26.3-0.12.2.jar` 的 `fabric.mod.json` 写着 `"environment": "server"`，Fabric Loader 在客户端（**含单人集成服务器**）会**直接跳过**它，而且不报错。实机日志 183 个模组里根本没有 servux，也没有任何加载失败告警(The bundled Servux jar declares `environment: server`, so Fabric Loader silently skips it on the client, integrated server included.)。
+- **于是整条通道静默断掉**：`PrinterPlaceServuxBridge.available()` 为假 → `bind()` 第一行 `isModLoaded("servux")` 直接 `return null`（唯一不打日志的分支）→ `printer_place_state_v1` 的类型登记与接收端都不执行 → 客户端 `canSend` 为假 → `stateChannel=false` → 放置执行器 `route()` 返回 `INVENTORY` → 每一块都走取货补背包(The state channel was never registered, so every request degraded to the inventory route.)。
+- **日志硬证据**：`[WarehouseDirectPlace] capabilities enabled=true stateChannel=false`。`enabled=true` 说明 hello 握手、三条规则、通道 id 全没问题，只差 state 这一条；而 `bind()` 里唯独 `isModLoaded` 那条是裸 `return null`，其余分支都会 `warn` —— "Servux placement API is unavailable" 全程没出现，正好反证就是它(The diagnostics line pinned it to the state channel alone.)。
+- **修法：结构化状态改由本模组自己算**，Servux 在场时才借它的解码器交叉验证。把它的两张表镜像进来（22 项白名单、`WATERLOGGED` / `POWERED` 两项黑名单，均按 0.12.2 字节码逐项核对），新增 `withRequested()` 直接从语义属性表算目标状态；`API == null` 时直接返回它，不再有「算不出来」这条路(The server now derives the block state itself, mirroring Servux's two tables verified against its bytecode.)。
+- **半砖特意跳过 `SlabType.DOUBLE`**：一件预扣物品放不出两个半砖；Servux 的 easy-place 也是留给第二遍去合成，内置解析不能在这点上和它分叉(The semantic path skips `SlabType.DOUBLE` so it stays consistent with Servux.)。
+- `PrinterPlaceNetwork.init()` 的 state 通道改成**无条件登记**；`PrinterPlaceService` 去掉 `!available()` 那道拒绝；`hasPermission()` 在没有 Servux 时放行 —— 权限本来就该由 carpet 规则 + `mayBuild` / `mayInteract` 决定(The state channel is registered unconditionally and the Servux-presence gate is gone.)。
+- **验证**（真服务端 `runServer` 跑 `PrinterDirectPlaceSelfCheck`）：26.3 **106 条断言全绿**（原 102 + 新增 L9 双半砖不下发 / L10 基线守卫 / L11 state 通道进广播集合 / L12 三条上行通道齐全）(106 assertions green on a real server.)。
+- **反证一**：`bind()` 强制 `return null` 模拟单人 → diag 打 `false`，L3–L10 仍全绿 ⇒ 内置解析与 Servux 回环**等价**，不是「换了个算法」(Forcing `bind()` to null keeps the main group green, proving the built-in path is equivalent.)。
+- **反证二**：把 state 登记重新包进 `if (false)` → `failures=2`，正好 L11 / L12 翻红 ⇒ 这两条确实咬住本次故障，不是摆设(Wrapping the registration back in `if (false)` flips exactly those two assertions.)。
+
+### 📦 Builds / 构建产物
+
+| MC 版本 | 文件 | 体积 | md5 |
+| --- | --- | --- | --- |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 437,066 B | `8077383f5287bdb4b3d1ef40208e6208` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 438,168 B | `ce2fc9286028e3c765d6372ae8e1ecee` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 437,183 B | `a0a69fcfa9c1894262d65a81761e2e60` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 438,586 B | `c7685e99343fede9b9eeeec75b19d56c` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 440,450 B | `9927b093ec9065d034459be5cd8c586f` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 439,597 B | `69a557ead24992585ab6f29cdca796e2` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 440,451 B | `7c58297e88c20d348883a2223779a614` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 439,596 B | `f396eb6c7857faaf1dac1c366eff79ae` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 437,346 B | `16d6252ff0b315e84b3ec0cafc593af1` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 439,199 B | `63fd49cb6f235573f5a99914135e7ce1` |
+
+> 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
+
+### ⚠️ 升级提示 / Upgrade Notes
+
+- **新增一条 Carpet 规则**（`voidWarehouseDirectPlace`，默认 `false`），规则集变了，所以版本号升到 1.0.17。存档格式、配置键、已有规则名**均未变**，直接替换 jar 即可(One new rule; no data-format or config change — just swap the jar.)。
+- **直放要三条一起开**：服务端 `voidWarehouse` + `voidWarehouseRestock` + `voidWarehouseDirectPlace`，客户端在 `litematica-printer` 配置里也打开 `voidWarehouseDirectPlace`。少一条就退回「补货到背包、手上放」(All three server rules plus the client option are required.)。
+- **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
+- **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
+- **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
+
+* * *
+
 ## Carpet Neko Addition 1.0.16
 
 ### ✨ Added & Improved / 新增与优化

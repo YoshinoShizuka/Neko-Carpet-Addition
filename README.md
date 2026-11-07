@@ -16,6 +16,7 @@
 | `autoMending` | `false` | 每秒把一件带经验修补的物品修满，先花经验条、再动等级 |
 | `voidWarehouse` | `false` | 铁砧改名的工作台成为全服共享仓库，一种物品一格、数量无上限 |
 | `voidWarehouseRestock` | `false` | 允许 litematica-printer 缺料时直接从仓库领一组（**依赖** `voidWarehouse`） |
+| `voidWarehouseDirectPlace` | `false` | 打印机缺料时从仓库预扣一件、直接放到目标位置，不经过背包（**依赖** `voidWarehouse` + `voidWarehouseRestock`） |
 | `voidWarehouseExchange` | `false` | 成品缺货时改用 N 合 1 配方的原料顶替，也可拆上级找零（**依赖** `voidWarehouse`） |
 | `voidWarehouseCraft` | `false` | 成品缺货时按玩家亲手合成过的配方扣原料，直接把成品取出来（**依赖** `voidWarehouse`） |
 | `voidWarehouseBlockDrops` | `false` | 玩家挖掉的方块，掉落物不进世界、直接进仓库（**依赖** `voidWarehouse`） |

@@ -5,6 +5,7 @@ import carpet.CarpetServer;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 
+import neko.voidwarehouse.restock.PrinterPlaceNotifier;
 import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
 
 /**
@@ -52,6 +53,11 @@ public class VoidWarehouseExtension implements CarpetExtension {
         // 「方块掉落物直接进虚空仓库」的聊天提示：按玩家汇总、每秒最多一条（见 VoidWarehouseBlockDrops#tick）。
         // 必须在「规则关着就提前 return」之前 —— 规则刚被关掉时，攒下的那几条也要发出去。
         VoidWarehouseBlockDrops.tick(server);
+
+        // 「直接放置从仓库扣料」的聊天提示：同一套「按玩家汇总、每秒最多一条」
+        // （见 PrinterPlaceNotifier#tick）。直放是全模组最高频的动作（实机峰值 34 次/秒），
+        // 一次一条会把聊天栏刷穿。同样必须在「规则关着就提前 return」之前。
+        PrinterPlaceNotifier.tick(server);
 
         if (VoidWarehouseSettings.voidWarehouse && VoidWarehouseSettings.voidWarehouseExchange) {
             VoidWarehouseExchangeBootstrap.tick(server);

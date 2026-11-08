@@ -53,20 +53,32 @@
 - **反证一**：`bind()` 强制 `return null` 模拟单人 → diag 打 `false`，L3–L10 仍全绿 ⇒ 内置解析与 Servux 回环**等价**，不是「换了个算法」(Forcing `bind()` to null keeps the main group green, proving the built-in path is equivalent.)。
 - **反证二**：把 state 登记重新包进 `if (false)` → `failures=2`，正好 L11 / L12 翻红 ⇒ 这两条确实咬住本次故障，不是摆设(Wrapping the registration back in `if (false)` flips exactly those two assertions.)。
 
+#### 交互距离检查重复测量，导致直放被整笔拒绝（[PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2)）
+
+1.0.17 发布后收到的第一份外部修复，来自配套客户端 [litematica-printer](https://github.com/Yur1Ca/litematica-printer) 的维护者 [Yur1Ca](https://github.com/Yur1Ca)（Hana）：直放在某些摆位上被服务端判为 `REJECTED`，根源是准入判断里**同一件事被量了两遍，而且两遍的阈值口径不同**(PR #2 removes a duplicated reach check from the placement gate.).
+
+- **被删掉的那条**：`player.getEyePosition().distanceToSqr(payload.hit().getLocation()) > Math.pow(player.blockInteractionRange() + 1.0, 2)` —— 量的是**眼睛到命中点**的距离(The removed line measured eye-to-hit-point.).
+- **留下的那条**：`allowedPosition()` 里的 `player.isWithinBlockInteractionRange(pos, 1.0)`。按 javap 的真实实现，它量的是**眼睛到方块 AABB 最近点**的距离，阈值同样是 `blockInteractionRange() + 1.0`(The surviving check measures eye-to-block-AABB with the same range.).
+- **命中点必然落在方块 AABB 内** ⇒ 前者恒 `≤` 后者，**只会更严，永远不会先放行**。它不是第二道防护，而是同一道闸门的更严格副本；删掉它不降低任何安全性，只去掉了「客户端瞄准点稍偏就被误拒」这条假阴性(Since the hit point always lies inside the AABB, the removed check could only be stricter — never a second line of defence.).
+- **验证**：五版本产物逐个 `javap` 复核，`PrinterPlaceService` 里 `distanceToSqr` 调用数归零、`allowedPosition` 内 `isWithinBlockInteractionRange` 仍在（26.3 / 26.2 / 26.1.2 / 26.1.1 为可读名，1.21.11 经 remap 后是 `method_56093`）(Verified per version by javap after remapping.).
+- **CI 五版本全绿后合并**（merge commit `302207f`）；本节列出的本版资产即由该提交的 CI 构建替换(All five versions went green before the merge; the assets listed here are that merge commit's CI build.).
+
 ### 📦 Builds / 构建产物
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 437,066 B | `8077383f5287bdb4b3d1ef40208e6208` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 438,168 B | `ce2fc9286028e3c765d6372ae8e1ecee` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 437,183 B | `a0a69fcfa9c1894262d65a81761e2e60` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 438,586 B | `c7685e99343fede9b9eeeec75b19d56c` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 440,450 B | `9927b093ec9065d034459be5cd8c586f` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 439,597 B | `69a557ead24992585ab6f29cdca796e2` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 440,451 B | `7c58297e88c20d348883a2223779a614` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 439,596 B | `f396eb6c7857faaf1dac1c366eff79ae` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 437,346 B | `16d6252ff0b315e84b3ec0cafc593af1` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 439,199 B | `63fd49cb6f235573f5a99914135e7ce1` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 436,942 B | `ed40c2cef3b71311b19173311a56a78f` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 437,613 B | `28ea5f03f72251a492952606aa878480` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 437,055 B | `142a3d2fd194d02893c35eea7da7ad54` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 438,032 B | `a1a0ba93043a9ca11746e6549b007b1a` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 440,322 B | `7a3ede4545e7aa6cb534461f7bc7e0db` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 439,062 B | `8e4e02f7c3ee8d24652d45ea00cb5526` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 440,323 B | `822129937716971a191a3b03e9f62717` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 439,061 B | `e6f3b82e9aeca5144d033d2bfba99bf5` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 437,230 B | `75416f6e376234badc9e6c9b3399bfb4` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 438,691 B | `d16a0d7d6892fe4bb011f705ac7206f3` |
+
+> **本表已按 `302207f` 的 CI 构建整表刷新**（2026-11-08，并入 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2)）。v1.0.17 是**同版本号原地替换**：规则集、配置键、存档格式一个字都没动，但 jar 的字节变了，md5 与首次发布不同 —— 请按上表核对(This table was refreshed against the CI build of `302207f`; the v1.0.17 assets were replaced in place, so their md5 differs from the first upload.)。
 
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 
@@ -77,6 +89,7 @@
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
+- **v1.0.17 的产物换过一次**：2026-11-08 把 v1.0.17 的五个 jar 原地替换为含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建，**版本号没变**，只是字节变了。已经下过首次发布的，按下方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place on 2026-11-08 to include PR #2; the version number is unchanged.)。
 
 * * *
 

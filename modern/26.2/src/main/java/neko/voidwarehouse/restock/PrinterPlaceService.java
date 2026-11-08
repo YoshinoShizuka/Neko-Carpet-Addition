@@ -116,9 +116,7 @@ public final class PrinterPlaceService {
         BlockPos clicked = payload.hit().getBlockPos();
         if (player.gameMode.getGameModeForPlayer() != GameType.SURVIVAL || !player.isAlive()
                 || !player.mayBuild() || player.isUsingItem() || player.containerMenu != player.inventoryMenu
-                || !allowedPosition(level, player, clicked) || !allowedPosition(level, player, target)
-                || player.getEyePosition().distanceToSqr(payload.hit().getLocation())
-                    > Math.pow(player.blockInteractionRange() + 1.0, 2)) {
+                || !allowedPosition(level, player, clicked) || !allowedPosition(level, player, target)) {
             return PlaceOutcome.of(PrinterPlaceResultPayload.REJECTED);
         }
         if (Block.getId(level.getBlockState(target)) != payload.expectedStateId()) {

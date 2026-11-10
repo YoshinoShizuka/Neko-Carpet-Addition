@@ -39,12 +39,21 @@ import java.util.UUID;
  * <p>所以这里改成：<b>从最小规模向上加，单次超过 {@link #BAIL_MS} 就停下并把它记为拐点</b>。
  * 目的是拿到「规模 → 耗时」这条曲线和那个拐点，而不是拿一次崩溃当结论。</p>
  *
- * <h2>三组实验</h2>
+ * <h2>各组实验</h2>
  * <ol>
+ *   <li><b>S 环境自检</b>：语料 / 原料 / 产物口径，外加 20 个真实玩家；</li>
  *   <li><b>A 规模曲线</b>：原料固定 10,000，配方 100 / 300 / 600 / 900 / 1236 条；</li>
  *   <li><b>B 原料量曲线</b>：配方固定 A 组能跑完的最大规模，原料 100 / 1,000 / 10,000 / 100,000；</li>
- *   <li><b>C 功能验收</b>：在 A 组最大规模上做取货、菜单、20 人并发、界面、可靠性。</li>
+ *   <li><b>C 功能验收</b>：取货、菜单、20 人并发；</li>
+ *   <li><b>D 热点</b>：逐条量 {@code maxCraftable}，点名最贵的配方；</li>
+ *   <li><b>E 正确性梯度</b>：按规模扫「界面判做不出、实际做得出」的条数；</li>
+ *   <li><b>F 双向精确性</b>：逐条把 {@code maxCraftable} 与 {@code plan} 二分真值对齐，
+ *       判多 / 判少都必须为 0；</li>
+ *   <li><b>G 界面货架对账</b>：从货架侧反查「仓库有料、有配方、却没出现」的产物。</li>
  * </ol>
+ *
+ * <p>E / F / G 三组是 1.0.17 那条「宽松上界 + 线性退让 64 次」缺陷的<b>回归闸门</b>：
+ * 修之前 E1 会红（丢 260 条），F2 也会红（判少 260 条）；修完之后三组必须全绿。</p>
  *
  * <h2>语料</h2>
  * <p>{@code C:/tmp/nca_recipes_263.txt} —— {@code RecipeCorpusExport} 在 26.3 真服务端枚举
@@ -394,12 +403,13 @@ public final class A2StressTest {
                     + " siblings=" + byOutput.get(sub.get(i).output()).size());
         }
 
-        // ---- E 组：MAX_VERIFY 线性回退的正确性后果（梯度）----
-        // maxCraftable 先用 boundCap 估一个「宽松上界」，再 cap-- 逐个试，最多 MAX_VERIFY(64) 次。
-        // 上界高估超过 64 时，64 次全部落空 -> 返回 0 -> 界面不出这一格。
+        // ---- E 组：线性回退的正确性后果（梯度；这是修复前那条缺陷的形状）----
+        // 1.0.17 之前：maxCraftable 先用 boundCap 估一个「宽松上界」，再 cap-- 逐个试，最多 64 次。
+        // 上界虚高超过 64 次时 64 次全部落空 -> 返回 0 -> 界面不出这一格；
         // 而同一条配方走 plan()（精确请求）只 simulate 一次，往往成功 ——
-        // 那就是「玩家看不到、其实做得出」。这组按规模扫，找出从哪一档开始丢。
-        System.out.println("---- E 组：maxCraftable 回退的正确性（按规模扫）----");
+        // 那就是「玩家看不到、其实做得出」。这一组按规模扫，记录还丢不丢。
+        // 改成二分之后全档应为 0，E1 就是这条回归闸门。
+        System.out.println("---- E 组：正确性梯度（按规模扫，看还丢不丢配方）----");
         int lastZero = 0;
         int lastLost = 0;
         for (int en : SCALE_LADDER) {
@@ -434,87 +444,164 @@ public final class A2StressTest {
         check("E1 满本时「界面判做不出、实际做得出」的配方数为 0（实测丢 " + lastLost
                 + " 条 / 判 0 共 " + lastZero + " 条）", lastLost == 0);
 
-        // ---- F 组：把「宽松上界到底虚高多少」量出来 ----
-        // E 组只证明「会错」；这组回答「错在哪个量级」，直接决定修法是「把 64 调大」还是「换算法」。
-        // 做法：复刻 boundCap / availOf（原方法是 private）算出上界 cap（单位=合成次数），
-        //      再用 plan() 当真值探针做二分（plan 只 simulate 一次，口径与执行完全一致）。
-        // 自洽校验：凡 maxCraftable 返回 R>0，必然有 cap − R_crafts ≤ MAX_VERIFY−1 = 63
-        //      （它就是「从 cap 往下退 p 次，第 p 次才成」）。这条不成立说明复刻走样，本组数据作废。
-        //      ⚠️ 分母只能是「返回 >0 的那几条」：返回 0 的那些压根没退到真值，不构成反例。
-        System.out.println("---- F 组：宽松上界 vs 真值（n=" + mainScale + "）----");
-        int capChecked = 0;
-        int posCount = 0;
-        int capConsistent = 0;
-        int failN = 0;
-        long failNs = 0;
-        long okNs = 0;
-        long[] probes = new long[sub.size()];
-        int probeN = 0;
-        long gapMin = Long.MAX_VALUE;
-        long gapMax = -1;
-        long askStart = System.nanoTime();
-        List<String> fEx = new ArrayList<>();
+        // ---- F 组：可达性 + 判少 + 非单调观测 ----
+        // 逐条把 maxCraftable 的返回值与「plan 二分出来的可行点」对齐。
+        //
+        // ⚠️ 这里<b>不能</b>把「got > truth」叫「判多」：maxCraftable 只返回自己用 simulate
+        // 验证过的数（快路径验证 cap、二分只把 feasible 的 mid 记成 best），所以「报一个取不出来的
+        // 数」在结构上就不可能。got > truth 只说明<b>可行集不是区间</b> —— truth 的二分漏掉了
+        // 更大的可行点（26.2 / 26.1.2 的 green_cushion 就是：got=13392 可行，truth=10046 却漏了）。
+        // 于是三条判据这样分工：
+        //   F1 可达性：报出来的数 plan 必须真能取出来（不变式，防将来加一条「猜」的快路径）；
+        //   F2 判少：got < truth 为 0。truth 永远是可行点，比它小就是漏报，这才是真缺陷；
+        //   F3 整数倍：返回值必须是 outputCount 的倍数；
+        //   非单调：got > truth 的条数只作观测输出，不判失败。
+        // hi 直接取 boundCap 的上界值：它按定义就是上界，二分区间必然盖住真值，不需要任何截断。
+        // （早先版本用「100_000 截断」，真值被压成 hi 本身，凭空造出一堆假 over —— 测具自己的坑。）
+        System.out.println("---- F 组：可达性 / 判少 / 非单调（n=" + mainScale + "）----");
+        int fChecked = 0;
+        int fExact = 0;
+        int fAhead = 0;
+        int fUnder = 0;
+        int fUnreachable = 0;
+        int fNotMultiple = 0;
+        long fCapSum = 0;
+        BigInteger fMaxGap = BigInteger.ZERO;
+        String fMaxGapLabel = "-";
+        List<String> fAheadEx = new ArrayList<>();
+        List<String> fUnderEx = new ArrayList<>();
+        List<String> fUnreachEx = new ArrayList<>();
+        long fStart = System.nanoTime();
         for (int i = 0; i < sub.size(); i++) {
+            if (System.nanoTime() - fStart > 40_000_000_000L) {
+                System.out.println("   !! F 组超过 40s，提前停在 " + i + "/" + sub.size());
+                break;
+            }
             VoidWarehouseRecipes.Recipe recipe = sub.get(i);
             Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(data, recipe, byOutput);
             BigInteger cap = capOf(recipe, stock, byOutput);
             if (cap == null) {
                 continue;
             }
-            BigInteger got = VoidWarehouseRecipes.maxCraftable(recipe, stock, byOutput);
+            fCapSum += Math.max(0L, cap.longValue());
             BigInteger out = BigInteger.valueOf(recipe.outputCount());
-            capChecked++;
-            if (got.signum() > 0) {
-                posCount++;
-                okNs += perRecipe[i];
-                if (cap.subtract(got.divide(out)).compareTo(BigInteger.valueOf(64)) < 0) {
-                    capConsistent++;
+            BigInteger got = VoidWarehouseRecipes.maxCraftable(recipe, stock, byOutput);
+            long truthCrafts = trueMaxCrafts(recipe, stock, byOutput, Math.max(0L, cap.longValue()));
+            BigInteger truth = BigInteger.valueOf(truthCrafts).multiply(out);
+            fChecked++;
+            if (got.mod(out).signum() != 0) {
+                fNotMultiple++;
+            }
+            if (got.signum() > 0
+                    && VoidWarehouseRecipes.plan(recipe, got, stock, byOutput) == null) {
+                fUnreachable++;
+                if (fUnreachEx.size() < 4) {
+                    fUnreachEx.add(recipe.output() + " got=" + got);
                 }
+            }
+            int cmp = got.compareTo(truth);
+            if (cmp > 0) {
+                fAhead++;
+                if (fAheadEx.size() < 4) {
+                    fAheadEx.add(recipe.output() + " got=" + got + " truth=" + truth);
+                }
+            } else if (cmp < 0) {
+                fUnder++;
+                BigInteger gap = truth.subtract(got);
+                if (gap.compareTo(fMaxGap) > 0) {
+                    fMaxGap = gap;
+                    fMaxGapLabel = recipe.output();
+                }
+                if (fUnderEx.size() < 4) {
+                    fUnderEx.add(recipe.output() + " got=" + got + " truth=" + truth);
+                }
+            } else {
+                fExact++;
+            }
+            sink += cmp;
+        }
+        System.out.printf("PERF exactness checked=%d exact=%d under=%d aheadNonMonotone=%d "
+                        + "unreachable=%d notMultiple=%d%n",
+                fChecked, fExact, fUnder, fAhead, fUnreachable, fNotMultiple);
+        System.out.printf("PERF exactness under.maxGap=%s at=%s capSum=%d%n",
+                fMaxGap, fMaxGapLabel, fCapSum);
+        if (!fUnderEx.isEmpty()) {
+            System.out.println("PERF exactness underExamples=" + fUnderEx);
+        }
+        if (!fAheadEx.isEmpty()) {
+            System.out.println("PERF exactness nonMonotoneExamples=" + fAheadEx);
+        }
+        if (!fUnreachEx.isEmpty()) {
+            System.out.println("PERF exactness unreachableExamples=" + fUnreachEx);
+        }
+        check("F1 报出来的数一定能取出来（plan(got) 成功；失败 " + fUnreachable + "）",
+                fUnreachable == 0);
+        check("F2 判少（plan 做得出更多、界面没报那么多）为 0（实测 " + fUnder + "）", fUnder == 0);
+        check("F3 返回值始终是 outputCount 的整数倍", fNotMultiple == 0);
+
+        // ---- G 组：界面货架对账（「该出现的没出现」从货架侧反查）----
+        // F 组是逐条算法对账，这组问的是玩家真正看到的那一格：
+        // 对每个「有配方、仓库里没货、却不在货架上」的产物，用 plan(1) 直接问一句
+        // 「现在点一下能不能做出来」。答能 -> 界面把它藏了，玩家永远看不见这个东西。
+        // 这条判据<b>不经过 maxCraftable</b>，所以它与被测代码是独立的。
+        System.out.println("---- G 组：界面货架对账（按规模扫）----");
+        int gLastAbsent = 0;
+        int gLastMissing = 0;
+        List<String> gLastEx = new ArrayList<>();
+        for (int gn : SCALE_LADDER) {
+            if (gn > corpus.size() || gn > mainScale) {
                 continue;
             }
-            failN++;
-            failNs += perRecipe[i];
-            // 只对「判 0」的那些求真值：它们才是「退让次数不够」的直接受害者
-            if (System.nanoTime() - askStart > 8_000_000_000L) {
-                continue;
+            VoidWarehouseData gd = build(gn, SCALE_RAW);
+            VoidWarehouseData.noteServerTick(4_000 + gn);
+            gd.markChanged();
+            List<VoidWarehouseData.ExchangeOffer> gOffers = gd.exchangeOffers();
+            Set<String> onShelf = new java.util.HashSet<>(gOffers.size() * 2);
+            int craftOffers = 0;
+            for (VoidWarehouseData.ExchangeOffer offer : gOffers) {
+                onShelf.add(offer.itemId());
+                if (offer.craft()) {
+                    craftOffers++;
+                }
             }
-            long hi = cap.multiply(out).min(BigInteger.valueOf(100_000L)).longValue();
-            long trueOut = trueMaxOut(recipe, stock, byOutput, hi);
-            if (trueOut <= 0) {
-                continue;   // 确实做不出来（跨版本的合法 0）
+            List<VoidWarehouseRecipes.Recipe> gSub = new ArrayList<>(
+                    corpus.subList(0, Math.min(gn, corpus.size())));
+            Map<String, List<VoidWarehouseRecipes.Recipe>> gBy =
+                    VoidWarehouseRecipes.byOutput(gSub);
+            int absent = 0;
+            int missing = 0;
+            List<String> mex = new ArrayList<>();
+            for (Map.Entry<String, List<VoidWarehouseRecipes.Recipe>> group : gBy.entrySet()) {
+                String itemId = group.getKey();
+                Item item = VoidWarehouseRecipeBook.itemOf(itemId);
+                if (item == null || gd.amountOf(item).signum() > 0 || onShelf.contains(itemId)) {
+                    continue;
+                }
+                absent++;
+                boolean craftable = false;
+                for (VoidWarehouseRecipes.Recipe r : group.getValue()) {
+                    Map<String, BigInteger> s = VoidWarehouseRecipeBook.stockFor(gd, r, gBy);
+                    if (VoidWarehouseRecipes.plan(r, BigInteger.ONE, s, gBy) != null) {
+                        craftable = true;
+                        break;
+                    }
+                }
+                if (craftable) {
+                    missing++;
+                    if (mex.size() < 4) {
+                        mex.add(itemId);
+                    }
+                }
             }
-            long trueCrafts = (trueOut + recipe.outputCount() - 1) / recipe.outputCount();
-            long need = cap.longValue() - trueCrafts;   // 需要退让几次才能摸到真值
-            if (need < 0) {
-                need = 0;
-            }
-            probes[probeN++] = need;
-            gapMin = Math.min(gapMin, need);
-            gapMax = Math.max(gapMax, need);
-            if (fEx.size() < 4) {
-                fEx.add(recipe.output() + " cap=" + cap + " true=" + trueCrafts + " need=" + need);
-            }
+            System.out.printf("PERF shelfAudit n=%d offers=%d craftOffers=%d absent=%d missing=%d ex=%s%n",
+                    gn, gOffers.size(), craftOffers, absent, missing, mex);
+            gLastAbsent = absent;
+            gLastMissing = missing;
+            gLastEx = mex;
         }
-        long[] pSlice = Arrays.copyOf(probes, Math.max(1, probeN));
-        int over = 0;
-        for (int i = 0; i < probeN; i++) {
-            if (probes[i] > 63) {
-                over++;
-            }
-        }
-        System.out.printf("PERF capSelfCheck checked=%d positive=%d consistent=%d (%.1f%%)%n",
-                capChecked, posCount, capConsistent,
-                posCount == 0 ? 0.0 : capConsistent * 100.0 / posCount);
-        System.out.printf("PERF gapProbe samples=%d need.p50=%d p95=%d max=%d over64=%d%n",
-                probeN, percentile(pSlice, 50), percentile(pSlice, 95), max(pSlice), over);
-        System.out.println("PERF gapProbe examples=" + fEx);
-        // 时间归因：判 0 的那批到底吃掉了多少时间。perRecipe 来自 D 组，与这里同一批配方、同一个下标。
-        double failPct = failN == 0 ? 0.0 : failN * 100.0 / Math.max(1, capChecked);
-        double timePct = (failNs + okNs) == 0 ? 0.0 : failNs * 100.0 / (failNs + okNs);
-        System.out.printf("PERF costSplit failRecipes=%d (%.1f%%) failMs=%.1f (%.1f%% of total) okMs=%.1f%n",
-                failN, failPct, failNs / 1e6, timePct, okNs / 1e6);
-        check("F1 复刻上界自洽（返回>0 的那些 cap − 已退让 < 64）",
-                posCount == 0 || capConsistent == posCount);
+        check("G1 满本时「有配方、有料、货架上却没有」的产物为 0（实测 " + gLastMissing
+                + " 条 / 不在架上的 " + gLastAbsent + " 条" + (gLastEx.isEmpty() ? "" : "，如 " + gLastEx) + "）",
+                gLastMissing == 0);
 
         check("U4 zh_cn 玩家判中文", !VoidWarehouseText.isEnglish(bots.get(0)));
         check("U4 en_us 玩家判英文", VoidWarehouseText.isEnglish(enBot));
@@ -757,12 +844,14 @@ public final class A2StressTest {
 
     // ============================================================ F 组工具：复刻宽松上界
     //
-    // 这三段是 VoidWarehouseRecipes#boundCap / #availOf / #forcedDemand 的**逐行复刻**，
-    // 原方法是 private，压测只能用公共 API 拼回来。复刻的正确性由 F1 那条自洽断言兜底：
-    // 只要「cap − 已退让 < 64」在所有成功样本上都成立，就说明这里算的上界与产品里那个是同一个数。
+    // 这两段是 VoidWarehouseRecipes#boundCap / #availOf / #forcedDemand 的**逐行复刻**，
+    // 原方法是 private，压测只能用公共 API 拼回来。用途只剩一个：给 trueMaxCrafts 的二分
+    // 提供一个**保证成立的上界**作 hi（boundCap 按定义就是上界），于是二分区间一定盖住真值。
     //
-    // 任何一个细节走样（cache 共享范围、path 是否每次新建、budget 消耗顺序）都会让上界偏大或偏小，
-    // F1 会当场掉下来 —— 所以这段代码是「可证伪」的，不是凭感觉抄的。
+    // 复刻走样的后果是「hi 偏小 -> 真值被截断 -> F1 假红」，所以 F1 报警时先怀疑这里：
+    // cache 共享范围、path 是否每次新建、budget 消耗顺序三处必须逐字一致。
+    // 历史证据：1.0.17 修复前，这套复刻在五个版本上都给出过 100% 自洽的上界（旧 F1 全绿），
+    // 所以它算出来的数与产品里那个是同一个。
 
     /** 复刻 maxCraftable 里「估一个宽松上界」的那一段。返回**合成次数**，不是成品个数。 */
     private static BigInteger capOf(VoidWarehouseRecipes.Recipe recipe, Map<String, BigInteger> stock,
@@ -847,19 +936,28 @@ public final class A2StressTest {
     }
 
     /**
-     * 用 {@code plan()} 当真值探针，二分出「最多能取几个成品」。
+     * 用 {@code plan()} 当真值探针，二分出「最多能做几次」（单位 = 合成次数）。
      *
      * <p>为什么拿 plan 当探针：它只跑<b>一次</b> simulate，口径与真正执行扣料完全一致，
-     * 所以「plan 能成」＝「点下去真能拿到」。二分的前提是「能做 k 个」对 k 单调
-     * （做得越多越难），这一点由 simulate 的语义保证；万一某个贪心分支跳变，
-     * 二分只会低估真值、不会高估 —— 而低估会让 need 偏大，方向上是保守的。</p>
+     * 所以「plan 能成」＝「点下去真能拿到」。{@code plan(recipe, crafts × out)} 内部算出的
+     * crafts 恰好是 {@code crafts}（{@code ceil} 之后不多不少），于是这里得到的与
+     * {@code simulate(crafts)} 是同一个判据。</p>
+     *
+     * <p>上界直接取 {@code boundCap} 的值：它按定义就是上界，所以二分区间一定盖住真值，
+     * <b>不会截断</b>。早先版本用「100_000 截断」省事，结果真值被压成 hi 本身，
+     * 于是「新实现报得比真值大」全是假报警 —— 这类测具自身的缺陷会直接冤枉被测代码。</p>
      */
-    private static long trueMaxOut(VoidWarehouseRecipes.Recipe recipe, Map<String, BigInteger> stock,
-                                   Map<String, List<VoidWarehouseRecipes.Recipe>> byOutput, long hi) {
+    private static long trueMaxCrafts(VoidWarehouseRecipes.Recipe recipe,
+                                      Map<String, BigInteger> stock,
+                                      Map<String, List<VoidWarehouseRecipes.Recipe>> byOutput,
+                                      long hiCrafts) {
         long lo = 0;
+        long hi = Math.max(0L, hiCrafts);
+        BigInteger out = BigInteger.valueOf(recipe.outputCount());
         while (lo < hi) {
             long mid = lo + (hi - lo + 1) / 2;
-            if (VoidWarehouseRecipes.plan(recipe, BigInteger.valueOf(mid), stock, byOutput) != null) {
+            if (VoidWarehouseRecipes.plan(recipe, out.multiply(BigInteger.valueOf(mid)), stock,
+                    byOutput) != null) {
                 lo = mid;
             } else {
                 hi = mid - 1;

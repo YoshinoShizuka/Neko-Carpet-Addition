@@ -61,8 +61,20 @@
 - **改法**：`Model` 从「每个分支复制一份」改成「**记旧值 + 回滚**」。这不是「写逆操作」—— 那条路以前被否过，理由是对的：漏一处账就错。这里不推导任何反向运算，只是每次写 map 前把 `(哪本账, 键, 旧值)` 压进撤销日志、回滚时倒序贴回；而「所有写都必须过日志」不靠自觉，靠三个 map 字段全部 `private`、只暴露带日志的写方法来**强制** —— 想绕过日志直接写 map，当场编译不过。附带三处：`pool` 改成库存的**惰性覆盖层**（探针不再每次复制一份库存）、探针**关掉扣料账本**（`feasible` 只问摆不摆得下）、小整数算术走 `long`。
 - **正确性怎么保证**：把改前 / 改后两份源码分别编译，喂同一语料**对拍 7,416 行**输出（1236 条 `maxCraftable` + 每条 5 个目标量的 `plan`，含 `consumed` / `surplus` 的完整内容），SHA-256 **逐字节相同**。压测侧的指纹也一致：`capSum` 从 18,610,821 一字不差地复现(A byte-identical 7,416-line diff against the previous implementation, plus an unchanged `capSum`.).
 - **结果**：五版本满本重建 **123.88 / 95.91 / 93.37 / 90.77 / 94.24 → 22.17 / 25.09 / 18.05 / 18.15 / 22.88 ms**（3.8 – 5.6×），全部低于 50 ms；单条 `maxCraftable` P99 从 1,650 µs 降到 **75 µs**、max 从 5,247 µs 降到 **336 µs**；规模曲线由超线性回到近线性（600 → 1236 条：改前涨 4.4 倍，改后涨 2.1 倍）。`A2` 判据**五版本首次全绿** —— `A2StressTest` 34 条 × 5、`SystemTest` 209 条 × 5、`CraftSelfCheck` 138 条 × 4，合计 **1,767 条断言零失败**(The A2 tick-budget assertion passes on all five versions for the first time.).
-- ⚠️ **原定的 R2 路线是错的，记在这里免得下一个人再走**：设计文档写的是「按页算 / 只脏化受影响的产物集」。实测这两条最多省 15%（闭包 3.25 ms + 部分 `plan`），却要动展示顺序（U2）与分页总数 —— 代价远大于收益。「减少探针数」同样走不通：324 条多探针配方的**真值全部落在上界的 1/2 以上**（上界估得很紧），二分 16 轮已接近信息论下限。**先归因，再优化**(The originally planned caching route was measured to be worth <15%; the real multiplier was per-probe allocation.).
+- ⚠️ **原定的 R2 路线是错的，记在这里免得下一个人再走**：设计文档写的是「按页算 / 只脏化受影响的产物集」。实测「按页算」最多省 15%（闭包 3.25 ms + 部分 `plan`），却要动展示顺序（U2）与分页总数 —— 代价远大于收益。（**「只脏化受影响的产物集」这个估计错了**，它其实省 93%，见下方 Performance 节的第三条 —— R3 就是这么做的。）「减少探针数」同样走不通：324 条多探针配方的**真值全部落在上界的 1/2 以上**（上界估得很紧），二分 16 轮已接近信息论下限。**先归因，再优化**(The originally planned caching route was measured to be worth <15%; the real multiplier was per-probe allocation.).
 - 顺带补上 **sources jar 不含 `common/` 共享层源码**的老缺口：五个子工程的 `sourcesJar` 现在把 `common` 的源码一并打进去 —— 此前打开 sources jar 根本找不到真正在跑的那份算法(The sources jar now bundles the shared `common/` sources.).
+
+#### 满本重建再降一个数量级：22.2 → 0.93 ms，只重算受影响的产物（`voidWarehouseCraft`）
+
+- **现象**：R2 之后满本（1236 条配方 / 746 个产物）单次重建 22 ms，已经进了 50 ms 预算，但玩家在仓库里连续取放时每个 tick 都要付一次 —— 稳态吃掉 44% 的 tick 预算。而这 22 ms 里**绝大多数是白算的**：取走 1 个圆石，只有 13 个产物的账会变(The full rebuild still cost 22 ms per tick of activity; 733 of 746 craftable entries were recomputed for nothing.)。
+- **原定路线被实测否掉**：设计文档的 R3 是「`maxCraftable` / `stockFor` 按 `(recipeId, stockVersion)` 缓存到 tick 级」。实测**命中率 0.0%** —— 一次取货必然改库存、必然推进版本，真实操作序列里「同一版本内再问同一条配方」根本不存在（60 次取货、65 次调用、重复 0 次）。真正在重复的是**整张表**。
+- **改法**：三个能改库存的原语（`consume` / `produce` / `put`）各记一笔「哪件物品变了」；每个产物在配方本换版时算一张**依赖集**（自己 ＋ 它每条候选配方整条闭包里的物品）；改动发生时只重算「依赖集里含脏物品」的产物。实测按物品平均只波及 **13.0 / 746 个产物（1.7%）**，中位数 1~5 个，最坏 `oak_log` 184 个（24.7%）—— 最坏也不会退化成整批(The dirty set is tracked at the three stock-mutating primitives; a per-product dependency set limits recomputation to the entries a change can actually affect.)。
+- **不动分页、不动展示序**：表还是那张完整的表（746 项，该是空的仍是空），只是没重算结果不会变的项 —— 于是当初担心的「怎么在不全算的前提下知道总页数」根本不存在。顺序稳定靠 `LinkedHashMap`：整批按配方遍历序填充，增量走 `put`、对已有键不改位置，所以「同一份库存、同一份配方本」无论走过多少次增量，遍历顺序都和整批一致。
+- **顺手多一条捷径**：`Container#setChanged()` 会调 `markChanged()`，而它「什么都没改」。脏集合为空就直接沿用上一份表 —— 满本这条路从 **13.57 ms 降到 0.000 ms**。判据必须带上「清空标志」：`clearContent()` 把库存整体清空却不逐件记账，少了这一项就会把上一份还带着已不存在物品的表当新表返回（这条是写完自检才想到的，M9 专为它补）。
+- **正确性怎么保证**：新增自检 **M 组 11 条**，给每次改动都配一份「整批重算」的对照 —— 原地 `clearContent()` 再灌回同一份库存（配方本一个字不动），把可兑表按字面量摊平**逐字节比对，顺序照原样不排序**。另做**两次变异测试**证明这组有牙：去掉依赖集里的「产物自己」→ **M3/M4 当场红**；去掉快捷路径的清空判据 → **M9 当场红**(An 11-assertion incremental-vs-full equivalence group, validated by two mutation tests that each turn it red.)。
+- **结果**：五版本满本重建 **22.17 / 25.09 / 18.05 / 18.15 / 22.88 → 0.93 / 1.17 / 1.07 / 0.75 / 1.46 ms**（15.7 – 24.2×）；满本「标脏但没变」13.57 → **0.000 ms**。**五版本 14 组套件、1,816 条断言零失败**，而正确性指纹一字未动：判 0 条数仍是 **0/17/43/43**、`lost=0`、`exact=1236 · under=0 · unreachable=0`、货架 `missing=0`、展示序 **727 项**一致、满本 `offers` 仍是 **746/671/652/652/652**(All five versions pass, and every correctness fingerprint is unchanged.)。
+- ⚠️ **配方本换版后的第一次重建仍是整批**（`max_ms` 23–73 ms，暖机下比稳态多 3~8 ms），因为依赖集要整张重建。仍在 50 ms 预算内，但余量比稳态小一个数量级。要压它得把依赖集也做成增量 —— 收益只在「刚学完配方的那一 tick」，暂不做。
+- ⚠️ **R2 里那句「脏化集合最多省 15%」是错的，已在设计文档里更正**：当时把「按页算」和「脏化集合」归成一类估，「按页算」确实只值 15%，「脏化集合」实测省 93%（733/746）。教训是**估算必须在真实调用序列上量**，不能在脑子里把两条代价结构不同的路线归成一类 —— 那比不做估算更危险，它会让人理直气壮地跳过唯一有效的那条。
 
 ### 🐛 Fixed / 修复
 
@@ -133,20 +145,20 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 442,111 B | `4b039cae1cea43c2156da5fb17d97ccb` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 489,498 B | `4578a7c3f6d5ca6f91470f400e6f176a` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 442,243 B | `f464a344fc36f90ac99e8fe63b1c4a80` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 489,880 B | `fe1fa1283194b00bf99d3c4d236f4ec8` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 445,510 B | `f0e328cf93f4b87a814c50f84defe945` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 490,891 B | `d5241d96590c4661d41b39b83a5fd5b1` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 445,511 B | `c7471806d17f453f9ce055b14d66df33` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 490,890 B | `f2e9036dddf81aab196c2687b458338a` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 442,535 B | `84c0e8a116c8cc8c835a0d9e1ed3cce5` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 490,614 B | `c377b63f6003e5602d7b37e80d553915` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 443,345 B | `a962a217f0dbd938ce1b1edb1ba7e37e` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 493,276 B | `8ed0ff5ade0f7de1da3e19dc39a89db0` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 443,479 B | `a4ed262b5d45b7d4bc5cfd2e218e99c5` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 493,690 B | `de9d37823bd421146aa07400214a5cc1` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 446,746 B | `b1be6061c97ba0352b15dc2f2278acc7` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 494,701 B | `4180fc2ab9f7dd57a8e8094396ee7e34` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 446,747 B | `7ef93622c912a297e8040982ea57750b` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 494,700 B | `685acc0c1b9a864129fc568cd506fccd` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 443,769 B | `96a126fab5219ffba52800708c980888` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 494,435 B | `d395dcb19bf7b38ecac9b0c3db92f446` |
 
-> **本表已按 2026-11-10 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第四次原地替换**：规则集、配置键、规则名仍然一个字都没动 —— 这次改的是 `common/` 共享层的 `MaxCraftable` 内部实现（**`Model` 从「每个分支复制一份」改成「记旧值 + 回滚」**，账本语义逐字节不变），外加把 `common/` 的源码补进 sources jar。主 jar 变大 0.5~1.7 KB 是新的撤销日志与惰性覆盖层，sources jar 变大 ~47 KB 是因为终于把共享层源码打进去了。md5 与前四次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-10; the v1.0.17 assets were replaced in place a fourth time so that `Model` no longer copies its ledgers per branch, and the sources jars finally bundle the shared `common/` sources.)。
+> **本表已按 2026-11-10 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第五次原地替换**：规则集、配置键、规则名仍然一个字都没动 —— 这次改的是 `VoidWarehouseData` 里「可兑表怎么重算」（**从「每次都把 746 个产物全算一遍」改成「只重算受影响的 13 个」**），扣料算法本身逐字节不变。主 jar 变大 1.2 KB 是新的脏集合、依赖集与增量重算，sources jar 变大 3.8 KB 同源。md5 与前四次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-10; the v1.0.17 assets were replaced in place a fifth time so that the offer table is recomputed incrementally, one entry per affected product.)。
 
-> 🔴 **已知缺口（既有，非本次引入）**：`-sources.jar` 只打包**版本树**里的源码，`common/` 那三份共享层的 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）**从来不在里面** —— 但它们编译出来的 class 是打进了主 jar 的（否则跑不起来）。所以想读扣料算法源码，请直接看仓库 `common/src/main/java/neko/voidwarehouse/`(The sources jar has never included the shared `common/` layer's sources, although its compiled classes are inside the main jar.)。
+> ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 
@@ -158,7 +170,7 @@
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
-- **v1.0.17 的产物换过四次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建。四次都**没改版本号**，只是字节变了。已经下过的按下方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place four times — PR #2, the per-recipe string list, the binary search, and the ledger-copy removal — with the version number unchanged.)。
+- **v1.0.17 的产物换过五次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建。五次都**没改版本号**，只是字节变了。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place five times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, and the incremental offer rebuild — with the version number unchanged.)。
 
 * * *
 

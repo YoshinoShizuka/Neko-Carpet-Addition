@@ -1,0 +1,870 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * 【临时压测，五版本共用同一份源码】配方本存满、原料充足、20 个真实 ServerPlayer 并发时，
+ * 性能 / 界面 / 可靠性三类的验收与<b>瓶颈定位</b>。
+ *
+ * <h2>为什么要做成梯度实验，而不是「一次拉满」</h2>
+ * <p>第一次尝试直接上「1236 条配方 + 每种原料 10 万」时，第二次 {@code exchangeOffers()}
+ * 把整台服务器卡到 <b>60 秒</b>，被 vanilla 的 watchdog 强制关机
+ * （{@code A single server tick took 60.00 seconds}）。崩溃堆栈指向
+ * {@code maxCraftable → simulate → supply → simulate → ...}。</p>
+ * <p>所以这里改成：<b>从最小规模向上加，单次超过 {@link #BAIL_MS} 就停下并把它记为拐点</b>。
+ * 目的是拿到「规模 → 耗时」这条曲线和那个拐点，而不是拿一次崩溃当结论。</p>
+ *
+ * <h2>三组实验</h2>
+ * <ol>
+ *   <li><b>A 规模曲线</b>：原料固定 10,000，配方 100 / 300 / 600 / 900 / 1236 条；</li>
+ *   <li><b>B 原料量曲线</b>：配方固定 A 组能跑完的最大规模，原料 100 / 1,000 / 10,000 / 100,000；</li>
+ *   <li><b>C 功能验收</b>：在 A 组最大规模上做取货、菜单、20 人并发、界面、可靠性。</li>
+ * </ol>
+ *
+ * <h2>语料</h2>
+ * <p>{@code C:/tmp/nca_recipes_263.txt} —— {@code RecipeCorpusExport} 在 26.3 真服务端枚举
+ * {@code RecipeManager} 导出的 1236 条真实合成配方（1042 种产物、477 种原料）。
+ * <b>五个版本读同一个文件</b>，版本之间唯一的变量就只剩「版本」。</p>
+ *
+ * <h2>判据</h2>
+ * <p>看 {@code A2S RESULT checks=N failures=0}。{@code runServer} 崩服也返回 {@code EXIT=0}，
+ * <b>不能</b>拿退出码当判据。性能数字看 {@code PERF } / {@code MEM } 前缀。</p>
+ */
+public final class A2StressTest {
+
+    static final Path CORPUS = Path.of("C:/tmp/nca_recipes_263.txt");
+
+    static final int BOT_COUNT = 20;
+
+    /** A 组规模梯度（条）。1236 = 26.3 全部合成配方 */
+    static final int[] SCALE_LADDER = {100, 300, 600, 900, 1236};
+
+    /** A 组固定原料量 */
+    static final BigInteger SCALE_RAW = BigInteger.valueOf(10_000);
+
+    /** B 组原料量梯度 */
+    static final long[] RAW_LADDER = {100L, 1_000L, 10_000L, 100_000L};
+
+    /** 单次重建超过这个毫秒数就认为「这一档不可用」，停止继续加大 */
+    static final double BAIL_MS = 3_000.0;
+
+    /** 每个档位重复几次取中位数 */
+    static final int ROUNDS = 3;
+
+    static final int WITHDRAW_SAMPLES = 60;
+
+    static final int WAIT_TICKS = 5;
+
+    private static boolean done;
+    private static int tickIndex;
+    private static int checks;
+    private static int failures;
+    private static final List<String> failedLabels = new ArrayList<>();
+    private static long sink;
+
+    private static ServerLevel level;
+    private static final List<ServerPlayer> bots = new ArrayList<>();
+    private static ServerPlayer enBot;
+    private static boolean fakeConnection;
+
+    private static final List<VoidWarehouseRecipes.Recipe> corpus = new ArrayList<>();
+    private static final LinkedHashSet<String> rawIds = new LinkedHashSet<>();
+    private static final LinkedHashSet<String> outputIds = new LinkedHashSet<>();
+
+    /** A 组最后跑完的那一档（C 组就用它） */
+    private static VoidWarehouseData mainData;
+    private static int mainScale;
+    private static double mainMs;
+    /** n=100 那一档的单次耗时，用来验证「小规模必须快」 */
+    private static double firstMs = -1;
+    /** 拐点：第一次超过 {@link #BAIL_MS} 的规模；-1 = 全部跑完都没超 */
+    private static int kneeScale = -1;
+
+    private A2StressTest() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        if (++tickIndex < WAIT_TICKS) {
+            return;
+        }
+        done = true;
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            failedLabels.add("抛异常: " + t);
+            System.out.println("!! [A2S] 抛异常: " + t);
+            t.printStackTrace(System.out);
+        }
+        finish(server);
+    }
+
+    private static void step(MinecraftServer server) throws Exception {
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+
+        level = server.overworld();
+        System.out.println("### A2S 开始");
+        System.out.println("### jvm=" + System.getProperty("java.version")
+                + " maxHeap=" + Runtime.getRuntime().maxMemory() / (1024 * 1024) + "MB");
+
+        loadCorpus();
+        check("S0 语料可读", corpus.size() > 1000);
+        System.out.println("   语料 " + corpus.size() + " 条 / 产物 " + outputIds.size()
+                + " 种 / 原料 " + rawIds.size() + " 种");
+
+        int dualRole = 0;
+        for (String id : rawIds) {
+            if (outputIds.contains(id)) {
+                dualRole++;
+            }
+        }
+        System.out.println("   双重身份（既是原料又是产物）" + dualRole + " 种"
+                + " -> 它们有货就不出虚拟格，是虚拟格数少于产物数的原因");
+
+        buildBots(server);
+        check("S1 造出 " + BOT_COUNT + " 个玩家", bots.size() == BOT_COUNT);
+        check("S1 假连接可用", fakeConnection);
+
+        // ============================================================ A 组：规模曲线
+        System.out.println("---- A 组：配方条数 -> offers 重建耗时（原料 " + SCALE_RAW + "）----");
+        for (int n : SCALE_LADDER) {
+            if (kneeScale > 0) {
+                System.out.println("   跳过 n=" + n + "（已在 n=" + kneeScale + " 撞到拐点）");
+                continue;
+            }
+            long t0 = System.nanoTime();
+            VoidWarehouseData data = build(n, SCALE_RAW);
+            long buildMs = (System.nanoTime() - t0) / 1_000_000L;
+
+            long[] ms = new long[ROUNDS];
+            int offers = 0;
+            for (int r = 0; r < ROUNDS; r++) {
+                VoidWarehouseData.noteServerTick(1_000 + r);
+                data.markChanged();
+                long s0 = System.nanoTime();
+                List<VoidWarehouseData.ExchangeOffer> built = data.exchangeOffers();
+                ms[r] = System.nanoTime() - s0;
+                offers = built.size();
+                sink += built.size();
+            }
+            double median = percentile(ms, 50) / 1e6;
+            System.out.printf("PERF scale n=%d offers=%d build_ms=%d offers_ms=%.2f max_ms=%.2f%n",
+                    n, offers, buildMs, median, max(ms) / 1e6);
+
+            if (n == SCALE_LADDER[0]) {
+                firstMs = median;
+            }
+            mainData = data;
+            mainScale = n;
+            mainMs = median;
+
+            if (median > BAIL_MS) {
+                kneeScale = n;
+                System.out.println("   !! n=" + n + " 单次 " + String.format("%.0f", median)
+                        + " ms 已超过 " + (int) BAIL_MS + " ms，停止加大规模");
+            }
+        }
+
+        check("A1 至少有一档跑完", mainData != null);
+        if (mainData == null) {
+            return;
+        }
+        check("A1 n=100 单次重建 < 200ms（实测 " + fmt(firstMs) + "）", firstMs < 200.0);
+        if (kneeScale < 0) {
+            // 一个 tick 的预算 50ms：满本单次重建必须在这条线以下，否则玩家一动库存就掉 tick
+            check("A2 满本（" + mainScale + " 条）单次重建 < 50ms（实测 " + fmt(mainMs) + "）",
+                    mainMs < 50.0);
+        } else {
+            System.out.println("!! 拐点出现在 n=" + kneeScale + "，满本重建不可用");
+        }
+
+        // ============================================================ B 组：原料量曲线
+        System.out.println("---- B 组：原料量 -> offers 重建耗时（配方 " + mainScale + " 条）----");
+        for (long raw : RAW_LADDER) {
+            VoidWarehouseData data = build(mainScale, BigInteger.valueOf(raw));
+            long[] ms = new long[ROUNDS];
+            int offers = 0;
+            for (int r = 0; r < ROUNDS; r++) {
+                VoidWarehouseData.noteServerTick(2_000 + r);
+                data.markChanged();
+                long s0 = System.nanoTime();
+                offers = data.exchangeOffers().size();
+                ms[r] = System.nanoTime() - s0;
+                sink += offers;
+            }
+            double median = percentile(ms, 50) / 1e6;
+            System.out.printf("PERF rawPerItem=%d offers=%d offers_ms=%.2f%n", raw, offers, median);
+            if (median > BAIL_MS) {
+                System.out.println("   !! 原料 " + raw + " 时已超 " + (int) BAIL_MS + " ms，停止加原料");
+                break;
+            }
+        }
+
+        // ============================================================ C 组：功能验收
+        VoidWarehouseData data = mainData;
+        System.out.println("---- C 组：在 n=" + mainScale + " 上做取货 / 菜单 / 并发 / 界面 / 可靠性 ----");
+
+        // ---- 取货 ----
+        List<String> sampleIds = new ArrayList<>(outputIds);
+        Random rnd = new Random(20261110L);
+        long[] withdrawNs = new long[WITHDRAW_SAMPLES];
+        int done_ = 0;
+        int takenTotal = 0;
+        int empty = 0;
+        for (int i = 0; i < WITHDRAW_SAMPLES; i++) {
+            String id = sampleIds.get(rnd.nextInt(sampleIds.size()));
+            Item item = VoidWarehouseRecipeBook.itemOf(id);
+            if (item == null) {
+                continue;
+            }
+            long t0 = System.nanoTime();
+            VoidWarehouseData.Withdrawal w = data.withdraw(new ItemStack(item), BigInteger.valueOf(64));
+            withdrawNs[done_++] = System.nanoTime() - t0;
+            takenTotal += w.taken();
+            if (w.isEmpty()) {
+                empty++;
+            }
+        }
+        long[] wSlice = Arrays.copyOf(withdrawNs, Math.max(1, done_));
+        System.out.printf("PERF withdraw.p50_us=%.1f p95_us=%.1f p99_us=%.1f max_us=%.1f taken=%d empty=%d/%d%n",
+                percentile(wSlice, 50) / 1e3, percentile(wSlice, 95) / 1e3,
+                percentile(wSlice, 99) / 1e3, max(wSlice) / 1e3, takenTotal, empty, done_);
+        check("C1 取货 p99 < 50ms（实测 " + fmt(percentile(wSlice, 99) / 1e6) + "）",
+                percentile(wSlice, 99) / 1e6 < 50.0);
+        check("C1 取货成功率 > 80%（实得 " + (done_ - empty) + "/" + done_ + "）",
+                done_ > 0 && (done_ - empty) * 100 / done_ > 80);
+
+        // ---- 菜单 ----
+        long[] menuNs = new long[BOT_COUNT];
+        int slotCount = -1;
+        int navOk = 0;
+        for (int i = 0; i < bots.size(); i++) {
+            ServerPlayer p = bots.get(i);
+            p.getInventory().clearContent();
+            long t0 = System.nanoTime();
+            VoidWarehouseMenu menu = new VoidWarehouseMenu(i, p.getInventory(), data, p);
+            menuNs[i] = System.nanoTime() - t0;
+            slotCount = menu.slots.size();
+            if (menu.getContainer() instanceof VoidWarehousePageContainer) {
+                navOk++;
+            }
+        }
+        System.out.printf("PERF menu.build.p50_ms=%.3f p95_ms=%.3f max_ms=%.3f slots=%d%n",
+                percentile(menuNs, 50) / 1e6, percentile(menuNs, 95) / 1e6, max(menuNs) / 1e6, slotCount);
+        check("C2 菜单格数 = 90（实测 " + slotCount + "）", slotCount == 90);
+        check("C2 " + BOT_COUNT + " 次构造都拿到页面容器", navOk == BOT_COUNT);
+        check("C2 单次构造 p95 < 50ms", percentile(menuNs, 95) / 1e6 < 50.0);
+
+        // ---- 20 人并发 ----
+        VoidWarehouseData.noteServerTick(3_000);
+        data.markChanged();
+        data.exchangeOffers();
+        long concStart = System.nanoTime();
+        int concTaken = 0;
+        int concOps = 0;
+        for (int round = 0; round < 3; round++) {
+            for (int i = 0; i < bots.size(); i++) {
+                String id = sampleIds.get((i * 37 + round * 11) % sampleIds.size());
+                Item item = VoidWarehouseRecipeBook.itemOf(id);
+                if (item == null) {
+                    continue;
+                }
+                concTaken += data.withdraw(new ItemStack(item), BigInteger.valueOf(16)).taken();
+                concOps++;
+            }
+        }
+        long concTotal = System.nanoTime() - concStart;
+        System.out.printf("PERF concurrent20.total_ms=%.2f ops=%d avg_us=%.1f taken=%d%n",
+                concTotal / 1e6, concOps, concTotal / 1e3 / Math.max(1, concOps), concTaken);
+        check("C3 并发 " + concOps + " 次取货总耗时 < 2000ms（实测 " + fmt(concTotal / 1e6) + "）",
+                concTotal / 1e6 < 2000.0);
+
+        // ---- 界面 ----
+        List<VoidWarehouseData.ExchangeOffer> offers = data.exchangeOffers();
+        int craft = 0;
+        int shown = 0;
+        for (VoidWarehouseData.ExchangeOffer offer : offers) {
+            if (offer.craft()) {
+                craft++;
+            }
+            if (offer.template() != null && !offer.template().isEmpty()
+                    && offer.obtainable() != null && offer.obtainable().signum() > 0) {
+                shown++;
+            }
+        }
+        System.out.println("UI offers=" + offers.size() + " craft=" + craft + " shown=" + shown);
+        check("U1 虚拟格全部标了「可合成」（" + craft + "/" + offers.size() + "）", craft == offers.size());
+        check("U1 每格都有样品与可数上限", shown == offers.size());
+
+        // 两次重建之间<b>绝不能让库存变</b>：上一版在这里直接拿 C3 并发取货之前的 offers 来比，
+        // 而并发段已经取走了几百个成品，虚拟格集合本来就不同 —— 那是测试设计错，不是产品缺陷。
+        VoidWarehouseData.noteServerTick(3_100);
+        data.markChanged();
+        List<VoidWarehouseData.ExchangeOffer> rebuilt = data.exchangeOffers();
+        VoidWarehouseData.noteServerTick(3_200);
+        data.markChanged();
+        List<VoidWarehouseData.ExchangeOffer> rebuilt2 = data.exchangeOffers();
+        boolean same = rebuilt.size() == rebuilt2.size();
+        if (same) {
+            for (int i = 0; i < rebuilt.size(); i++) {
+                if (!rebuilt.get(i).itemId().equals(rebuilt2.get(i).itemId())) {
+                    same = false;
+                    break;
+                }
+            }
+        }
+        check("U2 同库存下两次重建的展示顺序一致（" + rebuilt.size() + " 项）", same);
+        check("U3 同 tick 第二次读返回同一份引用", data.exchangeOffers() == rebuilt2);
+        // ---- D 组：热点定位（直接量单条 maxCraftable，点名最贵的配方）----
+        // maxCraftable / stockFor / byOutput 都是 public static，所以可以在压测里直接调用，
+        // 不必去猜「340 ms 花在哪」。
+        System.out.println("---- D 组：单条 maxCraftable 热点（n=" + mainScale + "）----");
+        List<VoidWarehouseRecipes.Recipe> sub = new ArrayList<>(
+                corpus.subList(0, Math.min(mainScale, corpus.size())));
+        Map<String, List<VoidWarehouseRecipes.Recipe>> byOutput =
+                VoidWarehouseRecipes.byOutput(sub);
+        long[] perRecipe = new long[sub.size()];
+        boolean[] zeroOf = new boolean[sub.size()];
+        long maxSingle = -1;
+        String maxLabel = "-";
+        long totalSingle = 0;
+        for (int i = 0; i < sub.size(); i++) {
+            VoidWarehouseRecipes.Recipe recipe = sub.get(i);
+            Map<String, BigInteger> stock =
+                    VoidWarehouseRecipeBook.stockFor(data, recipe, byOutput);
+            long s0 = System.nanoTime();
+            BigInteger out = VoidWarehouseRecipes.maxCraftable(recipe, stock, byOutput);
+            long s1 = System.nanoTime();
+            perRecipe[i] = s1 - s0;
+            totalSingle += s1 - s0;
+            zeroOf[i] = out.signum() == 0;   // 热点到底是「判 0」还是「一次就成但天生贵」
+            sink += out.signum();
+            if (perRecipe[i] > maxSingle) {
+                maxSingle = perRecipe[i];
+                maxLabel = recipe.output() + " (" + recipe.parts().size() + " 项)";
+            }
+        }
+        System.out.printf("PERF maxCraftable.p50_us=%.1f p95_us=%.1f p99_us=%.1f max_us=%.1f sum_ms=%.1f%n",
+                percentile(perRecipe, 50) / 1e3, percentile(perRecipe, 95) / 1e3,
+                percentile(perRecipe, 99) / 1e3, max(perRecipe) / 1e3, totalSingle / 1e6);
+        System.out.println("PERF maxCraftable.worst=" + maxLabel
+                + " at_us=" + String.format("%.1f", maxSingle / 1e3));
+
+        // Top-5 最贵，点名（报告里要能指出「是哪几条配方拖慢的」）
+        Integer[] order = new Integer[sub.size()];
+        for (int i = 0; i < order.length; i++) {
+            order[i] = i;
+        }
+        Arrays.sort(order, (a, b) -> Long.compare(perRecipe[b], perRecipe[a]));
+        for (int k = 0; k < Math.min(5, order.length); k++) {
+            int i = order[k];
+            System.out.println("PERF hot#" + (k + 1) + " " + sub.get(i).output()
+                    + " us=" + String.format("%.1f", perRecipe[i] / 1e3)
+                    + " parts=" + sub.get(i).parts().size()
+                    + " zero=" + zeroOf[i]
+                    + " siblings=" + byOutput.get(sub.get(i).output()).size());
+        }
+
+        // ---- E 组：MAX_VERIFY 线性回退的正确性后果（梯度）----
+        // maxCraftable 先用 boundCap 估一个「宽松上界」，再 cap-- 逐个试，最多 MAX_VERIFY(64) 次。
+        // 上界高估超过 64 时，64 次全部落空 -> 返回 0 -> 界面不出这一格。
+        // 而同一条配方走 plan()（精确请求）只 simulate 一次，往往成功 ——
+        // 那就是「玩家看不到、其实做得出」。这组按规模扫，找出从哪一档开始丢。
+        System.out.println("---- E 组：maxCraftable 回退的正确性（按规模扫）----");
+        int lastZero = 0;
+        int lastLost = 0;
+        for (int en : SCALE_LADDER) {
+            VoidWarehouseData freshN = build(en, SCALE_RAW);
+            List<VoidWarehouseRecipes.Recipe> subN = new ArrayList<>(
+                    corpus.subList(0, Math.min(en, corpus.size())));
+            Map<String, List<VoidWarehouseRecipes.Recipe>> byN =
+                    VoidWarehouseRecipes.byOutput(subN);
+            int zero = 0;
+            int lost = 0;
+            List<String> ex = new ArrayList<>();
+            for (VoidWarehouseRecipes.Recipe recipe : subN) {
+                Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(freshN, recipe, byN);
+                if (VoidWarehouseRecipes.maxCraftable(recipe, stock, byN).signum() > 0) {
+                    continue;
+                }
+                zero++;
+                VoidWarehouseRecipes.Plan plan =
+                        VoidWarehouseRecipes.plan(recipe, BigInteger.ONE, stock, byN);
+                if (plan != null && plan.crafts().signum() > 0) {
+                    lost++;
+                    if (ex.size() < 4) {
+                        ex.add(recipe.output() + "(" + recipe.parts().size() + "项)");
+                    }
+                }
+            }
+            System.out.printf("PERF zeroCurve n=%d zero=%d lost=%d lostPct=%.1f%% examples=%s%n",
+                    en, zero, lost, subN.isEmpty() ? 0.0 : lost * 100.0 / subN.size(), ex);
+            lastZero = zero;
+            lastLost = lost;
+        }
+        check("E1 满本时「界面判做不出、实际做得出」的配方数为 0（实测丢 " + lastLost
+                + " 条 / 判 0 共 " + lastZero + " 条）", lastLost == 0);
+
+        // ---- F 组：把「宽松上界到底虚高多少」量出来 ----
+        // E 组只证明「会错」；这组回答「错在哪个量级」，直接决定修法是「把 64 调大」还是「换算法」。
+        // 做法：复刻 boundCap / availOf（原方法是 private）算出上界 cap（单位=合成次数），
+        //      再用 plan() 当真值探针做二分（plan 只 simulate 一次，口径与执行完全一致）。
+        // 自洽校验：凡 maxCraftable 返回 R>0，必然有 cap − R_crafts ≤ MAX_VERIFY−1 = 63
+        //      （它就是「从 cap 往下退 p 次，第 p 次才成」）。这条不成立说明复刻走样，本组数据作废。
+        //      ⚠️ 分母只能是「返回 >0 的那几条」：返回 0 的那些压根没退到真值，不构成反例。
+        System.out.println("---- F 组：宽松上界 vs 真值（n=" + mainScale + "）----");
+        int capChecked = 0;
+        int posCount = 0;
+        int capConsistent = 0;
+        int failN = 0;
+        long failNs = 0;
+        long okNs = 0;
+        long[] probes = new long[sub.size()];
+        int probeN = 0;
+        long gapMin = Long.MAX_VALUE;
+        long gapMax = -1;
+        long askStart = System.nanoTime();
+        List<String> fEx = new ArrayList<>();
+        for (int i = 0; i < sub.size(); i++) {
+            VoidWarehouseRecipes.Recipe recipe = sub.get(i);
+            Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(data, recipe, byOutput);
+            BigInteger cap = capOf(recipe, stock, byOutput);
+            if (cap == null) {
+                continue;
+            }
+            BigInteger got = VoidWarehouseRecipes.maxCraftable(recipe, stock, byOutput);
+            BigInteger out = BigInteger.valueOf(recipe.outputCount());
+            capChecked++;
+            if (got.signum() > 0) {
+                posCount++;
+                okNs += perRecipe[i];
+                if (cap.subtract(got.divide(out)).compareTo(BigInteger.valueOf(64)) < 0) {
+                    capConsistent++;
+                }
+                continue;
+            }
+            failN++;
+            failNs += perRecipe[i];
+            // 只对「判 0」的那些求真值：它们才是「退让次数不够」的直接受害者
+            if (System.nanoTime() - askStart > 8_000_000_000L) {
+                continue;
+            }
+            long hi = cap.multiply(out).min(BigInteger.valueOf(100_000L)).longValue();
+            long trueOut = trueMaxOut(recipe, stock, byOutput, hi);
+            if (trueOut <= 0) {
+                continue;   // 确实做不出来（跨版本的合法 0）
+            }
+            long trueCrafts = (trueOut + recipe.outputCount() - 1) / recipe.outputCount();
+            long need = cap.longValue() - trueCrafts;   // 需要退让几次才能摸到真值
+            if (need < 0) {
+                need = 0;
+            }
+            probes[probeN++] = need;
+            gapMin = Math.min(gapMin, need);
+            gapMax = Math.max(gapMax, need);
+            if (fEx.size() < 4) {
+                fEx.add(recipe.output() + " cap=" + cap + " true=" + trueCrafts + " need=" + need);
+            }
+        }
+        long[] pSlice = Arrays.copyOf(probes, Math.max(1, probeN));
+        int over = 0;
+        for (int i = 0; i < probeN; i++) {
+            if (probes[i] > 63) {
+                over++;
+            }
+        }
+        System.out.printf("PERF capSelfCheck checked=%d positive=%d consistent=%d (%.1f%%)%n",
+                capChecked, posCount, capConsistent,
+                posCount == 0 ? 0.0 : capConsistent * 100.0 / posCount);
+        System.out.printf("PERF gapProbe samples=%d need.p50=%d p95=%d max=%d over64=%d%n",
+                probeN, percentile(pSlice, 50), percentile(pSlice, 95), max(pSlice), over);
+        System.out.println("PERF gapProbe examples=" + fEx);
+        // 时间归因：判 0 的那批到底吃掉了多少时间。perRecipe 来自 D 组，与这里同一批配方、同一个下标。
+        double failPct = failN == 0 ? 0.0 : failN * 100.0 / Math.max(1, capChecked);
+        double timePct = (failNs + okNs) == 0 ? 0.0 : failNs * 100.0 / (failNs + okNs);
+        System.out.printf("PERF costSplit failRecipes=%d (%.1f%%) failMs=%.1f (%.1f%% of total) okMs=%.1f%n",
+                failN, failPct, failNs / 1e6, timePct, okNs / 1e6);
+        check("F1 复刻上界自洽（返回>0 的那些 cap − 已退让 < 64）",
+                posCount == 0 || capConsistent == posCount);
+
+        check("U4 zh_cn 玩家判中文", !VoidWarehouseText.isEnglish(bots.get(0)));
+        check("U4 en_us 玩家判英文", VoidWarehouseText.isEnglish(enBot));
+
+        // ---- 可靠性：写盘 -> 读回 ----
+        var encoded = VoidWarehouseData.CODEC
+                .encodeStart(net.minecraft.nbt.NbtOps.INSTANCE, data).result().orElse(null);
+        check("R1 满本可编码", encoded != null);
+        if (encoded instanceof net.minecraft.nbt.CompoundTag tag) {
+            check("R1 写新键、不写老键",
+                    tag.contains("learned_recipes_lines") && !tag.contains("learned_recipes"));
+            int expect = data.learnedRecipeCount();
+            check("R1 落盘元素数 = " + expect,
+                    tag.get("learned_recipes_lines") instanceof net.minecraft.nbt.ListTag lines
+                            && lines.size() == expect);
+
+            Path file = Path.of(System.getProperty("java.io.tmpdir"), "nca_a2s_full.dat");
+            net.minecraft.nbt.NbtIo.writeCompressed(tag, file);
+            long onDisk = Files.size(file);
+            net.minecraft.nbt.CompoundTag backTag = net.minecraft.nbt.NbtIo
+                    .readCompressed(file, net.minecraft.nbt.NbtAccounter.unlimitedHeap());
+            VoidWarehouseData back = VoidWarehouseData.CODEC
+                    .parse(net.minecraft.nbt.NbtOps.INSTANCE, backTag).result().orElse(null);
+            check("R1 读回条数一致", back != null && back.learnedRecipeCount() == expect);
+            check("R1 读回后仍能反查", back != null && back.hasRecipeFor(outputIds.iterator().next()));
+            System.out.printf("MEM disk_bytes=%d recipes=%d perRecipe_bytes=%.1f%n",
+                    onDisk, expect, onDisk / (double) Math.max(1, expect));
+            if (back != null) {
+                sink += back.learnedRecipeCount();
+            }
+        }
+
+        // ---- 可靠性：上限 ----
+        int pad = VoidWarehouseRecipeBook.MAX_RECIPES - data.learnedRecipeCount();
+        for (int i = 0; i < pad; i++) {
+            data.learn(capRecipe(i));
+        }
+        check("R2 补到上限 " + VoidWarehouseRecipeBook.MAX_RECIPES,
+                data.learnedRecipeCount() == VoidWarehouseRecipeBook.MAX_RECIPES);
+        int rejected = 0;
+        for (int i = 0; i < 100; i++) {
+            if (!data.learn(capRecipe(100_000 + i))) {
+                rejected++;
+            }
+        }
+        check("R2 超限后 100 条全被拒", rejected == 100);
+        check("R2 条数没被撑破", data.learnedRecipeCount() == VoidWarehouseRecipeBook.MAX_RECIPES);
+
+        // ---- 可靠性：账目守恒 ----
+        BigInteger before = totalStock(data);
+        int took = 0;
+        BigInteger withdrawn = BigInteger.ZERO;
+        for (int i = 0; i < bots.size(); i++) {
+            String id = sampleIds.get(i % sampleIds.size());
+            Item item = VoidWarehouseRecipeBook.itemOf(id);
+            if (item == null) {
+                continue;
+            }
+            VoidWarehouseData.Withdrawal take = data.withdraw(new ItemStack(item), BigInteger.valueOf(8));
+            withdrawn = withdrawn.add(BigInteger.valueOf(take.taken()));
+            took += take.taken();
+        }
+        BigInteger after = totalStock(data);
+        BigInteger delta = before.subtract(after);
+        System.out.println("BOOK before=" + before + " after=" + after
+                + " delta=" + delta + " withdrawn=" + withdrawn);
+        check("R3 取货后总库存严格减少", took == 0 || delta.signum() > 0);
+        check("R3 净减少不小于取出的件数（不凭空造物）",
+                took == 0 || delta.compareTo(withdrawn) >= 0);
+
+        System.out.printf("MEM heap_used_mb=%.1f recipes=%d rawKinds=%d offers=%d%n",
+                usedAfterGc() / 1048576.0, data.learnedRecipeCount(), rawIds.size(), offers.size());
+    }
+
+    // ================================================================== 构造
+
+    /** 学 n 条 + 每种原料填到 {@code rawPerItem} */
+    private static VoidWarehouseData build(int n, BigInteger rawPerItem) {
+        VoidWarehouseData data = new VoidWarehouseData();
+        int limit = Math.min(n, corpus.size());
+        for (int i = 0; i < limit; i++) {
+            data.learn(corpus.get(i));
+        }
+        for (String id : rawIds) {
+            Item item = VoidWarehouseRecipeBook.itemOf(id);
+            if (item == null || item == Items.AIR) {
+                continue;
+            }
+            int max = Math.max(1, new ItemStack(item).getMaxStackSize());
+            BigInteger need = rawPerItem.subtract(data.amountOf(item));
+            if (need.signum() <= 0) {
+                continue;
+            }
+            long batches = need.add(BigInteger.valueOf(max)).subtract(BigInteger.ONE)
+                    .divide(BigInteger.valueOf(max)).longValue();
+            for (long i = 0; i < batches; i++) {
+                data.insert(new ItemStack(item, max));
+            }
+        }
+        return data;
+    }
+
+    private static void loadCorpus() throws Exception {
+        check("S0 语料文件存在", Files.exists(CORPUS));
+        for (String line : Files.readAllLines(CORPUS, StandardCharsets.UTF_8)) {
+            if (line.isBlank()) {
+                continue;
+            }
+            VoidWarehouseRecipes.Recipe recipe = VoidWarehouseRecipes.decode(line);
+            if (recipe == null) {
+                continue;
+            }
+            corpus.add(recipe);
+            outputIds.add(recipe.output());
+            for (VoidWarehouseRecipes.Part part : recipe.parts()) {
+                rawIds.addAll(part.candidates());
+            }
+        }
+    }
+
+    private static BigInteger totalStock(VoidWarehouseData data) {
+        BigInteger sum = BigInteger.ZERO;
+        for (String id : rawIds) {
+            Item item = VoidWarehouseRecipeBook.itemOf(id);
+            if (item != null) {
+                sum = sum.add(data.amountOf(item));
+            }
+        }
+        return sum;
+    }
+
+    private static VoidWarehouseRecipes.Recipe capRecipe(int i) {
+        return new VoidWarehouseRecipes.Recipe(null, "stress:pad_item_" + i, 1,
+                List.of(new VoidWarehouseRecipes.Part(List.of("minecraft:stone"), 1)));
+    }
+
+    // ================================================================== 假玩家
+
+    private static void buildBots(MinecraftServer server) {
+        for (int i = 0; i < BOT_COUNT; i++) {
+            GameProfile profile = new GameProfile(UUID.randomUUID(), "a2sbot" + i);
+            ServerPlayer p = new ServerPlayer(server, level, profile, zhInfo());
+            try {
+                Connection conn = new Connection(PacketFlow.SERVERBOUND);
+                p.connection = new ServerGamePacketListenerImpl(server, conn, p,
+                        CommonListenerCookie.createInitial(profile, false));
+                fakeConnection = true;
+            } catch (Throwable t) {
+                fakeConnection = false;
+            }
+            bots.add(p);
+        }
+        GameProfile enProfile = new GameProfile(UUID.randomUUID(), "a2sbot-en");
+        enBot = new ServerPlayer(server, level, enProfile, enInfo());
+        try {
+            Connection conn = new Connection(PacketFlow.SERVERBOUND);
+            enBot.connection = new ServerGamePacketListenerImpl(server, conn, enBot,
+                    CommonListenerCookie.createInitial(enProfile, false));
+        } catch (Throwable ignored) {
+            // 双语组只断言 isEnglish
+        }
+    }
+
+    private static ClientInformation zhInfo() {
+        return new ClientInformation("zh_cn", 2,
+                net.minecraft.world.entity.player.ChatVisiblity.FULL, true, 0,
+                net.minecraft.world.entity.player.Player.DEFAULT_MAIN_HAND, false, false,
+                net.minecraft.server.level.ParticleStatus.ALL);
+    }
+
+    private static ClientInformation enInfo() {
+        return new ClientInformation("en_us", 2,
+                net.minecraft.world.entity.player.ChatVisiblity.FULL, true, 0,
+                net.minecraft.world.entity.player.Player.DEFAULT_MAIN_HAND, false, false,
+                net.minecraft.server.level.ParticleStatus.ALL);
+    }
+
+    // ================================================================== 统计
+
+    static long percentile(long[] values, double p) {
+        long[] sorted = values.clone();
+        Arrays.sort(sorted);
+        int idx = (int) Math.round((p / 100.0) * (sorted.length - 1));
+        return sorted[Math.max(0, Math.min(sorted.length - 1, idx))];
+    }
+
+    static long max(long[] values) {
+        long m = Long.MIN_VALUE;
+        for (long v : values) {
+            if (v > m) {
+                m = v;
+            }
+        }
+        return m;
+    }
+
+    static long usedAfterGc() {
+        long best = Long.MAX_VALUE;
+        for (int i = 0; i < 4; i++) {
+            System.gc();
+            try {
+                Thread.sleep(40);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            Runtime rt = Runtime.getRuntime();
+            best = Math.min(best, rt.totalMemory() - rt.freeMemory());
+        }
+        return best;
+    }
+
+    static String fmt(double v) {
+        return String.format("%.2f", v);
+    }
+
+    // ================================================================== 收尾
+
+    private static void finish(MinecraftServer server) {
+        System.out.println("---- 失败清单 ----");
+        if (failedLabels.isEmpty()) {
+            System.out.println("   （无）");
+        } else {
+            for (String label : failedLabels) {
+                System.out.println("   x " + label);
+            }
+        }
+        System.out.println("A2S RESULT checks=" + checks + " failures=" + failures
+                + " kneeScale=" + kneeScale + " mainScale=" + mainScale + " sink=" + sink);
+        server.halt(false);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            failedLabels.add(label);
+        }
+        System.out.println("   " + (ok ? "ok  " : "FAIL") + " " + label);
+    }
+
+    // ============================================================ F 组工具：复刻宽松上界
+    //
+    // 这三段是 VoidWarehouseRecipes#boundCap / #availOf / #forcedDemand 的**逐行复刻**，
+    // 原方法是 private，压测只能用公共 API 拼回来。复刻的正确性由 F1 那条自洽断言兜底：
+    // 只要「cap − 已退让 < 64」在所有成功样本上都成立，就说明这里算的上界与产品里那个是同一个数。
+    //
+    // 任何一个细节走样（cache 共享范围、path 是否每次新建、budget 消耗顺序）都会让上界偏大或偏小，
+    // F1 会当场掉下来 —— 所以这段代码是「可证伪」的，不是凭感觉抄的。
+
+    /** 复刻 maxCraftable 里「估一个宽松上界」的那一段。返回**合成次数**，不是成品个数。 */
+    private static BigInteger capOf(VoidWarehouseRecipes.Recipe recipe, Map<String, BigInteger> stock,
+                                    Map<String, List<VoidWarehouseRecipes.Recipe>> byOutput) {
+        Map<String, BigInteger> cache = new HashMap<>();
+        int[] budget = new int[]{512};   // == VoidWarehouseRecipes.MAX_NODES
+        return boundCapOf(recipe.parts(),
+                id -> availOfProbe(id, stock, byOutput, cache, new LinkedHashSet<>(), 0, budget));
+    }
+
+    /** 复刻 boundCap：单候选按物品合并后相除取 min，多候选各自相除取 max 再取 min。 */
+    private static BigInteger boundCapOf(List<VoidWarehouseRecipes.Part> parts,
+                                         java.util.function.Function<String, BigInteger> avail) {
+        Map<String, Integer> forced = new HashMap<>();
+        for (VoidWarehouseRecipes.Part part : parts) {
+            if (part.candidates().size() == 1) {
+                forced.merge(part.candidates().get(0), part.count(), Integer::sum);
+            }
+        }
+        BigInteger cap = null;
+        for (Map.Entry<String, Integer> entry : forced.entrySet()) {
+            BigInteger each = avail.apply(entry.getKey())
+                    .divide(BigInteger.valueOf(entry.getValue()));
+            if (cap == null || each.compareTo(cap) < 0) {
+                cap = each;
+            }
+        }
+        for (VoidWarehouseRecipes.Part part : parts) {
+            if (part.candidates().size() <= 1) {
+                continue;
+            }
+            BigInteger best = BigInteger.ZERO;
+            for (String candidate : part.candidates()) {
+                BigInteger each = avail.apply(candidate)
+                        .divide(BigInteger.valueOf(part.count()));
+                if (each.compareTo(best) > 0) {
+                    best = each;
+                }
+            }
+            if (cap == null || best.compareTo(cap) < 0) {
+                cap = best;
+            }
+        }
+        return cap;
+    }
+
+    /** 复刻 availOf：「家里有的 + 全部拿去做能做出的」——明知共享原料会重复计数。 */
+    private static BigInteger availOfProbe(String item, Map<String, BigInteger> stock,
+                                           Map<String, List<VoidWarehouseRecipes.Recipe>> byOutput,
+                                           Map<String, BigInteger> cache, Set<String> path,
+                                           int depth, int[] budget) {
+        BigInteger cached = cache.get(item);
+        if (cached != null) {
+            return cached;
+        }
+        BigInteger base = stock.getOrDefault(item, BigInteger.ZERO);
+        if (depth >= VoidWarehouseRecipes.MAX_DEPTH || path.contains(item) || --budget[0] < 0) {
+            return base;
+        }
+        List<VoidWarehouseRecipes.Recipe> subs = byOutput.get(item);
+        if (subs == null || subs.isEmpty()) {
+            cache.put(item, base);
+            return base;
+        }
+        BigInteger bestMade = BigInteger.ZERO;
+        path.add(item);
+        try {
+            for (VoidWarehouseRecipes.Recipe sub : subs) {
+                BigInteger cap = boundCapOf(sub.parts(),
+                        id -> availOfProbe(id, stock, byOutput, cache, path, depth + 1, budget));
+                if (cap == null) {
+                    continue;
+                }
+                bestMade = bestMade.max(cap.multiply(BigInteger.valueOf(sub.outputCount())));
+            }
+        } finally {
+            path.remove(item);
+        }
+        BigInteger total = base.add(bestMade);
+        cache.put(item, total);
+        return total;
+    }
+
+    /**
+     * 用 {@code plan()} 当真值探针，二分出「最多能取几个成品」。
+     *
+     * <p>为什么拿 plan 当探针：它只跑<b>一次</b> simulate，口径与真正执行扣料完全一致，
+     * 所以「plan 能成」＝「点下去真能拿到」。二分的前提是「能做 k 个」对 k 单调
+     * （做得越多越难），这一点由 simulate 的语义保证；万一某个贪心分支跳变，
+     * 二分只会低估真值、不会高估 —— 而低估会让 need 偏大，方向上是保守的。</p>
+     */
+    private static long trueMaxOut(VoidWarehouseRecipes.Recipe recipe, Map<String, BigInteger> stock,
+                                   Map<String, List<VoidWarehouseRecipes.Recipe>> byOutput, long hi) {
+        long lo = 0;
+        while (lo < hi) {
+            long mid = lo + (hi - lo + 1) / 2;
+            if (VoidWarehouseRecipes.plan(recipe, BigInteger.valueOf(mid), stock, byOutput) != null) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return lo;
+    }
+}

@@ -1509,8 +1509,10 @@ public final class VoidWarehouseData extends SavedData {
      * 而那正是历史上最容易出错的地方。</p>
      *
      * @param itemId     物品 id（9 合 1 是 {@code "iron_ingot"} 这种只留 path 的口径；
-     *                   配方扣料是 {@code "minecraft:iron_ingot"} 这种全命名空间的口径 ——
-     *                   两者只在各自内部使用，不互相查表，所以不必统一）
+     *                   配方扣料是 {@code "minecraft:iron_ingot"} 这种全命名空间的口径）。
+     *                   <b>这两个口径确实会在 {@link #exchangeOffers()} 里相遇</b>：那里要让
+     *                   「同时命中 9 合 1 与配方」的物品只出一格，比较之前先归一成全名。
+     *                   所以<b>别把这个字段直接当去重键</b>用，除非你自己先归一化
      * @param template   这一件物品的样板（数量恒 1，无数据组件）
      * @param obtainable 现在最多能拿出多少个
      * @param bulk       普通模式右键「取一组」实际能取到的量。<b>不等于
@@ -2062,10 +2064,27 @@ public final class VoidWarehouseData extends SavedData {
         }
         if (craftEnabled()) {
             this.rebuildCraftCache();
-            // 已经有 9 合 1 条目的物品不重复出现（见本方法的注释）
+            // 已经有 9 合 1 条目的物品不重复出现（见本方法的注释）。
+            //
+            // <b>比较之前必须先把两边的 id 口径统一</b>：9 合 1 表的 itemId 只留 path
+            // （{@code "iron_ingot"}，见 VoidWarehouseExchangeBootstrap），而 collectCraftOffers
+            // 手里的是 VoidWarehouseRecipeBook.idOf 给的全名（{@code "minecraft:iron_ingot"}）。
+            // 拿 path 去 contains 全名<b>永远为 false</b> —— 这段去重曾经一次都没生效过：
+            // 只要玩家学了一条「铁锭 → 铁块」这种恰好也在 9 合 1 表里的配方，同一件东西就会
+            // 占两格（一格写「可兑」一格写「可合成」），玩家会以为能拿两份。之前没暴露，是因为
+            // 手头的语料里 9 合 1 与配方本没有交集。两边唯一的共同真相是 Item 对象本身，
+            // 所以只在边界上翻译一次；翻译不出来的（这个版本没这件物品）原样留着，至少不比丢。
             java.util.Set<String> taken = new java.util.HashSet<>(built.size() * 2);
             for (ExchangeOffer offer : built) {
-                taken.add(offer.itemId());
+                // 先补命名空间再翻译。<b>不能</b>拿 9 合 1 的 itemOf 直接吃全名：
+                // Identifier#withDefaultNamespace 对已经带冒号的字符串会拼成
+                // {@code minecraft:minecraft:iron_block} 并当场抛 IdentifierException
+                // （实测过，把整组自检炸掉了）。而 RecipeBook.itemOf 走 tryParse，
+                // 两种口径都认，于是这里是唯一需要知道口径差异的地方。
+                String raw = offer.itemId();
+                String full = raw.indexOf(':') >= 0 ? raw : "minecraft:" + raw;
+                String canonical = VoidWarehouseRecipeBook.idOf(VoidWarehouseRecipeBook.itemOf(full));
+                taken.add(canonical != null ? canonical : raw);
             }
             this.collectCraftOffers(built, taken);
         }
@@ -2126,6 +2145,11 @@ public final class VoidWarehouseData extends SavedData {
      *
      * <p>{@code taken} 是本次 9 合 1 已经占掉的物品 id —— 同一件东西在界面上出现两格
      * 会让玩家以为能拿两份，优先级给 9 合 1（理由见 {@link #exchangeOffers()}）。</p>
+     *
+     * <p><b>{@code taken} 的口径必须与 {@code offer.itemId()} 一致</b>（这里一律是全命名空间）。
+     * 曾经这里装的是 9 合 1 的 path 口径，而比的是全名 —— {@code Set#contains} 恒为
+     * {@code false}，整段去重是死代码。翻译放在调用方而不是这里，是因为只有
+     * {@link #exchangeOffers()} 同时看得见两种口径。</p>
      *
      * <p>滤在<b>取表时</b>而不是算的时候：9 合 1 的条目每个 tick 都可能变，
      * 但那不该让配方账重算一遍。</p>

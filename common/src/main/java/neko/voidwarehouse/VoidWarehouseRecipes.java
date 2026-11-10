@@ -116,7 +116,10 @@ public final class VoidWarehouseRecipes {
      *                    + 2 个云杉木板拼出来的东西，原版里没有这条 id），所以标识直接用
      *                    展开后的内容本身，天然去重、天然跨版本稳定。算法不看这个字段。
      *                    传 {@code null} 或空串时由构造函数按内容生成
-     * @param output      产物物品 id（{@code minecraft:} 前缀已去掉，与 9 合 1 表的口径一致）
+     * @param output      产物物品 id，<b>全命名空间</b>（{@code "minecraft:iron_ingot"}）；
+     *                    来源是 {@code VoidWarehouseRecipeBook#idOf}（即 {@code Identifier#toString}）。
+     *                    注意与 9 合 1 表的 id 口径<b>不同</b>（那张表只留 path），两者唯一相遇的
+     *                    地方是可兑表的去重，那里会显式翻译
      * @param outputCount 一次合成产出几个。木板是 4、活塞是 1 —— 这个值不能省，
      *                    否则「取 1 个木板」会算成扣 1 份原料却给 4 个
      * @param parts       原料清单，不可为空

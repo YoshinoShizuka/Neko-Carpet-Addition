@@ -183,20 +183,20 @@ public final class VoidWarehouseRecipes {
         if (recipe == null || want == null || want.signum() <= 0 || stock == null || byOutput == null) {
             return null;
         }
-        BigInteger out = BigInteger.valueOf(recipe.outputCount());
-        BigInteger crafts = want.add(out).subtract(ONE).divide(out);
+        int outCount = recipe.outputCount();
+        BigInteger crafts = ceilDiv(want, outCount);
         if (crafts.signum() <= 0) {
             return null;
         }
-        Model model = new Model(stock);
+        Model model = new Model(stock, true);
         if (!simulate(recipe, crafts, model, byOutput, 0, new LinkedHashSet<>(), new int[]{MAX_NODES})) {
             return null;
         }
-        BigInteger extra = crafts.multiply(out).subtract(want);
+        BigInteger extra = surplusOf(crafts, outCount, want);
         if (extra.signum() > 0) {
-            model.surplus.merge(recipe.output(), extra, BigInteger::add);
+            model.addSurplus(recipe.output(), extra);
         }
-        return new Plan(crafts, model.consumed, model.surplus);
+        return new Plan(crafts, model.consumedView(), model.surplusView());
     }
 
     /**
@@ -281,13 +281,16 @@ public final class VoidWarehouseRecipes {
      * <p>{@code crafts <= 0} 一律当作「摆不下」。做 0 次当然是成立的，但那不是
      * 「能做几个」的答案；返回 {@code false} 可以让二分的 {@code best} 稳稳停在
      * {@link #ZERO}，顺便省掉一次没意义的整树模拟。</p>
+     *
+     * <p>探针<b>关掉扣料账本</b>（{@link Model} 的 {@code trackBooks}）：这里只问摆不摆得下，
+     * 账本没人读，开着等于每次探针白写一半的 map —— 而满本重建要跑 5,000 多次探针。</p>
      */
     private static boolean feasible(Recipe recipe, BigInteger crafts, Map<String, BigInteger> stock,
                                     Map<String, List<Recipe>> byOutput) {
         if (crafts.signum() <= 0) {
             return false;
         }
-        return simulate(recipe, crafts, new Model(stock), byOutput, 0, new LinkedHashSet<>(),
+        return simulate(recipe, crafts, new Model(stock, false), byOutput, 0, new LinkedHashSet<>(),
                 new int[]{MAX_NODES});
     }
 
@@ -299,8 +302,8 @@ public final class VoidWarehouseRecipes {
      * 模拟会当成「家里 0 个原木」而直接判做不出来 —— 正是 1.0.15 报的那个 bug 的形态。</p>
      *
      * <p>只收闭包、<b>不是整仓快照</b>：一条配方通常 1~9 项、往下最多 4 层，
-     * 闭包也就几十种物品，而仓库可能有几百格。小 map 的复制成本可以忽略
-     * （模拟过程里每个分支都要复制一份）。</p>
+     * 闭包也就几十种物品，而仓库可能有几百格。这个 map 在模拟里是<b>只读</b>的 ——
+     * {@link Model} 把它当回落层，改动写在自己的覆盖层上，所以一次探针只付一次构造成本。</p>
      *
      * <p>不认识的 id（模组卸载后的残留配方）会拿到 {@code ZERO}，不会抛。</p>
      *
@@ -355,57 +358,166 @@ public final class VoidWarehouseRecipes {
      * 模拟过程中的三本账。
      *
      * <p>{@code pool} 是「还能用多少」的<b>可变池</b>：既有仓库里现成的，也有刚刚往下钻做出来的。
-     * 分支走错时要能退回去，所以每个分支都拿 {@link #copy()} 而不是改原件；
-     * 走对了再用 {@link #adopt} 把结果搬回来。</p>
+     * 分支走错时要能退回去 —— 用的是 <b>{@link #mark()} / {@link #rollback(int)} 日志化撤销</b>，
+     * 而不是「每个分支复制一份」。</p>
      *
-     * <p>为什么不用「先记操作日志、失败再回放逆操作」：逆操作的写法容易漏，
-     * 而漏一处就是账目对不上（这是本项目最不能接受的一类 bug）。复制小 map 笨但不会错。</p>
+     * <h2>为什么从「复制小 map」改成「记旧值回滚」</h2>
+     * <p>复制版是<b>对</b>的，但代价随探针数线性放大：满本 1236 条配方、每种原料上万时，
+     * 一次满本重建要跑 5,393 次探针，实测 {@code Model.copy()} 被调用 <b>164,505 次</b>
+     * —— 每次复制都要重建一个 40~60 项的 {@code HashMap} 外加两个 {@code LinkedHashMap}，
+     * 占掉满本重建 118 ms 里的绝大部分（归因见 {@code docs/配方本满本并发测试报告.md} §12）。</p>
+     *
+     * <p>「改用逆操作」原本被否掉过，理由是「逆操作的写法容易漏，漏一处就是账目对不上」。
+     * 这里避开那个风险的办法是：<b>不写逆操作，只记旧值</b> —— 每次改 map 前把
+     * (哪本账, 键, 旧值) 压进一条撤销日志，回滚时倒序贴回。它和逆操作的区别是
+     * 机械可验证：只要「所有写操作都经过 {@link #setPool} / {@link #addConsumed} /
+     * {@link #addSurplus}」这一条成立，回滚就必然精确 —— 而这条由 {@code pool}、
+     * {@code consumed}、{@code surplus} 三个字段都是 {@code private} 来<b>强制</b>：
+     * 想绕过日志直接写 map，当场编译不过。</p>
+     *
+     * <p>{@code pool} 还做成了<b>惰性覆盖层</b>：初始不复制库存，读的时候「自己的覆盖值优先，
+     * 否则回落到库存快照」。省掉的是每次探针一次 40~60 项的 {@code HashMap} 构造。</p>
      */
     private static final class Model {
-        final Map<String, BigInteger> pool;
-        final Map<String, BigInteger> consumed = new LinkedHashMap<>();
-        final Map<String, BigInteger> surplus = new LinkedHashMap<>();
+        private static final int POOL = 0;
+        private static final int CONSUMED = 1;
+        private static final int SURPLUS = 2;
 
-        Model(Map<String, BigInteger> stock) {
-            this.pool = new HashMap<>(stock);
+        /** 库存快照（只读，不为任何分支复制）。 */
+        private final Map<String, BigInteger> stock;
+        /** 覆盖值：本分支改过的物品才在这里有键；值可能是 {@link #ZERO}，所以判存在用 containsKey。 */
+        private final Map<String, BigInteger> pool = new HashMap<>();
+        private final Map<String, BigInteger> consumed = new LinkedHashMap<>();
+        private final Map<String, BigInteger> surplus = new LinkedHashMap<>();
+        /**
+         * 是否维护扣料账本（{@code consumed} / {@code surplus}）。
+         *
+         * <p>{@link #maxCraftable} 的探针只问「摆不摆得下」，账本既不参与判断也不被读取，
+         * 所以探针一律关掉它 —— 每次探针能省掉约一半的写操作。{@link #plan} 要拿账本当结果，
+         * 必须开着。这条开关不影响任何判断结果：账本只在 {@link #plan} 的返回值里被读。</p>
+         */
+        private final boolean trackBooks;
+
+        // 撤销日志用三个平行数组，不用对象 —— 每次探针要压上万条，装箱会把 GC 拖进来。
+        private int[] undoBook = new int[64];
+        private String[] undoKey = new String[64];
+        private BigInteger[] undoOld = new BigInteger[64];
+        private int undoSize;
+
+        Model(Map<String, BigInteger> stock, boolean trackBooks) {
+            this.stock = stock;
+            this.trackBooks = trackBooks;
         }
 
-        Model copy() {
-            Model copy = new Model(this.pool);
-            copy.consumed.putAll(this.consumed);
-            copy.surplus.putAll(this.surplus);
-            return copy;
+        /** 记下当前位置。回滚到这个位置 = 撤销这之后的所有写。 */
+        int mark() {
+            return this.undoSize;
         }
 
-        void adopt(Model other) {
-            this.pool.clear();
-            this.pool.putAll(other.pool);
-            this.consumed.clear();
-            this.consumed.putAll(other.consumed);
-            this.surplus.clear();
-            this.surplus.putAll(other.surplus);
+        /** 倒序把旧值贴回去。{@code old == null} 表示「当时这个键不存在」，回滚成删除。 */
+        void rollback(int mark) {
+            for (int i = this.undoSize - 1; i >= mark; i--) {
+                Map<String, BigInteger> book = bookAt(this.undoBook[i]);
+                String key = this.undoKey[i];
+                BigInteger old = this.undoOld[i];
+                if (old == null) {
+                    book.remove(key);
+                } else {
+                    book.put(key, old);
+                }
+            }
+            // 清引用：撤销日志数组会活到这次探针结束，不清就会拽着一堆字符串不放。
+            for (int i = mark; i < this.undoSize; i++) {
+                this.undoKey[i] = null;
+                this.undoOld[i] = null;
+            }
+            this.undoSize = mark;
+        }
+
+        /** 「还能用多少」：本分支改过就看覆盖值，没改过回落到库存。 */
+        BigInteger available(String item) {
+            // 覆盖值不会是 null（只写 ZERO 或正数），所以 get != null 就等价于 containsKey，
+            // 省掉一次哈希查找 —— 本方法是整个模拟器最热的一行。
+            BigInteger overridden = this.pool.get(item);
+            if (overridden != null) {
+                return overridden;
+            }
+            BigInteger base = this.stock.get(item);
+            return base == null ? ZERO : base;
+        }
+
+        void setPool(String item, BigInteger value) {
+            journal(POOL, item, this.pool.get(item));
+            this.pool.put(item, value);
+        }
+
+        void addConsumed(String item, BigInteger delta) {
+            if (!this.trackBooks) {
+                return;
+            }
+            BigInteger old = this.consumed.get(item);
+            journal(CONSUMED, item, old);
+            this.consumed.put(item, old == null ? delta : old.add(delta));
+        }
+
+        void addSurplus(String item, BigInteger delta) {
+            if (!this.trackBooks) {
+                return;
+            }
+            BigInteger old = this.surplus.get(item);
+            journal(SURPLUS, item, old);
+            this.surplus.put(item, old == null ? delta : old.add(delta));
+        }
+
+        Map<String, BigInteger> consumedView() {
+            return this.consumed;
+        }
+
+        Map<String, BigInteger> surplusView() {
+            return this.surplus;
+        }
+
+        private void journal(int book, String key, BigInteger old) {
+            if (this.undoSize == this.undoKey.length) {
+                int grown = this.undoSize * 2;
+                this.undoBook = java.util.Arrays.copyOf(this.undoBook, grown);
+                this.undoKey = java.util.Arrays.copyOf(this.undoKey, grown);
+                this.undoOld = java.util.Arrays.copyOf(this.undoOld, grown);
+            }
+            this.undoBook[this.undoSize] = book;
+            this.undoKey[this.undoSize] = key;
+            this.undoOld[this.undoSize] = old;
+            this.undoSize++;
+        }
+
+        private Map<String, BigInteger> bookAt(int book) {
+            return switch (book) {
+                case CONSUMED -> this.consumed;
+                case SURPLUS -> this.surplus;
+                default -> this.pool;
+            };
         }
     }
 
     /**
      * 把「做 {@code crafts} 次 {@code recipe}」真摆一遍，成功时把账写进 {@code model}。
      *
-     * <p>逐项处理原料；一项有多候选时按候选顺序试，<b>每个候选都在独立的副本上试</b>，
-     * 失败就换下一个（换了之后前一候选的扣料不会残留）。</p>
+     * <p>逐项处理原料；一项有多候选时按候选顺序试，<b>每个候选试之前先打个 {@code mark}，
+     * 失败就 {@code rollback} 回去</b> —— 换候选后前一候选的扣料不会残留。</p>
      */
     private static boolean simulate(Recipe recipe, BigInteger crafts, Model model,
                                     Map<String, List<Recipe>> byOutput,
                                     int depth, Set<String> path, int[] budget) {
         for (Part part : recipe.parts()) {
-            BigInteger amount = crafts.multiply(BigInteger.valueOf(part.count()));
+            BigInteger amount = times(crafts, part.count());
             boolean done = false;
             for (String candidate : part.candidates()) {
-                Model trial = model.copy();
-                if (supply(candidate, amount, trial, byOutput, depth, path, budget)) {
-                    model.adopt(trial);
+                int mark = model.mark();
+                if (supply(candidate, amount, model, byOutput, depth, path, budget)) {
                     done = true;
                     break;
                 }
+                model.rollback(mark);
             }
             if (!done) {
                 return false;
@@ -421,17 +533,19 @@ public final class VoidWarehouseRecipes {
      * 若改成「一缺货就整项去做」，会做出 4 个木板、用掉 3 个、剩 3 个入账 ——
      * 净效果虽然也是「多了 1 个木板」，但白扣了一次原木，玩家看到的就是「明明有木板还扣我原木」。</p>
      *
-     * <p>⚠️ 本方法会改 {@code model}，<b>失败时不会自动还原</b> —— 调用方必须传副本
-     * （{@link #simulate} 的候选循环与下面子配方循环都是这么做的）。</p>
+     * <p>⚠️ 本方法会改 {@code model}，<b>失败时不会自己还原</b> —— 还原由调用方按它自己记的
+     * {@code mark} 做（{@link #simulate} 的候选循环与下面子配方循环都是这么做的）。
+     * 自己还原反而会错：子配方循环里「已经扣掉的那部分库存」在换下一条子配方时<b>必须保留</b>，
+     * 所以这里只能由调用方决定回滚到哪个位置。</p>
      */
     private static boolean supply(String item, BigInteger amount, Model model,
                                   Map<String, List<Recipe>> byOutput,
                                   int depth, Set<String> path, int[] budget) {
-        BigInteger have = model.pool.getOrDefault(item, ZERO);
+        BigInteger have = model.available(item);
         BigInteger use = have.min(amount);
         if (use.signum() > 0) {
-            model.pool.put(item, have.subtract(use));
-            model.consumed.merge(item, use, BigInteger::add);
+            model.setPool(item, have.subtract(use));
+            model.addConsumed(item, use);
         }
         BigInteger rest = amount.subtract(use);
         if (rest.signum() <= 0) {
@@ -451,24 +565,80 @@ public final class VoidWarehouseRecipes {
         path.add(item);
         try {
             for (Recipe sub : subs) {
-                BigInteger out = BigInteger.valueOf(sub.outputCount());
+                int outCount = sub.outputCount();
                 // 要 rest 个，一次出 out 个 ⇒ 做 ceil(rest / out) 次。
                 // 多出来的 subCrafts × out − rest 个必须<b>入账回仓库</b>（不是丢掉，也不是白送）。
-                BigInteger subCrafts = rest.add(out).subtract(ONE).divide(out);
-                Model trial = model.copy();
-                if (simulate(sub, subCrafts, trial, byOutput, depth + 1, path, budget)) {
-                    BigInteger extra = subCrafts.multiply(out).subtract(rest);
+                BigInteger subCrafts = ceilDiv(rest, outCount);
+                int mark = model.mark();
+                if (simulate(sub, subCrafts, model, byOutput, depth + 1, path, budget)) {
+                    BigInteger extra = surplusOf(subCrafts, outCount, rest);
                     if (extra.signum() > 0) {
-                        trial.surplus.merge(item, extra, BigInteger::add);
+                        model.addSurplus(item, extra);
                     }
-                    model.adopt(trial);
                     return true;
                 }
+                model.rollback(mark);
             }
             return false;
         } finally {
             path.remove(item);
         }
+    }
+
+    // ================================================================== 小整数快路径
+
+    /**
+     * 模拟器里最热的三行都是 {@code BigInteger} 的乘除法：每个节点算 {@code crafts × count}，
+     * 每次往下钻算 {@code ceil(rest / out)} 与多出来的零头。{@code BigInteger} 每做一次
+     * 都要分配中间对象，而这里的量级（几次合成、几十个原料）用 {@code long} 完全装得下。
+     *
+     * <p>这不是凭感觉的微优化：满本重建 5,393 次探针只走 51,645 个节点，
+     * 平均一次探针 10 个节点 —— 单次探针的 4 µs 里既没有哈希表增长也没有 GC 压力，
+     * 剩下的就是这些算术的对象分配。归因见 {@code docs/配方本满本并发测试报告.md} §12。</p>
+     *
+     * <p>{@code 40} 位是保守阈值：{@code 2^40 ≈ 1.1×10¹²}，再乘最多 64 也不会溢出 {@code long}。
+     * 超过就退回 {@code BigInteger} 原路，<b>行为完全一致</b>（对拍验证过）。</p>
+     */
+    private static final int SMALL_BITS = 40;
+
+    /** 1~64 的 {@code BigInteger} 常量：{@code BigInteger.valueOf} 只缓存 -16~16，其余每次都新建。 */
+    private static final BigInteger[] SMALL_COUNT = new BigInteger[65];
+
+    static {
+        for (int i = 0; i < SMALL_COUNT.length; i++) {
+            SMALL_COUNT[i] = BigInteger.valueOf(i);
+        }
+    }
+
+    private static BigInteger small(int count) {
+        return count >= 0 && count < SMALL_COUNT.length
+                ? SMALL_COUNT[count] : BigInteger.valueOf(count);
+    }
+
+    /** {@code value × factor}。 */
+    private static BigInteger times(BigInteger value, int factor) {
+        if (value.bitLength() <= SMALL_BITS) {
+            return BigInteger.valueOf(value.longValue() * factor);
+        }
+        return value.multiply(small(factor));
+    }
+
+    /** {@code ceil(rest / out)}，要求 {@code out > 0}。 */
+    private static BigInteger ceilDiv(BigInteger rest, int out) {
+        if (rest.bitLength() <= SMALL_BITS) {
+            long r = rest.longValue();
+            return BigInteger.valueOf((r + out - 1) / out);
+        }
+        BigInteger divisor = small(out);
+        return rest.add(divisor).subtract(ONE).divide(divisor);
+    }
+
+    /** {@code crafts × out − rest}：做多了要入账的零头。 */
+    private static BigInteger surplusOf(BigInteger crafts, int out, BigInteger rest) {
+        if (crafts.bitLength() <= SMALL_BITS && rest.bitLength() <= SMALL_BITS) {
+            return BigInteger.valueOf(crafts.longValue() * out - rest.longValue());
+        }
+        return crafts.multiply(small(out)).subtract(rest);
     }
 
     // ================================================================== 上界

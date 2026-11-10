@@ -141,22 +141,39 @@
 - **验证**：五版本产物逐个 `javap` 复核，`PrinterPlaceService` 里 `distanceToSqr` 调用数归零、`allowedPosition` 内 `isWithinBlockInteractionRange` 仍在（26.3 / 26.2 / 26.1.2 / 26.1.1 为可读名，1.21.11 经 remap 后是 `method_56093`）(Verified per version by javap after remapping.).
 - **CI 五版本全绿后合并**（merge commit `302207f`）；本节列出的本版资产即由该提交的 CI 构建替换(All five versions went green before the merge; the assets listed here are that merge commit's CI build.).
 
+#### 同一件东西占两格：可兑表的去重从来没生效过（`voidWarehouseCraft` + `voidWarehouseExchange`）
+
+两条规则都开着时，一件物品会在界面上出现**两次** —— 一格写「可兑」、一格写「可合成」，玩家会以为能拿两份。去重代码一直都在，只是它比的是一套对不上的 id(When both rules are enabled, one item could occupy two cells because the dedup compared ids from two different naming conventions.).
+
+- **复现路径**：9 合 1 表里本来就有 `iron_ingot → iron_block`（9:1）。玩家再学一条「9 个铁锭 → 1 个铁块」的配方，仓库里放 18 个铁锭、0 个铁块，两条路**都**认为可以给出 `iron_block`(A recipe that duplicates an existing 9:1 conversion makes both paths offer the same item.).
+- **根因是两套 id 口径**：9 合 1 表的 id 只留 path（`iron_block`），配方本的是全命名空间（`minecraft:iron_block`）。去重写的是 `taken.contains(offer.itemId())` —— `Set<String>` 拿这两种拼法比，**恒为 `false`**，整段去重从落地那天起就是死代码(The dedup compared a bare path against a fully-qualified id, so it never matched.)。
+- 🔴 **两处注释合起来把这个 bug 说成了设计**：`Recipe.output` 写着「`minecraft:` 前缀已去掉，与 9 合 1 表的口径一致」（不实，它来自 `Identifier#toString`），`ExchangeOffer.itemId` 写着「两者只在各自内部使用，不互相查表，所以不必统一」（不实，`exchangeOffers()` 天天拿它们互相比）。两处都已订正(Two comments described the opposite of what the code did; both are corrected.).
+- **为什么一直没暴露**：语料 1042 个产物里有 **65** 个落在 9 合 1 表内，但 `voidWarehouseExchange` **默认是 `false`** —— 关着的时候 9 合 1 一条都不产，`taken` 本来就是空集，连「恒 `false`」都测不出来(With the exchange rule off by default, the dead comparison was invisible.).
+- **改法**：只在**一处**归一（`exchangeOffers()` 是唯一同时看得见两种口径的地方），先补命名空间再走 `VoidWarehouseRecipeBook.itemOf`（`tryParse`，两种都认），翻不出来的原样留着(One normalisation point, done at the only place that sees both conventions.).
+- 🔴 **不能拿 `Identifier#withDefaultNamespace` 当兜底**：它只吃裸 path，喂全名会拼成 `minecraft:minecraft:iron_block` 并**当场抛 `IdentifierException`**。第一版就是这么写的，把整组自检炸成日志里一句「自检抛异常」(`withDefaultNamespace` throws on an already-qualified id.).
+- **只影响两条规则都开的情况**：只开配方扣料时 `taken` 是空集，滤不掉任何东西 —— 五个版本 `A2StressTest` 的 `UI offers` 与本轮改动前**逐字相同**（738 / 663 / 644 / 644 / 644）(Single-rule setups are unaffected, verified byte-for-byte.).
+- 🔴 **`CRAFT_DIRTY_LIMIT = 96` 那条分支补了直接单测**：它没有任何可观测的行为差异，所以「造数据比结果」这条路根本测不出来。判据改成**往私有缓存泼一条错值、看它有没有被纠正**：脏物品恰好 96 种时走增量 → 错值原样留着；97 种时走整批 → 错值被纠正。一对读数把阈值钉死在原地，同时证明那段循环体不是死代码(The threshold branch is now covered by poisoning a private cache entry and watching whether it gets recomputed.).
+  - 配套四条防线：填充物按 `craftDeps` 的并集当排除集（不硬编码物品名）、阈值反射读产品常量（不抄第二份）、断言缓存是同一个 map 对象、潜影盒不进填充物（`insert` 会拆盒，脏集合 `size` 会失真）。
+- **验证**：`VoidWarehouseCraftSelfCheck` 新增 **N 组 12 条断言**（M 组之后），四版本各 **161 条**。**变异测试**把去重改回旧写法 → `N1 实测 2 格` / `N2 重复：iron_block / minecraft:iron_block` 当场红，改回来 `failures=0`(A mutation test confirms the new assertions bite.).
+- **五版本 1,864 条断言零失败**：`CraftSelfCheck` 161×4 + `SystemTest` 209×5 + `A2StressTest` 35×5。完整数据见 `docs/配方本满本并发测试报告.md` §14(1864 assertions green across five versions.).
+- ⚠️ **`SystemTest` 的 `sink=` 会变**（9,795,079 → 9,901,959）：`sink` 是非负数之和，去重只会让它**变小**，所以这个变化不可能来自本次修复 —— 是新增的 N 组往测试存档里多学了 3 条配方。它因此不再是跨版本指纹，能比的只有断言(`sink` moved for an unrelated reason and is no longer a cross-version fingerprint.).
+
 ### 📦 Builds / 构建产物
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 443,345 B | `a962a217f0dbd938ce1b1edb1ba7e37e` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 493,276 B | `8ed0ff5ade0f7de1da3e19dc39a89db0` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 443,479 B | `a4ed262b5d45b7d4bc5cfd2e218e99c5` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 493,690 B | `de9d37823bd421146aa07400214a5cc1` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 446,746 B | `b1be6061c97ba0352b15dc2f2278acc7` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 494,701 B | `4180fc2ab9f7dd57a8e8094396ee7e34` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 446,747 B | `7ef93622c912a297e8040982ea57750b` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 494,700 B | `685acc0c1b9a864129fc568cd506fccd` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 443,769 B | `96a126fab5219ffba52800708c980888` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 494,435 B | `d395dcb19bf7b38ecac9b0c3db92f446` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 443,495 B | `4064514b19019b2aab1fa1fc0b7dd388` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 494,187 B | `ea968b4ae643b21827d28c2f51891c40` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 443,622 B | `faee55f60e4eeda4a54325892d63e609` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 494,609 B | `ac70eda11c1b45a4b8a6285ccef6fd0b` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 446,889 B | `99bea7a6334e300914923fabb1d55b20` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 495,620 B | `43b4e3bb1610698fe94af0c5cc073fba` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 446,890 B | `df8894de62dfdf8e60930924b36cc803` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 495,619 B | `0736aafb231fe639ce157caeb7c92867` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 443,932 B | `08858fe6d8072c505bbf79d26b0da57c` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 495,364 B | `661201d4ee34c2d9dc43eb0bd504f4e5` |
 
-> **本表已按 2026-11-10 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第五次原地替换**：规则集、配置键、规则名仍然一个字都没动 —— 这次改的是 `VoidWarehouseData` 里「可兑表怎么重算」（**从「每次都把 746 个产物全算一遍」改成「只重算受影响的 13 个」**），扣料算法本身逐字节不变。主 jar 变大 1.2 KB 是新的脏集合、依赖集与增量重算，sources jar 变大 3.8 KB 同源。md5 与前四次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-10; the v1.0.17 assets were replaced in place a fifth time so that the offer table is recomputed incrementally, one entry per affected product.)。
+> **本表已按 2026-11-10 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第六次原地替换**：规则集、配置键、规则名仍然一个字都没动 —— 这次只改「可兑表怎么去重」（**把 9 合 1 的 path 口径在边界上翻成全名再比**）+ 两处与事实相反的注释，扣料算法与增量重算逻辑逐字节不变。主 jar 变大 150 B 就是那段归一，sources jar 变大 0.9 KB 主要是注释。md5 与前五次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-10; the v1.0.17 assets were replaced in place a sixth time, so that the offer-table dedup compares ids in one convention. Only that normalisation and two misleading comments changed.).
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 
@@ -170,7 +187,7 @@
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
-- **v1.0.17 的产物换过五次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建。五次都**没改版本号**，只是字节变了。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place five times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, and the incremental offer rebuild — with the version number unchanged.)。
+- **v1.0.17 的产物换过六次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日最后换成含「可兑表去重口径修正」的本地全量构建。六次都**没改版本号**，只是字节变了。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place six times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, and the dedup-convention fix — with the version number unchanged.)。
 
 * * *
 

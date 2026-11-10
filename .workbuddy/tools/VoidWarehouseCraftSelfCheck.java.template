@@ -1,10 +1,12 @@
 package neko.voidwarehouse;
 
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.crafting.CraftingInput;
@@ -13,10 +15,12 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 /**
  * 【临时自检】「配方学习 + 配方扣料」这一整条新链路。验证完删掉。
@@ -47,6 +51,9 @@ import java.util.Random;
  *   <li><b>M 增量等价</b>（R3）：可兑表改成「只重算受影响的产物」之后，每一次改动都必须与
  *       「整批重算」给出<b>逐字节相同</b>的结果（含顺序）。这组的风险不是算错而是<b>漏算</b> ——
  *       数量类断言看不出来，只有和一份从零算起的对照逐行比才抓得到。</li>
+ *   <li><b>N 去重口径 / 脏物品阈值</b>：同一件物品同时被 9 合 1 与配方命中时只许占一格
+ *       （这条去重曾经因为拿两套 id 口径互相比，<b>一次都没生效过</b>）；外加
+ *       {@code CRAFT_DIRTY_LIMIT} 的两侧边界 —— 恰好等于阈值走增量、多一个走整批。</li>
  * </ol>
  */
 public final class VoidWarehouseCraftSelfCheck {
@@ -139,6 +146,9 @@ public final class VoidWarehouseCraftSelfCheck {
                 groupM_incrementalEquivalence(server);
                 break;
             case 14:
+                groupN_dedupAndDirtyLimit(server);
+                break;
+            case 15:
                 cleanup(server);
                 break;
             default:
@@ -1106,6 +1116,292 @@ public final class VoidWarehouseCraftSelfCheck {
                 part("minecraft:cobblestone", 1),
                 part("minecraft:stick", 1)));
         return book;
+    }
+
+    // ================================================================ N 组
+
+    /** N 组故意塞进缓存的那一格：本身是产物、又不在 9 合 1 表里，不会和 N1 的去重纠缠 */
+    private static final String POISON_ID = "minecraft:piston";
+
+    /**
+     * <h2>N1/N2 —— 去重口径</h2>
+     * <p>9 合 1 表里本来就有 {@code iron_ingot → iron_block}（9:1），再学一条一模一样的换算，
+     * 就是「同一件物品被两条路同时命中」。修口径之前这里会出两格：一格是 9 合 1 的
+     * {@code "iron_block"}，一格是配方的 {@code "minecraft:iron_block"} ——
+     * 界面上一格写「可兑」一格写「可合成」，玩家会以为能拿两份。</p>
+     *
+     * <p>N1b 是反证的另一半：只断言「只剩一格」还不够，还得断言<b>留下的是哪一格</b>。
+     * 要是把方向写反（滤掉 9 合 1、留下配方），N1 照样绿。</p>
+     *
+     * <p>N2 把这件事抬成通用不变量：整张表里不许有两格指向<b>同一件物品</b>（按 Item 对象比，
+     * 不受 id 口径影响）。它不依赖 {@code iron_block} 这个具体样本，任何一档语料只要
+     * 同时命中两条路就会红。</p>
+     *
+     * <h2>N3~N5 —— {@code CRAFT_DIRTY_LIMIT} 的两侧边界</h2>
+     * <p>那条分支<b>没有可观测的行为差异</b>：整批和增量给出的结果本来就该一样，
+     * 所以「跑完对比结果」根本测不出分支跑没跑。改成往私有缓存里<b>塞一条错值</b>，
+     * 再看它有没有被纠正：</p>
+     * <ul>
+     *   <li>脏物品<b>全部不在任何产物的依赖集里</b> ⇒ 增量分支一格都不重算 ⇒ 错值原样留着；</li>
+     *   <li>整批分支 ⇒ 每一格都重算 ⇒ 错值必然消失。</li>
+     * </ul>
+     * <p>于是「阈值种→错值还在、阈值+1 种→错值没了」这一对读数就把阈值钉在原地，
+     * 也顺带证明那段循环体真的在跑，而不是永远进不去的死代码。</p>
+     *
+     * <p>阈值本身<b>反射读产品代码里的常量</b>，不在这里抄一份：抄一份就有两个真相，
+     * 产品那边调了 96 而测试还按 96 造数据，测的就变成一条不存在的线。</p>
+     */
+    private static void groupN_dedupAndDirtyLimit(MinecraftServer server) {
+        System.out.println("[N] 去重口径 / CRAFT_DIRTY_LIMIT 边界");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        // 9 合 1 规则<b>默认是关的</b>，不显式打开的话 collectNineInOneOffers 一条都不会产，
+        // N1 就变成「只有配方那格」的假绿。开完在组尾还原，别把开关留给后面的组。
+        VoidWarehouseSettings.voidWarehouseExchange = true;
+        // 学不进去也算正常：配方本落在存档里、跨轮持久化，同一台机器第二次跑时这条已经在书里了。
+        // 所以不拿 learn 的返回值当前置，改成下面直接看 craftOffers 里那一格有没有算出来。
+        data.learn(recipe("minecraft:iron_block", 1, part("minecraft:iron_ingot", 9)));
+        data.learn(recipe("minecraft:piston", 1,
+                part("minecraft:cobblestone", 4),
+                part("minecraft:oak_planks", 3),
+                part("minecraft:iron_ingot", 1),
+                part("minecraft:redstone", 1)));
+        data.learn(recipe("minecraft:oak_planks", 4, part("minecraft:oak_log", 1)));
+        data.insert(new ItemStack(Items.IRON_INGOT, 18));
+        data.insert(new ItemStack(Items.COBBLESTONE, 40));
+        data.insert(new ItemStack(Items.OAK_LOG, 8));
+        data.insert(new ItemStack(Items.REDSTONE, 5));
+
+        VoidWarehouseData.noteServerTick(910_000 + (++scratchTick));
+        List<VoidWarehouseData.ExchangeOffer> offers = data.exchangeOffers();
+
+        Map<String, VoidWarehouseData.ExchangeOffer> cache = craftOffersOf(data);
+        if (cache == null) {
+            check("N0 反射取 craftOffers 失败（内部字段改名了？）", false);
+            VoidWarehouseSettings.voidWarehouseExchange = false;
+            return;
+        }
+        check("N0 前置：craftOffers 里 iron_block 那一格就是「能做」（不然 N1 测不到重复）",
+                cache.get("minecraft:iron_block") != null);
+
+        int ironBlock = 0;
+        boolean nineInOneWon = false;
+        for (VoidWarehouseData.ExchangeOffer offer : offers) {
+            if (!isSameItem(offer.itemId(), "iron_block")) {
+                continue;
+            }
+            ironBlock++;
+            nineInOneWon |= !offer.craft();
+        }
+        check("N1 iron_block 同时命中 9 合 1 与配方时只占一格（实测 " + ironBlock + " 格）", ironBlock == 1);
+        check("N1b 留下的那一格是 9 合 1（优先级口径）", nineInOneWon);
+
+        String duplicate = firstDuplicateItem(offers);
+        check("N2 整张可兑表没有两格指向同一件物品"
+                + (duplicate == null ? "" : "（重复：" + duplicate + "）"), duplicate == null);
+
+        // ---- N3 前置 ----
+        Set<String> depIds = allDependencyIds(data);
+        Integer limit = dirtyLimit();
+        if (depIds == null || limit == null) {
+            check("N3 反射取 craftDeps / CRAFT_DIRTY_LIMIT 失败（内部结构改名了？）", false);
+            VoidWarehouseSettings.voidWarehouseExchange = false;
+            return;
+        }
+        check("N3 前置：piston 那一格在缓存里且答案是「能做」（脏水泼得上去）",
+                cache.get(POISON_ID) != null && depIds.contains(POISON_ID));
+        // ⚠️ 下面几条读数全靠「cache 一直是同一个 map 对象」。只有「配方本换版」那条分支
+        // 会重新 new 一个，N 组全程不 learn，所以不会被换掉；真被换掉的话 put 进去的错值
+        // 会随之消失，读数就变成「错值本来就不在」，看着像通过、其实什么都没测到 ——
+        // 所以 N5c 补一条对象同一性。这条坑是 M 组「对照组构造错」的同一类，写在前面提醒。
+        List<Item> fillers = pickFillerItems(depIds, limit + 1);
+        check("N3 前置：凑到 " + (limit + 1) + " 种不在任何依赖集里的填充物品（实测 "
+                + fillers.size() + "）", fillers.size() == limit + 1);
+        if (fillers.size() < limit + 1) {
+            VoidWarehouseSettings.voidWarehouseExchange = false;
+            return;
+        }
+
+        // ---- N4 恰好等于阈值：不超 ⇒ 走增量 ----
+        cache.put(POISON_ID, null);
+        int bad = touchAll(data, fillers.subList(0, limit));
+        check("N4 前置：" + limit + " 种填充物全部入库 / 出库成功（失败 " + bad + " 次）", bad == 0);
+        VoidWarehouseData.noteServerTick(910_000 + (++scratchTick));
+        data.exchangeOffers();
+        check("N4 " + limit + " 种脏物品（不超阈值）走增量分支 → 错值原样留着",
+                cache.get(POISON_ID) == null);
+
+        // ---- N5 阈值 +1：超 ⇒ 走整批 ----
+        bad = touchAll(data, fillers);
+        check("N5 前置：" + (limit + 1) + " 种填充物全部入库 / 出库成功（失败 " + bad + " 次）", bad == 0);
+        VoidWarehouseData.noteServerTick(910_000 + (++scratchTick));
+        List<VoidWarehouseData.ExchangeOffer> healed = data.exchangeOffers();
+        check("N5 " + (limit + 1) + " 种脏物品（超阈值）走整批分支 → 错值被纠正",
+                cache.get(POISON_ID) != null);
+        check("N5b 纠正回来的 piston 真的回到可兑表里", countSameItem(healed, POISON_ID) == 1);
+        check("N5c 缓存 map 始终是同一个对象（否则 N4/N5 的读数无意义）", cache == craftOffersOf(data));
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+    }
+
+    /** 反射取 {@code VoidWarehouseData} 的私有字段（自检与产品代码同一个 classloader，setAccessible 可用） */
+    private static java.lang.reflect.Field declaredField(String name) {
+        try {
+            java.lang.reflect.Field field = VoidWarehouseData.class.getDeclaredField(name);
+            field.setAccessible(true);
+            return field;
+        } catch (ReflectiveOperationException ex) {
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, VoidWarehouseData.ExchangeOffer> craftOffersOf(VoidWarehouseData data) {
+        java.lang.reflect.Field field = declaredField("craftOffers");
+        if (field == null) {
+            return null;
+        }
+        try {
+            Object raw = field.get(data);
+            return raw instanceof Map ? (Map<String, VoidWarehouseData.ExchangeOffer>) raw : null;
+        } catch (ReflectiveOperationException ex) {
+            return null;
+        }
+    }
+
+    /** 所有产物依赖集里出现过的 id（并集）。不在这张表里的物品，改了不会让任何一格重算 */
+    private static Set<String> allDependencyIds(VoidWarehouseData data) {
+        java.lang.reflect.Field field = declaredField("craftDeps");
+        if (field == null) {
+            return null;
+        }
+        try {
+            Object raw = field.get(data);
+            if (!(raw instanceof Map)) {
+                return null;
+            }
+            Set<String> all = new HashSet<>();
+            for (Object value : ((Map<?, ?>) raw).values()) {
+                if (!(value instanceof Set)) {
+                    continue;
+                }
+                for (Object id : (Set<?>) value) {
+                    if (id instanceof String) {
+                        all.add((String) id);
+                    }
+                }
+            }
+            return all;
+        } catch (ReflectiveOperationException ex) {
+            return null;
+        }
+    }
+
+    /** 产品代码里的 {@code CRAFT_DIRTY_LIMIT}（私有常量，反射读，避免测试里出现第二个真相） */
+    private static Integer dirtyLimit() {
+        java.lang.reflect.Field field = declaredField("CRAFT_DIRTY_LIMIT");
+        if (field == null) {
+            return null;
+        }
+        try {
+            return field.getInt(null);
+        } catch (ReflectiveOperationException | IllegalArgumentException ex) {
+            return null;
+        }
+    }
+
+    /**
+     * 挑 {@code wanted} 种<b>不在任何依赖集里</b>的可入库物品，用来造「改了很多东西、
+     * 但没有一个落在依赖集里」这种脏集合。
+     *
+     * <p>潜影盒排除掉：{@link VoidWarehouseData#insert} 会把非空盒拆成壳 + 箱 + 染料，
+     * 一次 {@code insert} 就多记好几样物品，脏集合的size 会跟预期对不上。</p>
+     */
+    private static List<Item> pickFillerItems(Set<String> depIds, int wanted) {
+        List<Item> picked = new ArrayList<>(wanted);
+        for (Item item : BuiltInRegistries.ITEM) {
+            if (picked.size() >= wanted) {
+                break;
+            }
+            if (item == null || item == Items.AIR) {
+                continue;
+            }
+            String itemId = VoidWarehouseRecipeBook.idOf(item);
+            if (itemId == null || depIds.contains(itemId)) {
+                continue;
+            }
+            ItemStack probe = new ItemStack(item, 1);
+            if (VoidWarehouseShulker.isShulkerBox(probe) || !VoidWarehouseData.isInsertable(probe)) {
+                continue;
+            }
+            picked.add(item);
+        }
+        return picked;
+    }
+
+    /**
+     * 让每样物品各进出一趟仓库：净库存不变，但脏集合里会精确多出这些物品。
+     *
+     * @return 失败次数（入库或出库没成功都算，非 0 就说明脏集合的 size 不可信）
+     */
+    private static int touchAll(VoidWarehouseData data, List<Item> items) {
+        int bad = 0;
+        for (Item item : items) {
+            if (!data.insert(new ItemStack(item, 1))) {
+                bad++;
+            }
+            if (!data.takeItem(item, 1)) {
+                bad++;
+            }
+        }
+        return bad;
+    }
+
+    /** 两个 id 是不是同一件物品（9 合 1 只留 path、配方本是全名，两种口径都要认） */
+    private static boolean isSameItem(String a, String b) {
+        Item left = itemOfId(a);
+        return left != null && left == itemOfId(b);
+    }
+
+    /**
+     * id → Item，两种口径都认（9 合 1 只留 path、配方本是全名）。
+     *
+     * <p>⚠️ 别拿 {@code VoidWarehouseExchangeBootstrap.itemOf} 当兜底：它内部是
+     * {@code Identifier#withDefaultNamespace}，对已经带冒号的字符串会拼成
+     * {@code minecraft:minecraft:iron_block} 并当场抛 {@code IdentifierException}
+     * —— 实测把 N 组整组炸掉，日志里只剩一句「自检抛异常」。</p>
+     */
+    private static Item itemOfId(String itemId) {
+        if (itemId == null || itemId.isEmpty()) {
+            return null;
+        }
+        String full = itemId.indexOf(':') >= 0 ? itemId : "minecraft:" + itemId;
+        return VoidWarehouseRecipeBook.itemOf(full);
+    }
+
+    /** 整张表里第一对有重复的物品（没有则 null）；按 Item 对象比，绕开 id 口径 */
+    private static String firstDuplicateItem(List<VoidWarehouseData.ExchangeOffer> offers) {
+        Map<Item, String> seen = new LinkedHashMap<>();
+        for (VoidWarehouseData.ExchangeOffer offer : offers) {
+            Item item = itemOfId(offer.itemId());
+            if (item == null) {
+                continue;
+            }
+            String previous = seen.putIfAbsent(item, offer.itemId());
+            if (previous != null) {
+                return previous + " / " + offer.itemId();
+            }
+        }
+        return null;
+    }
+
+    private static int countSameItem(List<VoidWarehouseData.ExchangeOffer> offers, String itemId) {
+        int n = 0;
+        for (VoidWarehouseData.ExchangeOffer offer : offers) {
+            if (isSameItem(offer.itemId(), itemId)) {
+                n++;
+            }
+        }
+        return n;
     }
 
     // ================================================================ 工具

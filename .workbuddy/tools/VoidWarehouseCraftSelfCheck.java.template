@@ -52,7 +52,8 @@ import java.util.Set;
  *       「整批重算」给出<b>逐字节相同</b>的结果（含顺序）。这组的风险不是算错而是<b>漏算</b> ——
  *       数量类断言看不出来，只有和一份从零算起的对照逐行比才抓得到。</li>
  *   <li><b>N 去重口径 / 脏物品阈值</b>：同一件物品同时被 9 合 1 与配方命中时只许占一格
- *       （这条去重曾经因为拿两套 id 口径互相比，<b>一次都没生效过</b>）；外加
+ *       （这条去重曾经因为拿两套 id 口径互相比，<b>一次都没生效过</b>）；两条路比例不同时
+ *       留下的那格必须还是 9 合 1 的账；界面上的数字按量取货必须真给得出来；外加
  *       {@code CRAFT_DIRTY_LIMIT} 的两侧边界 —— 恰好等于阈值走增量、多一个走整批。</li>
  * </ol>
  */
@@ -1137,6 +1138,17 @@ public final class VoidWarehouseCraftSelfCheck {
      * 不受 id 口径影响）。它不依赖 {@code iron_block} 这个具体样本，任何一档语料只要
      * 同时命中两条路就会红。</p>
      *
+     * <p>N1c 补的是 N1 的<b>一个盲点</b>：N1 学的那条配方写成 9:1，与 9 合 1 比例完全相同，
+     * 于是「留下哪一格」在数字上看不出来（两格都给 2）。再学一条 4:1 的同一产物把两边逼开 ——
+     * 配方那半给 4、9 合 1 给 2 —— 这时「只剩一格」和「那一格写的是 2」才同时有意义。
+     * 这两件事必须一起成立：界面取货根本不看 {@code offer().craft()}，tooltip 的数字
+     * 只要不是 9 合 1 那份，写的数就和实际扣的料不是一回事。</p>
+     *
+     * <p>N6 把「显示」和「取货」这两条并排放一次。它们是两条不同的路
+     * （{@code planExchangeMax} 允许部分 / {@code planExchange} 要求精确），
+     * 唯一必须守住的共同真相是：<b>界面写能拿几个，按量要几个就真能拿到几个</b>。
+     * N6b 顺手把已知的那点不对称（按量要得更多时会整段让位给配方）钉成一条读数。</p>
+     *
      * <h2>N3~N5 —— {@code CRAFT_DIRTY_LIMIT} 的两侧边界</h2>
      * <p>那条分支<b>没有可观测的行为差异</b>：整批和增量给出的结果本来就该一样，
      * 所以「跑完对比结果」根本测不出分支跑没跑。改成往私有缓存里<b>塞一条错值</b>，
@@ -1175,14 +1187,16 @@ public final class VoidWarehouseCraftSelfCheck {
         VoidWarehouseData.noteServerTick(910_000 + (++scratchTick));
         List<VoidWarehouseData.ExchangeOffer> offers = data.exchangeOffers();
 
-        Map<String, VoidWarehouseData.ExchangeOffer> cache = craftOffersOf(data);
-        if (cache == null) {
+        // 第一次读之后先取一份，只为 N0 前置用；N3 要用的那一份必须在 N1c 的 learn 之后重新取
+        // （learn 会让 recipeGeneration++，下一次读走「配方本换版」那条分支、重新 new 一个 map）。
+        Map<String, VoidWarehouseData.ExchangeOffer> initialCache = craftOffersOf(data);
+        if (initialCache == null) {
             check("N0 反射取 craftOffers 失败（内部字段改名了？）", false);
             VoidWarehouseSettings.voidWarehouseExchange = false;
             return;
         }
         check("N0 前置：craftOffers 里 iron_block 那一格就是「能做」（不然 N1 测不到重复）",
-                cache.get("minecraft:iron_block") != null);
+                initialCache.get("minecraft:iron_block") != null);
 
         int ironBlock = 0;
         boolean nineInOneWon = false;
@@ -1200,6 +1214,61 @@ public final class VoidWarehouseCraftSelfCheck {
         check("N2 整张可兑表没有两格指向同一件物品"
                 + (duplicate == null ? "" : "（重复：" + duplicate + "）"), duplicate == null);
 
+        // ---- N1c 两条路的比例不一样时，留下的那格必须还是 9 合 1 的账 ----
+        // 上面 N1 那条配方写的是 9:1，<b>与 9 合 1 比例一模一样</b>，所以两格算出来的数都是 2。
+        // 万一去重失效、玩家真的看见两格，两个数字也一样 —— 这组断言就测不出更难看的那种表现。
+        // 这里再学一条 4:1 的 iron_block（1 块 = 4 锭）把两边逼开：配方那半 maxCraftable 给 4，
+        // 9 合 1 给 2。期望仍然是「只出一格」且那一格写 2，因为——
+        //   · {@code VoidWarehouseMenu#withdrawFrom} 只取 {@code target.template()}，
+        //     <b>完全不看 {@code offer().craft()}</b>，取货永远按 {@code planExchange} 那条
+        //     「9 合 1 优先」的路走；tooltip 写成 4 而实际扣 9 合 1 的料，就是「写的数不是给的数」。
+        data.learn(recipe("minecraft:iron_block", 1, part("minecraft:iron_ingot", 4)));
+        VoidWarehouseData.noteServerTick(910_000 + (++scratchTick));
+        List<VoidWarehouseData.ExchangeOffer> strict = data.exchangeOffers();
+        // 前置：先证明两条路真的算出了<b>不同的数</b>。少了这一条，万一那条 4:1 根本没进配方本
+        // （本子满了 / recipeId 撞车 / learn 被规则开关挡掉），配方那半也会给 2，
+        // 下面「那一格写的是 2」就变成一个恒真的空断言 —— 通过得毫无意义。
+        // 这是 M 组「对照组构造错」的同一类坑：先确认对照组和实验组确实不同。
+        Map<String, VoidWarehouseData.ExchangeOffer> strictCraft = craftOffersOf(data);
+        VoidWarehouseData.ExchangeOffer craftHalf =
+                strictCraft == null ? null : strictCraft.get("minecraft:iron_block");
+        BigInteger craftOnly = craftHalf == null ? null : craftHalf.obtainable();
+        check("N1c 前置：配方那半单独算出来是 4（实测 " + craftOnly + "），否则两格同数、测不出区别",
+                craftOnly != null && craftOnly.equals(BigInteger.valueOf(4)));
+        int strictCells = countSameItem(strict, "iron_block");
+        check("N1c 再学一条 4:1 的 iron_block 之后仍然只占一格（实测 " + strictCells + " 格）",
+                strictCells == 1);
+        VoidWarehouseData.ExchangeOffer strictCell = firstSameItem(strict, "iron_block");
+        BigInteger shown = strictCell == null ? null : strictCell.obtainable();
+        check("N1c 那一格的数量取 9 合 1 口径的 2、不是配方的 4（实测 " + shown + "）",
+                shown != null && shown.equals(BigInteger.valueOf(2)));
+
+        // ---- N6 界面上写的数，按量取货必须真给得出来 ----
+        // 界面走 {@code planExchangeMax(sample, 64)}（允许部分），按量取货走
+        // {@code planExchange(sample, n)}（精确）。这里只钉一条真正的红线：
+        // <b>界面写能拿 n 个，按量要 n 个就必须真拿到 n 个</b> —— 反过来（写的多、给的少）
+        // 才是玩家点了没反应的病；写少给多只是不精确。所以判据是等号，不是「大于等于」，
+        // 因为「要 n 却给了更多」同样是在动玩家没要的东西。
+        ItemStack blockSample = new ItemStack(Items.IRON_BLOCK);
+        VoidWarehouseExchange.Plan maxPlan = data.planExchangeMax(blockSample, BigInteger.valueOf(64));
+        BigInteger displayed = maxPlan == null ? BigInteger.ZERO : maxPlan.amount();
+        VoidWarehouseExchange.Plan exactPlan = displayed.signum() > 0
+                ? data.planExchange(blockSample, displayed)
+                : null;
+        check("N6 界面写能拿 " + displayed + " 个 → 按量要 " + displayed + " 个必须正好拿到 "
+                        + displayed + " 个（实测 " + (exactPlan == null ? "null" : exactPlan.amount()) + "）",
+                exactPlan != null && exactPlan.amount().equals(displayed));
+        // 已知边角，<b>钉住行为而不是钉住正确性</b>：按量<b>要得比界面多</b>时，9 合 1 兑不出
+        // 整量会整段让位给配方那半，于是拿到配方的 4，而界面上的上限仍是 9 合 1 的 2。
+        // 方向是「多给」，不会造成点了拿不到；但它确实违反了「tooltip 写的数就是实际给的数」。
+        // 要修得动 {@code planExchange} 的分派顺序（先算 9 合 1 的上限再统一裁），属于语义变更，
+        // 本轮只把它变成一条能看见的读数 —— 将来谁把这行改绿了，等于承认改了分派顺序。
+        VoidWarehouseExchange.Plan greedy = data.planExchange(blockSample, BigInteger.valueOf(4));
+        check("N6b 按量比界面多要时整段让位给配方那半（界面 " + displayed + " / 按量 "
+                        + (greedy == null ? "null" : greedy.amount()) + "）—— 已知边角，钉住不修",
+                greedy != null && greedy.amount().equals(BigInteger.valueOf(4))
+                        && displayed.equals(BigInteger.valueOf(2)));
+
         // ---- N3 前置 ----
         Set<String> depIds = allDependencyIds(data);
         Integer limit = dirtyLimit();
@@ -1208,10 +1277,20 @@ public final class VoidWarehouseCraftSelfCheck {
             VoidWarehouseSettings.voidWarehouseExchange = false;
             return;
         }
+        // ⚠️ 这里必须<b>重新取</b>一份缓存引用：上面 N1c 的 learn 会让 recipeGeneration++，
+        // 下一次读走「配方本换版」那条分支、重新 new 一个 craftOffers map。
+        // 还抱着 N0 那份 initialCache 的话，下面 put 进去的错值泼在一个已经被丢掉的对象上，
+        // 读数变成「错值本来就不在」，看着像通过、其实什么都没测到。
+        Map<String, VoidWarehouseData.ExchangeOffer> cache = craftOffersOf(data);
+        if (cache == null) {
+            check("N3 反射取 craftOffers 失败（内部字段改名了？）", false);
+            VoidWarehouseSettings.voidWarehouseExchange = false;
+            return;
+        }
         check("N3 前置：piston 那一格在缓存里且答案是「能做」（脏水泼得上去）",
                 cache.get(POISON_ID) != null && depIds.contains(POISON_ID));
         // ⚠️ 下面几条读数全靠「cache 一直是同一个 map 对象」。只有「配方本换版」那条分支
-        // 会重新 new 一个，N 组全程不 learn，所以不会被换掉；真被换掉的话 put 进去的错值
+        // 会重新 new 一个，N3 之后不再 learn，所以不会被换掉；真被换掉的话 put 进去的错值
         // 会随之消失，读数就变成「错值本来就不在」，看着像通过、其实什么都没测到 ——
         // 所以 N5c 补一条对象同一性。这条坑是 M 组「对照组构造错」的同一类，写在前面提醒。
         List<Item> fillers = pickFillerItems(depIds, limit + 1);
@@ -1402,6 +1481,23 @@ public final class VoidWarehouseCraftSelfCheck {
             }
         }
         return n;
+    }
+
+    /**
+     * 可兑表里第一格指向 {@code itemId} 那件物品的条目；没有返回 {@code null}。
+     *
+     * <p>按 {@link Item} 对象比而不是按字符串比 —— 9 合 1 只留 path、配方本是全名，
+     * 字符串层面的 {@code equals} 会把同一件东西当成两件（这正是 1.0.17 修掉的那个 bug 的形状，
+     * 别在测试里再犯一次）。</p>
+     */
+    private static VoidWarehouseData.ExchangeOffer firstSameItem(
+            List<VoidWarehouseData.ExchangeOffer> offers, String itemId) {
+        for (VoidWarehouseData.ExchangeOffer offer : offers) {
+            if (isSameItem(offer.itemId(), itemId)) {
+                return offer;
+            }
+        }
+        return null;
     }
 
     // ================================================================ 工具

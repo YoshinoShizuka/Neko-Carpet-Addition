@@ -23,7 +23,7 @@ import java.util.function.Function;
  * <b>按这些配方，仓库里的东西现在够做几个</b>。</p>
  *
  * <p>本类没有价值体系、没有状态副本矩阵、也没有「从上往下探几百万次」那种东西。
- * 唯一的循环上限是 {@link #MAX_VERIFY}（验证退让次数）与 {@link #MAX_NODES}（展开预算），
+ * 唯一的循环上限是 {@link #MAX_NODES}（展开预算）与 {@link #MAX_DEPTH}（往下钻的层数），
  * 两者都是硬预算。</p>
  *
  * <h2>可以往下钻几层（1.0.16 起的语义）</h2>
@@ -45,10 +45,12 @@ import java.util.function.Function;
  *       那会把家里现成的木板白白放过、反而多扣原木。</li>
  * </ol>
  *
- * <h2>算法的形状：算上界 → 摆一遍 → 摆不下就退一步</h2>
- * <p>「能做几次」靠两步得出：先用<b>宽松上界</b>估一个次数（{@link #available}，宁可估大），
- * 再用 {@link #simulate} <b>真的把整套扣料摆一遍</b>（含往下钻的每一层、每一项选哪个候选）。
- * 摆不下就退 1 次再摆，最多退 {@link #MAX_VERIFY} 次。摆得下的那一次，账目就是最终账目 ——
+ * <h2>算法的形状：算上界 → 摆一遍 → 摆不下就二分</h2>
+ * <p>「能做几次」靠两步得出：先用<b>宽松上界</b>估一个次数（{@link #boundCap} / {@link #availOf}，
+ * 宁可估大），再用 {@link #simulate} <b>真的把整套扣料摆一遍</b>（含往下钻的每一层、每一项选哪个候选）。
+ * 上界本身摆得下就直接是答案（只跑一次模拟，实测 79% 的配方走这条）；摆不下就在
+ * {@code [0, 上界 - 1]} 上<b>二分</b>最大的可行次数 —— 「做得越多越难」是单调的。
+ * 摆得下的那一次，账目就是最终账目 ——
  * 于是「界面上说能做 N 个」与「真点下去能拿到 N 个」是<b>同一次模拟</b>的结果，
  * 不存在「显示得比真值大」。这是 9 合 1 在 1.0.7 栽过的形态，这里从结构上避开。</p>
  */
@@ -76,9 +78,6 @@ public final class VoidWarehouseRecipes {
      * 预算用完就当作「这一项没料」—— 保守失败，绝不返回一个没验证过的账。</p>
      */
     private static final int MAX_NODES = 512;
-
-    /** 验证阶段最多往下退几次（见 {@link #maxCraftable}）；正常数据里第一次就摆得下 */
-    private static final int MAX_VERIFY = 64;
 
     /** {@link #stockClosure} 最多收集多少种物品（防止病态配方把闭包撑爆） */
     private static final int MAX_CLOSURE = 256;
@@ -203,16 +202,32 @@ public final class VoidWarehouseRecipes {
     /**
      * 「现在最多能做几个（成品个数）」。
      *
-     * <p>两步：先用 {@link #available} 这套宽松上界估一个次数，再用 {@link #simulate}
-     * 摆一遍；摆不下就退 1 次再摆，最多退 {@link #MAX_VERIFY} 次。摆得下的那一次就是答案 ——
+     * <p>两步：先用 {@link #boundCap} / {@link #availOf} 这套宽松上界估一个次数，
+     * 再用 {@link #simulate} 摆一遍。上界本身摆得下就直接是答案（只跑一次模拟）；
+     * 摆不下就在 {@code [0, 上界 - 1]} 上<b>二分</b>，找得到的最大的那个可行次数就是答案。
      * 与 {@link #plan} 用的是<b>同一个模拟器</b>，所以「界面说能合成 N 个」与
      * 「真点下去能拿到 N 个」不会打架。</p>
      *
      * <p>为什么上界要「宽松」而不是「精确」：往下钻之后，「某项够不够」取决于这一项
      * 又去做了几次别的合成，精确上界本身就要靠搜索求。既然验证阶段已经把整棵树摆过一遍，
-     * 上界的作用就只是<b>把搜索起点压低</b>，估大一点无所谓（退几次就到真值），估小才是灾难
-     * （会少报）。所以 {@link #available} 一律取「家里有的 + 全部拿去做能做出的」，
-     * 明知共享原料时会重复计数 —— 那份误差由验证兜住。</p>
+     * 上界的作用就只是<b>把搜索区间压窄</b>，估大一点无所谓（多几次二分而已），估小才是灾难
+     * （会少报）。所以 {@link #availOf} 一律取「家里有的 + 全部拿去做能做出的」，
+     * 明知共享原料时会重复计数 —— 那份误差由二分兜住。</p>
+     *
+     * <h2>为什么是二分，不是「上界减 1 再试」</h2>
+     * <p>宽松上界的<b>相对</b>误差其实很小（实测 6%~33%），但真值本身在万位，
+     * 于是<b>绝对</b>误差也在千位：实测 P50 = 3,328 次、最大 114,081 次。
+     * 线性退让于是两头都堵死 —— 上限设小了（曾经是 64）就<b>退不到</b>真值，
+     * 配方被判成「做不出」而整格从界面消失；上限设大了就慢到不可用（按 P50 要慢 52 倍）。
+     * 二分只要 {@code ⌈log₂(上界+1)⌉} 次探针，与虚高多少<b>无关</b>。
+     * 这不是理论推演，是 1.0.17 之前真实发生过的缺陷，见
+     * {@code docs/配方本满本并发测试报告.md}。</p>
+     *
+     * <p>「做得越多越难」这条单调性<b>原本就在依赖</b>：旧实现从上界往下扫，
+     * 遇到第一个摆得下的就当成最大值 —— 那正是「可行集是区间」的假设。
+     * 二分不引入任何新假设，只是把「线性扫描」换成「对数查找」。
+     * 万一某个配方因为贪心分支选择而在某处非单调，二分只会<b>低估</b>（保守），
+     * 绝不会高估 —— 高估就是「显示能取、点下去失败」，那才是不能接受的方向。</p>
      *
      * <p>返回值是 {@code outputCount} 的整数倍 —— 它表示「能做出来的成品总数」，
      * 而不是次数。调用方要「正好取 N 个」时交给 {@link #plan}，那边会自己向上取整。</p>
@@ -232,13 +247,48 @@ public final class VoidWarehouseRecipes {
             return ZERO;
         }
         BigInteger out = BigInteger.valueOf(recipe.outputCount());
-        for (int probe = 0; probe < MAX_VERIFY && cap.signum() > 0; probe++, cap = cap.subtract(ONE)) {
-            Model model = new Model(stock);
-            if (simulate(recipe, cap, model, byOutput, 0, new LinkedHashSet<>(), new int[]{MAX_NODES})) {
-                return cap.multiply(out);
+        // 快路径：宽松上界本身就摆得下。它既是上界又可行，那它就是答案，没有更大的次数了。
+        // 实测 79% 的配方走这条，只跑 1 次 simulate —— 这个快路径必须留着，
+        // 否则每条配方都要多花 ⌈log₂⌉ 次探针，白贵一个数量级。
+        if (cap.signum() > 0 && feasible(recipe, cap, stock, byOutput)) {
+            return cap.multiply(out);
+        }
+        // 慢路径：二分 [0, cap - 1]。lo 始终是「已知可行 + 1」，hi 始终是「已知不可行 - 1」，
+        // 于是区间每轮都严格收缩，⌈log₂(cap+1)⌉ 轮后必停。
+        BigInteger lo = ZERO;
+        BigInteger hi = cap.subtract(ONE);
+        BigInteger best = ZERO;
+        while (lo.compareTo(hi) <= 0) {
+            BigInteger mid = lo.add(hi).shiftRight(1);
+            if (feasible(recipe, mid, stock, byOutput)) {
+                best = mid;
+                lo = mid.add(ONE);
+            } else {
+                hi = mid.subtract(ONE);
             }
         }
-        return ZERO;
+        return best.multiply(out);
+    }
+
+    /**
+     * 「按这份库存，做 {@code crafts} 次 {@code recipe} 到底摆不摆得下」。
+     *
+     * <p>单独抽出来是为了让 {@link #maxCraftable} 的二分读起来还是「一问一答」。
+     * 每次探针都拿一份<b>崭新</b>的 {@link Model} 与一份<b>崭新</b>的预算 ——
+     * 探针之间必须互不影响，否则前一次挖深了会让后一次因为预算耗尽而假失败，
+     * 二分的单调性前提当场作废。</p>
+     *
+     * <p>{@code crafts <= 0} 一律当作「摆不下」。做 0 次当然是成立的，但那不是
+     * 「能做几个」的答案；返回 {@code false} 可以让二分的 {@code best} 稳稳停在
+     * {@link #ZERO}，顺便省掉一次没意义的整树模拟。</p>
+     */
+    private static boolean feasible(Recipe recipe, BigInteger crafts, Map<String, BigInteger> stock,
+                                    Map<String, List<Recipe>> byOutput) {
+        if (crafts.signum() <= 0) {
+            return false;
+        }
+        return simulate(recipe, crafts, new Model(stock), byOutput, 0, new LinkedHashSet<>(),
+                new int[]{MAX_NODES});
     }
 
     /**

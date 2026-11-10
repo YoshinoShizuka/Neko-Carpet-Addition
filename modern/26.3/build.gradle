@@ -78,6 +78,14 @@ jar {
     }
 }
 
+// sources jar 也要带 common 的源码。
+// common 的 class 是合进主 jar 的（见上面的 jar 块），但 withSourcesJar() 默认只打
+// 本版本的源码树 —— 结果就是「source jar 里没有真正在跑的那份算法」。
+// 打开 sources 找不到 VoidWarehouseRecipes.java，等于没有源码包。
+tasks.named('sourcesJar') {
+    from(project(':common').sourceSets.main.allSource)
+}
+
 // ===== 产物定位辅助 =====
 // 标准的 jar 产物在 build/libs/ 下；这里额外做两件事，
 // 免得在 IDEA 里翻了半天找不到：

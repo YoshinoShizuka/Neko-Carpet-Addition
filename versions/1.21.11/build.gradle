@@ -88,3 +88,9 @@ jar {
         rename { "${it}_${project.base.archivesName.get()}" }
     }
 }
+
+// sources jar 也要带 common 的源码（理由同其它四个子工程：class 合进了主 jar，
+// 但 withSourcesJar() 默认只打本版本源码树）。
+tasks.named('sourcesJar') {
+    from(project(':common').sourceSets.main.allSource)
+}

@@ -52,6 +52,18 @@
 - **压测同时揪出一条更严重的同源缺陷**：满本时 **21%** 的配方被误判成「做不出」而整格从界面消失，同一批还吃掉 `exchangeOffers` 重建的 **93%** 时间。已在同一版的「🐛 修复」段落里修掉 —— 按本文件的版本号约定，修 bug 不升号(This round's stress test also uncovered a severe defect — one fifth of the recipe book silently vanished from the UI — fixed in the same release; bug fixes do not bump the version.)。
   - 完整数据、瓶颈归因与五版本对比见 `docs/配方本满本并发测试报告.md`(Full data and root-cause analysis are in the stress-test report.)。
 
+### ⚡ Performance / 性能
+
+#### 满本重建 123.88 → 22.17 ms：不再为每个分支复制一份账本（`voidWarehouseCraft`）
+
+- **现象**：满本 1236 条配方、每种原料上万时，`exchangeOffers` 单次重建要 **90 – 124 ms**，是 50 ms tick 预算的 2 – 2.5 倍。玩家在仓库里连续取放时，每个 tick 都要付一次 ⇒ 稳定掉 tick(The full recipe-book rebuild took 90–124 ms per call, 2–2.5× the 50 ms tick budget.)。
+- **根因不在「算了几条配方」**：离线归因（复刻 `collectCraftOffers` 的口径，算出的产物数 **746** 与服务端打出的 `offers=746` 一致）显示 `stockClosure` 只占 **2.7%**、`maxCraftable` 占 **82.7%**。再往下切：5,393 次探针里 **`Model.copy()` 被调用 164,505 次**（平均每探针 30 次），每次都要重建一个 40~60 项的 `HashMap` 外加两个 `LinkedHashMap`；**37% 的配方（324 条，各 16~17 次探针）吃掉 78% 的时间**(The cost was per-probe allocation, not the number of recipes.)。
+- **改法**：`Model` 从「每个分支复制一份」改成「**记旧值 + 回滚**」。这不是「写逆操作」—— 那条路以前被否过，理由是对的：漏一处账就错。这里不推导任何反向运算，只是每次写 map 前把 `(哪本账, 键, 旧值)` 压进撤销日志、回滚时倒序贴回；而「所有写都必须过日志」不靠自觉，靠三个 map 字段全部 `private`、只暴露带日志的写方法来**强制** —— 想绕过日志直接写 map，当场编译不过。附带三处：`pool` 改成库存的**惰性覆盖层**（探针不再每次复制一份库存）、探针**关掉扣料账本**（`feasible` 只问摆不摆得下）、小整数算术走 `long`。
+- **正确性怎么保证**：把改前 / 改后两份源码分别编译，喂同一语料**对拍 7,416 行**输出（1236 条 `maxCraftable` + 每条 5 个目标量的 `plan`，含 `consumed` / `surplus` 的完整内容），SHA-256 **逐字节相同**。压测侧的指纹也一致：`capSum` 从 18,610,821 一字不差地复现(A byte-identical 7,416-line diff against the previous implementation, plus an unchanged `capSum`.).
+- **结果**：五版本满本重建 **123.88 / 95.91 / 93.37 / 90.77 / 94.24 → 22.17 / 25.09 / 18.05 / 18.15 / 22.88 ms**（3.8 – 5.6×），全部低于 50 ms；单条 `maxCraftable` P99 从 1,650 µs 降到 **75 µs**、max 从 5,247 µs 降到 **336 µs**；规模曲线由超线性回到近线性（600 → 1236 条：改前涨 4.4 倍，改后涨 2.1 倍）。`A2` 判据**五版本首次全绿** —— `A2StressTest` 34 条 × 5、`SystemTest` 209 条 × 5、`CraftSelfCheck` 138 条 × 4，合计 **1,767 条断言零失败**(The A2 tick-budget assertion passes on all five versions for the first time.).
+- ⚠️ **原定的 R2 路线是错的，记在这里免得下一个人再走**：设计文档写的是「按页算 / 只脏化受影响的产物集」。实测这两条最多省 15%（闭包 3.25 ms + 部分 `plan`），却要动展示顺序（U2）与分页总数 —— 代价远大于收益。「减少探针数」同样走不通：324 条多探针配方的**真值全部落在上界的 1/2 以上**（上界估得很紧），二分 16 轮已接近信息论下限。**先归因，再优化**(The originally planned caching route was measured to be worth <15%; the real multiplier was per-probe allocation.).
+- 顺带补上 **sources jar 不含 `common/` 共享层源码**的老缺口：五个子工程的 `sourcesJar` 现在把 `common` 的源码一并打进去 —— 此前打开 sources jar 根本找不到真正在跑的那份算法(The sources jar now bundles the shared `common/` sources.).
+
 ### 🐛 Fixed / 修复
 
 #### 满本时 21% 的配方从界面消失（`maxCraftable` 线性退让 → 二分）
@@ -88,7 +100,7 @@
 
   虚拟格由 651 变 746 恰好等于「1042 种产物 − 296 种同时也是原料」，**一条不多一条不少** —— 货架终于和配方本对上了(The shelf count now equals distinct products minus dual-role ones, exactly.).
 - ⚠️ **一处诚实的退让**：单条 P50 从 11 µs 升到 19 µs。原因是「上界虚高 ≤ 15 次」的那批小配方，线性退让几次就中，二分却固定付 `⌈log₂⌉` 次探针。用中位贵 8 µs 换尾部省 3.8 ms，这个方向是对的(The median got 8 µs slower while the tail got 3.8 ms faster — a deliberate trade.).
-- ⚠️ **仍未达标**：满本重建 **123 – 162 ms** 依然超过 50 ms 的 tick 预算（修复前是它的 4.5~9.6 倍，现在是 2.5~3.2 倍）。这是**另一个问题**（每次库存变化都把 1236 条全部重算），不靠这次修复顺带解决(The rebuild still exceeds the 50 ms tick budget; that is a separate caching problem.)。
+- ⚠️ **仍未达标（本轮）**：满本重建 **123 – 162 ms** 依然超过 50 ms 的 tick 预算（修复前是它的 4.5~9.6 倍，现在是 2.5~3.2 倍）。当时判断这是**另一个问题**（每次库存变化都把 1236 条全部重算），需要单独一轮 —— 后续归因证明那个判断也不准，真正的瓶颈是每次探针的账本复制，已在同一版本的「⚡ Performance」节修掉，降到 18 – 25 ms(The remaining gap was closed later in the same version by the performance fix.).
 - **验证**：真服务端 `A2StressTest` 五版本 `checks=34`，只剩 **`A2`（tick 预算）** 一条红 —— 那是另一个问题，见下。逐组：E 组梯度全档 `lost=0`（26.2 起的版本还剩 17/43 条判 0，但 `lost` 为 0，那些是真的做不出）；F 组 `under=0 unreachable=0 notMultiple=0`，26.3 是 `exact=1236`、其余四版 `exact=1235`（差的 1 条是可行集非单调，见 `docs/配方本满本并发测试报告.md` §10.5）；G 组货架对账全档 `missing=0`。既有 `SystemTest` **209 条 × 5 版本零回归**。另有一份纯 JVM 离线 A/B 台（不进仓库）用同一语料把「老算法 vs 二分」逐条对比，`oldZero` 复现出服务端同一组数字 0/5/57/92/260，`exact` 全档等于配方总数(Pure-JVM A/B harness reproduced the server's numbers exactly.).
 - **溯源**：`git log -S "MAX_VERIFY"` 指向 `ac74e48 feat(voidwarehouse): voidWarehouseCraft`，配方扣料规则落地那一刻就在 —— **不是 A2 引入的**。A2 只是把配方本扩大到能装下 1236 条，第一次有人把这台机器开到它从没到过的转速上(The defect predates the recipe-book expansion; that change only made it reachable.)。
 - 只有 `common/` 一处改动（五版本共享层），外加五份 `VoidWarehouseData` 的注释订正(One change in the shared `common/` layer plus comment fixes in five copies.).
@@ -121,18 +133,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 440,369 B | `ec50a8a5647e0ee60284117fbb8255c0` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 441,851 B | `b6357ddc48eced2b3a399b112edd39b5` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 440,501 B | `5b5dd989c27a29317d0ecc7b49da42fc` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 442,233 B | `685c224b0ade5df15b8adced63638a4e` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 443,768 B | `f0e36f2dd3e317063c30bb5d83eec383` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 443,244 B | `2b2f78b0456d7226ab016f8960c03953` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 443,769 B | `c6726a89d1afdadca00834f6af02d796` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 443,243 B | `424cbad1c58c14d4f9a68bfdfe51b16d` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 440,728 B | `d83efd7bd86713be572dd7e78a51e63c` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 442,855 B | `f889ed8dea83c14a3dc8c08aa4cf4cb4` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 442,111 B | `4b039cae1cea43c2156da5fb17d97ccb` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 489,498 B | `4578a7c3f6d5ca6f91470f400e6f176a` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 442,243 B | `f464a344fc36f90ac99e8fe63b1c4a80` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 489,880 B | `fe1fa1283194b00bf99d3c4d236f4ec8` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 445,510 B | `f0e328cf93f4b87a814c50f84defe945` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 490,891 B | `d5241d96590c4661d41b39b83a5fd5b1` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 445,511 B | `c7471806d17f453f9ce055b14d66df33` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 490,890 B | `f2e9036dddf81aab196c2687b458338a` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 442,535 B | `84c0e8a116c8cc8c835a0d9e1ed3cce5` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 490,614 B | `c377b63f6003e5602d7b37e80d553915` |
 
-> **本表已按 2026-11-10 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第三次原地替换**：规则集、配置键、规则名一个字都没动，改动是「`maxCraftable` 从线性退让换成二分」+ 五份 `VoidWarehouseData` 的注释订正 —— 主 jar 变大 ~183 B 就是多出来的 `feasible` 方法，sources jar 变大 ~196 B 就是那几行注释。md5 与前三次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-10; the v1.0.17 assets were replaced in place a third time so that `maxCraftable` uses a binary search, so their md5 differs from all earlier uploads.)。
+> **本表已按 2026-11-10 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第四次原地替换**：规则集、配置键、规则名仍然一个字都没动 —— 这次改的是 `common/` 共享层的 `MaxCraftable` 内部实现（**`Model` 从「每个分支复制一份」改成「记旧值 + 回滚」**，账本语义逐字节不变），外加把 `common/` 的源码补进 sources jar。主 jar 变大 0.5~1.7 KB 是新的撤销日志与惰性覆盖层，sources jar 变大 ~47 KB 是因为终于把共享层源码打进去了。md5 与前四次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-10; the v1.0.17 assets were replaced in place a fourth time so that `Model` no longer copies its ledgers per branch, and the sources jars finally bundle the shared `common/` sources.)。
 
 > 🔴 **已知缺口（既有，非本次引入）**：`-sources.jar` 只打包**版本树**里的源码，`common/` 那三份共享层的 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）**从来不在里面** —— 但它们编译出来的 class 是打进了主 jar 的（否则跑不起来）。所以想读扣料算法源码，请直接看仓库 `common/src/main/java/neko/voidwarehouse/`(The sources jar has never included the shared `common/` layer's sources, although its compiled classes are inside the main jar.)。
 
@@ -146,7 +158,7 @@
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
-- **v1.0.17 的产物换过三次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建。三次都**没改版本号**，只是字节变了。已经下过的按下方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place three times — PR #2 on 2026-11-08, the per-recipe string list, and the binary search — with the version number unchanged.)。
+- **v1.0.17 的产物换过四次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建。四次都**没改版本号**，只是字节变了。已经下过的按下方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place four times — PR #2, the per-recipe string list, the binary search, and the ledger-copy removal — with the version number unchanged.)。
 
 * * *
 

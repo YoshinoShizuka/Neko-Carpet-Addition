@@ -37,6 +37,23 @@
 - **只报真正扣掉的**：被拒、过期、没货、规则关 —— 这些情况 `consumed` 为 0（预扣物已原样还回仓库），一条提示都不发(Only real deductions are reported.)。
 - 物品名保持可翻译组件原样发出，**绝不**在服务端 `getString()`：专用服务器没人注入语言表，那样中文客户端会看到英文物品名(Item names stay as translatable components so the client localises them.)。
 
+#### 配方本上限 512 → 2048 条，存档改为一配方一元素
+
+配方本以前把**全部配方拼成一个字符串**存在 `learned_recipes` 里，上限压在 512 条。这个数字不是性能上限，是 NBT 的 65535 字节上限倒推出来的一层保险 —— 而它真正的问题有两个：512 条本身没有任何物理依据（原版就有约 1500 条配方，认真玩一个档就可能填满），且**填满之后的「不再记录」是静默的**(The recipe book now stores one string per recipe instead of one joined blob, and the cap moves from 512 to 2048.).
+
+- **真正的墙是 975 条**：`StringTag` 走 `DataOutputStream#writeUTF`，长度字段 u16、数的是 modified UTF-8 字节。实测平均 **67.2 字节/条**，所以 975 条（65,512 B）能写、976 条（65,596 B）就超 —— 上限精确卡在这里(The real ceiling of the old format was 975 recipes, not 512.).
+- 🔴 **撞上去不报错，只是悄悄变空**：26.3 的 `NbtIo$StringFallbackDataOutput#writeUTF` 捕获 `UTFDataFormatException` 之后执行的是 `super.writeUTF("")` —— **键还在、内容长度变成 0**。实测把一个 70,000 字节的字符串写盘，文件只剩 **10 字节**。所以「查一下 `contains(key)` 还在不在」会误判成一切正常，判据只能是**读回来还剩几条**(The failure is silent: the key survives with an empty value, so only the read-back count reveals it.).
+- **改成一配方一元素**：新字段 `learned_recipes_lines`，`ListTag` 的元素计数是 int，单个元素几十字节，65535 这堵墙再也碰不到(The format is now a list of per-recipe strings.).
+- **codec 自己写，不用 `Codec.STRING.listOf()`**：后者全成或全不成 —— 实测混进一个 `IntTag` 就 `Not a string` 整份失败，进而整个 `VoidWarehouseData` 解码失败、上层当成「文件不存在」静默造空仓库并覆盖写盘，那正是本模组历史上最严重的事故形态。`RecipeLinesCodec` 逐元素独立解析，坏的那个元素只丢它自己，整表永远成功；底层 `decodeAll` 的逐行宽容照旧(A hand-written codec keeps the old per-item tolerance instead of the all-or-nothing behaviour of `Codec.listOf()`.).
+- **旧字段只读不写**：`learned_recipes_lines` 存在就用它，不存在才读 `learned_recipes` 并按 `\n` 切开迁移；写盘时旧字段那一路的 getter 恒 `Optional.empty()`，`optionalFieldOf` 于是一个字节都不写。老档**升级无需操作**，第一次写盘自动换键(Legacy saves migrate on first write, with no manual step.).
+- **顶层类型错时不宽容**：被人手工改成字符串之类的情况让解码失败，交给空壳闸门拒绝服务 —— 宁可让服主看见一个明确错误，也不把「整本配方凭空消失」伪装成一次正常读档(A wrong top-level type still fails loudly.).
+- **撞顶现在会说话**：达到 2048 条时服务端 `WARN` 一次（不是每学一条报一次 —— 满本是持续状态，会把日志刷穿）(Hitting the cap now logs a single warning.).
+- **验证**：`A2CodecTest` **35 条断言**（纯 JVM + 真 `NbtIo`）、`A2StorageSelfCheck` **27 条断言**（真服务端，26.3 与 1.21.11 各跑一次）、既有 `SystemTest` **209 条断言**全部零回归，三套合计 **271 条全绿**。实测 2048 条落盘 **5,604 字节**（配方原文 127,914 B，压缩比 23.6:1）、5000 条落盘 13,225 字节（24.5:1）(271 assertions green across three suites; 2048 recipes compress to about 5.6 KB on disk.).
+- 🔴 **已知限制：配方本变大会让部分物品不出现在界面**（本轮压测发现，**未修**）。`maxCraftable` 先估一个宽松上界再用 `cap--` 逐个退让，上限 `MAX_VERIFY = 64`。满本（1236 条）+ 原料充足时，上界比真值高出的**绝对次数**是 471 ~ 114,081（P50 = 3,328），远超 64，于是这批配方被判「做不出」—— 界面**根本不出现那一格**（不是灰的、不是写 0，是不存在）。实测 26.3 丢 **260 条（21.0%）**、其余四版本丢 269 条（21.8%）；按规模扫 **100 条 0% → 300 条 1.7% → 600 条 9.5% → 900 条 10.2% → 1236 条 21.0%**。同一根因还吃掉 `exchangeOffers` 重建的 **92–93%** 时间（满本 225–481 ms，是 50 ms tick 预算的 4.5–9.6 倍）(A known limit found by this round's stress test, not fixed yet: with a full recipe book the loose upper bound exceeds the true value by thousands, far beyond the 64-step fallback ladder, so up to 21% of recipes are reported as uncraftable and never appear in the UI — and that same batch accounts for 92–93% of the rebuild cost.).
+  - **这不是 A2 引入的**：`git log -S "MAX_VERIFY"` 指向 `ac74e48 feat(voidwarehouse): voidWarehouseCraft`，配方扣料规则落地那一刻就在。A2 只是**把配方本扩大到能装下 1236 条**，第一次有人把这台机器开到它从没到过的转速上(The defect predates this change; A2 only raised the ceiling high enough to reach it.)。
+  - **修法是换算法不是调常量**：`simulate` 对次数单调，二分 `[0, cap]` 用 `⌈log₂(cap+1)⌉+1 = 15` 次探针即可精确求值（现状 64 次还求不出）。调到 P50 要 3,328 次探针（慢 52 倍），调到 max 要 114,081 次（单条 4.0 秒）—— 调大没有出路(The fix is a binary search, not a bigger constant: 15 probes instead of 64, and it converges instead of giving up.)。
+  - 完整数据、瓶颈归因、五版本对比与修复建议见 `docs/配方本满本并发测试报告.md`(Full data, root-cause analysis and the fix proposal are in the stress-test report.)。
+
 ### 🐛 Fixed / 修复
 
 #### 结构化直放不再依赖 Servux（单人存档里整条规则完全不生效）
@@ -67,29 +84,30 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 436,942 B | `ed40c2cef3b71311b19173311a56a78f` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 437,613 B | `28ea5f03f72251a492952606aa878480` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 437,055 B | `142a3d2fd194d02893c35eea7da7ad54` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 438,032 B | `a1a0ba93043a9ca11746e6549b007b1a` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 440,322 B | `7a3ede4545e7aa6cb534461f7bc7e0db` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 439,062 B | `8e4e02f7c3ee8d24652d45ea00cb5526` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 440,323 B | `822129937716971a191a3b03e9f62717` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 439,061 B | `e6f3b82e9aeca5144d033d2bfba99bf5` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 437,230 B | `75416f6e376234badc9e6c9b3399bfb4` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 438,691 B | `d16a0d7d6892fe4bb011f705ac7206f3` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 440,186 B | `524c0b9c4ec3dd1259e07042e3f311ae` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 441,655 B | `3198e6571f1f6d4083af13a5df0ea8b8` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 440,319 B | `b9867ae8d2a7f068d43b800506d519f5` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 442,033 B | `786afc35dd81cea53617c95a0959d83d` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 443,586 B | `371a708258cc2d07d5de1c2662bf76c5` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 443,044 B | `661d4bf4eaf03bcaf472efecb4004c9d` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 443,587 B | `8c1c0fcc2d2f31b3271df02440232493` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 443,043 B | `3859483e8f3d9835e508484ee51189e6` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 440,548 B | `59e2bdb64be98ebf35057b2738da7657` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 442,654 B | `cee5bbc67f7837c00875769ccaecd05b` |
 
-> **本表已按 `302207f` 的 CI 构建整表刷新**（2026-11-08，并入 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2)）。v1.0.17 是**同版本号原地替换**：规则集、配置键、存档格式一个字都没动，但 jar 的字节变了，md5 与首次发布不同 —— 请按上表核对(This table was refreshed against the CI build of `302207f`; the v1.0.17 assets were replaced in place, so their md5 differs from the first upload.)。
+> **本表已按 2026-11-10 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + `dist`，非 CI 构建）。v1.0.17 **第二次原地替换**：规则集、配置键、规则名一个字都没动，但**配方本的存档格式从单字符串改成了逐条列表**，jar 的字节变了，md5 与上两次发布都不同 —— 请按上表核对(This table was refreshed against the local full build of 2026-11-10; the v1.0.17 assets were replaced in place a second time to change the recipe-book storage format, so their md5 differs from both earlier uploads.)。
 
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 
 ### ⚠️ 升级提示 / Upgrade Notes
 
-- **新增一条 Carpet 规则**（`voidWarehouseDirectPlace`，默认 `false`），规则集变了，所以版本号升到 1.0.17。存档格式、配置键、已有规则名**均未变**，直接替换 jar 即可(One new rule; no data-format or config change — just swap the jar.)。
+- **新增一条 Carpet 规则**（`voidWarehouseDirectPlace`，默认 `false`），规则集变了，所以版本号升到 1.0.17。配置键与已有规则名**均未变**，直接替换 jar 即可；但**配方本的存档格式在本版内变过一次**，见下一条(One new rule; no config-key change — just swap the jar. The recipe-book storage format did change once within this version, see below.)。
+- 🔴 **配方本的存档格式变了（同版本号内）**：`learned_recipes`（全部配方拼成一个字符串）→ `learned_recipes_lines`（一条配方一个元素）。老档**升级零操作**，第一次写盘时自动迁移；但**降级不行** —— 新版本写过的档，旧版本读不到配方（它只认旧键，而那键已经没了）。要回退版本请先备份存档。顺带把配方本上限从 **512 条放宽到 2048 条**，撞顶时服务端会 `WARN` 一次(The recipe-book field changed from a joined string to a per-recipe list; upgrades migrate on first write, downgrades lose the recipe book, so back up first. The cap also moves from 512 to 2048.).
 - **直放要三条一起开**：服务端 `voidWarehouse` + `voidWarehouseRestock` + `voidWarehouseDirectPlace`，客户端在 `litematica-printer` 配置里也打开 `voidWarehouseDirectPlace`。少一条就退回「补货到背包、手上放」(All three server rules plus the client option are required.)。
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
-- **v1.0.17 的产物换过一次**：2026-11-08 把 v1.0.17 的五个 jar 原地替换为含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建，**版本号没变**，只是字节变了。已经下过首次发布的，按下方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place on 2026-11-08 to include PR #2; the version number is unchanged.)。
+- **v1.0.17 的产物换过两次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 又换成含「配方本逐条列表」的本地全量构建。两次都**没改版本号**，只是字节变了。已经下过的按下方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place twice — on 2026-11-08 for PR #2, and again on 2026-11-10 for the per-recipe string list — with the version number unchanged.)。
 
 * * *
 

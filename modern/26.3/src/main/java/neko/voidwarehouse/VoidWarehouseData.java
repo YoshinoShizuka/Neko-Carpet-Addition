@@ -646,6 +646,73 @@ public final class VoidWarehouseData extends SavedData {
     private long offersTick = Long.MIN_VALUE;
 
     /**
+     * 库存变动过的物品，等下一次重算「可合成」条目时消费掉。
+     *
+     * <p><b>为什么要记「是谁变了」，而不是只标一个脏位</b>：{@link #markChanged()} 之后重算的是
+     * <b>整张</b>可兑表 —— 满本（1236 条配方、746 个产物）一次 22 ms。但玩家取走 1 个圆石，
+     * 真正会变的产物只有 13 个（实测：按物品统计的平均值，占 746 个产物的 1.7%），
+     * 其余 733 个的账一个字都不会变。记下变的是谁，就只需要重算那 13 个。</p>
+     *
+     * <p>往里记的只有三个原语：{@link #consume}（整个仓库唯一一处「减少数量」）、
+     * {@link #produce}、{@link #put}（增加端）。{@code entries} 的其它写入路径只有构造期的
+     * {@code absorb}，那时缓存还没建过，天然是整批重算。所以这个集合是<b>完备</b>的 ——
+     * 少记一处的后果是那件物品相关的产物一直显示旧数字，不会有别的表现。</p>
+     *
+     * <p>存 {@link Item} 而不是 id 字符串：这三个原语在取货路径上，一次兑换要改好几格，
+     * 而 {@code idOf} 每次都要 {@code Identifier.toString()} 分配一个字符串。
+     * 转成 id 只在重算时做一次。</p>
+     */
+    private final java.util.Set<Item> changedItems = new java.util.HashSet<>();
+
+    /**
+     * 每个产物当前的「可合成」条目（{@code itemId → 条目}）；{@code null} 值 = 此刻做不出来。
+     *
+     * <p>键集恒等于 {@link #recipesByOutput} 的键集：有配方就占一格，做不出来就是 {@code null}。
+     * <b>「仓库里有货」也必须占一格</b>，否则「数量从 0 变成 1」这个事件就无处标记 ——
+     * 而它正是产物从「可合成」消失的触发条件。</p>
+     *
+     * <p>用 {@link java.util.LinkedHashMap} 且只在整批重算时重新建表：增量更新走的 {@code put}
+     * 对已有键<b>不改顺序</b>，于是「同一份库存、同一份配方本」无论走过多少次增量，
+     * 遍历顺序都和整批重算一致 —— 展示序稳定靠的是这一条，不是靠排序兜底
+     * （{@link VoidWarehouseSort#rankOf} 对每件物品给出唯一秩，同秩时的先后由遍历序决定）。</p>
+     */
+    private Map<String, ExchangeOffer> craftOffers = new java.util.LinkedHashMap<>();
+
+    /**
+     * 产物 id → <b>影响它结果的那些物品 id</b>（依赖集）。只在配方本换版时重建。
+     *
+     * <p>= 产物自己 ＋ 它每条候选配方整条闭包的全部物品。产物自己必须在里面：
+     * 「仓库里有货就不出虚拟格」这条闸门看的是它自己的数量，而绝大多数配方并不把
+     * 自己的产物当原料（活塞用的是木板，不是活塞），它很可能不在自己的闭包里。</p>
+     *
+     * <p>反查方向（物品 → 产物）<b>故意不建索引</b>：一次改动只有一两个物品、产物有几百个，
+     * 直接拿脏物品去问每个产物的依赖集是 {@code 产物数 × 脏数} 次哈希查找
+     * （满本 746 × 2 ≈ 30 µs），比维护一张反查表省事得多，也不会出现「表没同步」这种事故。
+     * 脏物品超过 {@link #CRAFT_DIRTY_LIMIT} 时直接整批重算。</p>
+     */
+    private Map<String, java.util.Set<String>> craftDeps = new java.util.LinkedHashMap<>();
+
+    /** {@link #craftOffers} / {@link #craftDeps} 是按哪一版配方本算出来的（与 {@link #recipeGeneration} 对照） */
+    private int craftCacheGeneration = -1;
+
+    /**
+     * 下一次必须整批重算。
+     *
+     * <p>目前只有 {@link #clearContent()} 会置它：那一处把 {@code entries} 整体清空，
+     * 没有逐件记账的机会。置了它也不必重建依赖集（配方结构没变），只是把每个产物都算一遍。</p>
+     */
+    private boolean craftCacheBusted;
+
+    /**
+     * 脏物品多到这个数就放弃增量、整批重算。
+     *
+     * <p>增量判定的成本是 {@code 产物数 × 脏物品数}；脏物品多到这个量级时，
+     * 整批重算（每个产物跑一遍配方探针）反而更省。96 的依据：满本产物 746 个，
+     * 96 × 746 ≈ 7 万次哈希查找 ≈ 1 ms，已经接近整批重算的量级。</p>
+     */
+    private static final int CRAFT_DIRTY_LIMIT = 96;
+
+    /**
      * 当前的服务端 tick，由 {@link VoidWarehouseExtension#onTick} 每 tick 写一次。
      *
      * <p><b>是 static 的，故意的</b>：一来不必为了记一个 tick 戳就去 {@code VoidWarehouse.data(server)}
@@ -1099,6 +1166,7 @@ public final class VoidWarehouseData extends SavedData {
      */
     private boolean put(ItemStack incoming) {
         BigInteger count = BigInteger.valueOf(incoming.getCount());
+        this.changedItems.add(incoming.getItem());
         Entry entry = this.find(incoming);
         if (entry == null) {
             Entry created = new Entry(incoming, count);
@@ -1143,6 +1211,9 @@ public final class VoidWarehouseData extends SavedData {
      * 中间标脏会让「数量排序」视图缓存反复失效重建，纯属浪费。</p>
      */
     private void consume(Entry entry, BigInteger amount) {
+        // 记账必须先于 subtract：这一格可能因为扣到 0 而被摘掉，摘掉之后照样能拿到 template，
+        // 但「先记后改」读起来没有歧义，也不依赖 Entry 的生命周期。
+        this.changedItems.add(entry.template().getItem());
         entry.subtract(amount);
         if (entry.amount().signum() <= 0) {
             // Entry 没有覆写 equals，List#remove(Object) 按身份移除，正好只能摘掉这一格
@@ -1169,6 +1240,7 @@ public final class VoidWarehouseData extends SavedData {
         if (item == null || item == Items.AIR || amount.signum() <= 0) {
             return;
         }
+        this.changedItems.add(item);
         Entry entry = this.find(new ItemStack(item));
         if (entry == null) {
             Entry created = new Entry(new ItemStack(item), amount);
@@ -1969,12 +2041,33 @@ public final class VoidWarehouseData extends SavedData {
             // 不会凭空造物；名单下标也有界检查（见 displaySlotAt），不会越界。
             return this.offers;
         }
+        // 「标脏了、但其实什么都没变」是一条真实且高频的路径：容器的 setChanged() 会调
+        // markChanged()，而它在一个格子的点击里能被调好几次。这种情况直接沿用上一份 ——
+        // 9 合 1 与配方扣料都是库存的纯函数，库存没变就没有任何理由重算。
+        //
+        // 判据是 changedItems 为空：三个原语只要真的动了数量就一定往里记过，
+        // 所以「空」等价于「一格都没变」（完备性见 changedItems 的注释）。
+        // craftCacheBusted 必须一起看：clearContent() 会把库存整体清空并置起这个标志，
+        // 但它<b>不逐件记账</b>（changedItems 是空的），少了这个判断就会把上一份
+        // 「还带着已经不存在的物品」的表当新表返回。这个洞是写完自检才想到的 ——
+        // M 组每次都先 clearContent() 再灌料，脏集合立刻又非空，正好盖住了它。
+        if (this.offers != null && this.changedItems.isEmpty() && !this.craftCacheBusted) {
+            this.offersStale = false;
+            this.offersTick = serverTick;
+            return this.offers;
+        }
         List<ExchangeOffer> built = new ArrayList<>();
         if (exchangeEnabled()) {
             this.collectNineInOneOffers(built);
         }
         if (craftEnabled()) {
-            this.collectCraftOffers(built);
+            this.rebuildCraftCache();
+            // 已经有 9 合 1 条目的物品不重复出现（见本方法的注释）
+            java.util.Set<String> taken = new java.util.HashSet<>(built.size() * 2);
+            for (ExchangeOffer offer : built) {
+                taken.add(offer.itemId());
+            }
+            this.collectCraftOffers(built, taken);
         }
         built.sort(Comparator.comparingInt(offer -> VoidWarehouseSort.rankOf(offer.template())));
         this.offers = List.copyOf(built);
@@ -2029,7 +2122,105 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * 收集「可合成」条目：仓库里没货、但有已学配方、且<b>此刻真的做得出来</b>的产物。
+     * 把缓存里<b>此刻做不出来</b>（{@code null}）的产物滤掉，其余按遍历序交给上层排序。
+     *
+     * <p>{@code taken} 是本次 9 合 1 已经占掉的物品 id —— 同一件东西在界面上出现两格
+     * 会让玩家以为能拿两份，优先级给 9 合 1（理由见 {@link #exchangeOffers()}）。</p>
+     *
+     * <p>滤在<b>取表时</b>而不是算的时候：9 合 1 的条目每个 tick 都可能变，
+     * 但那不该让配方账重算一遍。</p>
+     */
+    private void collectCraftOffers(List<ExchangeOffer> built, java.util.Set<String> taken) {
+        for (ExchangeOffer offer : this.craftOffers.values()) {
+            if (offer == null || taken.contains(offer.itemId())) {
+                continue;
+            }
+            built.add(offer);
+        }
+    }
+
+    /**
+     * 只重算<b>受影响的那些产物</b>的「可合成」条目。
+     *
+     * <h2>为什么不是「按 (配方, 库存版本) 缓存到 tick 级」</h2>
+     * <p>原本的设计是给 {@code maxCraftable} 加一张 {@code (recipeId, stockVersion)} 的缓存，
+     * 让列表与取货路径共用。实测<b>命中率 0%</b>：一次取货必然改库存，
+     * {@link #markChanged()} 随之推进版本，于是「同一个版本里再问同一条配方」在真实操作序列里
+     * 根本不会发生（60 次取货、65 次调用，重复 0 次）。真正在重复的是<b>整张表</b>：
+     * 改一格库存，746 个产物全部重算，而其中只有 13 个的结果会变。</p>
+     *
+     * <h2>凭什么「只有 13 个会变」</h2>
+     * <p>产物的结果只依赖它候选配方<b>整条闭包</b>里那些物品的数量（外加它自己的数量，
+     * 决定它出不出现在界面上）。把这张依赖集记下来，改动一格就只碰「依赖集里含那一格」的产物
+     * —— 实测平均 13.0 个（占 746 个产物的 1.7%），中位数 1~5 个，最坏是
+     * {@code minecraft:oak_log}：184 个（24.7%），所以最坏情况也不会退化成整批。</p>
+     *
+     * <p>依赖集只在配方本换版时重建（{@link #buildCraftDeps()}）：闭包由配方结构决定，
+     * 与数量无关，库存怎么变都不会改变依赖关系。</p>
+     */
+    private void rebuildCraftCache() {
+        if (this.craftCacheGeneration != this.recipeGeneration) {
+            this.craftDeps = this.buildCraftDeps();
+            this.craftOffers = new java.util.LinkedHashMap<>(Math.max(16, this.craftDeps.size() * 2));
+            for (String itemId : this.craftDeps.keySet()) {
+                this.craftOffers.put(itemId, this.computeCraftOffer(itemId));
+            }
+        } else if (this.craftCacheBusted || this.changedItems.size() > CRAFT_DIRTY_LIMIT) {
+            for (String itemId : this.craftDeps.keySet()) {
+                this.craftOffers.put(itemId, this.computeCraftOffer(itemId));
+            }
+        } else if (!this.changedItems.isEmpty()) {
+            java.util.Set<String> dirty = new java.util.HashSet<>(this.changedItems.size() * 2);
+            for (Item item : this.changedItems) {
+                String itemId = VoidWarehouseRecipeBook.idOf(item);
+                if (itemId != null) {
+                    dirty.add(itemId);
+                }
+            }
+            for (Map.Entry<String, java.util.Set<String>> entry : this.craftDeps.entrySet()) {
+                java.util.Set<String> deps = entry.getValue();
+                boolean hit = false;
+                for (String itemId : dirty) {
+                    if (deps.contains(itemId)) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if (hit) {
+                    this.craftOffers.put(entry.getKey(), this.computeCraftOffer(entry.getKey()));
+                }
+            }
+        }
+        // 三个分支共用这一处收口：中途抛异常时 generation 不会前进、脏集合也不会被清掉，
+        // 下一次自然是整批重来 —— 失败方向必须是「多算」而不是「少算」。
+        this.craftCacheGeneration = this.recipeGeneration;
+        this.craftCacheBusted = false;
+        this.changedItems.clear();
+    }
+
+    /**
+     * 产物 id → 影响它结果的物品 id 集合。
+     *
+     * <p>配方本空时返回空表。除此之外每一项<b>必然</b>包含产物自己（理由见
+     * {@link #craftDeps}），再并上每条候选配方整条闭包的键集 ——
+     * 只要键集不要值，因为键集由配方结构决定、与数量无关。</p>
+     */
+    private Map<String, java.util.Set<String>> buildCraftDeps() {
+        Map<String, java.util.Set<String>> deps = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, List<VoidWarehouseRecipes.Recipe>> group : this.recipesByOutput.entrySet()) {
+            java.util.Set<String> items = new java.util.HashSet<>();
+            items.add(group.getKey());
+            for (VoidWarehouseRecipes.Recipe recipe : group.getValue()) {
+                items.addAll(VoidWarehouseRecipes.stockClosure(recipe, this.recipesByOutput,
+                        key -> BigInteger.ZERO).keySet());
+            }
+            deps.put(group.getKey(), items);
+        }
+        return deps;
+    }
+
+    /**
+     * 算一个产物此刻的「可合成」条目（仓库里没货、且有已学配方、且<b>此刻真的做得出来</b>）。
      *
      * <h2>为什么这里不用 9 合 1 的「探针」那一套</h2>
      * <p>9 合 1 的 {@code planMax} 要从上界往下逐个试，因为「能拿 5 个不一定能拿 4 个」（拆整块会跳档）。
@@ -2043,63 +2234,53 @@ public final class VoidWarehouseData extends SavedData {
      * 21% 的配方被判成「做不出」而整格从界面消失。改成二分之后，探针数与虚高多少无关。
      * 详见 {@code docs/配方本满本并发测试报告.md}。</p>
      */
-    private void collectCraftOffers(List<ExchangeOffer> built) {
-        if (this.recipesByOutput.isEmpty()) {
-            return;
+    private ExchangeOffer computeCraftOffer(String itemId) {
+        Item item = VoidWarehouseRecipeBook.itemOf(itemId);
+        if (item == null || this.amountOf(item).signum() > 0) {
+            return null;
         }
-        // 已经有 9 合 1 条目的物品不重复出现（见 exchangeOffers 的注释）
-        java.util.Set<String> taken = new java.util.HashSet<>(built.size());
-        for (ExchangeOffer offer : built) {
-            taken.add(offer.itemId());
+        List<VoidWarehouseRecipes.Recipe> candidates = this.recipesByOutput.get(itemId);
+        if (candidates == null || candidates.isEmpty()) {
+            return null;
         }
-        for (Map.Entry<String, List<VoidWarehouseRecipes.Recipe>> group : this.recipesByOutput.entrySet()) {
-            String itemId = group.getKey();
-            if (taken.contains(itemId)) {
-                continue;
+        // 同一产物可能有多条配方：取「做得最多」的那一条来算上限与账单，
+        // 与 planCraft 的「逐条试、第一条能做的就用」不冲突 —— 那边保证能给出至少这么多个。
+        VoidWarehouseRecipes.Recipe best = null;
+        BigInteger maxOut = BigInteger.ZERO;
+        Map<String, BigInteger> bestStock = Map.of();
+        for (VoidWarehouseRecipes.Recipe recipe : candidates) {
+            Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(this, recipe, this.recipesByOutput);
+            BigInteger out = VoidWarehouseRecipes.maxCraftable(recipe, stock, this.recipesByOutput);
+            if (out.compareTo(maxOut) > 0) {
+                maxOut = out;
+                best = recipe;
+                bestStock = stock;
             }
-            Item item = VoidWarehouseRecipeBook.itemOf(itemId);
-            if (item == null || this.amountOf(item).signum() > 0) {
-                continue;
-            }
-            // 同一产物可能有多条配方：取「做得最多」的那一条来算上限与账单，
-            // 与 planCraft 的「逐条试、第一条能做的就用」不冲突 —— 那边保证能给出至少这么多个。
-            VoidWarehouseRecipes.Recipe best = null;
-            BigInteger maxOut = BigInteger.ZERO;
-            Map<String, BigInteger> bestStock = Map.of();
-            for (VoidWarehouseRecipes.Recipe recipe : group.getValue()) {
-                Map<String, BigInteger> stock = VoidWarehouseRecipeBook.stockFor(this, recipe, this.recipesByOutput);
-                BigInteger out = VoidWarehouseRecipes.maxCraftable(recipe, stock, this.recipesByOutput);
-                if (out.compareTo(maxOut) > 0) {
-                    maxOut = out;
-                    best = recipe;
-                    bestStock = stock;
-                }
-            }
-            if (best == null || maxOut.signum() <= 0) {
-                continue;
-            }
-            // 账单 = 做满 maxOut 个要扣的原料（全部是负数）。余量不入账目：
-            // tooltip 的「用 X 12 个」说的是成本，「找回」那一段对配方扣料是噪音
-            // （产物多出来的部分会静静回到仓库，玩家不需要为此读一行字）。
-            VoidWarehouseRecipes.Plan plan = VoidWarehouseRecipes.plan(best, maxOut, bestStock, this.recipesByOutput);
-            if (plan == null) {
-                continue;
-            }
-            List<VoidWarehouseExchange.Delta> cost = new ArrayList<>(plan.consumed().size());
-            for (Map.Entry<String, BigInteger> entry : plan.consumed().entrySet()) {
-                if (entry.getValue().signum() > 0) {
-                    cost.add(new VoidWarehouseExchange.Delta(entry.getKey(), entry.getValue().negate()));
-                }
-            }
-            ItemStack sample = new ItemStack(item);
-            // 一次动作实际能拿多少：配方扣料是「做 n 次就给 n 份」，没有拆整块的跳档，
-            // 所以这里就是「上限与可做数量的较小者」—— 这个算式在<b>这条路径上</b>是精确的，
-            // 与 9 合 1 那边必须问规划器的情况不同（理由见 takeAmount 的注释）。
-            long maxStack = Math.max(1, sample.getMaxStackSize());
-            BigInteger bulk = maxOut.min(BigInteger.valueOf(maxStack));
-            BigInteger boxed = maxOut.min(BigInteger.valueOf(Math.max(1, VoidWarehouseShulker.capacity(sample))));
-            built.add(new ExchangeOffer(itemId, sample, maxOut, bulk, boxed, cost, true));
         }
+        if (best == null || maxOut.signum() <= 0) {
+            return null;
+        }
+        // 账单 = 做满 maxOut 个要扣的原料（全部是负数）。余量不入账目：
+        // tooltip 的「用 X 12 个」说的是成本，「找回」那一段对配方扣料是噪音
+        // （产物多出来的部分会静静回到仓库，玩家不需要为此读一行字）。
+        VoidWarehouseRecipes.Plan plan = VoidWarehouseRecipes.plan(best, maxOut, bestStock, this.recipesByOutput);
+        if (plan == null) {
+            return null;
+        }
+        List<VoidWarehouseExchange.Delta> cost = new ArrayList<>(plan.consumed().size());
+        for (Map.Entry<String, BigInteger> entry : plan.consumed().entrySet()) {
+            if (entry.getValue().signum() > 0) {
+                cost.add(new VoidWarehouseExchange.Delta(entry.getKey(), entry.getValue().negate()));
+            }
+        }
+        ItemStack sample = new ItemStack(item);
+        // 一次动作实际能拿多少：配方扣料是「做 n 次就给 n 份」，没有拆整块的跳档，
+        // 所以这里就是「上限与可做数量的较小者」—— 这个算式在<b>这条路径上</b>是精确的，
+        // 与 9 合 1 那边必须问规划器的情况不同（理由见 takeAmount 的注释）。
+        long maxStack = Math.max(1, sample.getMaxStackSize());
+        BigInteger bulk = maxOut.min(BigInteger.valueOf(maxStack));
+        BigInteger boxed = maxOut.min(BigInteger.valueOf(Math.max(1, VoidWarehouseShulker.capacity(sample))));
+        return new ExchangeOffer(itemId, sample, maxOut, bulk, boxed, cost, true);
     }
 
     /**
@@ -2641,6 +2822,10 @@ public final class VoidWarehouseData extends SavedData {
         }
         this.entries.clear();
         this.index.clear();
+        // 整体清空没有逐件记账的机会：让下一次重算把每个产物都算一遍。
+        // 依赖集不用重建 —— 配方结构没变，只是全部库存归零。
+        this.craftCacheBusted = true;
+        this.changedItems.clear();
         this.markChanged();
     }
 

@@ -1,0 +1,204 @@
+// A1 二进制容器 —— 已验证版本（见 docs/虚空仓库存储-A1二进制容器方案.md §4.1）
+// 落地时复制到 common/src/main/java/neko/voidwarehouse/WarehouseBlob.java
+// 纯 JVM 类，不引用任何 net.minecraft 类型，五版本共用一份。
+//
+package neko.voidwarehouse;
+
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 虚空仓库的二进制容器：把「物品片段」与「配方文本」装进一段自描述字节。
+ *
+ * <h2>为什么不是 NBT</h2>
+ * <p>物品那一条仍然是 NBT 片段（{@code ItemStack.CODEC} 的唯一稳定表示），
+ * 但<b>容器</b>不能再是 NBT —— 因为 NBT 的字符串字段受 {@code writeUTF} 的 65535 字节限制，
+ * 而配方本是「全部配方塞进一个字符串」，条数一多就写不出去（且是静默丢弃）。</p>
+ *
+ * <h2>容错原则</h2>
+ * <p>本类<b>只负责切分</b>，不判断片段是否合法：长度前缀读完就交付，
+ * 解析失败的片段由调用方原样保留、下次写回。所以一条坏数据永远不会牵连整份存档。</p>
+ *
+ * <h2>损坏输入的处置</h2>
+ * <p>容器自身的边界一旦不可信（magic/版本不符、长度前缀越界、条数为负），
+ * 一律抛 {@link CorruptException}，交给上层整份走兜底路径；
+ * 绝不在这里「跳过坏片段」—— 按错误的长度往前读只会把后续数据全部错位成垃圾。
+ * 所有长度比较都写成 {@code length > end - pos} 形式，避免 {@code pos + length} 的整数溢出。</p>
+ */
+public final class WarehouseBlob {
+
+    private static final byte[] MAGIC = {'N', 'C', 'A', 'W'};
+    private static final int FORMAT_VERSION = 1;
+    private static final int HEADER = 4 + 1 + 1 + 4;   // magic + version + flags + payloadLength
+
+    /** 预分配容量的上限：条数是外部输入，直接拿去 new ArrayList 会被损坏数据骗成 OOM */
+    private static final int PRESIZE_CAP = 1024;
+
+    private WarehouseBlob() {
+    }
+
+    /** 解码结果：两段原始数据，语义由调用方解释 */
+    public record Raw(List<byte[]> itemFragments, List<String> recipes) {
+        public Raw {
+            itemFragments = List.copyOf(itemFragments);
+            recipes = List.copyOf(recipes);
+        }
+    }
+
+    public static byte[] encode(List<byte[]> itemFragments, List<String> recipes) {
+        ByteArrayOutputStream payload = new ByteArrayOutputStream(1 << 16);
+        writeVarInt(payload, itemFragments.size());
+        for (byte[] frag : itemFragments) {
+            writeVarInt(payload, frag.length);
+            payload.write(frag, 0, frag.length);
+        }
+        writeVarInt(payload, recipes.size());
+        for (String text : recipes) {
+            byte[] utf8 = text.getBytes(StandardCharsets.UTF_8);
+            writeVarInt(payload, utf8.length);
+            payload.write(utf8, 0, utf8.length);
+        }
+
+        byte[] body = payload.toByteArray();
+        ByteArrayOutputStream out = new ByteArrayOutputStream(HEADER + body.length);
+        out.write(MAGIC, 0, MAGIC.length);
+        out.write(FORMAT_VERSION);
+        out.write(0);                      // flags（保留，恒 0）
+        writeInt(out, body.length);
+        out.write(body, 0, body.length);
+        return out.toByteArray();
+    }
+
+    /**
+     * 解出两段原始数据；magic / 版本不符或长度前缀越界时抛 {@link CorruptException}。
+     */
+    public static Raw decode(byte[] blob) {
+        if (blob == null || blob.length < HEADER) {
+            throw new CorruptException("blob 太短: " + (blob == null ? "null" : blob.length));
+        }
+        for (int i = 0; i < MAGIC.length; i++) {
+            if (blob[i] != MAGIC[i]) {
+                throw new CorruptException("magic 不符 @" + i);
+            }
+        }
+        int version = blob[4] & 0xFF;
+        if (version != FORMAT_VERSION) {
+            throw new CorruptException("未知格式版本 " + version);
+        }
+        int payloadLength = readInt(blob, 6);
+        // 减法的方向很关键：payloadLength 是 int，HEADER + payloadLength 会负溢出后放行
+        if (payloadLength < 0 || payloadLength > blob.length - HEADER) {
+            throw new CorruptException("payloadLength 越界: " + payloadLength
+                    + " (可用 " + (blob.length - HEADER) + ")");
+        }
+
+        Cursor c = new Cursor(blob, HEADER, HEADER + payloadLength);
+
+        int itemCount = c.readVarInt();
+        if (itemCount < 0) {
+            throw new CorruptException("物品条数为负: " + itemCount);
+        }
+        List<byte[]> items = new ArrayList<>(Math.min(itemCount, PRESIZE_CAP));
+        for (int i = 0; i < itemCount; i++) {
+            items.add(c.readBytes(c.readVarInt()));
+        }
+
+        int recipeCount = c.readVarInt();
+        if (recipeCount < 0) {
+            throw new CorruptException("配方条数为负: " + recipeCount);
+        }
+        List<String> recipes = new ArrayList<>(Math.min(recipeCount, PRESIZE_CAP));
+        for (int i = 0; i < recipeCount; i++) {
+            recipes.add(new String(c.readBytes(c.readVarInt()), StandardCharsets.UTF_8));
+        }
+
+        if (!c.atEnd()) {
+            throw new CorruptException("payload 尾部多出 " + c.remaining() + " 字节");
+        }
+        return new Raw(items, recipes);
+    }
+
+    public static final class CorruptException extends RuntimeException {
+        public CorruptException(String message) {
+            super(message);
+        }
+    }
+
+    // ------------------------------------------------------------------ varint / 游标
+
+    private static void writeVarInt(ByteArrayOutputStream out, int value) {
+        while ((value & ~0x7F) != 0) {
+            out.write((value & 0x7F) | 0x80);
+            value >>>= 7;
+        }
+        out.write(value);
+    }
+
+    private static void writeInt(ByteArrayOutputStream out, int value) {
+        out.write((value >>> 24) & 0xFF);
+        out.write((value >>> 16) & 0xFF);
+        out.write((value >>> 8) & 0xFF);
+        out.write(value & 0xFF);
+    }
+
+    private static int readInt(byte[] src, int offset) {
+        return ((src[offset] & 0xFF) << 24)
+                | ((src[offset + 1] & 0xFF) << 16)
+                | ((src[offset + 2] & 0xFF) << 8)
+                | (src[offset + 3] & 0xFF);
+    }
+
+    /** 只在 [pos, end) 里读，越界一律抛 —— 不做「宽容截断」 */
+    private static final class Cursor {
+        private final byte[] src;
+        private final int end;
+        private int pos;
+
+        Cursor(byte[] src, int start, int end) {
+            this.src = src;
+            this.pos = start;
+            this.end = end;
+        }
+
+        boolean atEnd() {
+            return this.pos == this.end;
+        }
+
+        int remaining() {
+            return this.end - this.pos;
+        }
+
+        int readVarInt() {
+            int value = 0;
+            int shift = 0;
+            while (true) {
+                if (this.pos >= this.end) {
+                    throw new CorruptException("varint 读越界 @" + this.pos);
+                }
+                if (shift > 28) {
+                    throw new CorruptException("varint 过长 @" + this.pos);
+                }
+                int b = this.src[this.pos++] & 0xFF;
+                value |= (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) {
+                    return value;
+                }
+                shift += 7;
+            }
+        }
+
+        byte[] readBytes(int length) {
+            // 写成减法：pos + length 在 length 接近 int 上限时会溢出成负数，从而放行
+            if (length < 0 || length > this.end - this.pos) {
+                throw new CorruptException("片段越界: len=" + length + " @" + this.pos
+                        + " 可用 " + (this.end - this.pos));
+            }
+            byte[] out = new byte[length];
+            System.arraycopy(this.src, this.pos, out, 0, length);
+            this.pos += length;
+            return out;
+        }
+    }
+}

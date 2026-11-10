@@ -1,0 +1,195 @@
+// A1 迁移契约验证（20 断言）：三字段 CODEC 写只写 blob / 读兼容老档 / blob 优先 / 坏字段整份失败
+// 跑法同 NbtEmbedTest（需要真 classpath，与 BlobTest 同包）。
+//
+package neko.voidwarehouse;
+
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.MapCodec;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.StringTag;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.Tag;
+
+import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * 验证 A1 的迁移契约（用 String 冒充物品片段，只测 CODEC 形状，不测 ItemStack）：
+ * <ul>
+ *   <li>写：只有 blob 落盘，两个老字段一个字节都不写</li>
+ *   <li>读：老存档（无 blob）、新存档（有 blob）、两者并存都能读，且 blob 优先</li>
+ * </ul>
+ */
+public final class CodecShapeTest {
+
+    private static int pass = 0;
+    private static int fail = 0;
+
+    private static final String BLOB_KEY = "blob";
+    private static final String ITEMS_KEY = "items";
+    private static final String RECIPES_KEY = "recipes";
+
+    /** 冒充 VoidWarehouseData 的迁移壳 */
+    record Payload(Optional<ByteBuffer> blob,
+                   Optional<List<String>> legacyItems,
+                   Optional<String> legacyRecipes,
+                   String origin) {
+
+        static Payload fromCodec(Optional<ByteBuffer> blob,
+                                 Optional<List<String>> legacyItems,
+                                 Optional<String> legacyRecipes) {
+            // blob 优先；没有 blob 才走老字段（= 老存档自动升级）
+            String origin = blob.isPresent() ? "blob" : (legacyItems.isPresent() || legacyRecipes.isPresent()
+                    ? "legacy" : "empty");
+            return new Payload(blob, legacyItems, legacyRecipes, origin);
+        }
+    }
+
+    static final Codec<Payload> CODEC = RecordCodecBuilder.create(instance -> instance.group(
+            Codec.BYTE_BUFFER.optionalFieldOf(BLOB_KEY)
+                    .forGetter(Payload::blob),
+            Codec.STRING.listOf().optionalFieldOf(ITEMS_KEY)
+                    .forGetter(p -> Optional.<List<String>>empty()),      // 只读不写
+            Codec.STRING.optionalFieldOf(RECIPES_KEY)
+                    .forGetter(p -> Optional.<String>empty())             // 只读不写
+    ).apply(instance, Payload::fromCodec));
+
+    public static void main(String[] args) {
+        M1_writeOnlyBlob();
+        M2_blobRoundTrip();
+        M3_readLegacy();
+        M4_blobWins();
+        M5_allAbsent();
+        M6_malformedIsNotTolerated();
+
+        System.out.println();
+        System.out.println("RESULT pass=" + pass + " fail=" + fail);
+        if (fail > 0) {
+            System.exit(1);
+        }
+    }
+
+    /** M1：写出去的 compound 只有 blob 一个键 —— 老字段一个字节都不占 */
+    private static void M1_writeOnlyBlob() {
+        byte[] blobBytes = WarehouseBlob.encode(List.of(), BlobTest.recipeTexts(2048));
+        Payload p = new Payload(Optional.of(ByteBuffer.wrap(blobBytes)), Optional.of(List.of("x")),
+                Optional.of("y"), "blob");
+
+        CompoundTag tag = (CompoundTag) CODEC.encodeStart(NbtOps.INSTANCE, p).result().orElseThrow();
+        check("M1 只有 blob 键", 1, tag.size());
+        check("M1 blob 在", true, tag.contains(BLOB_KEY));
+        check("M1 不写 items", false, tag.contains(ITEMS_KEY));
+        check("M1 不写 recipes", false, tag.contains(RECIPES_KEY));
+        check("M1 blob 字节数", blobBytes.length, tag.getByteArray(BLOB_KEY).orElseThrow().length);
+        System.out.println("      落盘 compound 的键: " + tag.keySet());
+    }
+
+    /** M2：编码→解码，blob 字节逐位不变，且能解回 2048 条配方 */
+    private static void M2_blobRoundTrip() {
+        List<String> recipes = BlobTest.recipeTexts(2048);
+        byte[] blobBytes = WarehouseBlob.encode(List.of(), recipes);
+        Payload p = new Payload(Optional.of(ByteBuffer.wrap(blobBytes)), Optional.empty(),
+                Optional.empty(), "blob");
+
+        Tag tag = CODEC.encodeStart(NbtOps.INSTANCE, p).result().orElseThrow();
+        Payload back = CODEC.parse(NbtOps.INSTANCE, tag).result().orElseThrow();
+
+        check("M2 走 blob 分支", "blob", back.origin());
+        ByteBuffer buf = back.blob().orElseThrow();
+        byte[] round = new byte[buf.remaining()];
+        buf.duplicate().get(round);
+        check("M2 字节数不变", blobBytes.length, round.length);
+        check("M2 容器解回条数", 2048, WarehouseBlob.decode(round).recipes().size());
+        check("M2 每条内容一致", recipes, WarehouseBlob.decode(round).recipes());
+    }
+
+    /** M3：老存档（只有 items + recipes，没有 blob）必须能读进来 */
+    private static void M3_readLegacy() {
+        CompoundTag legacy = new CompoundTag();
+        ListTag items = new ListTag();
+        items.add(StringTag.valueOf("(伪)"));
+        legacy.put(ITEMS_KEY, items);
+        legacy.putString(RECIPES_KEY, "minecraft:a*1;minecraft:b\u00d72");
+
+        Payload back = CODEC.parse(NbtOps.INSTANCE, legacy).result().orElseThrow();
+        check("M3 走 legacy 分支", "legacy", back.origin());
+        check("M3 blob 为空", false, back.blob().isPresent());
+        check("M3 读到老配方串", Optional.of("minecraft:a*1;minecraft:b\u00d72"), back.legacyRecipes());
+        check("M3 读到老物品串", Optional.of(List.of("(伪)")), back.legacyItems());
+    }
+
+    /** M4：两者并存时 blob 优先（迁移过程中可能出现的中间态） */
+    private static void M4_blobWins() {
+        byte[] blobBytes = WarehouseBlob.encode(List.of(), List.of("new"));
+        CompoundTag both = new CompoundTag();
+        both.put(BLOB_KEY, Codec.BYTE_BUFFER.encodeStart(NbtOps.INSTANCE, ByteBuffer.wrap(blobBytes))
+                .result().orElseThrow());
+        ListTag oldItems = new ListTag();
+        oldItems.add(StringTag.valueOf("(旧)"));
+        both.put(ITEMS_KEY, oldItems);
+        both.putString(RECIPES_KEY, "old*1;old\u00d71");
+
+        Payload back = CODEC.parse(NbtOps.INSTANCE, both).result().orElseThrow();
+        check("M4 走 blob 分支", "blob", back.origin());
+        ByteBuffer buf = back.blob().orElseThrow();
+        byte[] round = new byte[buf.remaining()];
+        buf.duplicate().get(round);
+        check("M4 用的是新数据", List.of("new"), WarehouseBlob.decode(round).recipes());
+    }
+
+    /** M5：全空（全新建档）—— 三个字段都缺时必须解出空壳而不是失败 */
+    private static void M5_allAbsent() {
+        Payload back = CODEC.parse(NbtOps.INSTANCE, new CompoundTag()).result().orElseThrow();
+        check("M5 走 empty 分支", "empty", back.origin());
+        check("M5 blob 空", false, back.blob().isPresent());
+
+        // 回写一个全空的 payload：一个键都不该产生
+        Payload empty = new Payload(Optional.empty(), Optional.empty(), Optional.empty(), "empty");
+        CompoundTag tag = (CompoundTag) CODEC.encodeStart(NbtOps.INSTANCE, empty).result().orElseThrow();
+        check("M5 空对象写出 0 键", 0, tag.size());
+    }
+
+    /**
+     * M6（关键性质）：optionalFieldOf 只容忍「缺失」，不容忍「存在但格式错」。
+     * 一个老字段内容坏掉 -> 整份 decode 失败 -> 上层空壳闸门拒绝服务。
+     * 这正是 A1 必须保留「逐条宽容」解码器的原因，也是迁移时必须做的回归项。
+     */
+    private static void M6_malformedIsNotTolerated() {
+        CompoundTag bad = new CompoundTag();
+        bad.putString(ITEMS_KEY, "这不是列表");          // 类型错：期望 ListTag 实际 StringTag
+        com.mojang.serialization.DataResult<Payload> outcome;
+        try {
+            outcome = CODEC.parse(NbtOps.INSTANCE, bad);
+        } catch (Throwable t) {
+            System.out.println("      抛异常: " + t);
+            fail("M6 格式错的老字段 -> 整份解析失败", "抛了异常而不是返回 DataResult.Error");
+            return;
+        }
+        boolean rejected = outcome.error().isPresent();
+        check("M6 格式错的老字段 -> 整份解析失败", true, rejected);
+        if (rejected) {
+            System.out.println("      报错: " + outcome.error().orElseThrow().message());
+            check("M6 解析结果为空", false, outcome.result().isPresent());
+        }
+    }
+
+    // ------------------------------------------------------------------
+
+    private static void fail(String name, String note) {
+        fail++;
+        System.out.println("  FAIL " + name + "  -> " + note);
+    }
+
+    private static void check(String name, Object expect, Object actual) {
+        if (expect.equals(actual)) {
+            pass++;
+            System.out.println("  OK   " + name);
+        } else {
+            fail++;
+            System.out.println("  FAIL " + name + "  期望 " + expect + " 实际 " + actual);
+        }
+    }
+}

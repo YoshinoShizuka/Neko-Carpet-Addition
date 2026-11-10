@@ -1,0 +1,362 @@
+package neko.voidwarehouse;
+
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtAccounter;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.Tag;
+import net.minecraft.server.MinecraftServer;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+import java.math.BigInteger;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+
+/**
+ * 【临时基准】配方本放大到 512 / 1024 / 2048 时，<b>存档那条路</b>（写盘 + 读档）到底贵多少。
+ *
+ * <p>纯逻辑那一半（{@code decodeAll} / {@code plan} / {@code maxCraftable} / 内存）
+ * 已经由 {@code RecipeScaleBench} 在普通 JVM 上测过了。这里只补<b>它测不到的两项</b>：</p>
+ * <ol>
+ *   <li><b>真实解码入口</b>：{@code VoidWarehouseData.CODEC.parse(NbtOps, tag)} ——
+ *       这就是 {@code SavedDataStorage#readSavedData} 干的事（含 {@code '\n'} 切分、逐行解码、
+ *       重建 {@code recipesByOutput}）。</li>
+ *   <li><b>真实写盘 + 读档</b>：{@code CODEC.encodeStart} → {@code NbtIo.writeCompressed}
+ *       （gzip）→ {@code NbtIo.readCompressed} → 再 parse。文件大小也是这一项给的。</li>
+ * </ol>
+ *
+ * <h2>为什么绕开 {@code learn()}</h2>
+ * <p>{@code learn()} 里那道 {@code size() >= MAX_RECIPES} 正是本基准要评估的对象，
+ * 拿它灌 2048 条会直接灌不进去。而 {@code VoidWarehouseData(List<Decoded>, String)} 这个
+ * 构造器的参数类型 {@code Decoded} 是 private —— 所以唯一能进到「已载入 2048 条」状态的
+ * 路径就是 {@code CODEC.parse}。这也正是真实读档走的路，比构造器更贴题。</p>
+ *
+ * <h2>挂法</h2>
+ * <p>由 {@code VoidWarehouseExtension#onTick} 调一次 {@link #tickOnce}，跑完 {@code server.halt}。
+ * 临时基准，测完连同 hook 一起删。</p>
+ */
+public final class RecipeScaleServerBench {
+
+    static final int RAW_KINDS = 64;
+    static final int SIZES[] = {512, 1024, 2048};
+    static volatile Object SINK;
+    private static boolean done;
+
+    private RecipeScaleServerBench() {
+    }
+
+    public static void tickOnce(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        try {
+            run(server);
+        } catch (Throwable t) {
+            t.printStackTrace();
+        } finally {
+            server.halt(false);
+        }
+    }
+
+    static void run(MinecraftServer server) throws IOException {
+        Path dir = Files.createTempDirectory("vw-recipe-bench");
+        System.out.println("### RECIPE-BENCH 开始，临时目录 " + dir);
+        System.out.println("### jvm=" + System.getProperty("java.version")
+                + " maxHeap=" + Runtime.getRuntime().maxMemory() / (1024 * 1024) + "MB");
+
+        // 预热一次 codec 路径（JIT + NbtOps 初始化），不计入结果
+        {
+            List<String> warmTexts = buildTexts(64, 7L);
+            VoidWarehouseData warm = parse(String.join("\n", warmTexts));
+            roundTrip(warm, dir.resolve("warm.nbt"));
+        }
+
+        for (int n : SIZES) {
+            List<String> texts = buildTexts(n, 20261110L);
+            String blob = String.join("\n", texts);
+
+            // ---- 1. CODEC.parse（= 读档解码；不含磁盘 IO）----
+            long[] parseNs = new long[21];
+            VoidWarehouseData data = null;
+            for (int r = -3; r < parseNs.length; r++) {
+                long t0 = System.nanoTime();
+                data = parse(blob);
+                long t1 = System.nanoTime();
+                if (r >= 0) {
+                    parseNs[r] = t1 - t0;
+                }
+            }
+            if (data == null) {
+                throw new IllegalStateException("parse 失败 n=" + n);
+            }
+            System.out.printf("RECIPE-BENCH n=%d parse(codec)      : %8.3f ms  (配方 %d 条已载入)%n",
+                    n, median(parseNs) / 1e6, data.learnedRecipeCount());
+
+            // ---- 2. 写盘（encode + gzip）----
+            // 这一步<b>可能失败</b>，而且失败本身就是要测的东西：learned_recipes 是单个 NBT 字符串，
+            // writeUTF 的上限是 65535 字节。超了就是 UTFDataFormatException，不是"慢"。
+            Path file = dir.resolve("vw-" + n + ".dat");
+            long[] writeNs = new long[21];
+            long size = -1;
+            int written = 0;
+            String writeErr = null;
+            for (int r = -3; r < writeNs.length; r++) {
+                long t0 = System.nanoTime();
+                try {
+                    roundTrip(data, file);
+                    written = LAST_ROUNDTRIP_RECIPES;
+                } catch (IOException | RuntimeException e) {
+                    writeErr = e.getClass().getSimpleName() + ": " + e.getMessage();
+                    break;
+                }
+                long t1 = System.nanoTime();
+                if (r >= 0) {
+                    writeNs[r] = t1 - t0;
+                }
+                if (r == writeNs.length - 1) {
+                    size = Files.size(file);
+                }
+            }
+            if (writeErr == null && written != n) {
+                writeErr = "回读只剩 " + written + " 条（应 " + n + "）—— 字符串超长被 NbtIo 静默丢弃";
+            }
+            if (writeErr != null) {
+                System.out.printf("RECIPE-BENCH n=%d 写盘               : 失败 -> %s%n", n, writeErr);
+            } else {
+                System.out.printf("RECIPE-BENCH n=%d 写+读往返(round)   : %8.3f ms  文件 %d 字节 (%.1f KB)%n",
+                        n, median(writeNs) / 1e6, size, size / 1024.0);
+            }
+
+            // ---- 3. 冷读档（含 gzip 解压 + parse）----
+            long[] readNs = new long[21];
+            for (int r = writeErr != null ? readNs.length : -3; r < readNs.length; r++) {
+                long t0 = System.nanoTime();
+                CompoundTag tag = readNbt(file);
+                VoidWarehouseData back = VoidWarehouseData.CODEC
+                        .parse(NbtOps.INSTANCE, tag).result().orElseThrow();
+                long t1 = System.nanoTime();
+                if (r >= 0) {
+                    readNs[r] = t1 - t0;
+                }
+                SINK = back;
+            }
+            if (writeErr == null) {
+                System.out.printf("RECIPE-BENCH n=%d 读档(gzip+parse)   : %8.3f ms  (%.1f KB 文件)%n",
+                        n, median(readNs) / 1e6, size / 1024.0);
+            }
+
+            // ---- 4. 常驻内存（放大法，总量恒定约 8192 条）----
+            int kCopies = Math.max(2, 8192 / n);
+            List<Object> hold = new ArrayList<>(kCopies);
+            long memBefore = usedAfterGc();
+            for (int k = 0; k < kCopies; k++) {
+                hold.add(parse(blob));
+            }
+            long memAfter = usedAfterGc();
+            SINK = hold;
+            double per = (memAfter - memBefore) / (double) kCopies / n;
+            System.out.printf("RECIPE-BENCH n=%d 常驻内存          : %8.0f B/条  [%d 份放大, 合计 %.2f MB]%n",
+                    n, per, kCopies, (memAfter - memBefore) / 1048576.0);
+            hold.clear();
+
+            // ---- 5. 一次真实查询：这条存档里「可合成」的产物有多少种 ----
+            long t0 = System.nanoTime();
+            int craftable = 0;
+            for (String text : texts) {
+                String out = text.substring(0, text.indexOf('*'));
+                if (data.hasRecipeFor(out)) {
+                    craftable++;
+                }
+            }
+            long t1 = System.nanoTime();
+            System.out.printf("RECIPE-BENCH n=%d hasRecipeFor x%d   : %8.3f ms  (命中 %d)%n",
+                    n, n, (t1 - t0) / 1e6, craftable);
+        }
+
+        // ---- 6. 二分探「最大能写进存档的条数」----
+        // 判据 = roundTrip 不抛 UTFDataFormatException。用同一批 4096 条的前 n 条做前缀，
+        // 保证不同 n 的配方平均长度一致（否则 mid/item 分界变化会污染结果）。
+        List<String> pool = buildTexts(4096, 20261110L);
+        int lo = 64;
+        int hi = 4096;
+        Path probe = dir.resolve("probe.dat");
+        while (lo + 1 < hi) {
+            int mid = (lo + hi) >>> 1;
+            try {
+                List<String> sub = pool.subList(0, mid);
+                roundTrip(parse(String.join("\n", sub)), probe);
+                if (LAST_ROUNDTRIP_RECIPES == mid) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            } catch (IOException | RuntimeException e) {
+                hi = mid;
+            }
+        }
+        long okBytes = 0;
+        try {
+            roundTrip(parse(String.join("\n", pool.subList(0, lo))), probe);
+            okBytes = Files.size(probe);
+        } catch (IOException | RuntimeException ignored) {
+            // 理论上走不到
+        }
+        // 必须按 UTF-8 字节算：分隔符用的是 '×'（U+00D7，2 字节），
+        // 而 writeUTF 的 65535 上限数的是 modified UTF-8 字节，不是 char。
+        long rawBytes = 0;
+        for (int i = 0; i < lo + 1 && i < pool.size(); i++) {
+            rawBytes += pool.get(i).getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 1;
+        }
+        long okBytesRaw = 0;
+        for (int i = 0; i < lo; i++) {
+            okBytesRaw += pool.get(i).getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 1;
+        }
+        System.out.printf("RECIPE-BENCH 可存档上限        : %d 条 (UTF-8 文本 %d 字节, gzip 后 %d 字节)%n",
+                lo, okBytesRaw, okBytes);
+        System.out.printf("RECIPE-BENCH 上限边界          : %d 条 = %d 字节 / %d 条 = %d 字节 (阈值 65535)%n",
+                lo, okBytesRaw, lo + 1, rawBytes);
+        System.out.printf("RECIPE-BENCH 平均条长          : %.1f 字节/条 (UTF-8) -> 65535 理论上限约 %d 条%n",
+                okBytesRaw / (double) lo, (int) (65535 / (okBytesRaw / (double) lo)));
+
+        System.out.println("### RECIPE-BENCH 结束");
+    }
+
+    // ------------------------------------------------------------------
+
+    static VoidWarehouseData parse(String blob) {
+        CompoundTag tag = new CompoundTag();
+        tag.putString("learned_recipes", blob);
+        return VoidWarehouseData.CODEC.parse(NbtOps.INSTANCE, tag).result()
+                .orElseThrow(() -> new IllegalStateException("CODEC.parse 解码失败"));
+    }
+
+    /**
+     * 写盘 + 立刻读回并 parse（读回结果不保持，只为把成本算全）。
+     *
+     * <p>不用 {@code NbtIo.writeCompressed}：在这个长度上量到过「文件只有 44 字节」
+     * （gzip 头写出去、正文没 flush）。自己管 {@code GZIPOutputStream} 的 close，
+     * 与原版 {@code writeCompressed} 内部是同一件事，但生命周期在眼皮底下。</p>
+     */
+    /** 上一次 roundTrip 写完后<b>读回来还剩几条配方</b>；小于写入数就是数据被静默丢掉 */
+    static int LAST_ROUNDTRIP_RECIPES;
+
+    static void roundTrip(VoidWarehouseData data, Path file) throws IOException {
+        Tag encoded = VoidWarehouseData.CODEC.encodeStart(NbtOps.INSTANCE, data).result()
+                .orElseThrow(() -> new IllegalStateException("CODEC.encodeStart 失败"));
+        if (!(encoded instanceof CompoundTag compound)) {
+            throw new IllegalStateException("编码结果不是 CompoundTag: " + encoded.getClass());
+        }
+        try (DataOutputStream out = new DataOutputStream(
+                new GZIPOutputStream(Files.newOutputStream(file), 8192))) {
+            NbtIo.write(compound, out);
+            out.flush();
+        }
+        CompoundTag back = readNbt(file);
+        VoidWarehouseData readBack = VoidWarehouseData.CODEC.parse(NbtOps.INSTANCE, back).result()
+                .orElseThrow(() -> new IllegalStateException("回读 parse 失败"));
+        SINK = readBack;
+        LAST_ROUNDTRIP_RECIPES = readBack.learnedRecipeCount();
+    }
+
+    static CompoundTag readNbt(Path file) throws IOException {
+        try (DataInputStream in = new DataInputStream(
+                new GZIPInputStream(Files.newInputStream(file), 8192))) {
+            return NbtIo.read(in, NbtAccounter.unlimitedHeap());
+        }
+    }
+
+    static String pad(int i) {
+        return String.format("%04d", i);
+    }
+
+    /** 与纯逻辑基准同构：两层（raw → mid → item），深度 2 */
+    static List<String> buildTexts(int n, long seed) {
+        int mids = Math.max(1, n / 4);
+        Random rnd = new Random(seed);
+        List<String> out = new ArrayList<>(n);
+        for (int i = 0; i < mids; i++) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("bench:mid").append(pad(i)).append('*').append(1 + rnd.nextInt(4)).append(';');
+            int kinds = 2 + rnd.nextInt(3);
+            boolean[] used = new boolean[RAW_KINDS];
+            for (int k = 0; k < kinds; k++) {
+                int idx;
+                do {
+                    idx = rnd.nextInt(RAW_KINDS);
+                } while (used[idx]);
+                used[idx] = true;
+                if (k > 0) {
+                    sb.append(',');
+                }
+                sb.append("bench:raw").append(pad(idx)).append('×').append(1 + rnd.nextInt(4));
+            }
+            out.add(sb.toString());
+        }
+        for (int i = mids; i < n; i++) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("bench:item").append(pad(i)).append('*').append(1 + rnd.nextInt(4)).append(';');
+            int midKinds = 1 + rnd.nextInt(3);
+            boolean[] usedMid = new boolean[mids];
+            boolean first = true;
+            for (int k = 0; k < midKinds; k++) {
+                int idx;
+                do {
+                    idx = rnd.nextInt(mids);
+                } while (usedMid[idx]);
+                usedMid[idx] = true;
+                if (!first) {
+                    sb.append(',');
+                }
+                first = false;
+                sb.append("bench:mid").append(pad(idx)).append('×').append(1 + rnd.nextInt(3));
+            }
+            int rawKinds = rnd.nextInt(5);
+            boolean[] usedRaw = new boolean[RAW_KINDS];
+            for (int k = 0; k < rawKinds; k++) {
+                int idx;
+                do {
+                    idx = rnd.nextInt(RAW_KINDS);
+                } while (usedRaw[idx]);
+                usedRaw[idx] = true;
+                if (!first) {
+                    sb.append(',');
+                }
+                first = false;
+                sb.append("bench:raw").append(pad(idx)).append('×').append(1 + rnd.nextInt(9));
+            }
+            out.add(sb.toString());
+        }
+        return out;
+    }
+
+    static long median(long[] a) {
+        long[] b = a.clone();
+        java.util.Arrays.sort(b);
+        return b[b.length / 2];
+    }
+
+    static long usedAfterGc() {
+        long best = Long.MAX_VALUE;
+        for (int i = 0; i < 4; i++) {
+            System.gc();
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            Runtime rt = Runtime.getRuntime();
+            best = Math.min(best, rt.totalMemory() - rt.freeMemory());
+        }
+        return best;
+    }
+}

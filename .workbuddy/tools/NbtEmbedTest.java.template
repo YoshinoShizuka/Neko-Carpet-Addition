@@ -1,0 +1,192 @@
+// A1 的 NBT 嵌入验证（17 断言）：Codec.BYTE_BUFFER -> ByteArrayTag -> NbtIo 往返
+// 需要真 classpath，且与 BlobTest 同包（复用其 recipeTexts）：
+//   CP="C:/Users/<u>/.gradle/caches/fabric-loom/26.3/minecraft-merged.jar"
+//   CP="$CP;<modules-2>/com.mojang/datafixerupper/10.0.21/*/datafixerupper-10.0.21.jar"
+//   # 还要 logging / joml / netty-all / gson / log4j-api / log4j-core / fastutil / guava / slf4j-api
+//   javac -encoding UTF-8 -cp "$CP" -d out neko/voidwarehouse/*.java
+//   java -Dstdout.encoding=UTF-8 -cp "out;$CP" neko.voidwarehouse.NbtEmbedTest
+// ⚠️ Git Bash 下 classpath 必须 ';' 分隔 + 'C:/...' 形式；用 '/c/...' 会 NoClassDefFoundError。
+// ⚠️ 依赖是逐步炸出来的：NbtIo 的异常分支会摸 Util -> SharedConstants，链比想象长。
+//
+package neko.voidwarehouse;
+
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.DataResult;
+import net.minecraft.nbt.ByteArrayTag;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtAccounter;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.Tag;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+/**
+ * 验证 A1 的落地假设：{@code Codec.BYTE_BUFFER}（NbtOps 下即 ByteArrayTag）
+ * 能装下远超 65535 字节的 payload，并走通 {@code NbtIo.writeCompressed} 往返。
+ */
+public final class NbtEmbedTest {
+
+    private static int pass = 0;
+    private static int fail = 0;
+
+    public static void main(String[] args) throws Exception {
+        Path dir = Path.of(System.getProperty("java.io.tmpdir"), "nbtembed");
+        Files.createDirectories(dir);
+
+        N1_tagShape();
+        N2_roundTrip(dir, 2048);
+        N2_roundTrip(dir, 5000);
+        N4_nbtStringBaseline(dir);
+        N5_quota();
+        N6_size(dir);
+
+        System.out.println();
+        System.out.println("RESULT pass=" + pass + " fail=" + fail);
+        if (fail > 0) {
+            System.exit(1);
+        }
+    }
+
+    /** N1：BYTE_BUFFER 在 NbtOps 下确实落成 ByteArrayTag，且长度是 int 语义（不受 65535 限制） */
+    private static void N1_tagShape() {
+        byte[] blob = WarehouseBlob.encode(List.of(), BlobTest.recipeTexts(2048));
+        ByteBuffer buf = ByteBuffer.wrap(blob);
+
+        DataResult<Tag> encoded = Codec.BYTE_BUFFER.encodeStart(NbtOps.INSTANCE, buf);
+        check("N1 编码成功", true, encoded.result().isPresent());
+        Tag tag = encoded.result().orElseThrow();
+        check("N1 落成 ByteArrayTag", "net.minecraft.nbt.ByteArrayTag", tag.getClass().getName());
+        check("N1 字节数一致", blob.length, ((ByteArrayTag) tag).size());
+
+        DataResult<ByteBuffer> parsed = Codec.BYTE_BUFFER.parse(NbtOps.INSTANCE, tag);
+        check("N1 解析成功", true, parsed.result().isPresent());
+        check("N1 解析后长度", blob.length, parsed.result().orElseThrow().remaining());
+    }
+
+    /** N2/N3：写盘 → 读回 → 解容器 → 内容逐条一致 */
+    private static void N2_roundTrip(Path dir, int count) throws IOException {
+        List<String> recipes = BlobTest.recipeTexts(count);
+        byte[] blob = WarehouseBlob.encode(List.of(), recipes);
+
+        CompoundTag root = new CompoundTag();
+        root.put("blob", Codec.BYTE_BUFFER.encodeStart(NbtOps.INSTANCE, ByteBuffer.wrap(blob))
+                .result().orElseThrow());
+
+        Path file = dir.resolve("blob-" + count + ".dat");
+        NbtIo.writeCompressed(root, file);
+        long onDisk = Files.size(file);
+
+        CompoundTag back = NbtIo.readCompressed(file, NbtAccounter.unlimitedHeap());
+        check("N" + count + " 回读含 blob 键", true, back.contains("blob"));
+
+        Tag tag = back.get("blob");
+        check("N" + count + " 回读仍是 ByteArrayTag", "net.minecraft.nbt.ByteArrayTag", tag.getClass().getName());
+
+        ByteBuffer buf = Codec.BYTE_BUFFER.parse(NbtOps.INSTANCE, tag).result().orElseThrow();
+        byte[] readBack = new byte[buf.remaining()];
+        buf.duplicate().get(readBack);
+
+        WarehouseBlob.Raw raw = WarehouseBlob.decode(readBack);
+        check("N" + count + " 配方条数", count, raw.recipes().size());
+        check("N" + count + " 配方内容", recipes, raw.recipes());
+
+        System.out.printf("      %d 条: blob=%,d B  落盘=%,d B  gzip %.1f:1%n",
+                count, blob.length, onDisk, blob.length / (double) onDisk);
+    }
+
+    /** N4：同体积的「单 String」走同一条 NbtIo 路径 —— 复现静默丢弃 */
+    private static void N4_nbtStringBaseline(Path dir) throws IOException {
+        List<String> recipes = BlobTest.recipeTexts(2048);
+        String text = String.join("\n", recipes);
+        int utf8 = text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        System.out.printf("      单 String 长度 = %,d 字符 / %,d UTF-8 字节%n", text.length(), utf8);
+
+        CompoundTag root = new CompoundTag();
+        root.putString("recipes", text);
+        check("N4 内存里写进去了", true, root.contains("recipes"));
+
+        Path file = dir.resolve("string-2048.dat");
+        String outcome;
+        try {
+            NbtIo.writeCompressed(root, file);
+            outcome = "没抛异常";
+        } catch (Exception e) {
+            outcome = "抛了 " + e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
+        long onDisk = Files.exists(file) ? Files.size(file) : -1;
+        System.out.printf("      writeCompressed -> %s, 文件 %,d B%n", outcome, onDisk);
+
+        CompoundTag back = NbtIo.readCompressed(file, NbtAccounter.unlimitedHeap());
+        boolean keyAlive = back.contains("recipes");
+        String content = keyAlive ? back.getString("recipes").orElse("<非字符串>") : null;
+        int contentLen = content == null ? -1 : content.length();
+        System.out.printf("      回读: 键存在=%s  内容长度=%d%s%n",
+                keyAlive, contentLen, contentLen == 0 ? " (被替换成空串!)" : "");
+
+        // 精确口径：字段没消失，内容被 StringFallbackDataOutput 换成空串
+        check("N4 反证-键仍在", true, keyAlive);
+        check("N4 反证-内容已被清空", 0, contentLen);
+    }
+
+    /** N5：读档配额 —— gzip 路径用 unlimitedHeap，但小配额会不会被卡 */
+    private static void N5_quota() throws IOException {
+        Path file = Path.of(System.getProperty("java.io.tmpdir"), "nbtembed", "blob-2048.dat");
+        String unlimited;
+        try {
+            CompoundTag t = NbtIo.readCompressed(file, NbtAccounter.unlimitedHeap());
+            unlimited = "OK (" + t.size() + " 键)";
+        } catch (Exception e) {
+            unlimited = "FAIL " + e.getClass().getSimpleName();
+        }
+        String small;
+        try {
+            NbtIo.readCompressed(file, NbtAccounter.create(2 * 1024 * 1024));
+            small = "OK";
+        } catch (Exception e) {
+            small = e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
+        System.out.println("      unlimitedHeap -> " + unlimited + " ; 2MB 配额 -> " + small);
+        check("N5 unlimitedHeap 能读回", true, unlimited.startsWith("OK"));
+    }
+
+    /** N6：文件体积对比 */
+    private static void N6_size(Path dir) throws IOException {
+        for (int n : new int[]{512, 2048}) {
+            List<String> recipes = BlobTest.recipeTexts(n);
+            int utf8 = 0;
+            for (String s : recipes) {
+                utf8 += s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+            }
+            byte[] blob = WarehouseBlob.encode(List.of(), recipes);
+            CompoundTag root = new CompoundTag();
+            root.put("blob", Codec.BYTE_BUFFER.encodeStart(NbtOps.INSTANCE, ByteBuffer.wrap(blob))
+                    .result().orElseThrow());
+            Path file = dir.resolve("size-" + n + ".dat");
+            NbtIo.writeCompressed(root, file);
+            System.out.printf("      n=%-4d 配方原文=%,8d B  blob=%,8d B  落盘=%,8d B%n",
+                    n, utf8, blob.length, Files.size(file));
+        }
+    }
+
+    // ------------------------------------------------------------------
+
+    private static void check(String name, Object expect, Object actual) {
+        if (expect.equals(actual)) {
+            pass++;
+            System.out.println("  OK   " + name);
+        } else {
+            fail++;
+            System.out.println("  FAIL " + name + "  期望 " + expect + " 实际 " + actual);
+        }
+    }
+
+    private static void fail(String name, String note) {
+        fail++;
+        System.out.println("  FAIL " + name + "  -> " + note);
+    }
+}

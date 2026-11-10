@@ -1,0 +1,424 @@
+import neko.voidwarehouse.VoidWarehouseRecipes;
+import neko.voidwarehouse.VoidWarehouseRecipes.Part;
+import neko.voidwarehouse.VoidWarehouseRecipes.Plan;
+import neko.voidwarehouse.VoidWarehouseRecipes.Recipe;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+
+/**
+ * 【临时基准】配方本从 512 放宽到 2048，性能会不会受影响。
+ *
+ * <p>只跑 {@code common} 里的 {@link VoidWarehouseRecipes}（纯逻辑、不碰 Minecraft），
+ * 所以五个版本共用同一份被测代码，测出来的数字与选哪个 MC 版本无关。</p>
+ *
+ * <h2>测什么</h2>
+ * <ol>
+ *   <li><b>读档解码</b>（{@code decodeAll} + {@code byOutput}）：每次进存档只做一次，
+ *       但与配方条数线性相关 —— 这是「加载耗时」的主体。</li>
+ *   <li><b>逐条 learn 的累积成本</b>：{@code VoidWarehouseData#learn} 每学一条都整体
+ *       {@code rebuildRecipes()}（全量解码 + 重建索引）⇒ 学满 N 条是 O(N²)。
+ *       放宽上限后这一项理论上涨 16 倍，是最可能踩的坑。</li>
+ *   <li><b>查询/匹配响应</b>（{@code stockClosure} / {@code plan} / {@code maxCraftable}）：
+ *       这三条是玩家每次打开界面、每次右键取物都会走的路径。</li>
+ *   <li><b>常驻内存</b>：{@code List<Recipe>} + {@code byOutput} 索引。</li>
+ * </ol>
+ *
+ * <h2>怎么造数据</h2>
+ * <p>两层结构，深度 2，与原版尺度一致（原木→木板→成品就是 2~3 层）：</p>
+ * <ul>
+ *   <li>{@code bench:raw0000..0063}：64 种「原始材料」，只出现在配方原料里；</li>
+ *   <li>{@code bench:mid####}（占 N/4 条配方）：原料全是原始材料；</li>
+ *   <li>{@code bench:item####}（占 3N/4 条）：原料 = 1~3 种 mid + 0~4 种原始材料。</li>
+ * </ul>
+ * <p>产物 id 全部唯一 ⇒ {@code byOutput} 每个 key 只有 1 条配方，与「玩家真学了很多不同东西」
+ * 的形态一致（同产物多配方是少数情况，另有一条 case 专门测）。</p>
+ *
+ * <h2>两种库存形态（缺一不可）</h2>
+ * <ul>
+ *   <li><b>FULL</b>：连中间产物都满仓（1e6）⇒ {@code supply} 第一层就命中，不往下钻，快路径；</li>
+ *   <li><b>LEAF</b>：只有原始材料满仓，中间产物为 0 ⇒ 强制往下钻两层，
+ *       这是「玩家只囤原料」的真实形态，也是最坏路径。</li>
+ * </ul>
+ *
+ * <h2>怎么算时间</h2>
+ * <p>每项先预热 3 轮（丢掉），再跑 {@code R} 轮取<b>中位数</b>。查询类每轮对 200 条
+ * 固定随机样本逐条调用、累加结果做 checksum（防止 JIT 把整段消掉）。
+ * Windows 上 {@code nanoTime} 粒度约 100ns，所以单次调用的量级都在 µs 以上才可信 —— 本基准
+ * 所有被测项都在这个量级以上，不做自动定批。</p>
+ *
+ * <p>用法：{@code java -cp out RecipeScaleBench <N>}（一个 JVM 只测一个 N，
+ * 保证内存采样不被上一个规模污染）。</p>
+ */
+public final class RecipeScaleBench {
+
+    static final int RAW_KINDS = 64;
+    static final BigInteger BIG = BigInteger.valueOf(1_000_000L);
+    static final int SAMPLES = 200;
+
+    static volatile Object SINK;   // 防 DCE
+
+    public static void main(String[] args) {
+        int n = args.length > 0 ? Integer.parseInt(args[0]) : 512;
+        long seed = 20261110L;
+
+        System.out.println("=== recipe-scale bench: N=" + n + " ===");
+        System.out.println("jvm=" + System.getProperty("java.version")
+                + " maxHeap=" + Runtime.getRuntime().maxMemory() / (1024 * 1024) + "MB"
+                + " os=" + System.getProperty("os.name") + " " + System.getProperty("os.arch"));
+
+        // ---- 造配方文本（这一步不计入任何被测项）----
+        List<String> texts = buildTexts(n, seed);
+        if (texts.size() != n) {
+            throw new IllegalStateException("造出的条数不对: " + texts.size() + " != " + n);
+        }
+
+        // 编码后的总字节数（存档里就是这一串）
+        // 按 UTF-8 字节算（配方里的 '×' 是 U+00D7，2 字节）—— 存档上限卡的就是这个数
+        long blobBytes = 0;
+        for (String s : texts) {
+            blobBytes += s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 1;
+        }
+        System.out.printf("blob: %d 条, %d 字节 (%.1f KB), 平均 %.1f 字节/条%n",
+                n, blobBytes, blobBytes / 1024.0, blobBytes / (double) n);
+
+        // ---------------------------------------------------------------- 1. 读档解码
+        List<Recipe> warm = null;
+        for (int i = 0; i < 3; i++) {
+            warm = VoidWarehouseRecipes.decodeAll(texts);
+        }
+        long[] dec = new long[15];
+        for (int r = 0; r < dec.length; r++) {
+            long t0 = System.nanoTime();
+            List<Recipe> decoded = VoidWarehouseRecipes.decodeAll(texts);
+            long t1 = System.nanoTime();
+            dec[r] = t1 - t0;
+            SINK = decoded;
+        }
+        long decodeNs = median(dec);
+        System.out.printf("decodeAll            : %8.3f ms  (%.3f us/条)%n",
+                decodeNs / 1e6, decodeNs / 1000.0 / n);
+
+        List<Recipe> recipes = VoidWarehouseRecipes.decodeAll(texts);
+
+        // ---------------------------------------------------------------- 2. 建索引
+        long[] idx = new long[15];
+        Map<String, List<Recipe>> byOutput = null;
+        for (int r = 0; r < idx.length; r++) {
+            long t0 = System.nanoTime();
+            Map<String, List<Recipe>> m = VoidWarehouseRecipes.byOutput(recipes);
+            long t1 = System.nanoTime();
+            idx[r] = t1 - t0;
+            byOutput = m;
+        }
+        long indexNs = median(idx);
+        System.out.printf("byOutput             : %8.3f ms  (%d 个产物 key)%n",
+                indexNs / 1e6, byOutput.size());
+
+        // 常驻内存的测量放在全部计时项之后（见文件末尾）：放大法要临时分配上千条对象，
+        // 放在计时中间会把堆弄脏、给中位数引入 GC 抖动。
+
+        // ---------------------------------------------------------------- 4. 查询样本
+        Random rnd = new Random(seed ^ 0x5DEECE66DL);
+        int[] pick = new int[Math.min(SAMPLES, n)];
+        boolean[] used = new boolean[n];
+        for (int i = 0; i < pick.length; i++) {
+            int k;
+            do {
+                k = rnd.nextInt(n);
+            } while (used[k]);
+            used[k] = true;
+            pick[i] = k;
+        }
+
+        BigInteger want64 = BigInteger.valueOf(64);
+        BigInteger want4096 = BigInteger.valueOf(4096);
+
+        for (String form : new String[]{"FULL", "LEAF"}) {
+            // 🔴 关键口径：真实调用路径传进来的是「闭包」（VoidWarehouseData#craftStock
+            //    -> VoidWarehouseRecipeBook#stockFor -> stockClosure），不是整仓。
+            //    Model 构造是 new HashMap<>(stock)，所以传整仓会让每次 simulate 都多拷 N 项 ——
+            //    那是基准自己的错，不是模组的成本。这里按真实口径先取闭包。
+            Map<String, BigInteger> warehouse = buildStock(form, recipes, byOutput);
+            Map<String, BigInteger>[] stockOf = new Map[pick.length];
+            for (int k = 0; k < pick.length; k++) {
+                stockOf[k] = VoidWarehouseRecipes.stockClosure(
+                        recipes.get(pick[k]), byOutput, warehouse::get);
+            }
+
+            // --- stockClosure ---
+            long[] clo = new long[15];
+            for (int r = -5; r < clo.length; r++) {
+                long t0 = System.nanoTime();
+                long acc = 0;
+                for (int i : pick) {
+                    acc += VoidWarehouseRecipes.stockClosure(recipes.get(i), byOutput, warehouse::get).size();
+                }
+                long t1 = System.nanoTime();
+                if (r >= 0) {
+                    clo[r] = t1 - t0;
+                }
+                SINK = acc;
+            }
+            long cloNs = median(clo);
+            System.out.printf("[%s] stockClosure      : %8.2f us/条  (闭包 %.1f 项)%n",
+                    form, cloNs / 1000.0 / pick.length, closureSize(recipes, byOutput, warehouse, pick));
+
+            // --- plan(want=64) ---
+            long[] pl = new long[15];
+            int ok64 = 0;
+            for (int r = -5; r < pl.length; r++) {
+                long t0 = System.nanoTime();
+                int ok = 0;
+                for (int k = 0; k < pick.length; k++) {
+                    Plan p = VoidWarehouseRecipes.plan(recipes.get(pick[k]), want64, stockOf[k], byOutput);
+                    if (p != null) {
+                        ok++;
+                        SINK = p.crafts();
+                    }
+                }
+                long t1 = System.nanoTime();
+                if (r >= 0) {
+                    pl[r] = t1 - t0;
+                }
+                ok64 = ok;
+            }
+            long planNs = median(pl);
+            System.out.printf("[%s] plan(want=64)     : %8.2f us/条  (成功 %d/%d)%n",
+                    form, planNs / 1000.0 / pick.length, ok64, pick.length);
+
+            // --- plan(want=4096) ---
+            long[] pl4 = new long[15];
+            for (int r = -5; r < pl4.length; r++) {
+                long t0 = System.nanoTime();
+                int ok = 0;
+                for (int k = 0; k < pick.length; k++) {
+                    Plan p = VoidWarehouseRecipes.plan(recipes.get(pick[k]), want4096, stockOf[k], byOutput);
+                    if (p != null) {
+                        ok++;
+                        SINK = p.crafts();
+                    }
+                }
+                long t1 = System.nanoTime();
+                if (r >= 0) {
+                    pl4[r] = t1 - t0;
+                }
+            }
+            long plan4Ns = median(pl4);
+            System.out.printf("[%s] plan(want=4096)   : %8.2f us/条%n",
+                    form, plan4Ns / 1000.0 / pick.length);
+
+            // --- maxCraftable（界面「可合成 N 个」走这条，最重）---
+            long[] mc = new long[15];
+            for (int r = -5; r < mc.length; r++) {
+                long t0 = System.nanoTime();
+                BigInteger acc = BigInteger.ZERO;
+                for (int k = 0; k < pick.length; k++) {
+                    acc = acc.add(VoidWarehouseRecipes.maxCraftable(recipes.get(pick[k]), stockOf[k], byOutput));
+                }
+                long t1 = System.nanoTime();
+                if (r >= 0) {
+                    mc[r] = t1 - t0;
+                }
+                SINK = acc;
+            }
+            long mcNs = median(mc);
+            System.out.printf("[%s] maxCraftable     : %8.2f us/条%n",
+                    form, mcNs / 1000.0 / pick.length);
+        }
+
+        // ---------------------------------------------------------------- 5. 逐条 learn 的 O(N²)
+        // VoidWarehouseData#learn 每学一条都 rebuildRecipes() = 全量 decodeAll + byOutput。
+        // 这里照抄那条路径，逐条学满 N 条，测总耗时。
+        java.util.LinkedHashSet<String> set = new java.util.LinkedHashSet<>();
+        long learnTotal = 0;
+        int learnRounds = 3;
+        for (int r = 0; r < learnRounds; r++) {
+            set.clear();
+            long t0 = System.nanoTime();
+            for (String text : texts) {
+                set.add(text);
+                List<Recipe> again = VoidWarehouseRecipes.decodeAll(set);
+                SINK = VoidWarehouseRecipes.byOutput(again);
+            }
+            long t1 = System.nanoTime();
+            learnTotal += (t1 - t0);
+        }
+        System.out.printf("learn 满 %d 条(累计) : %8.2f ms  (平均 %.3f ms/条；O(N^2) 形态)%n",
+                n, learnTotal / 1e6 / learnRounds, learnTotal / 1e6 / learnRounds / n);
+
+        // ---------------------------------------------------------------- 6. 同产物多配方（另一形态）
+        // 造 N/32 条「同一个产物、原料不同」的配方，测 byOutput 里 key 的候选列表变长后
+        // 「挑做得最多的那条」这条最贵的路径。
+        int cand = Math.max(1, n / 32);
+        List<Recipe> dup = new ArrayList<>();
+        for (int i = 0; i < cand; i++) {
+            List<Part> parts = new ArrayList<>();
+            parts.add(new Part(List.of("bench:raw" + pad(i % RAW_KINDS)), 3));
+            parts.add(new Part(List.of("bench:raw" + pad((i * 7 + 3) % RAW_KINDS)), 4));
+            dup.add(new Recipe(null, "bench:dupe", 1, parts));
+        }
+        Map<String, List<Recipe>> dupIndex = VoidWarehouseRecipes.byOutput(dup);
+        Map<String, BigInteger> dupStock = new LinkedHashMap<>();
+        for (int i = 0; i < RAW_KINDS; i++) {
+            dupStock.put("bench:raw" + pad(i), BIG);
+        }
+        long[] dupNs = new long[15];
+        for (int r = -5; r < dupNs.length; r++) {
+            long t0 = System.nanoTime();
+            BigInteger best = BigInteger.ZERO;
+            for (Recipe recipe : dupIndex.get("bench:dupe")) {
+                BigInteger v = VoidWarehouseRecipes.maxCraftable(recipe, dupStock, dupIndex);
+                if (v.compareTo(best) > 0) {
+                    best = v;
+                }
+            }
+            long t1 = System.nanoTime();
+            if (r >= 0) {
+                dupNs[r] = t1 - t0;
+            }
+            SINK = best;
+        }
+        System.out.printf("同产物 %d 条候选(maxCraftable 全扫): %8.2f us%n",
+                cand, median(dupNs) / 1000.0);
+
+        // ---------------------------------------------------------------- 7. 常驻内存（放最后）
+        // 直接量一份的差值会被 GC 噪声吃掉（512 条约 0.4 MB，噪声同量级）。
+        // 改成「放大法」：再造 K 份<b>独立</b>对象图，总量恒定约 8192 条，
+        // 于是三个规模的信号强度一致、可横向对比。
+        int kCopies = Math.max(2, 8192 / n);
+        List<Object> hold = new ArrayList<>(kCopies * 2);
+        long memBefore = usedAfterGc();
+        for (int k = 0; k < kCopies; k++) {
+            List<Recipe> copy = VoidWarehouseRecipes.decodeAll(texts);
+            hold.add(copy);
+            hold.add(VoidWarehouseRecipes.byOutput(copy));
+        }
+        long memAfter = usedAfterGc();
+        SINK = hold;
+        double perRecipeBytes = (memAfter - memBefore) / (double) kCopies / n;
+        System.out.printf("常驻内存 (recipes+byOutput): %.0f B/条  [%d 份 x %d 条放大测得, 合计 %.2f MB]%n",
+                perRecipeBytes, kCopies, n, (memAfter - memBefore) / 1048576.0);
+        System.out.printf("推算 %d 条的常驻开销: %.2f MB%n",
+                n, perRecipeBytes * (double) n / 1048576.0);
+    }
+
+    // ------------------------------------------------------------------ 数据构造
+
+    static String pad(int i) {
+        return String.format("%04d", i);
+    }
+
+    static List<String> buildTexts(int n, long seed) {
+        int mids = Math.max(1, n / 4);
+        Random rnd = new Random(seed);
+        List<String> out = new ArrayList<>(n);
+        // mid：原料全是原始材料
+        for (int i = 0; i < mids; i++) {
+            int kinds = 2 + rnd.nextInt(3);           // 2~4 种
+            List<Part> parts = new ArrayList<>(kinds);
+            boolean[] usedRaw = new boolean[RAW_KINDS];
+            for (int k = 0; k < kinds; k++) {
+                int idx;
+                do {
+                    idx = rnd.nextInt(RAW_KINDS);
+                } while (usedRaw[idx]);
+                usedRaw[idx] = true;
+                parts.add(new Part(List.of("bench:raw" + pad(idx)), 1 + rnd.nextInt(4)));
+            }
+            out.add(VoidWarehouseRecipes.encode(
+                    new Recipe(null, "bench:mid" + pad(i), 1 + rnd.nextInt(4), parts)));
+        }
+        // item：1~3 种 mid + 0~4 种原始材料
+        for (int i = mids; i < n; i++) {
+            List<Part> parts = new ArrayList<>();
+            int midKinds = 1 + rnd.nextInt(3);
+            boolean[] usedMid = new boolean[mids];
+            for (int k = 0; k < midKinds; k++) {
+                int idx;
+                do {
+                    idx = rnd.nextInt(mids);
+                } while (usedMid[idx]);
+                usedMid[idx] = true;
+                parts.add(new Part(List.of("bench:mid" + pad(idx)), 1 + rnd.nextInt(3)));
+            }
+            int rawKinds = rnd.nextInt(5);
+            boolean[] usedRaw = new boolean[RAW_KINDS];
+            for (int k = 0; k < rawKinds; k++) {
+                int idx;
+                do {
+                    idx = rnd.nextInt(RAW_KINDS);
+                } while (usedRaw[idx]);
+                usedRaw[idx] = true;
+                parts.add(new Part(List.of("bench:raw" + pad(idx)), 1 + rnd.nextInt(9)));
+            }
+            out.add(VoidWarehouseRecipes.encode(
+                    new Recipe(null, "bench:item" + pad(i), 1 + rnd.nextInt(4), parts)));
+        }
+        return out;
+    }
+
+    static Map<String, BigInteger> buildStock(String form, List<Recipe> recipes,
+                                              Map<String, List<Recipe>> byOutput) {
+        Map<String, BigInteger> stock = new LinkedHashMap<>();
+        if ("FULL".equals(form)) {
+            for (Recipe r : recipes) {
+                stock.put(r.output(), BIG);
+                for (Part p : r.parts()) {
+                    for (String c : p.candidates()) {
+                        stock.put(c, BIG);
+                    }
+                }
+            }
+        } else {
+            // 只有原始材料满仓，中间产物为 0（不是缺 key —— 缺 key 与 0 等价，但显式放 0 更接近真实：
+            // 仓库里那一格就是"有这种物品、数量 0"）
+            for (int i = 0; i < RAW_KINDS; i++) {
+                stock.put("bench:raw" + pad(i), BIG);
+            }
+            for (Recipe r : recipes) {
+                stock.putIfAbsent(r.output(), BigInteger.ZERO);
+            }
+        }
+        return stock;
+    }
+
+    static double closureSize(List<Recipe> recipes, Map<String, List<Recipe>> byOutput,
+                              Map<String, BigInteger> warehouse, int[] pick) {
+        long total = 0;
+        for (int i : pick) {
+            total += VoidWarehouseRecipes.stockClosure(recipes.get(i), byOutput, warehouse::get).size();
+        }
+        return total / (double) pick.length;
+    }
+
+    // ------------------------------------------------------------------ 工具
+
+    static long median(long[] a) {
+        long[] b = a.clone();
+        java.util.Arrays.sort(b);
+        return b[b.length / 2];
+    }
+
+    static long usedAfterGc() {
+        long best = Long.MAX_VALUE;
+        for (int i = 0; i < 4; i++) {
+            System.gc();
+            try {
+                Thread.sleep(60);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            Runtime rt = Runtime.getRuntime();
+            long used = rt.totalMemory() - rt.freeMemory();
+            if (used < best) {
+                best = used;
+            }
+        }
+        return best;
+    }
+}

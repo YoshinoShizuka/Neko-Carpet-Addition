@@ -43,7 +43,10 @@ import java.util.Random;
  *       仓库物品一条不许少；</li>
  *   <li><b>K 往下钻</b>（1.0.16 修的玩家报障）：木板没货、原木有货时必须扣原木做木板；
  *       同一份库存不带子配方时必须失败（反证）；先吃库存再补做；闭包含深一层的料；
- *       深度上限 / 撞环必须保守失败且不崩；真服务端整条链路走通。</li>
+ *       深度上限 / 撞环必须保守失败且不崩；真服务端整条链路走通；</li>
+ *   <li><b>M 增量等价</b>（R3）：可兑表改成「只重算受影响的产物」之后，每一次改动都必须与
+ *       「整批重算」给出<b>逐字节相同</b>的结果（含顺序）。这组的风险不是算错而是<b>漏算</b> ——
+ *       数量类断言看不出来，只有和一份从零算起的对照逐行比才抓得到。</li>
  * </ol>
  */
 public final class VoidWarehouseCraftSelfCheck {
@@ -133,6 +136,9 @@ public final class VoidWarehouseCraftSelfCheck {
                 groupL_interchangeable(server);
                 break;
             case 13:
+                groupM_incrementalEquivalence(server);
+                break;
+            case 14:
                 cleanup(server);
                 break;
             default:
@@ -902,6 +908,204 @@ public final class VoidWarehouseCraftSelfCheck {
         data.insert(new ItemStack(Items.COBBLESTONE, 64));
         check("L9 只学过橡木版、仓库只有白桦 → 做不出来（原料被具体化）",
                 data.planExchange(new ItemStack(Items.DROPPER), BigInteger.ONE) == null);
+    }
+
+    // ================================================================ M 增量等价
+
+    /**
+     * 「按受影响产物增量重算」必须与「从零整批重算」给出<b>逐字节相同</b>的可兑表。
+     *
+     * <h2>为什么要这份测试，而不是只跑原来的那些断言</h2>
+     * <p>增量重算的风险不是「算错」，而是<b>漏算</b>：某件物品变了、某个产物没被标记成受影响，
+     * 于是那一格一直显示旧数字。这种错误在「数量对不对」这类断言上往往看不出来
+     * （大多数产物的数字本来就该不动），只有把整张表拿去和一份<b>从零建起来的</b>比，
+     * 才能同时覆盖「该变的变了」和「不该变的没变」。</p>
+     *
+     * <h2>对照怎么造</h2>
+     * <p>把同一份库存原地清空再灌回，逼它走整批重算（细节与那个坑见
+     * {@link #sameAfterFullRebuild}），再把两张表按字面量摊平比对。</p>
+     *
+     * <p><b>为什么要比顺序</b>：展示序（U2）要求同一份库存下先后一致；增量的实现如果
+     * 改成「重算的产物挪到表尾」，数字全对、顺序却会跳。摊平里带顺序，一次就抓到。</p>
+     */
+    private static void groupM_incrementalEquivalence(MinecraftServer server) {
+        System.out.println("[M] 增量重算与整批重算等价");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        for (VoidWarehouseRecipes.Recipe recipe : incrementalBook()) {
+            data.learn(recipe);
+        }
+        // 数量故意取得不整齐：整十的数会把「差 1 个够不够」这类边界盖掉
+        data.insert(new ItemStack(Items.COBBLESTONE, 37));
+        data.insert(new ItemStack(Items.OAK_LOG, 11));
+        data.insert(new ItemStack(Items.OAK_PLANKS, 5));
+        data.insert(new ItemStack(Items.IRON_INGOT, 23));
+        data.insert(new ItemStack(Items.REDSTONE, 3));
+        data.insert(new ItemStack(Items.STICK, 9));
+        data.insert(new ItemStack(Items.LEVER, 2));      // 本身就是产物：有货 → 不该出虚拟格
+        data.insert(new ItemStack(Items.DIRT, 40));
+
+        sameAfterFullRebuild(data, "M1 初始");
+
+        // ① 最普通的一条路径：某格少 1 个
+        data.takeItem(Items.COBBLESTONE, 1);
+        sameAfterFullRebuild(data, "M2 圆石 37→36");
+
+        // ② 产物自己进了仓库 → 那一格必须立刻消失（闸门看的是产物自己的数量）
+        data.insert(new ItemStack(Items.PISTON, 1));
+        sameAfterFullRebuild(data, "M3 活塞有货 → 该格消失");
+
+        // ③ 又取空 → 那一格必须回来
+        data.takeItem(Items.PISTON, 1);
+        sameAfterFullRebuild(data, "M4 活塞取空 → 该格回来");
+
+        // ④ 动最上游：原木少 4 → 木板、木棍、活塞三层都要跟着变
+        data.takeItem(Items.OAK_LOG, 4);
+        sameAfterFullRebuild(data, "M5 原木 11→7（三层下钻全变）");
+
+        // ⑤ 把一种只被两条配方用到的原料抽干（整格移除）
+        data.takeItem(Items.REDSTONE, 3);
+        sameAfterFullRebuild(data, "M6 红石抽干（活塞/发射器同时失去配方）");
+
+        // ⑥ 加一条新配方 → 配方本换版，依赖集要重建
+        data.learn(recipe("minecraft:furnace", 1, part("minecraft:cobblestone", 8)));
+        sameAfterFullRebuild(data, "M7 学一条新配方（依赖集重建）");
+
+        // ⑦ 同一 tick 里连改三处、只读一次：脏集合必须累加，不能只记住最后一次
+        data.takeItem(Items.COBBLESTONE, 5);
+        data.takeItem(Items.OAK_LOG, 2);
+        data.insert(new ItemStack(Items.IRON_INGOT, 4));
+        sameAfterFullRebuild(data, "M8 同一 tick 连改三处");
+
+        // ⑧ <b>只 clearContent()、什么都不灌就读一次</b>：这是唯一「库存整体归零、却没有逐件记账」
+        //    的路径（changedItems 是空的）。快捷路径如果不看 craftCacheBusted，这里会把上一份
+        //    还写着可兑格的表原样返回 —— 界面上一堆点下去凑不出来的幽灵格。
+        data.clearContent();
+        VoidWarehouseData.noteServerTick(900_000 + (++scratchTick));
+        check("M9 清空后第一读是空表（快捷路径不许沿用旧表）", data.exchangeOffers().isEmpty());
+
+        // ⑨ 重新灌回两种原料：新表必须从零算起
+        data.insert(new ItemStack(Items.COBBLESTONE, 37));
+        data.insert(new ItemStack(Items.OAK_LOG, 11));
+        sameAfterFullRebuild(data, "M10 清空后重灌");
+
+        // ⑩ 逐格抽干（走 consume 那条路）：所有产物必须一起消失
+        data.takeItem(Items.COBBLESTONE, 37);
+        data.takeItem(Items.OAK_LOG, 11);
+        sameAfterFullRebuild(data, "M11 原料逐格抽干 → 全部消失");
+    }
+
+    /** 组内自增的假 tick：保证每次读都真的重算（同一 tick 内 exchangeOffers 会按 tick 合并） */
+    private static int scratchTick;
+
+    /**
+     * 比对「增量重算」与「整批重算」两条路给出的可兑表，必须逐字节相同。
+     *
+     * <h2>对照怎么造</h2>
+     * <p>把同一份库存原地清空再灌回：{@link VoidWarehouseData#clearContent()} 会把
+     * 「下次必须整批重算」的标志置起来，于是紧接着的那一次读会<b>把每个产物都算一遍</b>。
+     * 配方本一个字没动 —— 所以这确实是「同一份输入、两种算法」的对照。</p>
+     *
+     * <p>⚠️ 别改成「新建一个 VoidWarehouseData 灌同样的料」：{@code clearContent()} 只清库存、
+     * <b>不清配方本</b>，新实例没法复刻前面几组学过的配方，两边输入立刻不一致
+     * （实测：对照组少了 dropper、dispenser 的账单还差 9 个圆石）。教训是
+     * 「对照组的输入必须由被测对象自己决定」，不能靠测试代码重新拼一遍。</p>
+     */
+    private static void sameAfterFullRebuild(VoidWarehouseData data, String label) {
+        VoidWarehouseData.noteServerTick(900_000 + (++scratchTick));
+        String got = dumpOffers(data.exchangeOffers());
+
+        List<ItemStack> snapshot = new ArrayList<>();
+        for (int i = 0; i < data.entryCount(); i++) {
+            VoidWarehouseData.Entry entry = data.entryAt(i);
+            if (entry != null && entry.amount().signum() > 0) {
+                snapshot.add(entry.template().copyWithCount(entry.amount().intValue()));
+            }
+        }
+        data.clearContent();
+        for (ItemStack stack : snapshot) {
+            data.insert(stack);
+        }
+        VoidWarehouseData.noteServerTick(900_000 + (++scratchTick));
+        String want = dumpOffers(data.exchangeOffers());
+
+        // 不额外要求 want 非空：M9 是「原料抽干」那一档，正确答案就是 0 条。
+        // 「比对不是空转」由 M1~M8 兜着（那几档都有 2~4 条可兑）。
+        boolean ok = got.equals(want);
+        if (!ok) {
+            System.out.println("   !! 增量与整批不一致：");
+            String[] a = got.split("\n", -1);
+            String[] b = want.split("\n", -1);
+            int shown = 0;
+            for (int i = 0; i < Math.max(a.length, b.length) && shown < 8; i++) {
+                String x = i < a.length ? a[i] : "<少一行>";
+                String y = i < b.length ? b[i] : "<少一行>";
+                if (!x.equals(y)) {
+                    System.out.println("      增量: " + x);
+                    System.out.println("      整批: " + y);
+                    shown++;
+                }
+            }
+        }
+        check(label + "（" + lineCount(want) + " 条可兑）", ok);
+    }
+
+    /** 可兑表摊平成一串字面量；顺序照原样，不做排序（顺序本身就是要证的东西） */
+    private static String dumpOffers(List<VoidWarehouseData.ExchangeOffer> offers) {
+        StringBuilder sb = new StringBuilder(offers.size() * 96);
+        for (VoidWarehouseData.ExchangeOffer offer : offers) {
+            sb.append(offer.itemId()).append('|')
+                    .append(offer.obtainable()).append('|')
+                    .append(offer.bulk()).append('|')
+                    .append(offer.boxed()).append('|')
+                    .append(offer.craft() ? 'C' : 'X').append('|');
+            boolean first = true;
+            for (VoidWarehouseExchange.Delta delta : offer.totalCost()) {
+                if (!first) {
+                    sb.append(',');
+                }
+                first = false;
+                sb.append(delta.itemId()).append('=').append(delta.change());
+            }
+            sb.append('\n');
+        }
+        return sb.toString();
+    }
+
+    private static int lineCount(String text) {
+        int n = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '\n') {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /**
+     * M 组用的配方本：四条不同的失效路径各来一条 ——
+     * 单层多产出、两层下钻、四原料单产出、候选原料（木板两种）、产物自己是别人的原料。
+     */
+    private static List<VoidWarehouseRecipes.Recipe> incrementalBook() {
+        List<VoidWarehouseRecipes.Recipe> book = new ArrayList<>();
+        book.add(recipe("minecraft:oak_planks", 4, part("minecraft:oak_log", 1)));
+        book.add(recipe("minecraft:stick", 4, part("minecraft:oak_planks", 2)));
+        book.add(recipe("minecraft:piston", 1,
+                part("minecraft:cobblestone", 4),
+                part("minecraft:oak_planks", 3),
+                part("minecraft:iron_ingot", 1),
+                part("minecraft:redstone", 1)));
+        book.add(new VoidWarehouseRecipes.Recipe(null, "minecraft:dispenser", 1, List.of(
+                new VoidWarehouseRecipes.Part(List.of("minecraft:oak_planks", "minecraft:birch_planks"), 3),
+                part("minecraft:cobblestone", 7),
+                part("minecraft:redstone", 1))));
+        book.add(recipe("minecraft:sticky_piston", 1,
+                part("minecraft:piston", 1),
+                part("minecraft:slime_ball", 1)));
+        book.add(recipe("minecraft:lever", 1,
+                part("minecraft:cobblestone", 1),
+                part("minecraft:stick", 1)));
+        return book;
     }
 
     // ================================================================ 工具

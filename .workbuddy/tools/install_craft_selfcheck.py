@@ -71,9 +71,18 @@ def install(target):
     if not os.path.isfile(TEMPLATE):
         raise SystemExit("!! 模板不存在：%s" % TEMPLATE)
     body, _ = read_lf(TEMPLATE)
+    # RESULT 行的版本标签：模板里写死 `vw-craft/26.3`，四个版本共用一份模板，不换的话
+    # 四份日志都自称 26.3 —— 事后按版本号 grep 会一无所获，日志失去自证能力。
+    # （同 SystemTest 的 RESULT 行，上一轮踩过一次。）
+    ver = target.split("/")[-1]
+    label_old = '"SMOKE RESULT vw-craft/26.3 checks="'
+    label_new = '"SMOKE RESULT vw-craft/%s checks="' % ver
+    if label_old not in body:
+        raise SystemExit("!! RESULT 行标签不在模板里（模板结构改过？）")
+    body = body.replace(label_old, label_new)
     # 版本差异：1.21.x 的 assemble 要 registryAccess，26.x 不要。四个 modern 版本一致，直接落。
     write_back(os.path.join(ROOT, target, PKG, NAME), body, False)
-    print("%s: 已写入 %s（%d 行）" % (target, NAME, body.count("\n") + 1))
+    print("%s: 已写入 %s（%d 行，标签 vw-craft/%s）" % (target, NAME, body.count("\n") + 1, ver))
 
     ext = extension_path(target)
     ext_text, crlf = read_lf(ext)

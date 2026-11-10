@@ -109,6 +109,8 @@ public final class A2StressTest {
     private static VoidWarehouseData mainData;
     private static int mainScale;
     private static double mainMs;
+    /** 同上一档的「标脏但库存没变」耗时（快捷路径对照） */
+    private static double mainNoopMs;
     /** n=100 那一档的单次耗时，用来验证「小规模必须快」 */
     private static double firstMs = -1;
     /** 拐点：第一次超过 {@link #BAIL_MS} 的规模；-1 = 全部跑完都没超 */
@@ -177,17 +179,33 @@ public final class A2StressTest {
             long[] ms = new long[ROUNDS];
             int offers = 0;
             for (int r = 0; r < ROUNDS; r++) {
+                // ⚠️ 必须<b>真的动一格库存</b>再读，光调 markChanged() 不行：
+                // 「标脏了但一格都没变」是一条会走快捷路径的输入（容器 setChanged() 就这么调），
+                // 拿它当基准会把 22 ms 的量级量成 0，看起来很好、却什么都没测到。
+                // 真改一格才会触发「按受影响产物增量重算」，那才是玩家取货时发生的事。
+                data.take(0, 1);
                 VoidWarehouseData.noteServerTick(1_000 + r);
-                data.markChanged();
                 long s0 = System.nanoTime();
                 List<VoidWarehouseData.ExchangeOffer> built = data.exchangeOffers();
                 ms[r] = System.nanoTime() - s0;
                 offers = built.size();
                 sink += built.size();
             }
+            // 另一条路径：标脏但库存没变（快捷路径）。量它只是为了让日志里有个对照，
+            // 免得下次有人拿「改一格」的数字去解释「什么都没改」的场景。
+            long[] noopMs = new long[ROUNDS];
+            for (int r = 0; r < ROUNDS; r++) {
+                data.markChanged();
+                VoidWarehouseData.noteServerTick(1_500 + r);
+                long s0 = System.nanoTime();
+                sink += data.exchangeOffers().size();
+                noopMs[r] = System.nanoTime() - s0;
+            }
             double median = percentile(ms, 50) / 1e6;
-            System.out.printf("PERF scale n=%d offers=%d build_ms=%d offers_ms=%.2f max_ms=%.2f%n",
-                    n, offers, buildMs, median, max(ms) / 1e6);
+            double noopMs50 = percentile(noopMs, 50) / 1e6;
+            System.out.printf("PERF scale n=%d offers=%d build_ms=%d offers_ms=%.2f max_ms=%.2f noop_ms=%.3f%n",
+                    n, offers, buildMs, median, max(ms) / 1e6, noopMs50);
+            mainNoopMs = noopMs50;
 
             if (n == SCALE_LADDER[0]) {
                 firstMs = median;
@@ -210,8 +228,12 @@ public final class A2StressTest {
         check("A1 n=100 单次重建 < 200ms（实测 " + fmt(firstMs) + "）", firstMs < 200.0);
         if (kneeScale < 0) {
             // 一个 tick 的预算 50ms：满本单次重建必须在这条线以下，否则玩家一动库存就掉 tick
-            check("A2 满本（" + mainScale + " 条）单次重建 < 50ms（实测 " + fmt(mainMs) + "）",
+            check("A2 满本（" + mainScale + " 条）改一格后重建 < 50ms（实测 " + fmt(mainMs) + "）",
                     mainMs < 50.0);
+            // 「标脏但库存没变」走的是快捷路径（直接沿用上一份表），必须几乎不花时间。
+            // 这条判据防的是「快捷路径被顺手删掉」——删了之后 A2 依然绿，只有这里会红。
+            check("A3 满本（" + mainScale + " 条）标脏不变时重建 < 1ms（实测 " + fmt(mainNoopMs) + "）",
+                    mainNoopMs < 1.0);
         } else {
             System.out.println("!! 拐点出现在 n=" + kneeScale + "，满本重建不可用");
         }
@@ -223,8 +245,9 @@ public final class A2StressTest {
             long[] ms = new long[ROUNDS];
             int offers = 0;
             for (int r = 0; r < ROUNDS; r++) {
+                // 与 A 组同一口径：真动一格库存，否则量到的是快捷路径（≈0）
+                data.take(0, 1);
                 VoidWarehouseData.noteServerTick(2_000 + r);
-                data.markChanged();
                 long s0 = System.nanoTime();
                 offers = data.exchangeOffers().size();
                 ms[r] = System.nanoTime() - s0;

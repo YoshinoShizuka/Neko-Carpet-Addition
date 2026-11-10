@@ -93,6 +93,14 @@ def install(ver):
     for a, b in table:
         assert a in src, "%s 的移植串不在模板里：%s" % (ver, a)
         src = src.replace(a, b)
+
+    # RESULT 行的版本标签：模板里写死 `v26.3`，五个版本共用一份模板，不换的话
+    # 五份日志都自称 26.3 —— 事后按版本号 grep 会一无所获，日志失去自证能力。
+    label_old = '"SYSTEM TEST RESULT v26.3 checks="'
+    label_new = '"SYSTEM TEST RESULT v%s checks="' % ver
+    assert label_old in src, "RESULT 行标签不在模板里（模板结构改过？）"
+    src = src.replace(label_old, label_new)
+
     with io.open(test_path(ver), "w", encoding="utf-8", newline="") as f:
         f.write(src)
     print("  SystemTest.java 已安装（%d 行）" % src.count("\n"))

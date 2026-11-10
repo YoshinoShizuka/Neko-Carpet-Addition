@@ -28,6 +28,18 @@ TEMPLATE = os.path.join(SCRIPT_DIR, NAME + ".template")
 
 DEFAULT_TARGETS = ["modern/26.3", "modern/26.2", "modern/26.1.2", "modern/26.1.1"]
 
+
+def resolve_target(t):
+    """允许命令行只传裸版本号（26.3 / 26.1.1 ...），也允许传带前缀的 modern/26.3。
+
+    两个子工程根：modern/* 与 versions/1.21.11。裸版本号一律按 modern/ 前缀解析，
+    因为本脚本只服务四个 modern 版本（1.21.11 那份另行维护）。
+    """
+    t = t.strip().rstrip("/")
+    if "/" in t or os.sep in t:
+        return t
+    return "modern/" + t
+
 HOOK_OLD = """        VoidWarehouseData.noteServerTick(server.getTickCount());
 """
 
@@ -91,7 +103,9 @@ def remove(target):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in ("install", "remove"):
+        raise SystemExit("用法: python install_craft_selfcheck.py install|remove [版本 ...]")
     action = sys.argv[1]
-    targets = sys.argv[2:] or DEFAULT_TARGETS
+    targets = [resolve_target(t) for t in (sys.argv[2:] or DEFAULT_TARGETS)]
     for t in targets:
         {"install": install, "remove": remove}[action](t)

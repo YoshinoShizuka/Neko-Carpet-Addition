@@ -1,0 +1,540 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.Tag;
+import net.minecraft.network.Connection;
+import net.minecraft.network.chat.ClickEvent;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.inventory.CraftingMenu;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.crafting.CraftingInput;
+
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * 【临时自检】「配方存入与否的聊天确认提示」（需求一）—— 跑完删除。
+ *
+ * <h2>为什么非要真跑一遍</h2>
+ * <p>这套东西有两个编译器<b>完全不检查</b>的接缝，编译通过什么都不能说明：</p>
+ * <ol>
+ *   <li><b>mixin 字符串没失配、而且真的注入了</b>。{@code @Inject} 的坐标写错、
+ *       目标类根本不加载 —— 前者启动就崩，后者<b>一声不响</b>（mixin 懒加载，
+ *       没有玩家连接 {@code ServerCommonPacketListenerImpl} 就没人碰它）。</li>
+ *   <li><b>{@code ClickEvent.Custom} 的负载能原样回到服务端</b>。这条要靠
+ *       「把组件里那些按钮的 payload 抠出来、原样喂给 handler」来证 ——
+ *       客户端发出的就是这个 NBT，喂进去能走通就说明契约是通的。</li>
+ * </ol>
+ *
+ * <h2>判据为什么「有牙」</h2>
+ * <p>核心那条是 <b>B2「合成之后配方本里没有它」</b>：改回旧行为（合成就记）立刻变红。
+ * 每条正向断言都配一条反向的（点错 id 必须放行、过期令牌必须不记、别人点不动我的）。</p>
+ */
+public final class RecipePromptSelfCheck {
+
+    private static int checks = 0;
+    private static int failures = 0;
+    private static final List<String> failedLabels = new ArrayList<>();
+
+    private static ServerLevel level;
+    private static ServerPlayer bot;
+    private static ServerPlayer other;
+    private static VoidWarehouseData data;
+
+    private static boolean ran = false;
+
+    public static void run(MinecraftServer server) {
+        if (ran) {
+            return;
+        }
+        ran = true;
+        level = server.overworld();
+        // 规则必须先开着，否则 craftEnabled() 恒为假，onTake 那半截什么都不做（整组空转）
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+        data = VoidWarehouse.data(server);
+        System.out.println("[ENV] data 可用 = " + (data != null));
+        makeBots(server);
+        if (data == null) {
+            check("E0 虚空仓库数据可用（否则整组没法跑）", false);
+            finish(server);
+            return;
+        }
+        // ⚠️ 配方本没法在游戏里清空（那是玩家资产，产品侧没有清空入口）。
+        // 所以「这一轮是干净配方本」这个前提由安装脚本负责：跑之前先删存档里的 .dat。
+        // 这里再显式断言一次 —— 万一没删，要在第一条就红，而不是整组空转全绿。
+        VoidWarehouseRecipePrompt.resetForTest();
+
+        groupA_wiring();
+        groupB_onlyAskNotLearn();
+        groupC_click_contract();
+        groupD_click_roundtrip();
+        finish(server);
+    }
+
+    // ================================================================ A 接线
+
+    private static void groupA_wiring() {
+        System.out.println("[A] mixin 是否真的注入了");
+        // 🔴 老教训：build 成功 ≠ mixin 挂上了。判据只有一条 —— 到目标类里数方法。
+        check("A1 ServerCommonPacketListenerImpl 里有 carpetAutomending$onCustomClick",
+                hasInjectedMethod("net.minecraft.server.network.ServerCommonPacketListenerImpl",
+                        "carpetAutomending$onCustomClick"));
+        check("A2 ResultSlot 里有 carpetAutomending$learnRecipe（老功能没被这轮改动挤掉）",
+                hasInjectedMethod("net.minecraft.world.inventory.ResultSlot",
+                        "carpetAutomending$learnRecipe"));
+        // 反证：@Inject 不是 @Overwrite —— 原方法必须还在，否则别的模组/原版逻辑被顶掉
+        check("A3 原版 handleCustomClickAction 仍然存在（注入而非覆盖）",
+                hasMethod("net.minecraft.server.network.ServerCommonPacketListenerImpl",
+                        "handleCustomClickAction"));
+        check("A4 ClickEvent.Custom 有 id() 与 payload()（点回服务端靠这两个）",
+                hasMethod("net.minecraft.network.chat.ClickEvent$Custom", "id")
+                        && hasMethod("net.minecraft.network.chat.ClickEvent$Custom", "payload"));
+        // 🔴 这条是「接线」而不是「逻辑」：下线钩子漏挂时，别的一切都绿，
+        //    只有玩家「退出再进来」才会发现 `[总是记住]` 变成了永远不再问。
+        //    模组初始化跑在服务端起来之前，所以这里能直接读到它。
+        check("A5 模组初始化时调过 VoidWarehouseRecipePrompt.init()（下线会清本局开关）",
+                VoidWarehouseRecipePrompt.isInitCalled());
+    }
+
+    // ================================================================ B 只问不记
+
+    private static void groupB_onlyAskNotLearn() {
+        System.out.println("[B] 合成那一刻：只发问，不写本");
+        // 真实配方：2 木板竖着 → 4 木棍（走真的 RecipeManager，不是手搓的假配方）
+        CraftingMenu menu = new CraftingMenu(0, bot.getInventory());
+        // 木棍的标准摆法：最左<b>竖着</b>两块木板（合成格 0 与 3 = slotId 1 与 4）。
+        // 摆成横排是认不出配方的（第一版就摆错了，B0 当场红）。
+        putPlanksVertically(menu);
+        ItemStack stick = resultOf(menu);
+        check("B0 木棍配方被原版配方系统认出来（产物 = 木棍 × " + (stick.isEmpty() ? 0 : stick.getCount()) + "）",
+                !stick.isEmpty() && stick.is(Items.STICK) && stick.getCount() == 4);
+        VoidWarehouseRecipes.Recipe recipe = parsedFrom(menu, stick);
+        check("B0 解析成一条配方", recipe != null);
+        if (recipe == null) {
+            return;
+        }
+        // 前置：这条必须<b>不在</b>配方本里，否则 shouldAsk 直接 false，走的是老路，
+        // 下面的 B1/B2 会全红 —— 那种红是环境问题，一眼能认出来。
+        check("B0 前置：配方本里本来没有这条木棍配方（干净档）",
+                recipe != null && !data.knows(recipe));
+        int usedBefore = data.recipeBookUsed();
+        takeResult(menu, stick);
+
+        check("B1 合成后挂着一条待确认（是「问」而不是「记」）",
+                VoidWarehouseRecipePrompt.isPending(bot, recipe));
+        // 🔴 本条是这一整轮功能的核心：合成这一刻绝不能已经写进配方本
+        check("B2 合成后配方本里【没有】它（只问不记）", !data.knows(recipe));
+        check("B3 配方本用量没变（" + usedBefore + " → " + data.recipeBookUsed() + "）",
+                data.recipeBookUsed() == usedBefore);
+        check("B4 只挂一条待确认", VoidWarehouseRecipePrompt.pendingCount(bot.getUUID()) == 1);
+
+        // shift 连合：同一条配方连续合成不该刷屏（每次再挂一条会把前一条挤掉）
+        putPlanksVertically(menu);
+        takeResult(menu, stick);
+        putPlanksVertically(menu);
+        takeResult(menu, stick);
+        check("B5 连合同一条配方仍然只挂一条（不刷屏）",
+                VoidWarehouseRecipePrompt.pendingCount(bot.getUUID()) == 1);
+        check("B6 连合之后也还是没记", !data.knows(recipe));
+    }
+
+    // ================================================================ C 点击契约
+
+    private static void groupC_click_contract() {
+        System.out.println("[C] 聊天里那三个按钮：真的可点、而且不需要指令");
+        // 这一组用纯合成的配方对象（不经过合成台）：B 组那条已经挂着待确认了
+        VoidWarehouseRecipes.Recipe recipe = recipe("minecraft:torch", 4,
+                "minecraft:coal", 1, "minecraft:stick", 1);
+        Component line = VoidWarehouseRecipePrompt.ask(bot, false, data, recipe, ticks());
+        check("C1 问句发出来了", line != null);
+        if (line == null) {
+            return;
+        }
+        List<ClickEvent> clicks = clicksOf(line);
+        check("C2 一共三个可点按钮（实测 " + clicks.size() + "）", clicks.size() == 3);
+        boolean allCustom = true;
+        boolean allOurs = true;
+        boolean allHovered = true;
+        Set<String> decisions = new LinkedHashSet<>();
+        Set<String> tokens = new LinkedHashSet<>();
+        for (ClickEvent e : clicks) {
+            if (!(e instanceof ClickEvent.Custom custom)) {
+                allCustom = false;
+                continue;
+            }
+            if (!VoidWarehouseRecipePrompt.CLICK_ID.equals(custom.id())) {
+                allOurs = false;
+            }
+            if (custom.payload().isEmpty()) {
+                continue;
+            }
+            if (custom.payload().get() instanceof CompoundTag tag) {
+                tokens.add(tag.getStringOr("t", ""));
+                decisions.add(tag.getStringOr("d", ""));
+            }
+            if (styleHoverCount(line, custom) == 0) {
+                allHovered = false;
+            }
+        }
+        check("C3 三个按钮全是 ClickEvent.Custom（不是 RunCommand —— 用户要求一条指令都不留）",
+                allCustom);
+        check("C4 三个按钮的 id 都是 carpet_neko_addition:recipe_confirm", allOurs);
+        check("C5 三个按钮共用一个令牌（实测 " + tokens.size() + " 个不同令牌）", tokens.size() == 1);
+        check("C6 令牌非空", !tokens.contains(""));
+        check("C7 三个决策分别是 y / n / a（实测 " + decisions + "）",
+                decisions.equals(new LinkedHashSet<>(List.of("y", "n", "a"))));
+        check("C8 三个按钮都带悬停说明", allHovered);
+        check("C9 正文里明写「不点就不会记住」", line.getString().contains("不点就不会记住"));
+        check("C10 三个按钮文案是「记住」「不要」「总是记住」",
+                line.getString().contains("记住") && line.getString().contains("不要")
+                        && line.getString().contains("总是记住"));
+        // C 组留下的这条待确认交给 D 组用（D1 就点它）
+        pendingToken = onlyToken(tokens);
+        pendingRecipe = recipe;
+    }
+
+    private static String pendingToken = "";
+    private static VoidWarehouseRecipes.Recipe pendingRecipe;
+
+    // ================================================================ D 点击回路
+
+    private static void groupD_click_roundtrip() {
+        System.out.println("[D] 点下去之后：服务端认领、按决策行事");
+        if (pendingRecipe == null || pendingToken.isEmpty()) {
+            check("D0 C 组的按钮拿到了令牌（否则下面全都没法点）", false);
+            return;
+        }
+        int usedBefore = data.recipeBookUsed();
+        // D1~D3：点「记住」应该真的记进去，并且这条待确认随之消失
+        check("D1 点「记住」被认领（返回 true = 是我们的 id）",
+                click(bot, pendingToken, "y"));
+        check("D2 配方真的进了配方本", data.knows(pendingRecipe));
+        check("D3 待确认已消费掉", !VoidWarehouseRecipePrompt.isPending(bot, pendingRecipe));
+        check("D4 配方本用量 +1（" + usedBefore + " → " + data.recipeBookUsed() + "）",
+                data.recipeBookUsed() == usedBefore + 1);
+        // D5：同一个令牌再点一次 —— 令牌是一次性的，不能再记一次
+        int usedAfter = data.recipeBookUsed();
+        check("D5 同一个令牌再点一次仍然被认领（不静默）", click(bot, pendingToken, "y"));
+        check("D6 但配方本用量不变（令牌一次性，没有重复记）",
+                data.recipeBookUsed() == usedAfter);
+        // D7：错令牌
+        check("D7 乱造的令牌也被认领（回一句「已处理过」）", click(bot, "no-such-token", "y"));
+        // D8：别的 id 必须原样放行（不许抢别人的点击）
+        check("D8 别的模组的 id 原样放行（返回 false）",
+                !VoidWarehouseRecipePrompt.handleClick(bot,
+                        Identifier.fromNamespaceAndPath("other_mod", "click"), Optional.empty()));
+        // D9：有 id 没负载
+        check("D9 空负载不被当成点了按钮（认领但什么都没记）",
+                VoidWarehouseRecipePrompt.handleClick(bot,
+                        VoidWarehouseRecipePrompt.CLICK_ID, Optional.empty()));
+
+        // ---- D10 「不要」：不记，而且本局不再问这一条 ----
+        VoidWarehouseRecipePrompt.resetForTest();
+        VoidWarehouseRecipes.Recipe no = recipe("minecraft:chest", 1, "minecraft:oak_planks", 8);
+        String noToken = askToken(no);
+        check("D10 「不要」有按钮可点", !noToken.isEmpty());
+        click(bot, noToken, "n");
+        check("D11 点「不要」之后这条没进配方本", !data.knows(no));
+        check("D12 点「不要」之后被记住为「拒绝过」",
+                VoidWarehouseRecipePrompt.isRefused(bot.getUUID(), no));
+        check("D13 拒绝过的配方不再问（shouldAsk = false）",
+                !VoidWarehouseRecipePrompt.shouldAsk(bot, data, no,
+                        VoidWarehouseRecipeBook.MAX_RECIPES));
+
+        // ---- D14 「总是记住」：记下来 + 本局不再问任何配方 ----
+        VoidWarehouseRecipes.Recipe always = recipe("minecraft:furnace", 1,
+                "minecraft:cobblestone", 8);
+        String alwaysToken = askToken(always);
+        check("D14 「总是记住」有按钮可点", !alwaysToken.isEmpty());
+        click(bot, alwaysToken, "a");
+        check("D15 点「总是记住」之后这一条进了配方本", data.knows(always));
+        check("D16 开关切到了「总是记住」", VoidWarehouseRecipePrompt.isAuto(bot.getUUID()));
+        VoidWarehouseRecipes.Recipe later = recipe("minecraft:crafting_table", 1,
+                "minecraft:oak_planks", 4);
+        check("D17 之后任何新配方都不再问（含从没见过的这条）",
+                !VoidWarehouseRecipePrompt.shouldAsk(bot, data, later,
+                        VoidWarehouseRecipeBook.MAX_RECIPES));
+
+        // ---- D18 过期令牌 ----
+        VoidWarehouseRecipePrompt.resetForTest();
+        VoidWarehouseRecipes.Recipe stale = recipe("minecraft:ladder", 3, "minecraft:stick", 7);
+        Component staleLine = VoidWarehouseRecipePrompt.ask(bot, false, data, stale,
+                ticks() - VoidWarehouseRecipePrompt.TTL_TICKS - 1);
+        String staleToken = onlyToken(tokensOf(staleLine));
+        click(bot, staleToken, "y");
+        check("D18 过期令牌点下去不会被记", !data.knows(stale));
+        check("D19 过期令牌之后待确认也清掉了",
+                !VoidWarehouseRecipePrompt.isPending(bot, stale));
+
+        // ---- D20 待确认上限：最多 3 条，超了丢最旧 ----
+        VoidWarehouseRecipePrompt.resetForTest();
+        List<String> fourTokens = new ArrayList<>();
+        List<VoidWarehouseRecipes.Recipe> four = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            VoidWarehouseRecipes.Recipe r = recipe("minecraft:item_frame", 1 + i,
+                    "minecraft:stick", 8);
+            four.add(r);
+            fourTokens.add(askToken(r));
+        }
+        check("D20 连问 4 条之后只剩 3 条待确认（实测 "
+                + VoidWarehouseRecipePrompt.pendingCount(bot.getUUID()) + "）",
+                VoidWarehouseRecipePrompt.pendingCount(bot.getUUID())
+                        == VoidWarehouseRecipePrompt.MAX_PENDING);
+        check("D21 最旧的那条被挤掉了", !VoidWarehouseRecipePrompt.isPending(bot, four.get(0)));
+        check("D22 最新的那条还在", VoidWarehouseRecipePrompt.isPending(bot, four.get(3)));
+        click(bot, fourTokens.get(0), "y");
+        check("D23 点被挤掉的那条不会记进配方本", !data.knows(four.get(0)));
+
+        // ---- D24 别人点不动我的按钮 ----
+        VoidWarehouseRecipePrompt.resetForTest();
+        VoidWarehouseRecipes.Recipe mine = recipe("minecraft:barrel", 1,
+                "minecraft:oak_planks", 6);
+        String myToken = askToken(mine);
+        check("D24 队友拿到我的令牌也点不动（点了不记，我的那条还挂着）",
+                click(other, myToken, "y")
+                        && !data.knows(mine)
+                        && VoidWarehouseRecipePrompt.isPending(bot, mine));
+
+        // ---- D25 满本时不问（问了也记不进去，会让玩家白点一次） ----
+        VoidWarehouseRecipePrompt.resetForTest();
+        VoidWarehouseRecipes.Recipe full = recipe("minecraft:book", 1, "minecraft:paper", 3);
+        check("D25 配方本满时 shouldAsk = false（max 传 0 模拟已满）",
+                !VoidWarehouseRecipePrompt.shouldAsk(bot, data, full, 0));
+
+        // ---- D26 下线清状态 ----
+        VoidWarehouseRecipePrompt.resetForTest();
+        click(bot, askToken(recipe("minecraft:bookshelf", 1, "minecraft:oak_planks", 6)), "a");
+        check("D26 「总是记住」生效过", VoidWarehouseRecipePrompt.isAuto(bot.getUUID()));
+        VoidWarehouseRecipePrompt.forget(bot.getUUID());
+        check("D27 玩家下线后状态清空（重新登录恢复一条条问）",
+                !VoidWarehouseRecipePrompt.isAuto(bot.getUUID()));
+    }
+
+    // ================================================================ 工具
+
+    private static void makeBots(MinecraftServer server) {
+        GameProfile p1 = new GameProfile(UUID.randomUUID(), "promptbot");
+        bot = new ServerPlayer(server, level, p1, zh());
+        GameProfile p2 = new GameProfile(UUID.randomUUID(), "promptbot2");
+        other = new ServerPlayer(server, level, p2, zh());
+        boolean ok = false;
+        try {
+            bot.connection = new ServerGamePacketListenerImpl(server,
+                    new Connection(PacketFlow.SERVERBOUND), bot,
+                    CommonListenerCookie.createInitial(p1, false));
+            other.connection = new ServerGamePacketListenerImpl(server,
+                    new Connection(PacketFlow.SERVERBOUND), other,
+                    CommonListenerCookie.createInitial(p2, false));
+            ok = true;
+        } catch (Throwable t) {
+            // 没有连接也能跑数据层，只是发消息会被跳过
+            System.out.println("[ENV] 假连接注入失败：" + t);
+        }
+        System.out.println("[ENV] 假连接可用 = " + ok);
+    }
+
+    /** 与 ClientInformation.createDefault() 逐字段相同，只有 language 换成 zh_cn */
+    private static ClientInformation zh() {
+        return new ClientInformation("zh_cn", 2,
+                net.minecraft.world.entity.player.ChatVisiblity.FULL, true, 0,
+                net.minecraft.world.entity.player.Player.DEFAULT_MAIN_HAND, false, false,
+                net.minecraft.server.level.ParticleStatus.ALL);
+    }
+
+    private static long ticks() {
+        MinecraftServer server = level.getServer();
+        return server == null ? 0L : server.getTickCount();
+    }
+
+    /** 清空 3×3 合成格，然后最左竖着摆两块橡木木板（= 木棍配方） */
+    private static void putPlanksVertically(CraftingMenu menu) {
+        for (int i = 0; i < 9; i++) {
+            menu.getSlot(i + 1).set(ItemStack.EMPTY);
+        }
+        menu.getSlot(1).set(new ItemStack(Items.OAK_PLANKS));
+        menu.getSlot(4).set(new ItemStack(Items.OAK_PLANKS));
+    }
+
+    /** 问原版配方系统「这个摆法出什么」（不用页面上的结果格，那条路会被缓存干扰） */
+    private static ItemStack resultOf(CraftingMenu menu) {
+        List<ItemStack> grid = new ArrayList<>(9);
+        for (int i = 0; i < 9; i++) {
+            grid.add(menu.getSlot(i + 1).getItem());
+        }
+        return VoidWarehouseRecipeBook.resultOf(level.getServer(), level,
+                CraftingInput.of(3, 3, grid));
+    }
+
+    private static VoidWarehouseRecipes.Recipe parsedFrom(CraftingMenu menu, ItemStack result) {
+        List<ItemStack> grid = new ArrayList<>(9);
+        for (int i = 0; i < 9; i++) {
+            grid.add(menu.getSlot(i + 1).getItem());
+        }
+        return VoidWarehouseRecipeBook.fromGrid(grid, result);
+    }
+
+    /**
+     * 走一次真实的「取走产物」—— {@code ResultSlot#onTake} 是原版所有取货方式的共同出口，
+     * 我们的 mixin 就挂在这里。故意不自己在测试里调 prompt：要证明的是<b>接线通</b>。
+     */
+    private static void takeResult(CraftingMenu menu, ItemStack result) {
+        try {
+            menu.getSlot(0).onTake(bot, result.copy());
+        } catch (RuntimeException ex) {
+            check("B! onTake 抛异常了：" + ex, false);
+        }
+    }
+
+    private static List<ClickEvent> clicksOf(Component line) {
+        List<ClickEvent> out = new ArrayList<>();
+        if (line == null) {
+            return out;
+        }
+        collectClicks(line, out);
+        return out;
+    }
+
+    private static void collectClicks(Component c, List<ClickEvent> out) {
+        ClickEvent e = c.getStyle().getClickEvent();
+        if (e != null) {
+            out.add(e);
+        }
+        for (Component sibling : c.getSiblings()) {
+            collectClicks(sibling, out);
+        }
+    }
+
+    /** 这个点击事件有没有悬停说明（按钮得能看见提示，不然玩家不知道点了会发生什么） */
+    private static int styleHoverCount(Component c, ClickEvent target) {
+        if (c.getStyle().getClickEvent() == target && c.getStyle().getHoverEvent() != null) {
+            return 1;
+        }
+        int n = 0;
+        for (Component sibling : c.getSiblings()) {
+            n += styleHoverCount(sibling, target);
+        }
+        return n;
+    }
+
+    private static Set<String> tokensOf(Component line) {
+        Set<String> out = new LinkedHashSet<>();
+        for (ClickEvent e : clicksOf(line)) {
+            if (e instanceof ClickEvent.Custom custom && custom.payload().isPresent()
+                    && custom.payload().get() instanceof CompoundTag tag) {
+                out.add(tag.getStringOr("t", ""));
+            }
+        }
+        return out;
+    }
+
+    private static String onlyToken(Set<String> tokens) {
+        for (String t : tokens) {
+            if (!t.isEmpty()) {
+                return t;
+            }
+        }
+        return "";
+    }
+
+    /** 走真实的 handleClick（跟 mixin 里调的<b>同一个</b>入口） */
+    private static boolean click(ServerPlayer who, String token, String decision) {
+        ClickEvent e = VoidWarehouseRecipePrompt.click(token, decision);
+        if (!(e instanceof ClickEvent.Custom custom)) {
+            return false;
+        }
+        return VoidWarehouseRecipePrompt.handleClick(who, custom.id(), custom.payload());
+    }
+
+    /** 让服务端问一句，并把组件里的令牌掏出来（模拟玩家看到的那三个按钮） */
+    private static String askToken(VoidWarehouseRecipes.Recipe recipe) {
+        Component line = VoidWarehouseRecipePrompt.ask(bot, false, data, recipe, ticks());
+        return onlyToken(tokensOf(line));
+    }
+
+    /**
+     * 手搓一条配方（状态机不需要它真的存在于原版配方表里，只要内容是合法的物品 id）。
+     *
+     * @param idCountPairs 「物品 id, 数量」成对铺开，一对一样原料
+     */
+    private static VoidWarehouseRecipes.Recipe recipe(String output, int count,
+                                                     Object... idCountPairs) {
+        List<VoidWarehouseRecipes.Part> parts = new ArrayList<>();
+        for (int i = 0; i + 1 < idCountPairs.length; i += 2) {
+            parts.add(new VoidWarehouseRecipes.Part(
+                    List.of((String) idCountPairs[i]), (Integer) idCountPairs[i + 1]));
+        }
+        return new VoidWarehouseRecipes.Recipe(null, output, count, parts);
+    }
+
+    /**
+     * 🔴 判据必须是<b>子串</b>而不是全等：Mixin 会把注入方法改名成
+     * {@code handler$<hash>$carpetAutomending$onCustomClick}（前缀由 Mixin 加）。
+     * 写成 {@code equals} 一定假红 —— 这条踩过一次，记在案上。
+     */
+    private static boolean hasInjectedMethod(String className, String methodName) {
+        try {
+            for (Method m : Class.forName(className).getDeclaredMethods()) {
+                if (m.getName().contains(methodName)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            System.out.println("   [warn] 加载 " + className + " 失败：" + t);
+            return false;
+        }
+    }
+
+    private static boolean hasMethod(String className, String methodName) {
+        try {
+            for (Method m : Class.forName(className).getDeclaredMethods()) {
+                if (m.getName().equals(methodName)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            System.out.println("   [warn] 加载 " + className + " 失败：" + t);
+            return false;
+        }
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            failedLabels.add(label);
+        }
+        System.out.println("   " + (ok ? "ok  " : "FAIL") + " " + label);
+    }
+
+    private static void finish(MinecraftServer server) {
+        System.out.println("---- 失败清单 ----");
+        if (failedLabels.isEmpty()) {
+            System.out.println("   （无）");
+        } else {
+            for (String s : failedLabels) {
+                System.out.println("   × " + s);
+            }
+        }
+        System.out.println("PROMPT SELF CHECK RESULT v26.3 checks=" + checks
+                + " failures=" + failures);
+        server.halt(false);
+    }
+}

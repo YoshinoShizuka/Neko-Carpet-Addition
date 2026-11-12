@@ -1,0 +1,367 @@
+package neko.voidwarehouse;
+
+import com.mojang.authlib.GameProfile;
+import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * 【临时自检】「Ctrl+Alt+左键 把这一格的物品取出到背包放不下为止」（需求二的服务端侧）。
+ *
+ * <h2>这个功能为什么必须自检</h2>
+ * <p>它<b>直接改库存和背包</b>，一旦容量算错就是造物或吞货：</p>
+ * <ul>
+ *   <li>算多了 → 仓库扣账跟不上背包里的东西（凭空多出来）；</li>
+ *   <li>算少了 → 取到一半停下（玩家的东西卡在仓库里，观感像坏了）；</li>
+ *   <li>盒模式算错 → 「取 36 盒给了 37 盒」，那是刷盒子事故的复发路径。</li>
+ * </ul>
+ * <p>所以每条断言都同时咬住<b>三样东西</b>：背包里真有多少、仓库真扣了多少、
+ * 有没有多出盒子。只咬一头的话，扣账错了照样能绿。</p>
+ *
+ * <h2>判据的物理意义</h2>
+ * <p>「填满背包」的正确答案可以由<b>手算</b>出来：36 格 × 一堆 64 = 2304；圆石一盒
+ * 27×64 = 1728，36 格 × 1 盒 = 36 盒 = 62208 个。断言就写这些数，
+ * 不写「和实现算出来的一样」（那是自己跟自己比，永远绿）。</p>
+ */
+public final class FillSelfCheck {
+
+    private static int checks = 0;
+    private static int failures = 0;
+    private static final List<String> failedLabels = new ArrayList<>();
+
+    private static ServerLevel level;
+    private static ServerPlayer bot;
+    private static VoidWarehouseData data;
+
+    private static boolean ran = false;
+
+    /** 圆石：堆叠 64，一盒 27×64 */
+    private static final ItemStack COBBLE = new ItemStack(Items.COBBLESTONE);
+    private static final long CAP = 1728L;
+
+    public static void run(MinecraftServer server) {
+        if (ran) {
+            return;
+        }
+        ran = true;
+        level = server.overworld();
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+        // 兑换关掉：本组要「仓库有多少就给多少」，开着兑换会让「可兑」虚拟条目混进页面，
+        // 也会让 B 组那条「没有走兑换」的反证失去意义。
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+        data = VoidWarehouse.data(server);
+        System.out.println("[ENV] data 可用 = " + (data != null));
+        makeBot(server);
+        if (data == null) {
+            check("E0 虚空仓库数据可用", false);
+            finish(server);
+            return;
+        }
+        groupA_room();
+        groupB_loose();
+        groupC_box();
+        groupD_menu();
+        finish(server);
+    }
+
+    // ================================================================ A 容量算法
+
+    private static void groupA_room() {
+        System.out.println("[A] 「还能装多少」的算法");
+        clearInventory();
+        check("A1 空背包能吸收 36 × 64 = 2304 个圆石（实测 "
+                        + VoidWarehouseWithdraw.looseRoom(bot, COBBLE) + "）",
+                VoidWarehouseWithdraw.looseRoom(bot, COBBLE) == 2304L);
+        check("A2 空格数是 36（实测 " + VoidWarehouseWithdraw.emptySlots(bot) + "）",
+                VoidWarehouseWithdraw.emptySlots(bot) == 36);
+
+        bot.getInventory().setItem(0, new ItemStack(Items.COBBLESTONE, 32));
+        check("A3 有一格只装了 32 个圆石 → 余量少 32（2272，实测 "
+                        + VoidWarehouseWithdraw.looseRoom(bot, COBBLE) + "）",
+                VoidWarehouseWithdraw.looseRoom(bot, COBBLE) == 2272L);
+
+        bot.getInventory().setItem(1, new ItemStack(Items.DIRT, 64));
+        check("A4 一格装满泥土 → 再少 64（2208，实测 "
+                        + VoidWarehouseWithdraw.looseRoom(bot, COBBLE) + "）",
+                VoidWarehouseWithdraw.looseRoom(bot, COBBLE) == 2208L);
+
+        // 反证：不同物品<b>不能</b>合并进泥土那格，只能找空格
+        check("A5 泥土那格不算进圆石的余量", VoidWarehouseWithdraw.looseRoom(bot, COBBLE) < 2304L - 32L);
+
+        // 不可堆叠物：一格一个，能装多少就等于空格数
+        ItemStack sword = new ItemStack(Items.IRON_SWORD);
+        check("A6 不可堆叠物只按空格算（" + VoidWarehouseWithdraw.emptySlots(bot) + " 格）",
+                VoidWarehouseWithdraw.looseRoom(bot, sword)
+                        == VoidWarehouseWithdraw.emptySlots(bot));
+
+        clearInventory();
+    }
+
+    // ================================================================ B 普通模式
+
+    private static void groupB_loose() {
+        System.out.println("[B] 常规模式：纯散货铺满，一个盒子都不装");
+        clearInventory();
+        data.clearContent();
+        stock(Items.COBBLESTONE, 3000);
+        stock(Items.IRON_INGOT, 3000);
+
+        VoidWarehouseWithdraw.fill(bot, COBBLE, false);
+        long got = count(COBBLE);
+        check("B1 背包里得到 2304 个圆石（实测 " + got + "）", got == 2304L);
+        check("B2 仓库扣掉 2304（3000 → " + data.amountOf(Items.COBBLESTONE) + "）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(696)));
+        check("B3 一个潜影盒都没装（实测 " + countBoxes() + " 盒）", countBoxes() == 0);
+        // 反证：仓库里另外那 3000 铁锭是「可兑换材料」，取圆石绝不能动它
+        check("B4 铁锭一块没动（不走 9 合 1 兑换）",
+                data.amountOf(Items.IRON_INGOT).equals(BigInteger.valueOf(3000)));
+
+        // 背包此刻 36 格全满 64 → 再点一次必须「什么都不做」
+        VoidWarehouseWithdraw.fill(bot, COBBLE, false);
+        check("B5 背包满了之后再点，仓库一点没动（" + data.amountOf(Items.COBBLESTONE) + "）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(696)));
+        check("B6 背包数量也没变（" + count(COBBLE) + "）", count(COBBLE) == 2304L);
+
+        // 仓库不够装满：有多少给多少（这是「填满」与「按数量取货」的语义差别）
+        clearInventory();
+        data.clearContent();
+        stock(Items.COBBLESTONE, 100);
+        VoidWarehouseWithdraw.fill(bot, COBBLE, false);
+        check("B7 仓库只有 100 个 → 全给（实测 " + count(COBBLE) + "）", count(COBBLE) == 100L);
+        check("B8 仓库随之归零", data.amountOf(Items.COBBLESTONE).signum() == 0);
+    }
+
+    // ================================================================ C 盒模式
+
+    private static void groupC_box() {
+        System.out.println("[C] 潜影盒模式：满盒填满，一格一盒");
+        clearInventory();
+        data.clearContent();
+        stock(Items.COBBLESTONE, 200_000);
+        stock(Items.SHULKER_BOX, 40);
+
+        check("C0 一盒容量是 1728", VoidWarehouseShulker.capacity(COBBLE) == CAP);
+        VoidWarehouseWithdraw.fill(bot, COBBLE, true);
+        int boxes = countBoxes();
+        check("C1 背包被 36 个盒子填满（实测 " + boxes + "）", boxes == 36);
+        check("C2 每盒都是满的 1728 个（实测 " + boxFill() + "）", boxFill() == CAP);
+        check("C3 空盒扣了 36 个（40 → " + data.amountOf(Items.SHULKER_BOX) + "）",
+                data.amountOf(Items.SHULKER_BOX).equals(BigInteger.valueOf(4)));
+        check("C4 圆石扣了 36 × 1728 = 62208（200000 → "
+                        + data.amountOf(Items.COBBLESTONE) + "）",
+                data.amountOf(Items.COBBLESTONE)
+                        .equals(BigInteger.valueOf(200_000L - 36L * CAP)));
+
+        // 没有空盒、也没有壳/箱 → 一盒都给不出，且不许退化成散货（玩家要的是盒）
+        clearInventory();
+        data.clearContent();
+        stock(Items.COBBLESTONE, 5000);
+        VoidWarehouseWithdraw.fill(bot, COBBLE, true);
+        check("C5 没有盒子材料时一个都不给（背包 " + count(COBBLE) + " 个、" + countBoxes() + " 盒）",
+                count(COBBLE) == 0L && countBoxes() == 0);
+        check("C6 仓库也没动（" + data.amountOf(Items.COBBLESTONE) + "）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(5000)));
+
+        // 仓库里的数量不够一整盒 → 也不给（不能给半个满盒，那是「按数量取货」才做的事）
+        clearInventory();
+        data.clearContent();
+        stock(Items.COBBLESTONE, 1000);
+        stock(Items.SHULKER_BOX, 5);
+        VoidWarehouseWithdraw.fill(bot, COBBLE, true);
+        check("C7 不够一整盒时一个都不给（背包 " + count(COBBLE) + " 个、" + countBoxes() + " 盒）",
+                count(COBBLE) == 0L && countBoxes() == 0);
+        check("C8 空盒没被白扣（还是 5）",
+                data.amountOf(Items.SHULKER_BOX).equals(BigInteger.valueOf(5)));
+
+        // 空盒用完时用壳 + 箱现做：4 壳 + 2 箱 → 只能做 2 盒（壳 2 个/盒是瓶颈），
+        // 但圆石只够 1 整盒 → 给 1 盒，壳 −2、箱 −1
+        clearInventory();
+        data.clearContent();
+        stock(Items.COBBLESTONE, 2000);
+        stock(Items.SHULKER_SHELL, 4);
+        stock(Items.CHEST, 2);
+        check("C9 材料上限算对（4 壳 / 2 箱 → 最多 2 盒，实测 "
+                        + data.maxBoxesUpTo(36) + "）",
+                data.maxBoxesUpTo(36) == 2L);
+        VoidWarehouseWithdraw.fill(bot, COBBLE, true);
+        check("C10 现做出 1 盒（实测 " + countBoxes() + " 盒）", countBoxes() == 1);
+        check("C11 潜影壳扣 2（4 → " + data.amountOf(Items.SHULKER_SHELL) + "）",
+                data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(2)));
+        check("C12 箱子扣 1（2 → " + data.amountOf(Items.CHEST) + "）",
+                data.amountOf(Items.CHEST).equals(BigInteger.valueOf(1)));
+        check("C13 圆石扣 1728（2000 → " + data.amountOf(Items.COBBLESTONE) + "）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(272)));
+
+        // 反证：目标本身就是潜影盒 → 盒模式<b>不许</b>再包一层（那是刷盒子的老事故）
+        clearInventory();
+        data.clearContent();
+        stock(Items.SHULKER_BOX, 40);
+        VoidWarehouseWithdraw.fill(bot, new ItemStack(Items.SHULKER_BOX), true);
+        check("C14 取潜影盒本身时不许装盒（拿到的是散盒，实测 " + countBoxes() + " 盒）",
+                countBoxes() == 36 && boxFill() == 0L);
+    }
+
+    // ================================================================ D 菜单入口
+
+    private static void groupD_menu() {
+        System.out.println("[D] 菜单入口：slotId 是客户端说的，必须当不可信输入");
+        clearInventory();
+        data.clearContent();
+        stock(Items.COBBLESTONE, 3000);
+        VoidWarehouseMenu menu = new VoidWarehouseMenu(0, bot.getInventory(), data, bot);
+
+        // 越界 / 导航行 / 负数：一律不动（这几条与 clicked 的边界是同一套）
+        menu.fillToBackpack(bot, -1);
+        menu.fillToBackpack(bot, VoidWarehouseData.NAV_START);
+        menu.fillToBackpack(bot, VoidWarehouseData.NAV_START + 8);
+        menu.fillToBackpack(bot, VoidWarehouseData.TOTAL_SLOTS + 100);
+        check("D1 越界 / 导航行的 slotId 不会取货（背包 " + count(COBBLE) + " 个）",
+                count(COBBLE) == 0L);
+        check("D2 仓库也没动（" + data.amountOf(Items.COBBLESTONE) + "）",
+                data.amountOf(Items.COBBLESTONE).equals(BigInteger.valueOf(3000)));
+
+        // 真的点第 0 格：普通模式铺满
+        ((VoidWarehousePageContainer) menu.getContainer()).setShulkerMode(false);
+        menu.fillToBackpack(bot, 0);
+        check("D3 走菜单第 0 格：普通模式铺满 2304 个（实测 " + count(COBBLE) + "）",
+                count(COBBLE) == 2304L);
+
+        // 盒模式：同样一格，给 36 盒
+        clearInventory();
+        data.clearContent();
+        stock(Items.COBBLESTONE, 200_000);
+        stock(Items.SHULKER_BOX, 40);
+        ((VoidWarehousePageContainer) menu.getContainer()).setShulkerMode(true);
+        menu.fillToBackpack(bot, 0);
+        check("D4 同一个 slotId 在盒模式下给 36 盒（实测 " + countBoxes() + " 盒）",
+                countBoxes() == 36);
+        check("D5 盒模式每盒满 1728（实测 " + boxFill() + "）", boxFill() == CAP);
+
+        // 空格子（把仓库清空后同一格就不存在了）→ 什么都不做，也不许抛异常
+        data.clearContent();
+        clearInventory();
+        boolean threw = false;
+        try {
+            menu.fillToBackpack(bot, 0);
+        } catch (RuntimeException ex) {
+            threw = true;
+        }
+        check("D6 空格子不会抛异常也不会给东西", !threw && count(COBBLE) == 0L);
+    }
+
+    // ================================================================ 工具
+
+    private static void makeBot(MinecraftServer server) {
+        GameProfile profile = new GameProfile(UUID.randomUUID(), "fillbot");
+        bot = new ServerPlayer(server, level, profile, zh());
+        try {
+            bot.connection = new ServerGamePacketListenerImpl(server,
+                    new Connection(PacketFlow.SERVERBOUND), bot,
+                    CommonListenerCookie.createInitial(profile, false));
+        } catch (Throwable t) {
+            // 没有连接也能跑数据层，只是发消息会被跳过
+            System.out.println("[ENV] 假连接注入失败：" + t);
+        }
+    }
+
+    private static ClientInformation zh() {
+        return new ClientInformation("zh_cn", 2,
+                net.minecraft.world.entity.player.ChatVisiblity.FULL, true, 0,
+                net.minecraft.world.entity.player.Player.DEFAULT_MAIN_HAND, false, false,
+                net.minecraft.server.level.ParticleStatus.ALL);
+    }
+
+    private static void clearInventory() {
+        for (int i = 0; i < Inventory.INVENTORY_SIZE; i++) {
+            bot.getInventory().setItem(i, ItemStack.EMPTY);
+        }
+    }
+
+    /** 往仓库里放东西（insert 是「入库」，会自动按堆叠合并） */
+    private static void stock(Item item, int amount) {
+        int left = amount;
+        while (left > 0) {
+            int n = Math.min(item.getDefaultMaxStackSize(), left);
+            data.insert(new ItemStack(item, n));
+            left -= n;
+        }
+    }
+
+    /** 背包里有多少个这种物品（含盒子里面的） */
+    private static long count(ItemStack sample) {
+        long total = 0;
+        for (int i = 0; i < Inventory.INVENTORY_SIZE; i++) {
+            ItemStack slot = bot.getInventory().getItem(i);
+            if (!slot.isEmpty() && ItemStack.isSameItemSameComponents(slot, sample)) {
+                total += slot.getCount();
+            }
+        }
+        return total;
+    }
+
+    private static int countBoxes() {
+        int n = 0;
+        for (int i = 0; i < Inventory.INVENTORY_SIZE; i++) {
+            ItemStack slot = bot.getInventory().getItem(i);
+            if (!slot.isEmpty() && VoidWarehouseShulker.isShulkerBox(slot)) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /** 第一个盒子里面装了几个圆石（没有盒子返回 -1；用来验「满盒」） */
+    private static long boxFill() {
+        for (int i = 0; i < Inventory.INVENTORY_SIZE; i++) {
+            ItemStack slot = bot.getInventory().getItem(i);
+            if (!slot.isEmpty() && VoidWarehouseShulker.isShulkerBox(slot)) {
+                long total = 0;
+                for (ItemStack inside : VoidWarehouseShulker.contentsOf(slot)) {
+                    if (!inside.isEmpty() && inside.is(Items.COBBLESTONE)) {
+                        total += inside.getCount();
+                    }
+                }
+                return total;
+            }
+        }
+        return -1L;
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            failedLabels.add(label);
+        }
+        System.out.println("   " + (ok ? "ok  " : "FAIL") + " " + label);
+    }
+
+    private static void finish(MinecraftServer server) {
+        System.out.println("---- 失败清单 ----");
+        if (failedLabels.isEmpty()) {
+            System.out.println("   （无）");
+        } else {
+            for (String s : failedLabels) {
+                System.out.println("   × " + s);
+            }
+        }
+        System.out.println("FILL SELF CHECK RESULT v26.3 checks=" + checks
+                + " failures=" + failures);
+        server.halt(false);
+    }
+}

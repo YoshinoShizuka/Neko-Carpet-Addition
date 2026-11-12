@@ -600,7 +600,11 @@ public class VoidWarehouseMenu extends ChestMenu {
         //    实测：仓库 5 个空盒 → 交出「1 个装着 5 个空盒的盒子」（实收 6 个）→ 送回仓库
         //    变成 5 个空盒 + 2 壳 + 1 箱，来回几轮壳和箱就无限增长（2026-11 事故）。
         //    盒子本来就是盒子，没有再装一道的理由。见 VoidWarehouseShulker#isBoxable。
-        if (!VoidWarehouseShulker.isBoxable(template)) {
+        //
+        //    ⚠️ <b>「格子本身是做盒子的材料」（潜影壳 / 箱子）同理</b>：材料账与这一格共源，
+        //    取走整整一盒容量之后仓库里那 2 壳 + 1 箱恰好归零，consumeBoxMaterials 只留一条
+        //    WARN —— 于是「1 个箱子换 1 个潜影盒」可以无限循环。见 isBoxPart。
+        if (!VoidWarehouseShulker.isBoxable(template) || VoidWarehouseShulker.isBoxPart(template)) {
             this.withdrawFrom(target, 0, player);
             return;
         }

@@ -603,7 +603,7 @@ public class VoidWarehouseMenu extends ChestMenu {
         //    实测：仓库 5 个空盒 → 交出「1 个装着 5 个空盒的盒子」（实收 6 个）→ 送回仓库
         //    变成 5 个空盒 + 2 壳 + 1 箱，来回几轮壳和箱就无限增长（2026-11 事故）。
         //    盒子本来就是盒子，没有再装一道的理由。见 VoidWarehouseShulker#isBoxable。
-        if (!VoidWarehouseShulker.isBoxable(template)) {
+        if (!VoidWarehouseShulker.isBoxable(template) || VoidWarehouseShulker.isBoxPart(template)) {
             this.withdrawFrom(target, 0, player);
             return;
         }

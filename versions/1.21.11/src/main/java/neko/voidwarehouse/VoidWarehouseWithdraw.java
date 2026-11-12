@@ -243,8 +243,11 @@ public final class VoidWarehouseWithdraw {
         //   （planBoxMaterials 空盒优先），takeExact 先把它扣空之后材料就扣不到了 ——
         //   于是「取 5 个盒子出来 6 个」、送回仓库后壳和箱无限增长（2026-11 事故）。
         //   盒子本来就是盒子，直接给。见 VoidWarehouseShulker#isBoxable。
-        // allowBox = false 与「目标本身是盒子」是同一件事：都不许再包一层。
-        boolean noPacking = !allowBox || !VoidWarehouseShulker.isBoxable(sample);
+        // allowBox = false 与「目标本身是盒子 / 是盒子材料」是同一件事：都不许再包一层。
+        //   「是盒子材料」（潜影壳 / 箱子）这一条见 VoidWarehouseShulker#isBoxPart ——
+        //   材料账与取货共用一个格子时，取完就扣不到了（1 箱换 1 盒的循环）。
+        boolean noPacking = !allowBox || !VoidWarehouseShulker.isBoxable(sample)
+                || VoidWarehouseShulker.isBoxPart(sample);
         long fullBoxes = noPacking ? 0 : requested / capacity;
         long loose = noPacking ? requested : requested % capacity;
         // 散货超过 LOOSE_PACK_STACKS 组：它单独要占掉一大片背包格子，顺手装进一个盒子
@@ -356,7 +359,10 @@ public final class VoidWarehouseWithdraw {
         }
         long have = stock.min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
 
-        if (boxMode && VoidWarehouseShulker.isBoxable(sample)) {
+        // 盒子材料（潜影壳 / 箱子）不进盒模式分支：它自己就是盒子成本，取完就扣不到了，
+        // 会变成「1 个箱子换 1 个潜影盒」的循环（见 VoidWarehouseShulker#isBoxPart）。
+        if (boxMode && VoidWarehouseShulker.isBoxable(sample)
+                && !VoidWarehouseShulker.isBoxPart(sample)) {
             long capacity = VoidWarehouseShulker.capacity(sample);
             int freeSlots = emptySlots(player);
             if (freeSlots <= 0) {

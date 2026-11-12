@@ -20,7 +20,11 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 「玩家亲手合成过什么」的唯一记录点 —— 挂在 {@code ResultSlot#onTake} 上。
@@ -57,6 +61,16 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  */
 @Mixin(ResultSlot.class)
 public abstract class CraftResultMixin {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("carpet_neko_addition/recipe");
+
+    /**
+     * 异常日志的条数预算。
+     *
+     * <p>一个「每次都抛」的坏配方会跟着每一次合成都抛，不封顶就是把日志刷穿 ——
+     * 而这个日志的用处只是「让人知道这里有东西坏了」，前几条就够了。</p>
+     */
+    private static final AtomicInteger WARN_BUDGET = new AtomicInteger(3);
 
     @Shadow
     @Final
@@ -109,8 +123,16 @@ public abstract class CraftResultMixin {
                     serverPlayer.sendSystemMessage(line);
                 }
             }
-        } catch (RuntimeException ignored) {
-            // 见类注释「异常一律吞掉」：旁路记录失败绝不能影响合成本身
+        } catch (RuntimeException ex) {
+            // 见类注释「异常一律吞掉」：旁路记录失败绝不能影响合成本身。
+            //
+            // 但「照样吞」不等于「一声不响」。1.0.17 的实机测试报过「合成后没有提示」，
+            // 能查的东西只有存档里那几条新配方 —— 日志里一个字都没有，因为异常被这里吞了，
+            // 于是「配方记下来了、提示没发出去」这种情况在事后完全无法与「一切正常」区分。
+            // 所以这里照样不影响合成，但要留一条痕迹；条数有预算，不会刷屏。
+            if (WARN_BUDGET.getAndDecrement() > 0) {
+                LOGGER.warn("虚空仓库：记录配方时抛异常，本次合成已照常完成（后续同类异常不再重复打印）", ex);
+            }
         }
     }
 }

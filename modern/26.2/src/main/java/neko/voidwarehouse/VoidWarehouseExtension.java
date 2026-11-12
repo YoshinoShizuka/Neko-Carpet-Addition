@@ -5,8 +5,11 @@ import carpet.CarpetServer;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 
+import neko.automending.TranslationLoader;
 import neko.voidwarehouse.restock.PrinterPlaceNotifier;
 import neko.voidwarehouse.restock.VoidWarehouseRestockSettings;
+
+import java.util.Map;
 
 /**
  * 虚空仓库的 Carpet 扩展。
@@ -29,6 +32,26 @@ public class VoidWarehouseExtension implements CarpetExtension {
         CarpetServer.settingsManager.parseSettingsClass(VoidWarehouseSettings.class);
         // 补货规则单独成类：它只存在于能用 Fabric networking 的那几个版本
         CarpetServer.settingsManager.parseSettingsClass(VoidWarehouseRestockSettings.class);
+    }
+
+    /**
+     * 把本模组 {@code assets/carpet_neko_addition/lang/<lang>.json} 里的规则名与描述交给 Carpet。
+     *
+     * <p><b>这是 Carpet 扩展的契约，不是可选项</b>：Carpet 在 {@code SettingsManager} 构造时
+     * 遍历每个扩展调一次，把结果并进它的翻译表；而 {@code ParsedRule} 的描述
+     * <b>是在解析规则那一刻就从这张表里快照下来的</b>
+     * （{@code Translations.trOrNull("carpet.rule.<名字>.desc")}），之后换语言也不会重新取。
+     * 所以扩展不实现它，规则就会被解析成「没有描述」。</p>
+     *
+     * <p>之前这几个键是被 {@code neko.automending.AutoMendingExtension#canHasTranslations}
+     * 顺带注册的（两条规则共用同一个 lang 文件），表面上能显示。但那是一条<b>没有人写下来的
+     * 隐式依赖</b>：哪天 autoMending 那个扩展被拆出去、被条件注册、或者换了 lang 文件，
+     * 虚空仓库这六条规则会一起「没有描述」，而且不会有任何报错。
+     * 「每条规则各自一个扩展」的规矩本来就要求各自把契约实现完整，所以这里补上。</p>
+     */
+    @Override
+    public Map<String, String> canHasTranslations(String lang) {
+        return TranslationLoader.load(lang);
     }
 
     /**

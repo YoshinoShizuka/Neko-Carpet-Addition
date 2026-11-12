@@ -13,7 +13,15 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * 配方本的三种聊天栏提示：<b>记住了 / 快满了 / 已满</b>。
+ * 配方本的四种聊天栏提示：<b>记住了 / 早就记过 / 快满了 / 已满</b>。
+ *
+ * <h2>为什么「早就记过」也要说一句</h2>
+ * <p>这一条是拿真实事故换来的：1.0.17 的实机测试里，玩家在「配方本已经装着 1844 条」的存档
+ * 连着合了 8 次东西，配方本确实长到了 1852 条 —— 也就是说功能完全正常，但聊天栏一个字都没有，
+ * 于是被当成「合成后没有提示」的 bug 报了上来。原因就是重复合成被设计成完全静默：
+ * <b>「什么都没说」和「功能没生效」在玩家眼里一模一样</b>。
+ * <p>所以它必须说，但<b>每个玩家只说一次</b>：重复合成毕竟是常态，每合一次报一次就是刷屏。
+ * 规则没开（{@code DISABLED}）仍然彻底闭嘴 —— 玩家压根没打算用这个功能。
  *
  * <h2>为什么要单独一个类</h2>
  * <p>提示是「怎么用这个结果」，不是「结果本身」。数据层（{@link VoidWarehouseData}）的
@@ -81,6 +89,8 @@ public final class VoidWarehouseRecipeNotice {
         boolean fullNotified;
         /** 已经就「快满」提示过一次 */
         boolean nearFullNotified;
+        /** 已经就「这条早就在本子里」提示过一次（每个玩家一次，不按产物分） */
+        boolean duplicateNotified;
         /** 上次满本提示的 tick；初值让「第一次一定放行」 */
         long lastFullTick = -FULL_REPEAT_TICKS;
     }
@@ -113,10 +123,9 @@ public final class VoidWarehouseRecipeNotice {
         if (who == null || result == null) {
             return List.of();
         }
-        // 这两种结局一个字都不该说：重复合成是常态（同一件东西合十次要说十次？），
-        // 规则没开更是完全不该打扰 —— 玩家压根没打算用这个功能。
-        if (result == VoidWarehouseData.LearnResult.DUPLICATE
-                || result == VoidWarehouseData.LearnResult.DISABLED) {
+        // 规则没开就彻底闭嘴：玩家压根没打算用这个功能，不该打扰。
+        // 重复合成不在此列 —— 它要说，只是每玩家只说一次（见类注释那条事故）。
+        if (result == VoidWarehouseData.LearnResult.DISABLED) {
             return List.of();
         }
         State state = STATE.computeIfAbsent(who, key -> new State());
@@ -142,6 +151,13 @@ public final class VoidWarehouseRecipeNotice {
             if (isNearFull(used, max) && !state.nearFullNotified) {
                 state.nearFullNotified = true;
                 out.addAll(nearFullLines(en, used, max));
+            }
+        } else if (result == VoidWarehouseData.LearnResult.DUPLICATE) {
+            // 「什么也没说」和「功能没生效」在玩家眼里是一模一样的，所以这条必须说。
+            // 但每个玩家只说一次：重复合成是常态，每合一次报一次就是刷屏。
+            if (!state.duplicateNotified) {
+                state.duplicateNotified = true;
+                out.add(duplicateLine(en));
             }
         } else if (result == VoidWarehouseData.LearnResult.FULL) {
             // 边沿必说一次；之后每 30 秒最多再说一次。满本之后玩家每合成一次都会走到这里，
@@ -169,6 +185,13 @@ public final class VoidWarehouseRecipeNotice {
         MutableComponent body = VoidWarehouseText.body(en ? "Learned recipe: " : "已记住配方：");
         body.append(describe(recipe, en));
         return VoidWarehouseText.info(en, body);
+    }
+
+    /** 「这条配方之前已经记过了」—— 每个玩家只报一次（理由见类注释） */
+    private static Component duplicateLine(boolean en) {
+        return VoidWarehouseText.info(en,
+                "这条配方之前已经记过了，不会重复记录。",
+                "This recipe is already recorded; it will not be added again.");
     }
 
     /**

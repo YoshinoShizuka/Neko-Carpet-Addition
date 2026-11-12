@@ -1472,11 +1472,29 @@ public final class VoidWarehouseCraftSelfCheck {
         check("P6c 恰好 5 条时不画蛇添足写「另有」", exact.size() == 2
                 && !exact.get(1).getString().contains("另有"));
 
-        // ---- P7 重复 / 规则关：一个字都不说 ----
-        check("P7 DUPLICATE 不发任何行", VoidWarehouseRecipeNotice.onCrafted(
-                UUID.randomUUID(), false, VoidWarehouseData.LearnResult.DUPLICATE,
-                fresh, sixOld, 10, max, 1_000L).isEmpty());
-        check("P7b DISABLED 不发任何行", VoidWarehouseRecipeNotice.onCrafted(
+        // ---- P7 重复：第一次说一句、之后闭嘴；规则关：一个字都不说 ----
+        // 「一句都不说」曾经是设计，但实机测试把它判成了 bug（合了 8 次、配方本确实长了 8 条，
+        // 聊天栏却一个字都没有 —— 玩家无从分辨「已经记过」和「功能没生效」）。
+        UUID dupWho = UUID.randomUUID();
+        List<Component> dup1 = VoidWarehouseRecipeNotice.onCrafted(
+                dupWho, false, VoidWarehouseData.LearnResult.DUPLICATE,
+                fresh, sixOld, 10, max, 1_000L);
+        check("P7 同一玩家第一次撞上「已记过」要说 1 行（实测 " + dup1.size() + "）", dup1.size() == 1);
+        check("P7b 那行写「之前已经记过了」", dup1.size() == 1
+                && dup1.get(0).getString().contains("之前已经记过了"));
+        check("P7c 同一玩家第二次就闭嘴（重复合成是常态，不能刷屏）",
+                VoidWarehouseRecipeNotice.onCrafted(
+                        dupWho, false, VoidWarehouseData.LearnResult.DUPLICATE,
+                        fresh, sixOld, 10, max, 1_200L).isEmpty());
+        check("P7d 换个玩家还会说（状态是按玩家分的）",
+                VoidWarehouseRecipeNotice.onCrafted(
+                        UUID.randomUUID(), false, VoidWarehouseData.LearnResult.DUPLICATE,
+                        fresh, sixOld, 10, max, 1_000L).size() == 1);
+        check("P7e 英文玩家的「已记过」是英文", VoidWarehouseRecipeNotice.onCrafted(
+                        UUID.randomUUID(), true, VoidWarehouseData.LearnResult.DUPLICATE,
+                        fresh, sixOld, 10, max, 1_000L).get(0).getString()
+                .contains("already recorded"));
+        check("P7f DISABLED 不发任何行", VoidWarehouseRecipeNotice.onCrafted(
                 UUID.randomUUID(), false, VoidWarehouseData.LearnResult.DISABLED,
                 fresh, sixOld, 10, max, 1_000L).isEmpty());
 
@@ -1580,6 +1598,39 @@ public final class VoidWarehouseCraftSelfCheck {
                     outcome.othersBefore().size() == pre);
             check("P15c 快照里没有刚学进去的这条（顺序写反的话它就会在里面）",
                     !containsRecipe(outcome.othersBefore(), probe2.recipeId()));
+        }
+
+        // ---- Q 翻译契约：扩展必须自己把 lang 文件交给 Carpet ----
+        // Carpet 构造 SettingsManager 时会遍历每个扩展调一次 canHasTranslations，
+        // 而规则描述是在「解析规则那一刻」就从这张表里快照下来的（ParsedRule.description）。
+        // 所以这个方法是契约、不是可选项：不实现它，六条规则会一起变成「没有描述」，
+        // 而且不会有任何报错。历史上这几个键是被 autoMending 那个扩展顺带注册的 ——
+        // 表面上能显示，但那是一条没人写下来的隐式依赖。
+        VoidWarehouseExtension extension = null;
+        for (carpet.CarpetExtension candidate : carpet.CarpetServer.extensions) {
+            if (candidate instanceof VoidWarehouseExtension vw) {
+                extension = vw;
+                break;
+            }
+        }
+        check("Q1 虚空仓库扩展已注册到 Carpet", extension != null);
+        if (extension != null) {
+            String[] rules = {"voidWarehouse", "voidWarehouseCraft", "voidWarehouseExchange",
+                    "voidWarehouseBlockDrops", "voidWarehouseRestock", "voidWarehouseDirectPlace"};
+            for (String lang : new String[]{"zh_cn", "en_us"}) {
+                java.util.Map<String, String> map = extension.canHasTranslations(lang);
+                int missing = 0;
+                for (String rule : rules) {
+                    if (!map.containsKey("carpet.rule." + rule + ".name")) {
+                        missing++;
+                    }
+                    if (!map.containsKey("carpet.rule." + rule + ".desc")) {
+                        missing++;
+                    }
+                }
+                check("Q2 " + lang + " 的 6 条规则（名+描述共 12 键）由扩展自己交出（缺 "
+                        + missing + " 项）", missing == 0);
+            }
         }
 
         VoidWarehouseSettings.voidWarehouseExchange = false;

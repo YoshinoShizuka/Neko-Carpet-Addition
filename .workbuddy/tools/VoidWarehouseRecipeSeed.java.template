@@ -1,0 +1,459 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.crafting.CraftingRecipe;
+import net.minecraft.world.item.crafting.CustomRecipe;
+import net.minecraft.world.item.crafting.RecipeHolder;
+import net.minecraft.world.item.crafting.display.RecipeDisplay;
+import net.minecraft.world.item.crafting.display.ShapedCraftingRecipeDisplay;
+import net.minecraft.world.item.crafting.display.ShapelessCraftingRecipeDisplay;
+import net.minecraft.world.item.crafting.display.SlotDisplay;
+import net.minecraft.world.level.block.Blocks;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * 【一次性工具，26.3 专用】生成一份「配方本已填到指定条数」的测试存档。
+ *
+ * <h2>为什么要走反射批量写，而不是逐条 {@code learn}</h2>
+ * <p>{@code learnWithResult} 每学一条都要 {@code rebuildRecipes()}（全量重建，
+ * O(N²)）。填 2048 条 = 2048 次重建，满本那一侧单次就要 20 ms 上下，累计一分钟以上 ——
+ * 一次性卡在首个 tick 里，服务端看门狗会直接把进程掐掉。</p>
+ * <p>所以这里反射拿到 {@code recipeTexts} 直接整体替换，只调 <b>一次</b>
+ * {@code rebuildRecipes()}，再按 {@code learnWithResult} 的做法把
+ * {@code recipeGeneration} +1 并清空 {@code offers} / {@code unifiedOrder} /
+ * {@code amountOrder} 三个缓存。<b>不碰落盘与 codec</b>：写盘仍由服务端自己做。</p>
+ *
+ * <h2>填进来的都是什么配方</h2>
+ * <ul>
+ *   <li><b>真实原版配方全在</b>（口径与 {@code RecipeCorpusExport} 一致：CustomRecipe 跳过、
+ *       原料只取第一候选、一条一个元素）；</li>
+ *   <li>但<b>故意留几个不学</b>（见 {@link #RESERVED}）—— 满本之后想要触发「已满」提示，
+ *       必须有一条<b>不在本子里</b>的配方可合。全学了的话任何原版合成都是 DUPLICATE，永远静默；</li>
+ *   <li>木棍只留<b>橡木</b>那一条：这样在非满本的档里合桦木木棍，会同时演示
+ *       「已记住」+「还能这样合：2 橡木木板 → 4 木棍」；</li>
+ *   <li>不够的数用<b>占位配方</b>补（同一件物品换同一件，永远做不出来，也不进库存），
+ *       只为把本子顶到上限。填充物见 {@link #FILLER}。</li>
+ * </ul>
+ *
+ * <h2>参数从哪来</h2>
+ * <p>{@code C:/tmp/nca_seed.txt}，每行 {@code key=value}：
+ * {@code target=<配方本目标条数>}、{@code stock=<每件物品库存，0 = 不填库存>}。
+ * 文件不存在时用 {@code target=2048, stock=1000000}。</p>
+ */
+public final class VoidWarehouseRecipeSeed {
+
+    /** 等 RecipeManager 绑好再动手（同 RecipeCorpusExport） */
+    private static final int WAIT_TICKS = 5;
+
+    /**
+     * 故意<b>不学</b>的产物：满本档里合这些 → FULL → 「配方本已满」。
+     * 都挑「木头 + 一块石头/铁」能立刻做出来的，进游戏就能试。
+     */
+    private static final Set<String> RESERVED = Set.of(
+            "minecraft:crafting_table",
+            "minecraft:chest",
+            "minecraft:furnace",
+            "minecraft:torch",
+            "minecraft:wooden_pickaxe",
+            "minecraft:ladder",
+            "minecraft:bowl");
+
+    /**
+     * 占位填充物：都是「正常玩拿不到 / 拿到了也不该用来合」的原版物品。
+     * <b>它们不进库存</b>，所以「2 屏障 → 1 屏障」这类配方永远不可行，也不会在界面上出现。
+     */
+    private static final String[] FILLER = {
+            "minecraft:barrier",
+            "minecraft:bedrock",
+            "minecraft:structure_void",
+            "minecraft:jigsaw",
+            "minecraft:command_block",
+            "minecraft:debug_stick",
+            "minecraft:light",
+            "minecraft:structure_block",
+            "minecraft:spawner",
+            "minecraft:end_portal_frame",
+    };
+
+    private static boolean done;
+    private static int tickIndex;
+
+    private VoidWarehouseRecipeSeed() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        if (++tickIndex < WAIT_TICKS) {
+            return;
+        }
+        done = true;
+        try {
+            seed(server);
+        } catch (Throwable t) {
+            System.out.println("!! [SEED] 抛异常: " + t);
+            t.printStackTrace(System.out);
+        } finally {
+            server.halt(false);
+        }
+    }
+
+    private static void seed(MinecraftServer server) throws Exception {
+        int target = 2048;
+        int stockPerItem = 1_000_000;
+        boolean readOnly = false;
+        Path conf = Path.of("C:/tmp/nca_seed.txt");
+        if (Files.exists(conf)) {
+            for (String line : Files.readAllLines(conf, StandardCharsets.UTF_8)) {
+                line = line.trim();
+                int eq = line.indexOf('=');
+                if (eq <= 0) {
+                    continue;
+                }
+                String key = line.substring(0, eq).trim();
+                String value = line.substring(eq + 1).trim();
+                if ("target".equals(key)) {
+                    target = Integer.parseInt(value);
+                } else if ("stock".equals(key)) {
+                    stockPerItem = Integer.parseInt(value);
+                } else if ("readonly".equals(key)) {
+                    readOnly = "1".equals(value) || "true".equalsIgnoreCase(value);
+                }
+            }
+        }
+        if (readOnly) {
+            // 只读复核：不动任何数据，只把「这份存档读回来是什么样」和
+            // 「三种提示拿这些数字渲染成什么」打出来。交付前跑一次。
+            verifyOnly(server);
+            return;
+        }
+        System.out.println("### [SEED] 开始 target=" + target + " stockPerItem=" + stockPerItem);
+
+        // ---------------------------------------------------------- 1. 配方
+        Set<String> texts = new LinkedHashSet<>();
+        int real = 0;
+        int skippedReserved = 0;
+        int notCrafting = 0;
+        int special = 0;
+        int bad = 0;
+
+        for (RecipeHolder<?> holder : server.getRecipeManager().getRecipes()) {
+            if (!(holder.value() instanceof CraftingRecipe crafting)) {
+                notCrafting++;
+                continue;
+            }
+            if (crafting instanceof CustomRecipe) {
+                special++;
+                continue;
+            }
+            List<RecipeDisplay> displays = crafting.display();
+            if (displays == null || displays.isEmpty()) {
+                continue;
+            }
+            RecipeDisplay first = displays.get(0);
+            List<SlotDisplay> ingredientSlots;
+            if (first instanceof ShapedCraftingRecipeDisplay shaped) {
+                ingredientSlots = shaped.ingredients();
+            } else if (first instanceof ShapelessCraftingRecipeDisplay shapeless) {
+                ingredientSlots = shapeless.ingredients();
+            } else {
+                continue;
+            }
+            ItemStack result = stackOf(first.result());
+            String outId = result.isEmpty() ? null : VoidWarehouseRecipeBook.idOf(result.getItem());
+            if (outId == null) {
+                bad++;
+                continue;
+            }
+            List<VoidWarehouseRecipes.Part> parts = new ArrayList<>();
+            for (SlotDisplay slot : ingredientSlots) {
+                String id = firstCandidateOf(slot);
+                if (id == null) {
+                    continue;
+                }
+                parts.add(new VoidWarehouseRecipes.Part(List.of(id), Math.max(1, countOf(slot))));
+            }
+            if (parts.isEmpty()) {
+                bad++;
+                continue;
+            }
+            String text;
+            try {
+                text = VoidWarehouseRecipes.encode(new VoidWarehouseRecipes.Recipe(
+                        null, outId, Math.max(1, result.getCount()), parts));
+            } catch (RuntimeException ex) {
+                bad++;
+                continue;
+            }
+            if (VoidWarehouseRecipes.decode(text) == null) {
+                bad++;
+                continue;
+            }
+            if (RESERVED.contains(outId)) {
+                skippedReserved++;
+                continue;
+            }
+            // 木棍只留橡木那一条（演示「还能这样合」用）
+            if ("minecraft:stick".equals(outId) && !text.contains("oak_planks")) {
+                skippedReserved++;
+                continue;
+            }
+            if (texts.add(text)) {
+                real++;
+            }
+        }
+
+        // ---------------------------------------------------------- 2. 占位补齐
+        int pad = 0;
+        if (texts.size() < target) {
+            outer:
+            for (String filler : FILLER) {
+                for (int n = 2; n <= 64; n++) {
+                    for (int k = 1; k <= 3; k++) {
+                        if (texts.size() >= target) {
+                            break outer;
+                        }
+                        String text = VoidWarehouseRecipes.encode(new VoidWarehouseRecipes.Recipe(
+                                null, filler, k,
+                                List.of(new VoidWarehouseRecipes.Part(List.of(filler), n))));
+                        if (texts.add(text)) {
+                            pad++;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------- 3. 批量写入
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        bulkSetRecipes(data, texts);
+        int decoded = decodedCount(data);
+
+        // ---------------------------------------------------------- 4. 库存
+        int inserted = 0;
+        int skippedStock = 0;
+        if (stockPerItem > 0) {
+            data.clearContent();
+            Set<String> fillerIds = Set.of(FILLER);
+            for (Item item : BuiltInRegistries.ITEM) {
+                if (item == Items.AIR) {
+                    continue;
+                }
+                String id = VoidWarehouseRecipeBook.idOf(item);
+                if (id == null || fillerIds.contains(id)) {
+                    skippedStock++;
+                    continue;
+                }
+                ItemStack stack = new ItemStack(item);
+                stack.setCount(stockPerItem);
+                if (data.insert(stack)) {
+                    inserted++;
+                } else {
+                    skippedStock++;
+                }
+            }
+            data.setDirty();
+        }
+
+        // ---------------------------------------------------------- 5. 放一个终端
+        boolean terminal = placeTerminal(server);
+
+        // ---------------------------------------------------------- 6. 落盘
+        boolean saved = server.saveEverything(true, true, true);
+        System.out.println("SEED DETAIL notCrafting=" + notCrafting + " custom=" + special
+                + " bad=" + bad + " skippedReserved=" + skippedReserved);
+        System.out.println("SEED DETAIL recipes real=" + real + " pad=" + pad
+                + " texts=" + texts.size() + " decoded=" + decoded);
+        System.out.println("SEED DETAIL stock items=" + inserted + " skipped=" + skippedStock
+                + " perItem=" + stockPerItem);
+        System.out.println("SEED DETAIL terminalPlaced=" + terminal + " full=" + data.recipeBookFull()
+                + " used=" + data.recipeBookUsed());
+        System.out.println("SEED RESULT target=" + target + " texts=" + texts.size()
+                + " decoded=" + decoded + " saved=" + saved);
+        for (String text : texts.stream().limit(5).toList()) {
+            System.out.println("SEED SAMPLE " + text);
+        }
+    }
+
+    /**
+     * 只读复核：把存档读回来的样子 + 三种提示的真实渲染打出来。
+     *
+     * <p>为什么非要这一步：生成与保存发生在<b>同一个进程</b>里，内存里的那份对了，
+     * 不代表落盘的 dat 换个进程还能读回来。交付前拿交付的那份世界原样跑一遍，
+     * 读回来的条数、终端、提示文案都由 mod 自己的代码回答，不靠猜。</p>
+     */
+    private static void verifyOnly(MinecraftServer server) throws Exception {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        int used = data.recipeBookUsed();
+        int max = VoidWarehouseRecipeBook.MAX_RECIPES;
+        System.out.println("VERIFY used=" + used + " max=" + max + " full=" + data.recipeBookFull()
+                + " decoded=" + decodedCount(data)
+                + " stone=" + data.amountExact(new ItemStack(Items.STONE))
+                + " terminals=" + VoidWarehouseTerminals.size(server.overworld()));
+
+        // 三种提示各渲染一次（用真实的 used / max）
+        VoidWarehouseRecipes.Recipe torch = new VoidWarehouseRecipes.Recipe(
+                null, "minecraft:torch", 4,
+                List.of(new VoidWarehouseRecipes.Part(List.of("minecraft:stick"), 1)));
+        VoidWarehouseRecipes.Recipe birchStick = new VoidWarehouseRecipes.Recipe(
+                null, "minecraft:stick", 4,
+                List.of(new VoidWarehouseRecipes.Part(List.of("minecraft:birch_planks"), 2)));
+        VoidWarehouseRecipes.Recipe oakStick = new VoidWarehouseRecipes.Recipe(
+                null, "minecraft:stick", 4,
+                List.of(new VoidWarehouseRecipes.Part(List.of("minecraft:oak_planks"), 2)));
+
+        long tick = server.getTickCount();
+        java.util.UUID probe = java.util.UUID.randomUUID();
+
+        List<Component> full = VoidWarehouseRecipeNotice.onCrafted(
+                probe, false, VoidWarehouseData.LearnResult.FULL, torch,
+                List.of(), used, max, tick);
+        List<Component> learned = VoidWarehouseRecipeNotice.onCrafted(
+                java.util.UUID.randomUUID(), false, VoidWarehouseData.LearnResult.LEARNED, birchStick,
+                List.of(oakStick), Math.min(used + 1, max), max, tick);
+        List<Component> nearFull = VoidWarehouseRecipeNotice.onCrafted(
+                java.util.UUID.randomUUID(), false, VoidWarehouseData.LearnResult.LEARNED, birchStick,
+                List.of(oakStick), max, max, tick);
+
+        dump("FULL", full);
+        dump("LEARNED", learned);
+        dump("NEARFULL", nearFull);
+        System.out.println("VERIFY RESULT used=" + used + " fullLines=" + full.size()
+                + " learnedLines=" + learned.size() + " nearFullLines=" + nearFull.size());
+    }
+
+    private static void dump(String tag, List<Component> lines) {
+        for (int i = 0; i < lines.size(); i++) {
+            System.out.println("VERIFY LINE " + tag + "[" + i + "] " + lines.get(i).getString());
+        }
+    }
+
+    /**
+     * 把 {@code recipeTexts} 整体换掉，然后只重建一次。
+     *
+     * <p>反射集中在这一处：字段名在 26.x 不混淆，改名字了这里会当场
+     * {@code NoSuchFieldException}，不会静默写错。</p>
+     */
+    @SuppressWarnings("unchecked")
+    private static void bulkSetRecipes(VoidWarehouseData data, Set<String> texts) throws Exception {
+        Field fTexts = VoidWarehouseData.class.getDeclaredField("recipeTexts");
+        fTexts.setAccessible(true);
+        Set<String> live = (Set<String>) fTexts.get(data);
+        live.clear();
+        live.addAll(texts);
+
+        Method rebuild = VoidWarehouseData.class.getDeclaredMethod("rebuildRecipes");
+        rebuild.setAccessible(true);
+        rebuild.invoke(data);
+
+        Field fGen = VoidWarehouseData.class.getDeclaredField("recipeGeneration");
+        fGen.setAccessible(true);
+        fGen.setInt(data, fGen.getInt(data) + 1);
+
+        for (String name : new String[]{"offers", "unifiedOrder", "amountOrder"}) {
+            Field cache = VoidWarehouseData.class.getDeclaredField(name);
+            cache.setAccessible(true);
+            cache.set(data, null);
+        }
+        data.setDirty();
+    }
+
+    /** 解码后的条数：必须等于 texts.size()，否则说明有条目被 codec 悄悄丢了 */
+    private static int decodedCount(VoidWarehouseData data) throws Exception {
+        Field f = VoidWarehouseData.class.getDeclaredField("recipes");
+        f.setAccessible(true);
+        Object value = f.get(data);
+        return value instanceof List<?> list ? list.size() : -1;
+    }
+
+    /** 在出生点放一个工作台并登记成虚空仓库终端，进游戏右键就能开界面 */
+    private static boolean placeTerminal(MinecraftServer server) {
+        try {
+            ServerLevel level = server.overworld();
+            // 26.3 起没有 getSharedSpawnPos 了：出生点收进 LevelData.RespawnData
+            BlockPos spawn = level.getRespawnData().pos();
+            // 别放在出生点那一格：玩家会直接站在工作台上，反而没法对着它右键。
+            // 往旁边挪几格，找「脚下有地、自己这格是空气」的位置。
+            BlockPos pos = spawn;
+            for (int dx = 1; dx <= 4; dx++) {
+                BlockPos p = spawn.offset(dx, 0, 0);
+                if (level.getBlockState(p).isAir() && !level.getBlockState(p.below()).isAir()) {
+                    pos = p;
+                    break;
+                }
+            }
+            level.setBlockAndUpdate(pos, Blocks.CRAFTING_TABLE.defaultBlockState());
+            VoidWarehouseTerminals.add(level, pos);
+            System.out.println("SEED DETAIL terminal at " + pos.getX() + "," + pos.getY() + "," + pos.getZ());
+            return true;
+        } catch (Throwable t) {
+            System.out.println("!! [SEED] 放终端失败: " + t);
+            return false;
+        }
+    }
+
+    // ---------------------------------------------------------------- 语料口径（与 RecipeCorpusExport 同源）
+
+    private static ItemStack stackOf(SlotDisplay display) {
+        if (display instanceof SlotDisplay.ItemStackSlotDisplay stackDisplay) {
+            try {
+                ItemStack stack = stackDisplay.stack().create();
+                return stack == null ? ItemStack.EMPTY : stack;
+            } catch (RuntimeException ex) {
+                return ItemStack.EMPTY;
+            }
+        }
+        if (display instanceof SlotDisplay.ItemSlotDisplay itemDisplay) {
+            try {
+                Item item = itemDisplay.item().value();
+                return item == null ? ItemStack.EMPTY : new ItemStack(item);
+            } catch (RuntimeException ex) {
+                return ItemStack.EMPTY;
+            }
+        }
+        return ItemStack.EMPTY;
+    }
+
+    private static String firstCandidateOf(SlotDisplay display) {
+        if (display instanceof SlotDisplay.ItemStackSlotDisplay || display instanceof SlotDisplay.ItemSlotDisplay) {
+            ItemStack stack = stackOf(display);
+            return stack.isEmpty() ? null : VoidWarehouseRecipeBook.idOf(stack.getItem());
+        }
+        if (display instanceof SlotDisplay.TagSlotDisplay tagDisplay) {
+            try {
+                for (Holder<Item> holder : tagDisplay.tag()) {
+                    String id = VoidWarehouseRecipeBook.idOf(holder.value());
+                    if (id != null) {
+                        return id;
+                    }
+                }
+            } catch (RuntimeException ex) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static int countOf(SlotDisplay display) {
+        ItemStack stack = stackOf(display);
+        return stack.isEmpty() ? 1 : stack.getCount();
+    }
+}

@@ -189,6 +189,19 @@
 - **五版本 1,864 条断言零失败**：`CraftSelfCheck` 161×4 + `SystemTest` 209×5 + `A2StressTest` 35×5。完整数据见 `docs/配方本满本并发测试报告.md` §14(1864 assertions green across five versions.).
 - ⚠️ **`SystemTest` 的 `sink=` 会变**（9,795,079 → 9,901,959）：`sink` 是非负数之和，去重只会让它**变小**，所以这个变化不可能来自本次修复 —— 是新增的 N 组往测试存档里多学了 3 条配方。它因此不再是跨版本指纹，能比的只有断言(`sink` moved for an unrelated reason and is no longer a cross-version fingerprint.).
 
+### 🧪 Testing / 测试
+
+- 配方存储与原料兑换的完整覆盖测试 **65 条断言 × 5 版本 = 325 条全绿**（`CraftExchangeAudit`，真服务端、真 `ServerPlayer`、真存档）：持久化 19（含**真落盘**）、兑换数量 18、20 人并发 12、账平 16(A 65-assertion audit over five targets, 325 checks total, all green on a real server.).
+- **真落盘**单独成组（P7a–h）：把当前存档标脏 → `saveAndJoin()` → 从游戏自己写出的 `.dat` 读回来，配方文本按序逐条相同、库存逐格相同（26.3 实测 **1,865 条**：磁盘 == 内存）。P1–P6 只证明编解码器跟自己对得上，碰不到目录规则、外层 `data` 包装和写盘时机 —— 而玩家问的是「关服再开服还在不在」(The disk round trip reads back the file the game itself wrote, which the codec-only round trip cannot prove.)。
+- 🔴 **「文件在」不等于「这次写的」**：旧档也在。唯一能证明「刚刚真落盘」的是 **mtime**，所以加了一条 `P7c 这个档是刚刚写的（mtime 距今 < 120 秒）`。少了它，在 1.21.11 上读到一份三周前的 48 字节空档也会全绿 —— 第一版就是这么假绿的(The mtime check is what distinguishes a fresh write from a stale file.).
+- 两种目录布局都得认：≤1.21.x 是 `world/data/carpet_neko_addition_void_warehouse.dat`，26.x 是 `world/dimensions/minecraft/overworld/data/carpet_neko_addition/void_warehouse.dat`。写死单一路径，1.21.11 必然假红(Both storage layouts must be probed explicitly.).
+- **吞材料专项：没有吞。** 判据不是「写死给几个」而是**等价守恒** —— 「仓库少掉的等价 == 玩家拿到的等价」，少了就是吞、多了就是造。199 份计划逐份对平：9 合 1 扫 159 组（11 个可计价族，50 份给出计划）+ 配方扣料扫 160 组（149 份给出计划）。另加两条：**不跨族串味**（取铁锭不动金锭）、**全程无负数**(No item swallowing: 199 plans, each conserving value exactly; no cross-family leakage, no negatives.).
+- **`deltas` 是净变化，交付量已经含在里面**：4 铁块 + 5 铁锭取 9 铁锭，`deltas` 只有 `iron_block −1`（拆块 +9 与交付 −9 相抵）。所以「执行后铁锭归零」是**错的**断言 —— 那要求仓库凭空少 9 个。第一版审计就是按「扣库存」的直觉写的，报了 3 条假红(`deltas` is a net change; the delivered amount is already inside it.)。
+- 20 人并发四组场景账全平：30 木板各取 1 → 20 个全拿到、**只做 5 次合成**（余量复用，耗 10 木板）；9 木板 → 16 成 / 4 空手 / 剩 1 未被吃；40 木板各取 4 → 80 个；20 木板 → 10 人各 4(Twenty real players, four scenarios, all balanced.).
+- 边界五条：取 65 夹到 **64**；63 木板取 64 只做 **16 次**（扣 32、剩 31，给足即停）；8 铁锭取 1 铁块**取不到且原样 8**；`want=0/-1` 不动库存；1 木板取不到。
+- 三条**真风险**已量出但未改代码：① 规划与执行若拆到两个 tick，清空库存后执行旧 plan ⇒ 木棍 0→3（**凭空造物**），当前调用图不可达；② 数据结构非线程安全，真 8 线程 × 1,600 次调用异常 **5 ~ 1,284 次**（单线程服务端不触发）；③ `Entry#subtract` 把负值静默夹到 0（审计能抓成活平被抹，但现场无提示）(Three real risks measured but intentionally left alone; see `docs/配方存储与原料兑换覆盖测试.md`.).
+- 三次写错期望值的教训已归档：把「取出」当成「扣库存」、把「给足即停」当成「料不够就少给」、把「余量复用」当成「一人一份料」—— 九条假红全是我的语义错，产品行为是对的(Nine false failures were all my own semantic misreadings.).
+
 ### 📦 Builds / 构建产物
 
 | MC 版本 | 文件 | 体积 | md5 |

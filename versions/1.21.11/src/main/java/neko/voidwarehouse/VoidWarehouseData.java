@@ -872,6 +872,30 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
+     * {@link #learnWithResult} 的四种结局。
+     *
+     * <h2>为什么非得是枚举</h2>
+     * <p>{@link #learn} 只回一个 {@code boolean}，可 {@code false} 藏着<b>三种完全不同的原因</b>：
+     * 规则没开、这条已经记过、本子满了。玩家该看到的东西也完全不同 ——
+     * 规则没开该<b>彻底静默</b>（他压根没打算用这个功能），重复不该打扰（合成本来就是重复动作），
+     * 只有「满了」必须说一声：不说的话玩家以为记住了，等到要用的时候才发现界面里压根没这一格，
+     * 而那时候他已经想不起来是哪一次合成没记上。</p>
+     *
+     * <p>三件事挤在一个 {@code false} 里，调用方就只能猜。所以多开一条能说清的路，
+     * 旧的 {@link #learn} 保留原语义（{@code == LEARNED}），既有调用点一行不用改。</p>
+     */
+    public enum LearnResult {
+        /** 新记下一条 */
+        LEARNED,
+        /** 这条已经在配方本里（重复合成是常态，不该每合一次都写盘） */
+        DUPLICATE,
+        /** 配方本已满，这条没记 */
+        FULL,
+        /** 规则没开，什么都没做 */
+        DISABLED
+    }
+
+    /**
      * 记下一条配方（玩家刚刚在合成台上真的做出来的那一条）。
      *
      * <p>规则没开时<b>直接返回 {@code false} 且什么都不做</b> —— 关着的规则不该悄悄
@@ -880,13 +904,26 @@ public final class VoidWarehouseData extends SavedData {
      *
      * <p>返回 {@code true} 表示这是一条<b>新</b>配方；已经记过的返回 {@code false}
      * （重复合成同一件东西是常态，不该每合一次都写一次盘）。</p>
+     *
+     * <p><b>需要知道「为什么没记住」时用 {@link #learnWithResult}</b> ——
+     * 这个布尔版分不出「重复」和「满了」。</p>
      */
     public boolean learn(VoidWarehouseRecipes.Recipe recipe) {
+        return this.learnWithResult(recipe) == LearnResult.LEARNED;
+    }
+
+    /**
+     * 同 {@link #learn}，但把结局说清楚（见 {@link LearnResult}）。
+     *
+     * <p>落盘、重建、缓存失效这套动作与旧版逐字节相同，唯一区别是返回值更细 ——
+     * 所以这是一次<b>纯增量</b>改动，不改任何既有行为。</p>
+     */
+    public LearnResult learnWithResult(VoidWarehouseRecipes.Recipe recipe) {
         if (!craftEnabled() || recipe == null) {
-            return false;
+            return LearnResult.DISABLED;
         }
         if (this.recipeTexts.contains(recipe.recipeId())) {
-            return false;
+            return LearnResult.DUPLICATE;
         }
         if (this.recipeTexts.size() >= VoidWarehouseRecipeBook.MAX_RECIPES) {
             if (!this.capWarned) {
@@ -895,7 +932,7 @@ public final class VoidWarehouseData extends SavedData {
                                 + "现有 {} 条仍可正常用；要记更多请调大 VoidWarehouseRecipeBook.MAX_RECIPES",
                         VoidWarehouseRecipeBook.MAX_RECIPES, this.recipeTexts.size());
             }
-            return false;
+            return LearnResult.FULL;
         }
         this.recipeTexts.add(recipe.recipeId());
         this.rebuildRecipes();
@@ -905,7 +942,75 @@ public final class VoidWarehouseData extends SavedData {
         this.unifiedOrder = null;
         this.amountOrder = null;
         this.setDirty();
-        return true;
+        return LearnResult.LEARNED;
+    }
+
+    /** 配方本满了吗（聊天提示与界面都用它，别各写一份 {@code size() >= MAX}） */
+    public boolean recipeBookFull() {
+        return this.recipeTexts.size() >= VoidWarehouseRecipeBook.MAX_RECIPES;
+    }
+
+    /** 配方本现在用掉多少条（提示里要报「已用 N / 上限」） */
+    public int recipeBookUsed() {
+        return this.recipeTexts.size();
+    }
+
+    /**
+     * 同一个产物已经记下的配方，<b>按 {@code recipeId} 排序</b>。
+     *
+     * <p>排序不是为了好看：提示里只列前几条，顺序不稳的话同一件事两次提示会列出不同的配方，
+     * 玩家会以为配方本自己变了。{@code recipeId} 由配方内容算出（见
+     * {@link VoidWarehouseRecipes.Recipe}），天然稳定。</p>
+     *
+     * <p>⚠️ 调用方要在 {@link #learnWithResult} <b>之前</b>取：learn 之后新配方已经进本子，
+     * 再取就会把它自己列进「已有配方」，提示里出现「木棍还能这样合：…木棍」这种自指。</p>
+     */
+    public List<VoidWarehouseRecipes.Recipe> recipesFor(String outputId) {
+        if (outputId == null) {
+            return List.of();
+        }
+        List<VoidWarehouseRecipes.Recipe> list = this.recipesByOutput.get(outputId);
+        if (list == null || list.isEmpty()) {
+            return List.of();
+        }
+        List<VoidWarehouseRecipes.Recipe> sorted = new ArrayList<>(list);
+        sorted.sort(java.util.Comparator.comparing(VoidWarehouseRecipes.Recipe::recipeId));
+        return sorted;
+    }
+
+    /**
+     * {@link #learnCapturingOthers} 的结果：结局 + <b>学之前</b>同产物已经有哪些配方。
+     *
+     * @param result       这次学的结果
+     * @param othersBefore 调 {@link #learnWithResult} <b>之前</b>取的 {@link #recipesFor}，
+     *                     所以里面<b>一定不含刚学进去的这一条</b>
+     */
+    public record LearnOutcome(LearnResult result, List<VoidWarehouseRecipes.Recipe> othersBefore) {
+        public LearnOutcome {
+            othersBefore = List.copyOf(othersBefore);
+        }
+    }
+
+    /**
+     * 学一条，同时把「学之前同产物还有哪些配方」一起交出来。
+     *
+     * <h2>为什么把这两步并成一个方法</h2>
+     * <p>聊天提示要列出「木棍还能这样合：2 橡木木板 → 4 木棍」，而这份列表<b>必须在
+     * {@link #learnWithResult} 之前取</b>：learn 之后新配方已经进了本子，再取就会把它自己
+     * 算进「已有」，提示里出现「木棍还能这样合：…木棍」这种自己配自己的句子。</p>
+     *
+     * <p>这个先后顺序是整件事里最容易写反的一处，<b>而且写反了不会报错</b>，只是提示多一条。
+     * 留在调用方（{@code CraftResultMixin}）里两行代码的话，自检够不着 —— 那要真玩家。
+     * 固化成一个方法之后，「反了没有」就变成一条能断言的返回值。</p>
+     */
+    public LearnOutcome learnCapturingOthers(VoidWarehouseRecipes.Recipe recipe) {
+        if (recipe == null) {
+            return new LearnOutcome(LearnResult.DISABLED, List.of());
+        }
+        // ⚠️ 这两行的顺序就是全部要点：先取「已有」，再学。
+        List<VoidWarehouseRecipes.Recipe> othersBefore = this.recipesFor(recipe.output());
+        LearnResult result = this.learnWithResult(recipe);
+        return new LearnOutcome(result, othersBefore);
     }
 
     /** 配方本里现在有几条<b>能用的</b>（自检与界面提示用；读不出来的那种不算，见构造函数） */

@@ -3,9 +3,13 @@ package neko.voidwarehouse.mixin;
 import neko.voidwarehouse.VoidWarehouse;
 import neko.voidwarehouse.VoidWarehouseData;
 import neko.voidwarehouse.VoidWarehouseRecipeBook;
+import neko.voidwarehouse.VoidWarehouseRecipeNotice;
 import neko.voidwarehouse.VoidWarehouseRecipes;
+import neko.voidwarehouse.VoidWarehouseText;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.CraftingContainer;
 import net.minecraft.world.inventory.ResultSlot;
@@ -88,7 +92,23 @@ public abstract class CraftResultMixin {
             if (data == null) {
                 return;
             }
-            data.learn(recipe);
+            // ⚠️ 用 learnCapturingOthers 而不是自己写「先 recipesFor 再 learn」：
+            // 那个先后顺序写反了不会报错，只会让提示多列一条自己。固化进数据层之后
+            // 自检能直接断言「交出来的 othersBefore 里没有刚学的那条」。
+            VoidWarehouseData.LearnOutcome outcome = data.learnCapturingOthers(recipe);
+            // 提示在这里发，不塞进数据层：数据层的定位是纯状态，一旦它自己去
+            // sendSystemMessage 就绑死了「必须有真玩家」这个前提（自检跑不了、
+            // 打印机那种无人路径也没法复用）。同 PrinterRestockNetwork 的分层规矩。
+            // 整个方法体在 try/catch 里 —— 发消息炸了也不能让玩家合不成本。
+            if (player instanceof ServerPlayer serverPlayer) {
+                for (Component line : VoidWarehouseRecipeNotice.onCrafted(
+                        player.getUUID(), VoidWarehouseText.isEnglish(serverPlayer),
+                        outcome.result(), recipe, outcome.othersBefore(),
+                        data.recipeBookUsed(), VoidWarehouseRecipeBook.MAX_RECIPES,
+                        server.getTickCount())) {
+                    serverPlayer.sendSystemMessage(line);
+                }
+            }
         } catch (RuntimeException ignored) {
             // 见类注释「异常一律吞掉」：旁路记录失败绝不能影响合成本身
         }

@@ -136,9 +136,10 @@
 仓库里放 **1728 个潜影壳 + 1 个箱子**、0 个空盒，盒模式点壳那一格：拿到「1 个装着 1728 个壳的盒子」，把盒子送回仓库 → 变回 1728 个壳 + **1 个空盒**。净效果 = **1 个箱子（8 木板）换 1 个潜影盒**，可无限循环 —— 而原版要 2 壳 + 1 箱(In box mode, withdrawing shells or chests paid for the outer box out of the very stacks being taken, so one chest bought a whole shulker box over and over.)。
 
 - **根因是顺序**：`hasBoxMaterials` 在**取货之前**验（那 2 壳 + 1 箱那时还躺在仓库里），`consumeBoxMaterials` 在**取货之后**扣（壳已经跟着货一起被取空）。中间没有任何一步把「这批货马上就要走」算进材料账。菜单点格子那条更糟 —— 变异测试实测「盒子给了、货只扣了 2 个壳」（1728 → 1726）(The material check ran before the withdrawal and the deduction after it, so the goods could pay for their own box.)。
-- **改法**：新增 `VoidWarehouseShulker.isBoxPart()`（潜影壳 / 箱子），三处装盒判据都带上它 —— `fill` 的盒模式分支、`executeCore` 的 `noPacking`、菜单的 `withdrawShulkerBox`。**盒子材料永远不从「正要装进盒子的那批货」里出**，与「潜影盒不套盒」是同一类处理（`pack` 绕过了原版 `canFitInsideContainerItems`，凡是能当材料的东西都得自己挡）(The box's own materials may never come from the stacks being packed.)。
-- **代价**：盒模式下点壳 / 箱的格子改成按散货给（原来是「装 1728 个壳的一盒」，几乎没人真要那个）(Those two items now come out loose in box mode.).
-- **是不是本轮引入的**：不是。盒模式上线时这条路就在，本轮只是把它从「按数量取货输 1728」缩成一次点击。补的 15 条断言里，`E14/E15` 专门钉「按数量取货」那条老口子。
+- **改法是「预留」，不是「禁用」**：`VoidWarehouseShulker#isBoxPart` 标出壳 / 箱；`VoidWarehouseData` 新增 `materialStock` / `hasBoxMaterials(plan, leaving, count)` / `maxBoxesUpTo(limit, sample)` 与 `canMakeBoxes`（二分，判据对盒数单调不增）—— **材料账先把「马上要离库的那批货」刨掉，再看够不够**。三处取货口都换这套口径：`fill` 用带预留的盒数、`executeCore` 验三参版、菜单 `withdrawShulkerBox` 先把交付量收一点(The stack being packed is reserved out of the material account; the box is still given, but its cost must come from stock outside that batch.)。
+- **两种结果**：库存刚好只够一盒容量时（1728 壳 + 1 箱）**一盒都不给**并报「盒子材料不够」—— 盒子钱付不出，不该白送；库存宽裕时照给满盒，材料随货一起扣（20000 壳 + 100 箱 → 11 满盒，壳扣 19030、箱扣 11）。菜单点一格更细：1728 壳 + 1 箱 → 给一个装 **1726** 个壳的盒子，另扣 2 壳 + 1 箱，账是平的(At the boundary the box is refused; otherwise it is full and the materials are charged.)。
+- **中途改过一次方案**：第一版把这两样**一律挡在装盒之外**（点一下给散货）。玩家要求保留「一盒壳」的能力，于是改成现在的预留版 —— 三处 `noPacking` 判据撤回，换成材料账预留(The first fix simply refused to pack those items; the shipped fix keeps the box and reserves the materials.)。
+- **是不是本轮引入的**：不是。盒模式上线时这条路就在，本轮只是把它从「按数量取货输 1728」缩成一次点击。E 组 **18 条断言** + 变异实测（摘掉预留后 **10 条同时红**）钉住三处口径。
 
 #### 取货时不再把物品放进副手 / 盔甲槽
 
@@ -231,9 +232,10 @@
   - 🔴 **`B2 合成后配方本里没有它`** 是这一整轮的核心断言：改回「合成就记」立刻变红(B2 is the assertion that encodes the whole feature.)。
   - **payload 是从组件里抠出来喂回去的**：把聊天行里那三个按钮的 `ClickEvent.Custom` 摘下、原样交给 `handleClick` —— 客户端发出的就是这个 NBT，喂进去能走通才说明契约是通的(The payloads are harvested from the message component and fed back, exactly what a client sends.)。
   - **先在干净档上跑**：配方本在游戏里没有清空入口，第二次跑时那些「新配方」早就在本里了 ⇒ 提问分支根本不进 ⇒ B 组全红。所以跑之前把 `.dat` 挪走(`install_prompt_selfcheck.py` 负责)(The recipe book has no in-game reset, so the harness moves the save aside first.)。
-- 填满背包 **50 条断言 × 5 版本 = 250 条全绿**（`FillSelfCheck`）：容量算法 6、常规模式 8、盒模式 15、菜单入口 6、**盒子材料不与取货同源 15**(Fifty assertions per version, all green.)。
-- 🔴 **E 组（15 条）是照「变异必须变红」设计的**，而它的第一版**测不出东西**：那时仓库只放壳、不放箱子，旧写法会先在「盒子材料不够」退出，于是「没有盒子」这条断言**靠错误的理由通过**。补上箱子后才有判别力。同理，`fill` 自己的分支守在 `executeCore` 之前，两条守卫互相掩护 —— 只摘 `executeCore` 那一条时 `E3–E9` 仍然全绿，所以必须单独用反射直接打 `executeCore(allowBox=true)`（`E14/E15`），否则「按数量取货」这条最初的口子会无声复发(The mutation test first passed for the wrong reason; the group now isolates each of the three guards.).
-- **变异实测**：摘掉 `executeCore` 与菜单两处判据 → `E11–E15` 五条**同时红**（`E11 实测 1 盒`、`E13 箱子 1 → 0`、`E14 实测 1 盒`、`E15 箱子 1 → 0`），装回去 50/50 全绿(Removing the guards turns exactly those five red.).
+- 填满背包 **53 条断言 × 5 版本 = 265 条全绿**（`FillSelfCheck`）：容量算法 6、常规模式 8、盒模式 15、菜单入口 6、**盒子材料预留 18**(Fifty-three assertions per version, all green.)。
+- 🔴 **E 组（18 条）两个方向都咬**：不只要证「不会白送盒」，还要证「盒子照给」—— 库存刚好一盒容量时一盒都不给、库存宽裕时照给 11 满盒且材料随货扣干净、菜单那盒装 1726 个（为材料留 2 个壳）。只写「没有盒子」的话，把功能整个删掉也能全绿(The group pins both refusal and delivery, so deleting the feature cannot pass.)。
+- **第一版 E 组是假绿**：仓库只放壳、不放箱子 ⇒ 旧写法先在「盒子材料不够」退出 ⇒ 「没有盒子」靠错误的理由通过。补上箱子后才有判别力。另外 `fill` 自己的分支守在 `executeCore` 之前，两条守卫互相掩护 —— 所以必须单独用反射直接打 `executeCore(allowBox=true)`（`E17/E18`），否则「按数量取货」这条最初的口子会无声复发。
+- **变异实测**：把三处预留退回「不预留」→ `E3 / E5 / E10 / E11 / E13–E18` **10 条同时红**（`实测 1 盒`、`壳 0 / 箱 0`、`盒里装 1726 → -1`），装回去 53/53 全绿。26.3 与 1.21.11 各 53/53；`SystemTest` 209 条零回归(Removing the reservation turns exactly those ten red; both ends of the version range stay green.)。
   - 每条断言同时咬**三样**：背包里真有多少、仓库真扣了多少、有没有多出盒子。只咬一头的话扣账错了照样能绿(Each assertion pins inventory contents, warehouse deduction and box count at once.)。
   - 期望值全是**手算**的物理量：36 格 × 64 = 2304；圆石一盒 27×64 = 1728，36 格 × 1 盒 = 62208。不写「和实现算出来的一样」(All expectations are hand-computed physical quantities.)。
   - 🔴 **`getContainerSize()` 是 43 不是 36**：第一版容量算法直接沿用，实测算出 2752（= 43 × 64）—— 多出来的 7 格是副手、身体盔甲和鞍。这条错会同时污染「填满背包」和「按数量取货」，见上方 Fixed(`getContainerSize()` is 43; the first version computed 2752 instead of 2304.)。
@@ -253,18 +255,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 468,895 B | `89f004522191d544328daf878510f874` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 523,193 B | `ab8ed5b383e9fa3d7a3c0530d1051bf5` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 469,059 B | `846467905b1a13a4938fde7c4fbea119` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 523,425 B | `290d7374a9da5e69036b2aa34393c519` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 472,321 B | `a1bb2cc56a68f3335a0ac77f24251049` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 524,439 B | `fa9dee03ca72283449280de3594084f0` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 472,322 B | `3b28b5272c2275cd128fa9a07f1758a6` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 524,438 B | `891472c4da6f8942cf2330a9a9efd1fc` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 469,305 B | `f4be8a167fe9b66ecb1aabda616044f9` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 524,254 B | `4f4d3559ee53628eb57e019cc6d3159f` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 469,923 B | `971c7a7441252ed0835c1573ba73034a` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 525,005 B | `149dae46c13e44483de7319bc8a6d3d9` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 470,057 B | `efbf755eea47138eebdb912a197c334f` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 525,318 B | `1d87ab0b7d78064633292b29529b3983` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 473,319 B | `06268080f34ea25803f52cb76f15bdfd` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 526,328 B | `54937412a8b430c358f46a582d705a63` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 473,320 B | `ee4779fccd2c0aa1e7b0adbe0176f107` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 526,327 B | `795788fb80cebc6883f64053f1b247b5` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 470,301 B | `5b22c8c8c5e325372e85a5d428301874` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 526,164 B | `85f7f461726f4f5dab95867f1b685ce7` |
 
-> **本表已按 2026-11-12 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十一次原地替换**：规则集、配置键、规则名仍然一个字都没动（两条新功能都挂在既有规则下面，这次补的 `isBoxPart` 也只是判据）。配方本落盘格式、扣料算法、可兑表口径逐字节不变。主 jar 比上一版大 136 / 137 / 132 / 132 / 148 B，sources jar 大 885 / 761 / 764 / 764 / 778 B（一个 6 行的判据方法 + 注释）。md5 与之前十次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-12; the v1.0.17 assets were replaced in place an eleventh time, closing the box-material leak. Recipe storage format, cost deduction and the offer table are byte-identical.)。
+> **本表已按 2026-11-12 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十二次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版把「壳 / 箱不装盒」改成「壳 / 箱照常装盒、但材料账先预留离库的货」—— 盒子能给的时候仍然给，边界上一盒都不给。配方本落盘格式、扣料算法、可兑表口径逐字节不变。主 jar 比上一版大 1,028 / 998 / 998 / 998 / 996 B，sources jar 大 1,812 / 1,893 / 1,889 / 1,889 / 1,910 B（`Data` 新增四个方法 + 二分判据 + 注释）。md5 与之前十一次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-12; the v1.0.17 assets were replaced in place a twelfth time, switching from "refuse to pack" to "reserve the materials". Recipe storage format, cost deduction and the offer table are byte-identical.)。
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 

@@ -266,24 +266,24 @@ public final class FillSelfCheck {
         check("D6 空格子不会抛异常也不会给东西", !threw && count(COBBLE) == 0L);
     }
 
-    // ================================================================ E 盒子材料不与取货同源
+    // ================================================================ E 盒子材料要预留
 
     /**
-     * 目标格本身就是「装盒的材料」（潜影壳 / 箱子）时，盒模式<b>必须</b>按散货给。
+     * 目标格本身就是「装盒的材料」（潜影壳 / 箱子）时，<b>盒子照给，但材料只能从那批货之外出</b>。
      *
-     * <h2>这条洞的算术</h2>
-     * <p>材料账是「先验、取货、再扣」，所以「把整整一盒容量的壳一次性取走」会让仓库里那
-     * 2 个壳恰好归零，{@code consumeBoxMaterials} 再也扣不到（只留一条 WARN）。
-     * 仓库 1728 壳 + 1 箱 → 取壳 → 拿到「装着 1728 壳的盒子」→ 送回仓库变回 1728 壳 +
-     * <b>1 个空盒</b>。净效果 = <b>1 个箱子（8 木板）换 1 个潜影盒</b>，可无限循环。</p>
+     * <h2>两种结果都要钉</h2>
+     * <p>材料账是「先验材料 → 取货 → 再扣材料」，所以「把整整一盒容量的壳一次性取走」会让
+     * 仓库里那 2 个壳恰好归零，{@code consumeBoxMaterials} 再也扣不到（只留一条 WARN）。
+     * 旧账：1728 壳 + 1 箱 → 拿到「装着 1728 壳的盒子」→ 送回仓库变回 1728 壳 + 1 个空盒，
+     * 净效果 = <b>1 个箱子换 1 个潜影盒</b>，可无限循环。</p>
      *
-     * <p>所以这组断言的判据不是「代码有没有调 isBoxPart」，而是<b>背包里有没有出现盒子</b>、
-     * <b>仓库那个箱子有没有被动</b> —— 改回旧写法时这两条会同时红。</p>
+     * <p>现在的口径是<b>预留</b>：先扣掉「马上要离库的那批」，再看材料够不够。于是同一笔账
+     * 会有两种结果 —— 库存刚好够一盒时<b>一盒都不给</b>（付不出盒子钱）；库存宽裕时照给，
+     * 但壳 / 箱会跟货一起被扣干净。这组断言两个方向都咬。</p>
      */
     private static void groupE_boxPart() {
-        System.out.println("[E] 盒子材料（潜影壳 / 箱子）本身不参与装盒");
+        System.out.println("[E] 盒子材料（潜影壳 / 箱子）也要预留，不能拿自己的货付账");
 
-        // 直接判据：只有壳和箱算材料；圆石、潜影盒都不算
         check("E1 isBoxPart 认得潜影壳与箱子，不认圆石",
                 VoidWarehouseShulker.isBoxPart(new ItemStack(Items.SHULKER_SHELL))
                         && VoidWarehouseShulker.isBoxPart(new ItemStack(Items.CHEST))
@@ -291,37 +291,51 @@ public final class FillSelfCheck {
         check("E2 潜影盒自己不算「材料」（它走的是 isBoxable 那条）",
                 !VoidWarehouseShulker.isBoxPart(new ItemStack(Items.SHULKER_BOX)));
 
-        // 1728 个壳正好是一盒容量：取完仓库就空了，正是「材料与货共源」那一幕
+        // 边界：1728 个壳正好是一盒容量，取完仓库就空了 —— 付不出那 2 个壳，一盒都不给
         clearInventory();
         data.clearContent();
         stock(Items.SHULKER_SHELL, 1728);
         stock(Items.CHEST, 1);
         VoidWarehouseWithdraw.fill(bot, new ItemStack(Items.SHULKER_SHELL), true);
-        check("E3 盒模式点潜影壳：背包里一个盒子都没有（实测 " + countBoxes() + " 盒）",
+        check("E3 盒模式点壳、库存刚好一盒容量：一盒都不给（实测 " + countBoxes() + " 盒）",
                 countBoxes() == 0);
-        check("E4 给的是散壳 1728 个（实测 " + count(new ItemStack(Items.SHULKER_SHELL)) + "）",
-                count(new ItemStack(Items.SHULKER_SHELL)) == 1728L);
-        check("E5 仓库那个箱子一个没动（1 → " + data.amountOf(Items.CHEST) + "）",
-                data.amountOf(Items.CHEST).equals(BigInteger.ONE));
-        check("E6 仓库的壳被扣干净（1728 → " + data.amountOf(Items.SHULKER_SHELL) + "）",
-                data.amountOf(Items.SHULKER_SHELL).signum() == 0);
+        check("E4 也不许退化成散货（背包壳 "
+                        + count(new ItemStack(Items.SHULKER_SHELL)) + "）",
+                count(new ItemStack(Items.SHULKER_SHELL)) == 0L);
+        check("E5 仓库一件没动（壳 " + data.amountOf(Items.SHULKER_SHELL)
+                        + " / 箱 " + data.amountOf(Items.CHEST) + "）",
+                data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(1728))
+                        && data.amountOf(Items.CHEST).equals(BigInteger.ONE));
 
-        // 反过来：任务本身是箱子，同样不许给盒（否则 1728 箱 → 1 盒，那 1 个箱子扣不到）
+        // 宽裕：20000 壳 + 100 箱 → 11 盒（20000/1728 是瓶颈），材料照扣
+        clearInventory();
+        data.clearContent();
+        stock(Items.SHULKER_SHELL, 20_000);
+        stock(Items.CHEST, 100);
+        VoidWarehouseWithdraw.fill(bot, new ItemStack(Items.SHULKER_SHELL), true);
+        check("E6 库存宽裕时照给 11 盒（实测 " + countBoxes() + " 盒）", countBoxes() == 11);
+        check("E7 每盒都装满 1728 个壳（实测 " + boxItemCount(Items.SHULKER_SHELL) + "）",
+                boxItemCount(Items.SHULKER_SHELL) == CAP);
+        check("E8 壳扣 11×1728 + 22 = 19030（20000 → "
+                        + data.amountOf(Items.SHULKER_SHELL) + "）",
+                data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(970)));
+        check("E9 箱子扣 11（100 → " + data.amountOf(Items.CHEST) + "）",
+                data.amountOf(Items.CHEST).equals(BigInteger.valueOf(89)));
+
+        // 反过来：目标本身是箱子，同一边界
         clearInventory();
         data.clearContent();
         stock(Items.CHEST, 1728);
         stock(Items.SHULKER_SHELL, 2);
         VoidWarehouseWithdraw.fill(bot, new ItemStack(Items.CHEST), true);
-        check("E7 盒模式点箱子：同样不给盒（实测 " + countBoxes() + " 盒）", countBoxes() == 0);
-        check("E8 给的是散箱 1728 个（实测 " + count(new ItemStack(Items.CHEST)) + "）",
-                count(new ItemStack(Items.CHEST)) == 1728L);
-        check("E9 潜影壳没被白扣（2 → " + data.amountOf(Items.SHULKER_SHELL) + "）",
-                data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(2)));
+        check("E10 盒模式点箱、库存刚好一盒容量：一盒都不给（实测 " + countBoxes() + " 盒）",
+                countBoxes() == 0);
+        check("E11 仓库没动（箱 " + data.amountOf(Items.CHEST)
+                        + " / 壳 " + data.amountOf(Items.SHULKER_SHELL) + "）",
+                data.amountOf(Items.CHEST).equals(BigInteger.valueOf(1728))
+                        && data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(2)));
 
-        // 菜单入口（点格子取一盒）走的是另一个方法，判据必须同样带着 isBoxPart。
-        // 🔴 这一场必须**同时**放壳和箱子：只放壳时旧写法会先在「盒子材料不够」那里退出、
-        //    一个东西都不拿，于是「没有盒子」这条断言会**假绿**（它是因为别的原因通过的）。
-        //    也要按物品找格子 —— 仓库里有两格时第 0 格是哪一件不由我们决定。
+        // 菜单点一格（取一盒）：1728 壳 + 1 箱 → 盒子里 1726 个，另扣 2 壳 + 1 箱
         // 🔴 第三个参数在 26.x 是 ContainerInput、1.21.11 是 ClickType —— 模板不能写死版本名
         //    （安装脚本不做版本替换），所以反射从 clicked 自己的签名里取那个枚举的 PICKUP。
         clearInventory();
@@ -337,7 +351,7 @@ public final class FillSelfCheck {
                 break;
             }
         }
-        check("E10 菜单里能找到潜影壳那一格（slotId=" + shellSlot + "）", shellSlot >= 0);
+        check("E12 菜单里能找到潜影壳那一格（slotId=" + shellSlot + "）", shellSlot >= 0);
 
         Method clicked = null;
         for (Method m : VoidWarehouseMenu.class.getMethods()) {
@@ -356,28 +370,29 @@ public final class FillSelfCheck {
             }
         }
         if (clicked == null || pickup == null || shellSlot < 0) {
-            check("E11 菜单盒模式点壳格：也不给盒（找不到 clicked/PICKUP/格子）", false);
-            check("E12 菜单那条按散货给一组 64", false);
-            check("E13 菜单那条没动仓库的箱子", false);
+            check("E13 菜单盒模式点壳格：给 1 盒（找不到 clicked/PICKUP/格子）", false);
+            check("E14 盒里装 1726 个", false);
+            check("E15 仓库壳归零", false);
+            check("E16 仓库箱归零", false);
         } else {
             try {
                 clicked.invoke(menu, shellSlot, 0, pickup, bot);
             } catch (ReflectiveOperationException ex) {
                 System.out.println("[ENV] 菜单点击反射失败：" + ex);
             }
-            check("E11 菜单盒模式点壳格：也不给盒（实测 " + countBoxes() + " 盒）",
-                    countBoxes() == 0);
-            check("E12 菜单那条按散货给一组 64（1728 → "
+            check("E13 菜单给 1 盒（实测 " + countBoxes() + " 盒）", countBoxes() == 1);
+            check("E14 盒里装 1726 个壳（预留 2 个当材料，实测 "
+                            + boxItemCount(Items.SHULKER_SHELL) + "）",
+                    boxItemCount(Items.SHULKER_SHELL) == 1726L);
+            check("E15 仓库壳归零（1726 取走 + 2 材料，实测 "
                             + data.amountOf(Items.SHULKER_SHELL) + "）",
-                    data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(1728 - 64)));
-            check("E13 菜单那条没动仓库的箱子（1 → " + data.amountOf(Items.CHEST) + "）",
-                    data.amountOf(Items.CHEST).equals(BigInteger.ONE));
+                    data.amountOf(Items.SHULKER_SHELL).signum() == 0);
+            check("E16 仓库箱归零（材料，实测 " + data.amountOf(Items.CHEST) + "）",
+                    data.amountOf(Items.CHEST).signum() == 0);
         }
 
-        // 「按数量取货」（聊天栏输数字）走的是 executeCore(allowBox = true)，守卫在 executeCore 里。
-        // 🔴 这条必须单独钉：fill 自己的分支守在 executeCore 之前，两条守卫互相掩护 ——
-        //    只摘 executeCore 那一条时，前面 E3–E9 依然全绿（fill 早就拐去散货分支了），
-        //    于是「按数量取货 1728 个壳」这个最初能走通的口子会无声复发。
+        // 「按数量取货」（聊天栏输数字）走 executeCore(allowBox = true)，与 fill 是两个入口：
+        // 🔴 必须单独钉 —— 只摘一处判据时另一处会把它盖住，这个口子就无声复发。
         clearInventory();
         data.clearContent();
         stock(Items.SHULKER_SHELL, 1728);
@@ -392,10 +407,12 @@ public final class FillSelfCheck {
         } catch (ReflectiveOperationException ex) {
             System.out.println("[ENV] executeCore 反射失败：" + ex);
         }
-        check("E14 按数量取货（allowBox=true）也不给盒（" + (coreOk ? "" : "反射失败，")
+        check("E17 按数量取货也不白送盒（" + (coreOk ? "" : "反射失败，")
                         + "实测 " + countBoxes() + " 盒）", coreOk && countBoxes() == 0);
-        check("E15 它也没动仓库的箱子（1 → " + data.amountOf(Items.CHEST) + "）",
-                data.amountOf(Items.CHEST).equals(BigInteger.ONE));
+        check("E18 仓库也没动（壳 " + data.amountOf(Items.SHULKER_SHELL)
+                        + " / 箱 " + data.amountOf(Items.CHEST) + "）",
+                data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(1728))
+                        && data.amountOf(Items.CHEST).equals(BigInteger.ONE));
     }
 
     // ================================================================ 工具
@@ -457,6 +474,23 @@ public final class FillSelfCheck {
             }
         }
         return n;
+    }
+
+    /** 第一个盒子里面装了几个这种物品（没有盒子返回 -1） */
+    private static long boxItemCount(Item item) {
+        for (int i = 0; i < Inventory.INVENTORY_SIZE; i++) {
+            ItemStack slot = bot.getInventory().getItem(i);
+            if (!slot.isEmpty() && VoidWarehouseShulker.isShulkerBox(slot)) {
+                long total = 0;
+                for (ItemStack inside : VoidWarehouseShulker.contentsOf(slot)) {
+                    if (!inside.isEmpty() && inside.is(item)) {
+                        total += inside.getCount();
+                    }
+                }
+                return total;
+            }
+        }
+        return -1L;
     }
 
     /** 第一个盒子里面装了几个圆石（没有盒子返回 -1；用来验「满盒」） */

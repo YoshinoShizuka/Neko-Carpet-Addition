@@ -56,7 +56,7 @@
 
 配方本以前是**完全静默**的：学会了没有、撞没撞上限，玩家只能自己打开界面数格子猜。撞上限尤其糟 —— 合成照做，但那条配方没记，等哪天真要用了才发现界面里没有这一格，而那时已经想不起来是哪一次没记上(The recipe book used to be silent; a full book dropped recipes without a word.).
 
-- **记住一条就报一句**：`[虚空仓库] 已记住配方：2 桦木木板 → 4 木棍`。原料数量和产物数量都写 —— 同产物的不同配方产物数可能不一样，只写原料会让人误以为产物相同(One line per newly learned recipe, with both ingredient and output counts.)。
+- **记住一条就报一句，句尾直接给出用量**：`[虚空仓库] 已记住配方：2 桦木木板 → 4 木棍，目前配方数量：1,845 / 2,048。` 原料数量和产物数量都写 —— 同产物的不同配方产物数可能不一样，只写原料会让人误以为产物相同；用量接在同一行是因为「又记住一条」的下一句通常就是「还能记多少」，拆成两行等于每条提示都变两行(One line per newly learned recipe, with both counts and the book usage appended.)。
 - **同产物还有别的走法时一并列出**（这条是重点）：「2 橡木木板 → 木棍」与「2 桦木木板 → 木棍」在仓库里是**两条独立配方** —— 从合成格记录的是玩家实际放的那一种，不做 tag 归一 —— 所以新学桦木那条会接一行 `└ 还能这样合：2 橡木木板 → 4 木棍；…`。玩家由此知道这不是替换，是多了一条路(When the same output already has other recipes, they are listed on a second line.).
 - **最多列 5 条**，其余折成「另有 N 条」；按 `recipeId` 排序之后再截断 —— 顺序不稳的话同一件事两次提示会列出不同的配方，玩家会以为配方本自己变了(At most five are listed, sorted stably, with the rest collapsed into a count.)。
 - **快满预警**：用到上限的 90%（2048 条时是 1844 条）报一次，且一个玩家只报一次(A single near-full warning at 90%.)。
@@ -70,7 +70,7 @@
 - `learn` 的返回值从「只有 `boolean`」扩出一个 `LearnResult`（`LEARNED` / `DUPLICATE` / `FULL` / `DISABLED`），旧的 `learn` 保留原语义、既有调用点一行未改 —— 三种 `false` 挤在一个布尔里，调用方永远只能猜(The boolean `learn` is kept; a new `LearnResult` explains why a recipe was rejected.).
 - **物品名保持可翻译组件**发出，绝不在服务端 `getString()`：专用服务器没人注入语言表，那样中文客户端会看到英文名(Item names stay translatable components.).
 - **不新增规则、不升版本号**：提示跟着 `voidWarehouseCraft` 走 —— 规则开着才有配方本，才有提示，语义自洽(No new rule; the notices follow the existing craft rule.).
-- **验证**：`VoidWarehouseCraftSelfCheck` 新增 P 组 **45 条** + Q 组 **3 条**断言（166 → 214），五次变异全部咬住 —— 把「先取后学」调反、`LIST_LIMIT` 放到 100、`FULL_REPEAT_TICKS` 归零、把「已记过」改回静默、让 `canHasTranslations` 返回空表，分别打出 2 / 2 / 2 / 1 / 3 条红(48 new assertions; five mutations each broke exactly the intended checks.)。
+- **验证**：`VoidWarehouseCraftSelfCheck` 新增 P 组 **48 条** + Q 组 **3 条**断言（166 → 217），五次变异全部咬住 —— 把「先取后学」调反、`LIST_LIMIT` 放到 100、`FULL_REPEAT_TICKS` 归零、把「已记过」改回静默、让 `canHasTranslations` 返回空表，分别打出 2 / 2 / 2 / 1 / 3 条红(51 new assertions; five mutations each broke exactly the intended checks.)。
 - **Q 组的判据不是「界面上看得见」，而是「扩展自己交出了键」**：`canHasTranslations(lang)` 对 `zh_cn` / `en_us` 各查 6 条规则的 12 个键，缺一个就红。查「界面显示」是没有牙的 —— 那几个键历史上是被另一个扩展顺带注册的，界面照样显示(The assertion checks that the extension itself supplies the keys, not that the UI happens to render them.)。
 
 #### 每条规则各自把翻译契约实现完整：`canHasTranslations`
@@ -193,18 +193,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 453,296 B | `bdbe19b75b1f86f49d4f57219623226b` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 503,682 B | `a354b8d9cf1c8c6ce1fb7bdf785542f8` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 453,432 B | `17dbd718063e99232d5aec6313bbfb60` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 504,120 B | `c3716317ac7ac974f886ef95ad1c8c38` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 456,699 B | `20f08e651c7e17bae630e9bcaa662720` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 505,131 B | `447cd2913f260df17e5591b5d1ac6f69` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 456,700 B | `dc95277771b3e4cc3b89efde6f84bf9c` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 505,130 B | `f2e5199291d3d8e341b7701348d1f384` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 453,765 B | `36b62815c290d29db9cb3d72f95bf29c` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 504,899 B | `95bfdafb70f4975397f57b5c94d85bb9` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 453,408 B | `e5a62ad62cbdfab20c56e5fe8a06dc8d` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 503,912 B | `aadb4d808df8129da197858de36d4963` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 453,544 B | `1346faabf726316d60ee4b4563b88f97` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 504,351 B | `a26a4f436e5abf437056f1ea06c00d82` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 456,811 B | `2cdef7ff07105a57fca0bbb108483065` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 505,362 B | `5c41e91a8752f396a556bf31caa02345` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 456,812 B | `c158fa5583f07c5686d01282c4a10626` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 505,361 B | `377b6fd1a3856d36e19c24a82ceced1f` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 453,878 B | `2c1f2b95908adcf0288eb83f6531cd88` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 505,128 B | `bb9405a3f3238d4cae5d6de9c3455775` |
 
-> **本表已按 2026-11-12 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第八次原地替换**：规则集、配置键、规则名仍然一个字都没动 —— 这次改的全是「说话」：`DUPLICATE` 不再静默（每玩家一次）、`CraftResultMixin` 的 `catch` 补了节流告警、`VoidWarehouseExtension` 补上 `canHasTranslations`。配方本落盘格式、扣料算法、可兑表口径逐字节不变。主 jar 变大 800 / 800 / 800 / 800 / 764 B，sources jar 变大 1,774 / 1,757 / 1,757 / 1,757 / 1,768 B，就是这几处。md5 与前七次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-12; the v1.0.17 assets were replaced in place an eighth time, this round changing only the chat notices and the translation contract. Recipe storage format, cost deduction and the offer table are byte-identical.).
+> **本表已按 2026-11-12 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第九次原地替换**：规则集、配置键、规则名仍然一个字都没动 —— 这次只把用量接进「已记住」那一行（`已记住配方：2 云杉木板 → 4 木棍，目前配方数量：1,845 / 2,048。`）。配方本落盘格式、扣料算法、可兑表口径逐字节不变。主 jar 变大 112 / 112 / 112 / 112 / 113 B，sources jar 变大 230 / 231 / 231 / 231 / 229 B，就是这一处。md5 与前八次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-12; the v1.0.17 assets were replaced in place a ninth time, appending the book usage to the "learned" line. Recipe storage format, cost deduction and the offer table are byte-identical.).
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 
@@ -218,7 +218,7 @@
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
-- **v1.0.17 的产物换过八次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建。八次都**没改版本号**，只是字节变了。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place eight times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, and the duplicate-notice plus translation-contract fix — with the version number unchanged.)。
+- **v1.0.17 的产物换过九次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建。九次都**没改版本号**，只是字节变了。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place eight times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, and the book-usage suffix on the learned line — with the version number unchanged.)。
 
 * * *
 

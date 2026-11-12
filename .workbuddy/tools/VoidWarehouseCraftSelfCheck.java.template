@@ -4,6 +4,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.Item;
@@ -21,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * 【临时自检】「配方学习 + 配方扣料」这一整条新链路。验证完删掉。
@@ -55,6 +57,9 @@ import java.util.Set;
  *       （这条去重曾经因为拿两套 id 口径互相比，<b>一次都没生效过</b>）；两条路比例不同时
  *       留下的那格必须还是 9 合 1 的账；界面上的数字按量取货必须真给得出来；外加
  *       {@code CRAFT_DIRTY_LIMIT} 的两侧边界 —— 恰好等于阈值走增量、多一个走整批。</li>
+ *   <li><b>P 配方本聊天提示</b>：记住一条时说一声、同产物有别的配方时一并列出（最多 5 条
+ *       + 「另有 N 条」）、快满预警一次、满了边沿说一次之后 30 秒一次、重复与规则关一个字
+ *       都不说。重点在「同产物已有配方必须在 learn <b>之前</b>取」—— 反了就会把自己列进去。</li>
  * </ol>
  */
 public final class VoidWarehouseCraftSelfCheck {
@@ -150,6 +155,9 @@ public final class VoidWarehouseCraftSelfCheck {
                 groupN_dedupAndDirtyLimit(server);
                 break;
             case 15:
+                groupP_recipeNotice(server);
+                break;
+            case 16:
                 cleanup(server);
                 break;
             default:
@@ -1320,6 +1328,305 @@ public final class VoidWarehouseCraftSelfCheck {
         check("N5b 纠正回来的 piston 真的回到可兑表里", countSameItem(healed, POISON_ID) == 1);
         check("N5c 缓存 map 始终是同一个对象（否则 N4/N5 的读数无意义）", cache == craftOffersOf(data));
         VoidWarehouseSettings.voidWarehouseExchange = false;
+    }
+
+    // ================================================================ P 组
+
+    /** P 组用的产物：木棍。不在 9 合 1 表里，不会被 N 组那套去重搅进来 */
+    private static final String NOTICE_OUTPUT = "minecraft:stick";
+
+    /**
+     * <h2>P —— 配方本的三种聊天提示：记住了 / 快满了 / 已满</h2>
+     *
+     * <p>这三件事全在 {@link VoidWarehouseRecipeNotice#onCrafted} 里判，而它<b>返回要发的行</b>
+     * 而不是自己去发 —— 于是这里能直接断言「发了几行、写了什么」，不用造真玩家，
+     * 也不用拦 {@code sendSystemMessage}。这是把「怎么用结果」和「结果本身」分开的副产品，
+     * 不是为测试专门开的洞。</p>
+     *
+     * <p>用量与上限是<b>入参</b>而不是从 data 里读，所以「1843 条不吭声 / 1844 条预警 /
+     * 满了边沿说一次、之后 30 秒一次」这些边界可以零成本造 —— 真把配方本填到 2048 条
+     * 要几十秒，而且每学一条都触发一次全量重建。</p>
+     *
+     * <p><b>P2 是这组里最要紧的</b>：同产物已有配方必须在 {@code learn} <b>之前</b>取。
+     * 两种顺序都跑一遍，断言「先取」那份不含自己、「后取」那份含自己 ——
+     * 后者就是提示里出现「木棍还能这样合：…木棍」这种自指的病。</p>
+     *
+     * <p>⚠️ 配方本落在存档里、<b>跨进程持久化</b>，所以凡是要读真配方本的地方一律用
+     * 「相对变化」断言（after == before + 1、contains），不写绝对条数；新配方也用探测法
+     * 现找一条没学过的，不然第二次跑就全是 DUPLICATE。</p>
+     */
+    private static void groupP_recipeNotice(MinecraftServer server) {
+        System.out.println("[P] 配方本聊天提示：记住 / 快满 / 已满");
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+
+        // 三条同产物、不同原料的木棍配方。用不同木板而不是同一种，recipeId 才各不相同
+        // （同一种学两次会被 recipeTexts 去重掉，拿不到「多条同产物配方」这个场景）。
+        VoidWarehouseRecipes.Recipe a = recipe(NOTICE_OUTPUT, 4, part("minecraft:oak_planks", 2));
+        VoidWarehouseRecipes.Recipe b = recipe(NOTICE_OUTPUT, 4, part("minecraft:birch_planks", 2));
+        VoidWarehouseRecipes.Recipe c = recipe(NOTICE_OUTPUT, 4, part("minecraft:spruce_planks", 3));
+        data.learn(a);
+        data.learn(b);
+        data.learn(c);
+
+        // ---- P0/P1 recipesFor：取得到、排序稳 ----
+        List<VoidWarehouseRecipes.Recipe> before = data.recipesFor(NOTICE_OUTPUT);
+        check("P0 recipesFor 含刚学的那三条（实测 " + before.size() + " 条）",
+                before.size() >= 3 && containsRecipe(before, a.recipeId())
+                        && containsRecipe(before, b.recipeId())
+                        && containsRecipe(before, c.recipeId()));
+        boolean ordered = true;
+        for (int i = 1; i < before.size(); i++) {
+            ordered &= before.get(i - 1).recipeId().compareTo(before.get(i).recipeId()) < 0;
+        }
+        check("P1 recipesFor 按 recipeId 升序（提示只列前几条，顺序不稳会让玩家以为配方本自己变了）",
+                ordered);
+        check("P1b 连续两次取，结果逐项相同", sameRecipeIds(before, data.recipesFor(NOTICE_OUTPUT)));
+
+        // ---- P2 先取再学：新配方不许出现在「已有」里 ----
+        // 找一条本子里还没有的配方。⚠️ 这里只能用 recipesFor 去「看」，**不能**用
+        // learnWithResult 去试探 —— 试探本身就是学入，会把快照污染掉（第一版就这么错的：
+        // 循环里 probe 一学进去，后面的 snapshot 就已经含它自己，P2a/P2b 当场双红）。
+        VoidWarehouseRecipes.Recipe fresh = null;
+        for (int n = 7; n <= 20 && fresh == null; n++) {
+            // 7 个木板做木棍原版没有，但 Recipe 只是仓库自己的记录，不要求是原版真配方。
+            // 从 7 试到 20 是为了跨轮稳定：跑过几遍之后前面几个都被学过了。
+            VoidWarehouseRecipes.Recipe probe =
+                    recipe(NOTICE_OUTPUT, 4, part("minecraft:oak_planks", n));
+            if (!containsRecipe(data.recipesFor(NOTICE_OUTPUT), probe.recipeId())) {
+                fresh = probe;
+            }
+        }
+        check("P2 前置：找到一条本轮还没学过的配方（否则下面几条空转）", fresh != null);
+        if (fresh == null) {
+            VoidWarehouseSettings.voidWarehouseExchange = false;
+            return;
+        }
+        List<VoidWarehouseRecipes.Recipe> snapshot = data.recipesFor(NOTICE_OUTPUT);
+        int beforeSize = snapshot.size();
+        check("P2a 学之前取的那份里没有它自己", !containsRecipe(snapshot, fresh.recipeId()));
+        boolean learnedNow = data.learnWithResult(fresh) == VoidWarehouseData.LearnResult.LEARNED;
+        check("P2b learnWithResult 对这条新配方返回 LEARNED", learnedNow);
+        check("P2c 学之后份数 +1（实测 " + beforeSize + " → "
+                        + data.recipesFor(NOTICE_OUTPUT).size() + "）",
+                data.recipesFor(NOTICE_OUTPUT).size() == beforeSize + 1);
+        check("P2d 学之后再取就会把它列进「已有」—— 这就是快照必须抢在 learn 之前的理由",
+                containsRecipe(data.recipesFor(NOTICE_OUTPUT), fresh.recipeId()));
+
+        // ---- P3 四种结局 ----
+        check("P3 重复学同一条返回 DUPLICATE",
+                data.learnWithResult(fresh) == VoidWarehouseData.LearnResult.DUPLICATE);
+        VoidWarehouseSettings.voidWarehouseCraft = false;
+        check("P3b 配方扣料规则关掉后返回 DISABLED",
+                data.learnWithResult(recipe("minecraft:torch", 4, part("minecraft:stick", 1)))
+                        == VoidWarehouseData.LearnResult.DISABLED);
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+
+        // ---- P4 文案：一行「记住」+ 一行「还能这样合」（旧配方列表是入参，完全可控）----
+        int max = VoidWarehouseRecipeBook.MAX_RECIPES;
+        List<VoidWarehouseRecipes.Recipe> threeOld = List.of(a, b, c);
+        List<Component> lines = VoidWarehouseRecipeNotice.onCrafted(
+                UUID.randomUUID(), false, VoidWarehouseData.LearnResult.LEARNED,
+                fresh, threeOld, 10, max, 1_000L);
+        check("P4 学会一条且同产物有旧配方 → 2 行（实测 " + lines.size() + "）", lines.size() == 2);
+        check("P4b 第一行是「已记住配方：…」", lines.size() == 2
+                && lines.get(0).getString().contains("已记住配方："));
+        check("P4c 第二行以「└ 」开头且写「还能这样合：」", lines.size() == 2
+                && lines.get(1).getString().startsWith("└ ")
+                && lines.get(1).getString().contains("还能这样合："));
+        check("P4d 三条旧配方全列出来（箭头个数 == 3，实测 "
+                        + (lines.size() == 2 ? countOccurrences(lines.get(1).getString(), "→") : -1) + "）",
+                lines.size() == 2 && countOccurrences(lines.get(1).getString(), "→") == 3);
+        check("P4e 新配方自己的形状出现在第一行（含箭头与产物数量）",
+                lines.size() == 2 && lines.get(0).getString().contains("→")
+                        && lines.get(0).getString().contains("4"));
+
+        // ---- P5 没有旧配方 → 只有一行 ----
+        List<Component> solo = VoidWarehouseRecipeNotice.onCrafted(
+                UUID.randomUUID(), false, VoidWarehouseData.LearnResult.LEARNED,
+                fresh, List.of(), 10, max, 1_000L);
+        check("P5 同产物没有旧配方 → 只发 1 行（实测 " + solo.size() + "）", solo.size() == 1);
+
+        // ---- P6 截断：最多 5 条 + 「另有 N 条」 ----
+        List<VoidWarehouseRecipes.Recipe> sixOld = new ArrayList<>(6);
+        sixOld.add(recipe(NOTICE_OUTPUT, 4, part("minecraft:acacia_planks", 2)));
+        sixOld.add(recipe(NOTICE_OUTPUT, 4, part("minecraft:dark_oak_planks", 2)));
+        sixOld.add(recipe(NOTICE_OUTPUT, 4, part("minecraft:mangrove_planks", 2)));
+        sixOld.add(recipe(NOTICE_OUTPUT, 4, part("minecraft:cherry_planks", 2)));
+        sixOld.add(recipe(NOTICE_OUTPUT, 4, part("minecraft:bamboo_planks", 2)));
+        sixOld.add(recipe(NOTICE_OUTPUT, 4, part("minecraft:crimson_planks", 2)));
+        List<Component> cut = VoidWarehouseRecipeNotice.onCrafted(
+                UUID.randomUUID(), false, VoidWarehouseData.LearnResult.LEARNED,
+                fresh, sixOld, 10, max, 1_000L);
+        check("P6 6 条旧配方只列 5 条（实测箭头 "
+                        + (cut.size() == 2 ? countOccurrences(cut.get(1).getString(), "→") : -1) + " 个）",
+                cut.size() == 2 && countOccurrences(cut.get(1).getString(), "→") == 5);
+        check("P6b 被截掉的写「另有 1 条」", cut.size() == 2
+                && cut.get(1).getString().contains("另有 1 条"));
+        List<Component> exact = VoidWarehouseRecipeNotice.onCrafted(
+                UUID.randomUUID(), false, VoidWarehouseData.LearnResult.LEARNED,
+                fresh, sixOld.subList(0, 5), 10, max, 1_000L);
+        check("P6c 恰好 5 条时不画蛇添足写「另有」", exact.size() == 2
+                && !exact.get(1).getString().contains("另有"));
+
+        // ---- P7 重复 / 规则关：一个字都不说 ----
+        check("P7 DUPLICATE 不发任何行", VoidWarehouseRecipeNotice.onCrafted(
+                UUID.randomUUID(), false, VoidWarehouseData.LearnResult.DUPLICATE,
+                fresh, sixOld, 10, max, 1_000L).isEmpty());
+        check("P7b DISABLED 不发任何行", VoidWarehouseRecipeNotice.onCrafted(
+                UUID.randomUUID(), false, VoidWarehouseData.LearnResult.DISABLED,
+                fresh, sixOld, 10, max, 1_000L).isEmpty());
+
+        // ---- P8 快满阈值：差一条不吭声、正好到就预警 ----
+        int threshold = (int) (((long) max * VoidWarehouseRecipeNotice.NEAR_FULL_PERCENT + 99) / 100);
+        check("P8 快满阈值 = ceil(" + max + " × " + VoidWarehouseRecipeNotice.NEAR_FULL_PERCENT
+                + "%) = " + threshold, threshold == 1844);
+        check("P8b 差一条不预警（" + (threshold - 1) + "）",
+                !VoidWarehouseRecipeNotice.isNearFull(threshold - 1, max));
+        check("P8c 正好到阈值就预警（" + threshold + "）",
+                VoidWarehouseRecipeNotice.isNearFull(threshold, max));
+
+        // ---- P9 快满只报一次 ----
+        UUID nearWho = UUID.randomUUID();
+        List<Component> near1 = VoidWarehouseRecipeNotice.onCrafted(
+                nearWho, false, VoidWarehouseData.LearnResult.LEARNED,
+                fresh, List.of(), threshold, max, 2_000L);
+        check("P9 刚到阈值：「记住」1 行 +「快满」2 行 = 3 行（实测 " + near1.size() + "）",
+                near1.size() == 3);
+        check("P9b 快满那行写「快满了」并带「已用 / 上限」（千分位）", near1.size() == 3
+                && near1.get(1).getString().contains("快满了")
+                && near1.get(1).getString().contains("1,844 / 2,048"));
+        List<Component> near2 = VoidWarehouseRecipeNotice.onCrafted(
+                nearWho, false, VoidWarehouseData.LearnResult.LEARNED,
+                fresh, List.of(), threshold + 1, max, 2_100L);
+        check("P9c 同一玩家再学一条不再重复报快满（只剩 1 行，实测 " + near2.size() + "）",
+                near2.size() == 1);
+
+        // ---- P10/P11 满本：边沿说一次，之后 30 秒一次 ----
+        UUID fullWho = UUID.randomUUID();
+        List<Component> full1 = VoidWarehouseRecipeNotice.onCrafted(
+                fullWho, false, VoidWarehouseData.LearnResult.FULL,
+                fresh, List.of(), max, max, 3_000L);
+        check("P10 满本第一次 → 2 行（实测 " + full1.size() + "）", full1.size() == 2);
+        check("P10b 文案说清「已满」和「没记住」", full1.size() == 2
+                && full1.get(0).getString().contains("已满")
+                && full1.get(0).getString().contains("没记住"));
+        List<Component> full2 = VoidWarehouseRecipeNotice.onCrafted(
+                fullWho, false, VoidWarehouseData.LearnResult.FULL,
+                fresh, List.of(), max, max, 3_100L);
+        check("P11 30 秒内再合成不刷屏（0 行，实测 " + full2.size() + "）", full2.isEmpty());
+        List<Component> full3 = VoidWarehouseRecipeNotice.onCrafted(
+                fullWho, false, VoidWarehouseData.LearnResult.FULL,
+                fresh, List.of(), max, max,
+                3_000L + VoidWarehouseRecipeNotice.FULL_REPEAT_TICKS);
+        check("P11b 过了 30 秒再提醒一次（2 行，实测 " + full3.size() + "）", full3.size() == 2);
+
+        // ---- P12 用量掉回去之后，边沿标记要能复位 ----
+        List<Component> back = VoidWarehouseRecipeNotice.onCrafted(
+                fullWho, false, VoidWarehouseData.LearnResult.LEARNED,
+                fresh, List.of(), 10, max, 4_000L);
+        check("P12 用量掉回阈值以下 → 只发「记住」那行（实测 " + back.size() + "）", back.size() == 1);
+        List<Component> again = VoidWarehouseRecipeNotice.onCrafted(
+                fullWho, false, VoidWarehouseData.LearnResult.FULL,
+                fresh, List.of(), max, max, 4_100L);
+        check("P12b 再次变满时重新提示（否则「提示过」这个标记会一辈子卡住，实测 "
+                + again.size() + " 行）", again.size() == 2);
+
+        // ---- P13 双语：英文客户端拿英文，且不混中文 ----
+        List<Component> en1 = VoidWarehouseRecipeNotice.onCrafted(
+                UUID.randomUUID(), true, VoidWarehouseData.LearnResult.LEARNED,
+                fresh, threeOld, 10, max, 5_000L);
+        check("P13 英文客户端走英文文案", en1.size() == 2
+                && en1.get(0).getString().contains("Learned recipe:"));
+        check("P13b 英文版不混中文", en1.size() == 2
+                && !en1.get(0).getString().contains("已记住")
+                && !en1.get(1).getString().contains("还能这样合"));
+
+        // ---- P14 一条配方的渲染形状 ----
+        String desc = VoidWarehouseRecipeNotice.describe(fresh, false).getString();
+        String descEn = VoidWarehouseRecipeNotice.describe(fresh, true).getString();
+        // 探到的那条配方原料数量是循环变量决定的（7~20 里的第一个空位），
+        // 所以这里不能写死「7」，要按 fresh 自己的数字验。
+        int partCount = fresh.parts().get(0).count();
+        System.out.println("      P 渲染样例：" + desc + "   |   " + descEn);
+        check("P14 渲染成「原料数量 原料名 → 产物数量 产物名」（实测 " + desc + "）",
+                desc.contains("→") && desc.contains(String.valueOf(partCount))
+                        && desc.contains(String.valueOf(fresh.outputCount())));
+        check("P14b 英文版同一形状、且不带中文箭头以外的中文",
+                descEn.contains("→") && !descEn.contains("个"));
+
+        // ---- P15 「学之前」的快照由数据层固化，别在调用方手写两行 ----
+        // 产品侧唯一入口是 learnCapturingOthers：它先 recipesFor 再 learn，
+        // 把最容易写反的那个顺序收进方法体。反了的话 othersBefore 里会有刚学的那条。
+        VoidWarehouseRecipes.Recipe probe2 = null;
+        for (int n = 21; n <= 30 && probe2 == null; n++) {
+            VoidWarehouseRecipes.Recipe probe =
+                    recipe(NOTICE_OUTPUT, 4, part("minecraft:oak_planks", n));
+            if (!containsRecipe(data.recipesFor(NOTICE_OUTPUT), probe.recipeId())) {
+                probe2 = probe;
+            }
+        }
+        check("P15 前置：再造一条本轮没学过的配方", probe2 != null);
+        if (probe2 != null) {
+            int pre = data.recipesFor(NOTICE_OUTPUT).size();
+            VoidWarehouseData.LearnOutcome outcome = data.learnCapturingOthers(probe2);
+            check("P15a learnCapturingOthers 的结局是 LEARNED",
+                    outcome.result() == VoidWarehouseData.LearnResult.LEARNED);
+            check("P15b 交出来的快照是「学之前」那一份（" + pre + " 条，实测 "
+                            + outcome.othersBefore().size() + " 条）",
+                    outcome.othersBefore().size() == pre);
+            check("P15c 快照里没有刚学进去的这条（顺序写反的话它就会在里面）",
+                    !containsRecipe(outcome.othersBefore(), probe2.recipeId()));
+        }
+
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+    }
+
+    /** 两份配方列表的 recipeId 序列是否逐项相同 */
+    private static boolean sameRecipeIds(List<VoidWarehouseRecipes.Recipe> a,
+                                         List<VoidWarehouseRecipes.Recipe> b) {
+        if (a == null || b == null || a.size() != b.size()) {
+            return false;
+        }
+        for (int i = 0; i < a.size(); i++) {
+            if (!a.get(i).recipeId().equals(b.get(i).recipeId())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 列表里有没有这条 recipeId */
+    private static boolean containsRecipe(List<VoidWarehouseRecipes.Recipe> list, String recipeId) {
+        if (list == null || recipeId == null) {
+            return false;
+        }
+        for (VoidWarehouseRecipes.Recipe recipe : list) {
+            if (recipeId.equals(recipe.recipeId())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 子串出现次数（用来数提示里列了几条配方、有几个箭头） */
+    private static int countOccurrences(String text, String needle) {
+        if (text == null || needle == null || needle.isEmpty()) {
+            return 0;
+        }
+        int n = 0;
+        int from = 0;
+        while (true) {
+            int at = text.indexOf(needle, from);
+            if (at < 0) {
+                return n;
+            }
+            n++;
+            from = at + needle.length();
+        }
     }
 
     /** 反射取 {@code VoidWarehouseData} 的私有字段（自检与产品代码同一个 classloader，setAccessible 可用） */

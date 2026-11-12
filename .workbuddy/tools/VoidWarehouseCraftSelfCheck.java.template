@@ -1443,6 +1443,14 @@ public final class VoidWarehouseCraftSelfCheck {
         check("P4e 新配方自己的形状出现在第一行（含箭头与产物数量）",
                 lines.size() == 2 && lines.get(0).getString().contains("→")
                         && lines.get(0).getString().contains("4"));
+        // 用量就接在「已记住」这一行尾部：玩家看到「记住了」的下一句通常是「还能记多少」。
+        // 判据写「10 / 2,048」而不是只写「2,048」—— 只认后者的话，写成「0 / 2,048」也会绿。
+        String learnedZh = lines.isEmpty() ? "" : lines.get(0).getString();
+        check("P4f 第一行接上「目前配方数量：10 / 2,048」（实测 " + learnedZh + "）",
+                learnedZh.contains("目前配方数量：10 / 2,048")
+                        && learnedZh.endsWith("。"));
+        check("P4g 那串数字只在末尾出现一次（别把用量重复写两遍）",
+                countOccurrences(learnedZh, "2,048") == 1);
 
         // ---- P5 没有旧配方 → 只有一行 ----
         List<Component> solo = VoidWarehouseRecipeNotice.onCrafted(
@@ -1562,6 +1570,10 @@ public final class VoidWarehouseCraftSelfCheck {
         check("P13b 英文版不混中文", en1.size() == 2
                 && !en1.get(0).getString().contains("已记住")
                 && !en1.get(1).getString().contains("还能这样合"));
+        check("P13c 英文版的用量写 recipe book: 10 / 2,048（实测 "
+                        + (en1.isEmpty() ? "" : en1.get(0).getString()) + "）",
+                !en1.isEmpty() && en1.get(0).getString().contains("recipe book: 10 / 2,048")
+                        && en1.get(0).getString().endsWith("."));
 
         // ---- P14 一条配方的渲染形状 ----
         String desc = VoidWarehouseRecipeNotice.describe(fresh, false).getString();

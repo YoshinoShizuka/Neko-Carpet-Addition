@@ -142,7 +142,7 @@ public final class VoidWarehouseRecipeNotice {
 
         List<Component> out = new ArrayList<>(3);
         if (result == VoidWarehouseData.LearnResult.LEARNED) {
-            out.add(learnedLine(en, recipe));
+            out.add(learnedLine(en, recipe, used, max));
             Component others = othersLine(en, othersBefore);
             if (others != null) {
                 out.add(others);
@@ -180,10 +180,21 @@ public final class VoidWarehouseRecipeNotice {
 
     // ------------------------------------------------------------------ 文案
 
-    /** 「已记住配方：2 桦木木板 → 4 木棍」 */
-    private static Component learnedLine(boolean en, VoidWarehouseRecipes.Recipe recipe) {
+    /**
+     * 「已记住配方：2 桦木木板 → 4 木棍，目前配方数量：1,845 / 2,048。」
+     *
+     * <p>把用量直接接在这一行，是因为「又记住一条」和「还剩多少名额」是同一个念头 ——
+     * 玩家看到「记住了」的下一句往往就是「那还能记多少」。分开成两行会让每条提示都变两行，
+     * 而这里只是一个数字，接在句尾刚好。快满预警仍然独立一行（那是<b>警告</b>，不是附注）。</p>
+     */
+    private static Component learnedLine(boolean en, VoidWarehouseRecipes.Recipe recipe,
+                                         int used, int max) {
         MutableComponent body = VoidWarehouseText.body(en ? "Learned recipe: " : "已记住配方：");
         body.append(describe(recipe, en));
+        body.append(VoidWarehouseText.body(en ? ", recipe book: " : "，目前配方数量："));
+        body.append(VoidWarehouseText.key(VoidWarehouseText.count(used)
+                + " / " + VoidWarehouseText.count(max)));
+        body.append(VoidWarehouseText.body(en ? "." : "。"));
         return VoidWarehouseText.info(en, body);
     }
 

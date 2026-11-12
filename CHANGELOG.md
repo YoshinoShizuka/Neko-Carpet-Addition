@@ -62,7 +62,7 @@
 - **快满预警**：用到上限的 90%（2048 条时是 1844 条）报一次，且一个玩家只报一次(A single near-full warning at 90%.)。
 - **满了**：边沿必报一次，之后每 30 秒最多一次 —— 满本之后玩家每合成一次都会撞上，不节流就是每合一次刷两行(Edge-triggered once, then at most every 30 seconds.)。
 - **不说的情况也写死**：重复合成同一件东西（合成本来就是重复动作）、规则没开（玩家压根没打算用这个功能）—— 一个字都不发(Duplicate and disabled stay silent.)。
-- 🔴 **「同产物已有配方」必须在 `learn` 之前取**：learn 之后新配方已经进了本子，再取就会把它自己列进「已有」，提示里出现「木棍还能这样合：…木棍」这种自己配自己的句子。这个顺序写反了**不会报错**，只是提示多一条 —— 所以它被固化进 `VoidWarehouseData#learnCapturingOthers`，由自检直接断言交出来的快照里没有刚学的那条(The pre-learn snapshot is captured inside the data layer, which makes the ordering testable.).
+- 🔴 **「同产物已有配方」必须在 `learn` 之前取**：learn 之后新配方已经进了本子，再取就会把它自己列进「已有」，提示里出现「还能这样合：2 桦木木板 → 4 木棍」—— 刚学的那条自己列自己。这个顺序写反了**不会报错**，只是提示多一条 —— 所以它被固化进 `VoidWarehouseData#learnCapturingOthers`，由自检直接断言交出来的快照里没有刚学的那条(The pre-learn snapshot is captured inside the data layer, which makes the ordering testable.).
 - `learn` 的返回值从「只有 `boolean`」扩出一个 `LearnResult`（`LEARNED` / `DUPLICATE` / `FULL` / `DISABLED`），旧的 `learn` 保留原语义、既有调用点一行未改 —— 三种 `false` 挤在一个布尔里，调用方永远只能猜(The boolean `learn` is kept; a new `LearnResult` explains why a recipe was rejected.).
 - **物品名保持可翻译组件**发出，绝不在服务端 `getString()`：专用服务器没人注入语言表，那样中文客户端会看到英文名(Item names stay translatable components.).
 - **不新增规则、不升版本号**：提示跟着 `voidWarehouseCraft` 走 —— 规则开着才有配方本，才有提示，语义自洽(No new rule; the notices follow the existing craft rule.).

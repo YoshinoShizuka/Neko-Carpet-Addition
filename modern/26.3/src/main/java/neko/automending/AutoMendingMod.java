@@ -3,6 +3,8 @@ package neko.automending;
 import neko.NekoConstants;
 import neko.cooking.CookingExtension;
 import neko.voidwarehouse.VoidWarehouseExtension;
+import neko.voidwarehouse.VoidWarehouseRecipePrompt;
+import neko.voidwarehouse.fill.FillNetwork;
 import neko.voidwarehouse.restock.PrinterQueryNetwork;
 import neko.voidwarehouse.restock.PrinterRestockNetwork;
 import neko.voidwarehouse.restock.PrinterPlaceNetwork;
@@ -39,5 +41,11 @@ public class AutoMendingMod implements ModInitializer {
         // ④ 搜索（只读 + 视图过滤）：客户端搜索框的目录下发与匹配集合回传。
         // 三条独立通道（hello / catalog / apply），限流各一张表；纯原版客户端不发不收，零影响。
         SearchNetwork.init();
+        // ⑤ 一键填满背包（Ctrl+Alt+左键）：客户端识别手势、服务端只收一个 slotId。
+        // 有副作用（扣仓库、动背包），50ms 限流；纯原版客户端永远不发这条包。
+        FillNetwork.init();
+        // ⑥ 配方确认提示的「本局开关」要跟着登录走：不接下线钩子，`[总是记住]` 就变成
+        //    「永远不再问」，而玩家没有任何入口能改回来（没有指令、没有按钮）。
+        VoidWarehouseRecipePrompt.init();
     }
 }

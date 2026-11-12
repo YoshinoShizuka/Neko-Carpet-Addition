@@ -474,6 +474,36 @@ public class VoidWarehouseMenu extends ChestMenu {
     }
 
     /**
+     * Ctrl + Alt + 左键（由客户端识别后走 {@code fill_request} 通道发来）：把这一格的物品
+     * <b>取出到背包放不下为止</b>。逻辑本身在 {@code VoidWarehouseWithdraw#fill}，
+     * 这里只负责三件事：<b>校验 slotId</b>、<b>解析这一格是什么</b>、<b>取完刷新给所有人</b>。
+     *
+     * <h2>为什么校验放在菜单里</h2>
+     * <p>{@code slotId} 是客户端说的，<b>必须当成不可信输入</b>。而「哪些 slotId 是仓库内容格」
+     * 只有菜单自己知道（导航行从 {@code VoidWarehouseData#NAV_START} 开始、
+     * 后面还有玩家背包格）。放在这里就与 {@code clicked} 用<b>同一套边界</b>，
+     * 不会出现「点击能走的格子，这条通道能走到别的格子」这种错位。</p>
+     *
+     * <h2>为什么取完要 {@code syncAllViewers}</h2>
+     * <p>仓库的每个查看者都共享同一份库存 —— 一个人取走 1728 个圆石，
+     * 别人界面上的数量必须立刻跟着变。这与翻页/排序/取货是同一条收尾规矩。</p>
+     */
+    public void fillToBackpack(ServerPlayer player, int slotId) {
+        // ① 只认第 1..5 行的内容格。负值、导航行、玩家背包格一律不动。
+        if (slotId < 0 || slotId >= VoidWarehouseData.NAV_START) {
+            return;
+        }
+        // ② 这一格现在到底是什么，只解析一次（数量排序 / 可兑条目都会让它随时间变）
+        VoidWarehouseData.DisplaySlot target = this.slotAt(slotId);
+        if (target.isEmpty()) {
+            return;
+        }
+        // ③ 模式由<b>服务端</b>自己读（跟着这个玩家的界面走），不听客户端的
+        VoidWarehouseWithdraw.fill(player, target.template(), this.pageContainer.shulkerMode());
+        this.syncAllViewers(player);
+    }
+
+    /**
      * 翻页。页码是<b>每个玩家各自</b>的（存在 {@link VoidWarehouseViews} 里，关界面也保留），
      * 所以只重发自己这一个菜单。
      *

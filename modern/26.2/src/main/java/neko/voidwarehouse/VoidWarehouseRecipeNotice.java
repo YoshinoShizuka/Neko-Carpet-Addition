@@ -178,6 +178,69 @@ public final class VoidWarehouseRecipeNotice {
         return used > 0 && max > 0 && (long) used * 100L >= (long) max * NEAR_FULL_PERCENT;
     }
 
+    // ------------------------------------------------------------------ 提问与答复
+
+    /**
+     * 「要记住这条配方吗？」+ 三个可点击按钮。
+     *
+     * <p>这一行替代了原来「合成了就记」的默认行为，所以措辞必须<b>把后果说全</b>：
+     * 不点就不记。含糊其辞会让玩家以为「问一句只是通知」，等他发现配方本没涨时
+     * 已经是几天之后的事了（1.0.17 那次「什么都没说 = 功能没生效」的教训反过来用）。</p>
+     *
+     * <p>三个按钮的语义差别只有<b>作用范围</b>：{@code [记住]} 管这一条，
+     * {@code [总是记住]} 顺手把本局的询问开关关掉。悬停里各写一句，免得玩家靠猜。</p>
+     */
+    public static Component askLine(boolean en, VoidWarehouseRecipes.Recipe recipe, String token) {
+        MutableComponent body = VoidWarehouseText.body(en
+                ? "Remember this recipe? "
+                : "要记住这条配方吗？");
+        body.append(describe(recipe, en));
+        body.append(VoidWarehouseText.body(en ? "   " : "   "));
+        body.append(VoidWarehouseText.button(
+                en ? "Remember" : "记住", VoidWarehouseText.ACTION,
+                VoidWarehouseRecipePrompt.click(token, "y"),
+                VoidWarehouseText.body(en
+                        ? "Add it to the recipe book.\nOther new recipes will still ask."
+                        : "记进配方本，以后可以按它扣料。\n其它新配方仍然会问。")));
+        body.append(VoidWarehouseText.body(" "));
+        body.append(VoidWarehouseText.button(
+                en ? "No" : "不要", VoidWarehouseText.NOTE,
+                VoidWarehouseRecipePrompt.click(token, "n"),
+                VoidWarehouseText.body(en
+                        ? "Do not record it.\nThis recipe will not ask again until you log in again."
+                        : "不记这一条。\n本次登录内不会再问这一条。")));
+        body.append(VoidWarehouseText.body(" "));
+        body.append(VoidWarehouseText.button(
+                en ? "Always" : "总是记住", VoidWarehouseText.ACTION,
+                VoidWarehouseRecipePrompt.click(token, "a"),
+                VoidWarehouseText.body(en
+                        ? "Record it and stop asking.\nBack to normal after you log in again."
+                        : "记下来，并且本次登录内不再问任何配方。\n重新登录后恢复一条条询问。")));
+        body.append(VoidWarehouseText.body(en ? "\n└ Not clicking means it is NOT recorded." : "\n└ 不点就不会记住。"));
+        return VoidWarehouseText.info(en, body);
+    }
+
+    /** 点「不要」之后的回执。必须说 —— 点了没反应会被当成界面坏了 */
+    static Component refusedLine(boolean en) {
+        return VoidWarehouseText.info(en,
+                "好，这条不记（本次登录内不再问这一条）。",
+                "OK, this one is not recorded (will not ask again until you log in again).");
+    }
+
+    /** 点「总是记住」之后的补充行：把「怎么恢复」明写出来，不靠玩家记命令 */
+    static Component autoOnLine(boolean en) {
+        return VoidWarehouseText.info(en,
+                "└ 已切换为自动记住：本次登录内不再询问，重新登录后恢复。",
+                "└ Auto-remember on: no more prompts until you log in again.");
+    }
+
+    /** 令牌认不出来 / 已经用掉 / 已经过期 —— 三种都归到这一句 */
+    static Component alreadyHandledLine(boolean en) {
+        return VoidWarehouseText.info(en,
+                "这条提示已经处理过了（或者已经过期）。",
+                "This prompt was already handled (or has expired).");
+    }
+
     // ------------------------------------------------------------------ 文案
 
     /**

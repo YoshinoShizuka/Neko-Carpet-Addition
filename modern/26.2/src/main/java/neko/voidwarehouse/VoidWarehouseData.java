@@ -957,6 +957,17 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
+     * 这条配方是不是<b>已经在</b>配方本里（只查，不改任何东西）。
+     *
+     * <p>「合成后要不要问一句」必须靠它判断，而<b>不能</b>先调 {@code learnWithResult}
+     * 再读返回值 —— 那时候已经学进去了，问也晚了。三种情况靠它分流：
+     * 已记过（走「早就记过」那条提示）、已满（走「满了」）、其余才提问。</p>
+     */
+    public boolean knows(VoidWarehouseRecipes.Recipe recipe) {
+        return recipe != null && this.recipeTexts.contains(recipe.recipeId());
+    }
+
+    /**
      * 同一个产物已经记下的配方，<b>按 {@code recipeId} 排序</b>。
      *
      * <p>排序不是为了好看：提示里只列前几条，顺序不稳的话同一件事两次提示会列出不同的配方，
@@ -1481,6 +1492,29 @@ public final class VoidWarehouseData extends SavedData {
                 empty.intValueExact(),
                 craft.multiply(BigInteger.valueOf(VoidWarehouseShulker.SHELL_COST)).intValueExact(),
                 craft.multiply(BigInteger.valueOf(VoidWarehouseShulker.CHEST_COST)).intValueExact());
+    }
+
+    /**
+     * 现有材料最多能凑出几个盒子（<b>空盒 + 用壳/箱现做的</b>），上限 {@code limit}。
+     *
+     * <p>给「Ctrl+Alt+左键 填满背包」用：那条路要先把「能装几盒」算出来再决定取多少，
+     * 而不是像「按数量取货」那样先定数量再验材料 —— 后者在材料不够时会整单取消，
+     * 但「填满」没有「玩家要了多少」这个前提，取消是不合适的（见
+     * {@code VoidWarehouseWithdraw#fill}）。</p>
+     *
+     * <p>算法与 {@code planBoxMaterials} 必须一致：先吃空盒，不够的每盒 2 壳 + 1 箱。
+     * 所以这里的可现做数 = {@code min(壳 / 2, 箱 / 1)}，与那边逐项乘回去等价。</p>
+     */
+    public long maxBoxesUpTo(long limit) {
+        if (limit <= 0) {
+            return 0L;
+        }
+        BigInteger empty = this.emptyBoxCount();
+        BigInteger craftable = this.amountOf(Items.SHULKER_SHELL)
+                .divide(BigInteger.valueOf(VoidWarehouseShulker.SHELL_COST))
+                .min(this.amountOf(Items.CHEST)
+                        .divide(BigInteger.valueOf(VoidWarehouseShulker.CHEST_COST)));
+        return empty.add(craftable).min(BigInteger.valueOf(limit)).longValue();
     }
 
     /**

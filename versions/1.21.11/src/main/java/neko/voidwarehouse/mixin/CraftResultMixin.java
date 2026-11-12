@@ -4,6 +4,7 @@ import neko.voidwarehouse.VoidWarehouse;
 import neko.voidwarehouse.VoidWarehouseData;
 import neko.voidwarehouse.VoidWarehouseRecipeBook;
 import neko.voidwarehouse.VoidWarehouseRecipeNotice;
+import neko.voidwarehouse.VoidWarehouseRecipePrompt;
 import neko.voidwarehouse.VoidWarehouseRecipes;
 import neko.voidwarehouse.VoidWarehouseText;
 import net.minecraft.network.chat.Component;
@@ -104,6 +105,26 @@ public abstract class CraftResultMixin {
             }
             VoidWarehouseData data = VoidWarehouse.data(server);
             if (data == null) {
+                return;
+            }
+            // ---- 问一句，还是直接记？ ----
+            // 1.0.17 起默认「问了才记」：合成这一刻<b>只发问、不写配方本</b>，等玩家点了才写。
+            // 三种情况不问（已记过 / 本满 / 玩家本局选过「总是记住」或对这条点过「不要」），
+            // 直接落到下面原来的老路，文案与节流一个字都不变。
+            //
+            // 「已经挂着同一条待确认」要单独判：shift 连合同一条配方会连续走到这里，
+            // 不拦的话每次合成都会再挂一条（并把前一条挤掉），聊天栏立刻刷屏。
+            if (player instanceof ServerPlayer asker
+                    && VoidWarehouseRecipePrompt.shouldAsk(asker, data, recipe,
+                            VoidWarehouseRecipeBook.MAX_RECIPES)) {
+                if (!VoidWarehouseRecipePrompt.isPending(asker, recipe)) {
+                    Component ask = VoidWarehouseRecipePrompt.ask(
+                            asker, VoidWarehouseText.isEnglish(asker), data, recipe,
+                            server.getTickCount());
+                    if (ask != null) {
+                        asker.sendSystemMessage(ask);
+                    }
+                }
                 return;
             }
             // ⚠️ 用 learnCapturingOthers 而不是自己写「先 recipesFor 再 learn」：

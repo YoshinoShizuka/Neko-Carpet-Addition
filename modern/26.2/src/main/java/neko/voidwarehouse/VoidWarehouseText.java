@@ -1,7 +1,9 @@
 package neko.voidwarehouse;
 
 import net.minecraft.ChatFormatting;
+import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.HoverEvent;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.chat.Style;
 import net.minecraft.server.level.ServerPlayer;
@@ -226,6 +228,29 @@ public final class VoidWarehouseText {
     /** {@link #tinted(Component, ChatFormatting)} 的 RGB 版 */
     static MutableComponent tinted(Component text, int rgb) {
         return text.copy().withStyle(Style.EMPTY.withColor(rgb).withItalic(false));
+    }
+
+    /**
+     * 一个可点击的按钮：{@code [标签]} + 悬停说明。
+     *
+     * <h2>为什么不是「命令链接」</h2>
+     * <p>聊天里能让玩家点一下就跑的机制有两条：{@code RunCommand}（要注册指令）和
+     * {@code Custom}（自定义 id + NBT 负载，原版客户端会发
+     * {@code ServerboundCustomClickActionPacket}）。玩家明确要求<b>不新增任何指令</b>，
+     * 所以这里只走第二条，见 {@link VoidWarehouseRecipePrompt}。</p>
+     *
+     * <h2>为什么颜色分两种</h2>
+     * <p>同一行里三四个按钮全一个颜色，玩家得逐个读完才知道哪个是主选。主选（记住）用
+     * {@link #ACTION} 绿 —— 与「能做的事」同一个语义；放弃的那一项（不要）用
+     * {@link #NOTE} 深灰，退到背景里。</p>
+     */
+    static MutableComponent button(String label, ChatFormatting color,
+                                   ClickEvent click, Component hover) {
+        return Component.literal("[" + label + "]").withStyle(Style.EMPTY
+                .withColor(color)
+                .withItalic(false)
+                .withClickEvent(click)
+                .withHoverEvent(new HoverEvent.ShowText(hover)));
     }
 
     /**

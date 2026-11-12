@@ -214,6 +214,23 @@ public final class VoidWarehouseWithdraw {
      * <p>顺序与 {@code withdrawShulkerBox} 一致：先校验 → 生成产物 → 检查背包 → 放成功才扣账。</p>
      */
     private static void execute(ServerPlayer player, ItemStack sample, long requested) {
+        executeCore(player, sample, requested, true);
+    }
+
+    /**
+     * 取货的核心，{@code allowBox} 决定「允不允许顺手装盒」。
+     *
+     * <h2>为什么要这个开关</h2>
+     * <p>「按数量取货」（右键输入数字）希望散货多了就装盒 —— 那是省背包格子。
+     * 但「Ctrl+Alt+左键 填满背包」在<b>常规模式</b>下的语义是「把格子铺满」，
+     * 玩家要的就是一片能顺手拿的散货；这时若悄悄给成盒子，点一下背包里冒出个
+     * 装着 1728 个圆石的潜影盒，跟玩家的预期完全对不上。
+     * 所以填满这条路明确传 {@code false}，<b>一个盒子都不装</b>。</p>
+     *
+     * @param allowBox {@code false} = 绝不装盒，请求多少就给多少散货
+     */
+    private static void executeCore(ServerPlayer player, ItemStack sample, long requested,
+                                    boolean allowBox) {
         boolean en = VoidWarehouseText.isEnglish(player);
         VoidWarehouseData data = VoidWarehouse.data(player.level().getServer());
         if (data == null) {
@@ -226,12 +243,13 @@ public final class VoidWarehouseWithdraw {
         //   （planBoxMaterials 空盒优先），takeExact 先把它扣空之后材料就扣不到了 ——
         //   于是「取 5 个盒子出来 6 个」、送回仓库后壳和箱无限增长（2026-11 事故）。
         //   盒子本来就是盒子，直接给。见 VoidWarehouseShulker#isBoxable。
-        boolean boxTarget = !VoidWarehouseShulker.isBoxable(sample);
-        long fullBoxes = boxTarget ? 0 : requested / capacity;
-        long loose = boxTarget ? requested : requested % capacity;
+        // allowBox = false 与「目标本身是盒子」是同一件事：都不许再包一层。
+        boolean noPacking = !allowBox || !VoidWarehouseShulker.isBoxable(sample);
+        long fullBoxes = noPacking ? 0 : requested / capacity;
+        long loose = noPacking ? requested : requested % capacity;
         // 散货超过 LOOSE_PACK_STACKS 组：它单独要占掉一大片背包格子，顺手装进一个盒子
         // （这个盒子同样要算材料，所以盒子总数是 fullBoxes + 1）
-        boolean packLoose = !boxTarget && loose > (long) LOOSE_PACK_STACKS * max;
+        boolean packLoose = !noPacking && loose > (long) LOOSE_PACK_STACKS * max;
         long totalBoxes = packLoose ? fullBoxes + 1 : fullBoxes;
 
         // ① 校验物品库存（精确口径：同物品 + 同数据组件，与 takeExact 一致）。
@@ -290,6 +308,138 @@ public final class VoidWarehouseWithdraw {
         }
         data.consumeBoxMaterials(plan);
         player.sendSystemMessage(successMessage(en, sample, requested, fullBoxes, loose, packLoose));
+    }
+
+    // ------------------------------------------------------------------ 填满背包
+
+    /**
+     * Ctrl + Alt + 左键：<b>把这一格的物品取出，装到背包放不下为止</b>。
+     *
+     * <h2>两种模式的语义不同，必须分开算</h2>
+     * <table border="1">
+     *   <tr><th>模式</th><th>给什么</th><th>「装得下多少」怎么算</th></tr>
+     *   <tr><td>常规</td><td><b>纯散货</b>，一个盒子都不装</td>
+     *       <td>每个格子还能塞多少（同类格算余量、空格算一整叠）之和</td></tr>
+     *   <tr><td>潜影盒</td><td><b>满盒</b>，一格一个</td>
+     *       <td>空格数 × 一盒容量</td></tr>
+     * </table>
+     * <p>常规模式特意<b>不许</b>装盒：玩家要的是「顺手能拿的一片散货」。
+     * 悄悄给成盒子会跟预期对不上（见 {@link #executeCore} 的 {@code allowBox}）。</p>
+     *
+     * <h2>三个上限取最小</h2>
+     * <ol>
+     *   <li><b>背包放得下多少</b> —— 主判据，这个功能的名字就叫「填满背包」；</li>
+     *   <li><b>仓库有多少</b> —— 只取现有的，<b>绝不走 9 合 1 兑换补齐</b>
+     *       （与「按数量取货」不同：那是玩家明确要 N 个，这里是「有多少给我多少」）；</li>
+     *   <li>盒模式下还有<b>材料够做几个盒子</b>（空盒优先，其次壳 + 箱）。</li>
+     * </ol>
+     *
+     * <h2>为什么这里不用 All-or-nothing 的取消语义</h2>
+     * <p>「按数量取货」是玩家点了名要 N 个，给不够就该整单取消。
+     * 填满背包没有「要多少个」这个前提 —— 能装多少就装多少，取到的数量由上面三个上限
+     * 里最小的那个决定，所以它天然是<b>「按上限裁剪」</b>而不是「不够就取消」。
+     * 唯一会全盘拒绝的情形是「一个都装不下 / 一个都没有」，那时发一句提示就结束。</p>
+     */
+    public static void fill(ServerPlayer player, ItemStack sample, boolean boxMode) {
+        if (player == null || sample == null || sample.isEmpty()) {
+            return;
+        }
+        boolean en = VoidWarehouseText.isEnglish(player);
+        VoidWarehouseData data = VoidWarehouse.data(player.level().getServer());
+        if (data == null) {
+            return;
+        }
+        BigInteger stock = data.amountExact(sample);
+        if (stock.signum() <= 0) {
+            player.sendSystemMessage(msgFillNoStock(en));
+            return;
+        }
+        long have = stock.min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+
+        if (boxMode && VoidWarehouseShulker.isBoxable(sample)) {
+            long capacity = VoidWarehouseShulker.capacity(sample);
+            int freeSlots = emptySlots(player);
+            if (freeSlots <= 0) {
+                player.sendSystemMessage(msgInvFull(en));
+                return;
+            }
+            long byMaterial = data.maxBoxesUpTo(freeSlots);
+            long byStock = have / capacity;
+            long boxes = Math.min(Math.min((long) freeSlots, byMaterial), byStock);
+            if (boxes <= 0) {
+                // 三种「一个盒子都给不出」的原因分开说清楚，别让玩家去猜
+                if (byStock <= 0) {
+                    player.sendSystemMessage(msgFillNotEnoughForBox(en, capacity, have));
+                } else {
+                    player.sendSystemMessage(msgNoParts(en));
+                }
+                return;
+            }
+            executeCore(player, sample, boxes * capacity, true);
+            return;
+        }
+
+        long room = looseRoom(player, sample);
+        if (room <= 0) {
+            player.sendSystemMessage(msgInvFull(en));
+            return;
+        }
+        executeCore(player, sample, Math.min(room, have), false);
+    }
+
+    /**
+     * 背包里还能吸收多少个 {@code sample}（同类格算余量、空格算一整叠）。
+     *
+     * <p>🔴 只数<b>那 36 格</b>（{@link Inventory#INVENTORY_SIZE}），不是
+     * {@code getContainerSize()} —— 后者在 26.3 是 <b>43</b>（36 格 + 副手 + 身体盔甲 + 鞍），
+     * 拿它当「背包容量」会把副手和盔甲槽也算成能塞圆石的地方，
+     * 于是「填满背包」实际会往副手里塞一组石头（实测踩过：算出 2752 = 43×64）。</p>
+     */
+    static long looseRoom(Player player, ItemStack sample) {
+        Inventory inv = player.getInventory();
+        int max = Math.max(1, sample.getMaxStackSize());
+        long room = 0;
+        for (int i = 0; i < Inventory.INVENTORY_SIZE; i++) {
+            ItemStack slot = inv.getItem(i);
+            if (slot.isEmpty()) {
+                room += max;
+            } else if (ItemStack.isSameItemSameComponents(slot, sample)) {
+                room += Math.max(0, Math.max(1, slot.getMaxStackSize()) - slot.getCount());
+            }
+        }
+        return room;
+    }
+
+    /** 背包里有几个完全空着的格子（潜影盒一格一个，装不了盒就只能算空格）；只数那 36 格 */
+    static int emptySlots(Player player) {
+        Inventory inv = player.getInventory();
+        int n = 0;
+        for (int i = 0; i < Inventory.INVENTORY_SIZE; i++) {
+            if (inv.getItem(i).isEmpty()) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private static Component msgFillNoStock(boolean en) {
+        return VoidWarehouseText.info(en, "仓库里没有这种物品了",
+                "The warehouse has none of that item left");
+    }
+
+    /** 仓库里不够装满一整盒 —— 把「还差多少」说出来，玩家才知道要不要再攒 */
+    private static Component msgFillNotEnoughForBox(boolean en, long capacity, long have) {
+        return VoidWarehouseText.info(en,
+                VoidWarehouseText.body("仓库里不够装满一整盒（一盒 ")
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(capacity)))
+                        .append(VoidWarehouseText.body("，现有 "))
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(have)))
+                        .append(VoidWarehouseText.body("）")),
+                VoidWarehouseText.body("Not enough for even one full box (needs ")
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(capacity)))
+                        .append(VoidWarehouseText.body(", have "))
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(have)))
+                        .append(VoidWarehouseText.body(")")));
     }
 
     /**
@@ -375,7 +525,9 @@ public final class VoidWarehouseWithdraw {
      */
     private static boolean canFitAll(Player player, List<ItemStack> outputs) {
         Inventory inv = player.getInventory();
-        int size = inv.getContainerSize();
+        // 🔴 36，不是 getContainerSize()（26.3 那是 43，含副手 / 身体盔甲 / 鞍）。
+        // 用 43 的话「放得下」会把副手格也算进去，取货就会往副手里塞一组东西。
+        int size = Inventory.INVENTORY_SIZE;
         List<ItemStack> sim = new ArrayList<>(size);
         for (int i = 0; i < size; i++) {
             sim.add(inv.getItem(i).copy());
@@ -413,8 +565,8 @@ public final class VoidWarehouseWithdraw {
     /** 把产物真正放进背包（调用方已用 {@link #canFitAll} 确认能全部放下） */
     private static void moveIntoInventory(Player player, ItemStack stack) {
         Inventory inv = player.getInventory();
-        // 先合并进同类格
-        int size = inv.getContainerSize();
+        // 先合并进同类格（同样只认那 36 格，理由见 canFitAll）
+        int size = Inventory.INVENTORY_SIZE;
         for (int i = 0; i < size && !stack.isEmpty(); i++) {
             ItemStack slot = inv.getItem(i);
             if (slot.isEmpty() || !ItemStack.isSameItemSameComponents(slot, stack)) {

@@ -180,7 +180,7 @@ public final class VoidWarehouseShulker {
     /**
      * 这种物品本身是不是<b>做盒子的材料</b>（潜影壳 / 箱子）。
      *
-     * <h2>为什么这两个也要单独挡一道</h2>
+     * <h2>为什么这两样的材料账要单独算</h2>
      * <p>装盒的材料账（{@link VoidWarehouseData#planBoxMaterials}）是从<b>仓库</b>扣
      * {@link #SHELL_COST} 壳 + {@link #CHEST_COST} 箱，而两个取货口都是
      * <b>先把货取走、再扣材料</b>（顺序不能反：扣材料会移除别的格子、让下标前移）。</p>
@@ -192,9 +192,9 @@ public final class VoidWarehouseShulker {
      * 「装着 1728 壳的盒子」，送回仓库变回 1728 壳 + <b>1 个空盒</b>。净效果 =
      * <b>1 个箱子（8 木板）换 1 个潜影盒</b>，可无限循环；而原版要 2 壳 + 1 箱。</p>
      *
-     * <p>所以这两样<b>一律不装盒</b>：盒模式下点壳 / 箱的格子按散货给，与「潜影盒不套盒」
-     * 是同一类处理 —— {@link #pack} 绕过了原版 {@code canFitInsideContainerItems}，
-     * 凡是「盒子自己的材料」都不能从「正要装进盒子的那批货」里出。</p>
+     * <p>所以取这两样时，材料账必须先<b>把「马上要离库的那批货」刨掉</b>（{@link VoidWarehouseData#hasBoxMaterials(BoxMaterials, ItemStack, BigInteger)}
+     * 与 {@link VoidWarehouseData#maxBoxesUpTo(long, ItemStack)}）—— 盒子照给，但成本只能从那批货<b>之外</b>的库存里出。
+     * {@link #pack} 绕过了原版 {@code canFitInsideContainerItems}，凡是能当材料的东西都得自己把账算清楚。</p>
      */
     public static boolean isBoxPart(ItemStack template) {
         if (template == null || template.isEmpty()) {

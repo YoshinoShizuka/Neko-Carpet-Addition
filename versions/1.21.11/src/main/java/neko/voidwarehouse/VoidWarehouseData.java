@@ -1494,6 +1494,94 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
+     * 材料账上还剩多少：<b>把「马上就要离库的那批货」先刨掉</b>。
+     *
+     * <p>只对潜影壳 / 箱子有意义 —— 它们既是货、又是装盒的材料。取货口是
+     * 「先验材料 → 取货 → 再扣材料」，所以同一格里的东西不能既当货、又被当成材料余额：
+     * 否则「整盒容量一次取走」会让材料恰好归零，外盒等于白送（见
+     * {@link VoidWarehouseShulker#isBoxPart} 里的那笔账）。</p>
+     *
+     * <p>目标物与 {@code item} 不同时原样返回，所以对普通物品这条路径与不带预留完全一致。</p>
+     */
+    private BigInteger materialStock(Item item, ItemStack leaving, BigInteger leavingCount) {
+        BigInteger have = this.amountOf(item);
+        if (leaving == null || leaving.isEmpty() || !leaving.is(item)
+                || leavingCount == null || leavingCount.signum() <= 0) {
+            return have;
+        }
+        return have.subtract(leavingCount).max(BigInteger.ZERO);
+    }
+
+    /**
+     * 这些材料够不够 —— <b>把「盒子里要装的那批货」预留掉之后再算</b>。
+     *
+     * <p>与 {@link #hasBoxMaterials(BoxMaterials)} 的差别只在：目标物本身就是潜影壳 / 箱子时，
+     * 材料不能拿「即将离库的那批」来付。其余情况两者完全等价
+     * （{@code leaving} 与材料无关时一个数都不减）。</p>
+     */
+    public boolean hasBoxMaterials(BoxMaterials plan, ItemStack leaving, BigInteger leavingCount) {
+        if (plan == null) {
+            return false;
+        }
+        if (plan.shells() > 0 && this.materialStock(Items.SHULKER_SHELL, leaving, leavingCount)
+                .compareTo(BigInteger.valueOf(plan.shells())) < 0) {
+            return false;
+        }
+        return plan.chests() <= 0
+                || this.materialStock(Items.CHEST, leaving, leavingCount)
+                        .compareTo(BigInteger.valueOf(plan.chests())) >= 0;
+    }
+
+    /**
+     * 现有材料最多能凑出几个盒子，上限 {@code limit}，<b>并且把「盒子里要装的那批货」预留掉</b>。
+     *
+     * <p>为什么不能直接用 {@link #maxBoxesUpTo(long)}：目标物本身就是潜影壳 / 箱子时，
+     * 装进盒子的那批货与材料从同一格里出。{@code min(壳/2, 箱/1)} 会把「马上要装走的壳」
+     * 也算成可用材料，于是算出来的盒数在扣账那一步付不出材料钱（外盒白送）。</p>
+     *
+     * <p>这里用二分：{@code canMakeBoxes(n)} 的可行性随 {@code n} 单调不增
+     * （货越多、要现做的盒子也越多，两头都在吃同一批库存），所以上界取
+     * {@link #maxBoxesUpTo(long)} 之后二分不会漏解。</p>
+     */
+    public long maxBoxesUpTo(long limit, ItemStack sample) {
+        if (limit <= 0) {
+            return 0L;
+        }
+        long lo = 0L;
+        long hi = this.maxBoxesUpTo(limit);
+        while (lo < hi) {
+            long mid = (lo + hi + 1) >>> 1;
+            if (this.canMakeBoxes(mid, sample)) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return lo;
+    }
+
+    /** {@link #maxBoxesUpTo(long, ItemStack)} 的判据：{@code boxes} 盒连同货一起，材料够不够 */
+    private boolean canMakeBoxes(long boxes, ItemStack sample) {
+        if (boxes <= 0) {
+            return true;
+        }
+        if (sample == null || sample.isEmpty()) {
+            return false;
+        }
+        long capacity = VoidWarehouseShulker.capacity(sample);
+        if (capacity <= 0 || boxes > Long.MAX_VALUE / capacity) {
+            return false;
+        }
+        BigInteger goods = BigInteger.valueOf(boxes * capacity);
+        long empty = this.emptyBoxCount().min(BigInteger.valueOf(boxes)).longValue();
+        long craft = boxes - empty;
+        return this.materialStock(Items.SHULKER_SHELL, sample, goods)
+                        .compareTo(BigInteger.valueOf(craft * VoidWarehouseShulker.SHELL_COST)) >= 0
+                && this.materialStock(Items.CHEST, sample, goods)
+                        .compareTo(BigInteger.valueOf(craft * VoidWarehouseShulker.CHEST_COST)) >= 0;
+    }
+
+    /**
      * 现有材料最多能凑出几个盒子（<b>空盒 + 用壳/箱现做的</b>），上限 {@code limit}。
      *
      * <p>给「Ctrl+Alt+左键 填满背包」用：那条路要先把「能装几盒」算出来再决定取多少，
@@ -1503,6 +1591,8 @@ public final class VoidWarehouseData extends SavedData {
      *
      * <p>算法与 {@code planBoxMaterials} 必须一致：先吃空盒，不够的每盒 2 壳 + 1 箱。
      * 所以这里的可现做数 = {@code min(壳 / 2, 箱 / 1)}，与那边逐项乘回去等价。</p>
+     * <p>⚠️ 这个重载<b>不做预留</b>，只当上界用。真要拿去决定「给几盒」请用
+     * {@link #maxBoxesUpTo(long, ItemStack)}。</p>
      */
     public long maxBoxesUpTo(long limit) {
         if (limit <= 0) {

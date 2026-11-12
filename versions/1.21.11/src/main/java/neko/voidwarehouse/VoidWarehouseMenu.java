@@ -603,7 +603,7 @@ public class VoidWarehouseMenu extends ChestMenu {
         //    实测：仓库 5 个空盒 → 交出「1 个装着 5 个空盒的盒子」（实收 6 个）→ 送回仓库
         //    变成 5 个空盒 + 2 壳 + 1 箱，来回几轮壳和箱就无限增长（2026-11 事故）。
         //    盒子本来就是盒子，没有再装一道的理由。见 VoidWarehouseShulker#isBoxable。
-        if (!VoidWarehouseShulker.isBoxable(template) || VoidWarehouseShulker.isBoxPart(template)) {
+        if (!VoidWarehouseShulker.isBoxable(template)) {
             this.withdrawFrom(target, 0, player);
             return;
         }
@@ -635,7 +635,23 @@ public class VoidWarehouseMenu extends ChestMenu {
         //    必须与「聊天按数量取货」用同一份算法（VoidWarehouseData.planBoxMaterials），
         //    否则玩家会遇到「库里有空盒，却在界面里被要求补潜影壳」的分裂行为。
         VoidWarehouseData.BoxMaterials plan = this.data.planBoxMaterials(1);
-        if (!this.data.hasBoxMaterials(plan)) {
+        // 🔴 目标物本身就是盒子材料（潜影壳 / 箱子）：这一盒的成本只能从那批货<b>之外</b>出。
+        //    所以先把要交出去的量收一点、留够 plan 里的壳 / 箱 —— 否则取走整整一盒容量之后
+        //    仓库里那 2 壳 + 1 箱恰好归零，consumeBoxMaterials 只留一条 WARN，
+        //    等于「1 个箱子换 1 个潜影盒」（见 VoidWarehouseShulker#isBoxPart）。
+        //    例：仓库 1728 壳 + 1 箱 → 交出的那盒装 <b>1726</b> 个，另扣 2 壳 + 1 箱，账是平的。
+        if (VoidWarehouseShulker.isBoxPart(template)) {
+            long reserve = (template.is(Items.SHULKER_SHELL) ? plan.shells() : 0)
+                    + (template.is(Items.CHEST) ? plan.chests() : 0);
+            long have = this.data.amountExact(template)
+                    .min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+            available = Math.min(available, Math.max(0L, have - reserve));
+            if (available <= 0) {
+                this.message(player, this.msgNoBoxParts());
+                return;
+            }
+        }
+        if (!this.data.hasBoxMaterials(plan, template, BigInteger.valueOf(available))) {
             this.message(player, this.msgNoBoxParts());
             return;
         }

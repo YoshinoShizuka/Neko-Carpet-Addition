@@ -601,10 +601,9 @@ public class VoidWarehouseMenu extends ChestMenu {
         //    变成 5 个空盒 + 2 壳 + 1 箱，来回几轮壳和箱就无限增长（2026-11 事故）。
         //    盒子本来就是盒子，没有再装一道的理由。见 VoidWarehouseShulker#isBoxable。
         //
-        //    ⚠️ <b>「格子本身是做盒子的材料」（潜影壳 / 箱子）同理</b>：材料账与这一格共源，
-        //    取走整整一盒容量之后仓库里那 2 壳 + 1 箱恰好归零，consumeBoxMaterials 只留一条
-        //    WARN —— 于是「1 个箱子换 1 个潜影盒」可以无限循环。见 isBoxPart。
-        if (!VoidWarehouseShulker.isBoxable(template) || VoidWarehouseShulker.isBoxPart(template)) {
+        //    ⚠️ 「格子本身是做盒子的材料」（潜影壳 / 箱子）<b>不在这条里</b>：它们可以装盒，
+        //    但材料账必须先把「马上要交出去的那批」刨掉，见下面 ② 的预留。见 isBoxPart。
+        if (!VoidWarehouseShulker.isBoxable(template)) {
             this.withdrawFrom(target, 0, player);
             return;
         }
@@ -636,7 +635,23 @@ public class VoidWarehouseMenu extends ChestMenu {
         //    必须与「聊天按数量取货」用同一份算法（VoidWarehouseData.planBoxMaterials），
         //    否则玩家会遇到「库里有空盒，却在界面里被要求补潜影壳」的分裂行为。
         VoidWarehouseData.BoxMaterials plan = this.data.planBoxMaterials(1);
-        if (!this.data.hasBoxMaterials(plan)) {
+        // 🔴 目标物本身就是盒子材料（潜影壳 / 箱子）：这一盒的成本只能从那批货<b>之外</b>出。
+        //    所以先把要交出去的量收一点、留够 plan 里的壳 / 箱 —— 否则取走整整一盒容量之后
+        //    仓库里那 2 壳 + 1 箱恰好归零，consumeBoxMaterials 只留一条 WARN，
+        //    等于「1 个箱子换 1 个潜影盒」（见 VoidWarehouseShulker#isBoxPart）。
+        //    例：仓库 1728 壳 + 1 箱 → 交出的那盒装 <b>1726</b> 个，另扣 2 壳 + 1 箱，账是平的。
+        if (VoidWarehouseShulker.isBoxPart(template)) {
+            long reserve = (template.is(Items.SHULKER_SHELL) ? plan.shells() : 0)
+                    + (template.is(Items.CHEST) ? plan.chests() : 0);
+            long have = this.data.amountExact(template)
+                    .min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+            available = Math.min(available, Math.max(0L, have - reserve));
+            if (available <= 0) {
+                this.message(player, this.msgNoBoxParts());
+                return;
+            }
+        }
+        if (!this.data.hasBoxMaterials(plan, template, BigInteger.valueOf(available))) {
             this.message(player, this.msgNoBoxParts());
             return;
         }

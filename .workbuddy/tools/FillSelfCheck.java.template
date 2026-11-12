@@ -15,6 +15,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 
 import java.math.BigInteger;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -76,6 +77,7 @@ public final class FillSelfCheck {
         groupB_loose();
         groupC_box();
         groupD_menu();
+        groupE_boxPart();
         finish(server);
     }
 
@@ -264,6 +266,138 @@ public final class FillSelfCheck {
         check("D6 空格子不会抛异常也不会给东西", !threw && count(COBBLE) == 0L);
     }
 
+    // ================================================================ E 盒子材料不与取货同源
+
+    /**
+     * 目标格本身就是「装盒的材料」（潜影壳 / 箱子）时，盒模式<b>必须</b>按散货给。
+     *
+     * <h2>这条洞的算术</h2>
+     * <p>材料账是「先验、取货、再扣」，所以「把整整一盒容量的壳一次性取走」会让仓库里那
+     * 2 个壳恰好归零，{@code consumeBoxMaterials} 再也扣不到（只留一条 WARN）。
+     * 仓库 1728 壳 + 1 箱 → 取壳 → 拿到「装着 1728 壳的盒子」→ 送回仓库变回 1728 壳 +
+     * <b>1 个空盒</b>。净效果 = <b>1 个箱子（8 木板）换 1 个潜影盒</b>，可无限循环。</p>
+     *
+     * <p>所以这组断言的判据不是「代码有没有调 isBoxPart」，而是<b>背包里有没有出现盒子</b>、
+     * <b>仓库那个箱子有没有被动</b> —— 改回旧写法时这两条会同时红。</p>
+     */
+    private static void groupE_boxPart() {
+        System.out.println("[E] 盒子材料（潜影壳 / 箱子）本身不参与装盒");
+
+        // 直接判据：只有壳和箱算材料；圆石、潜影盒都不算
+        check("E1 isBoxPart 认得潜影壳与箱子，不认圆石",
+                VoidWarehouseShulker.isBoxPart(new ItemStack(Items.SHULKER_SHELL))
+                        && VoidWarehouseShulker.isBoxPart(new ItemStack(Items.CHEST))
+                        && !VoidWarehouseShulker.isBoxPart(COBBLE));
+        check("E2 潜影盒自己不算「材料」（它走的是 isBoxable 那条）",
+                !VoidWarehouseShulker.isBoxPart(new ItemStack(Items.SHULKER_BOX)));
+
+        // 1728 个壳正好是一盒容量：取完仓库就空了，正是「材料与货共源」那一幕
+        clearInventory();
+        data.clearContent();
+        stock(Items.SHULKER_SHELL, 1728);
+        stock(Items.CHEST, 1);
+        VoidWarehouseWithdraw.fill(bot, new ItemStack(Items.SHULKER_SHELL), true);
+        check("E3 盒模式点潜影壳：背包里一个盒子都没有（实测 " + countBoxes() + " 盒）",
+                countBoxes() == 0);
+        check("E4 给的是散壳 1728 个（实测 " + count(new ItemStack(Items.SHULKER_SHELL)) + "）",
+                count(new ItemStack(Items.SHULKER_SHELL)) == 1728L);
+        check("E5 仓库那个箱子一个没动（1 → " + data.amountOf(Items.CHEST) + "）",
+                data.amountOf(Items.CHEST).equals(BigInteger.ONE));
+        check("E6 仓库的壳被扣干净（1728 → " + data.amountOf(Items.SHULKER_SHELL) + "）",
+                data.amountOf(Items.SHULKER_SHELL).signum() == 0);
+
+        // 反过来：任务本身是箱子，同样不许给盒（否则 1728 箱 → 1 盒，那 1 个箱子扣不到）
+        clearInventory();
+        data.clearContent();
+        stock(Items.CHEST, 1728);
+        stock(Items.SHULKER_SHELL, 2);
+        VoidWarehouseWithdraw.fill(bot, new ItemStack(Items.CHEST), true);
+        check("E7 盒模式点箱子：同样不给盒（实测 " + countBoxes() + " 盒）", countBoxes() == 0);
+        check("E8 给的是散箱 1728 个（实测 " + count(new ItemStack(Items.CHEST)) + "）",
+                count(new ItemStack(Items.CHEST)) == 1728L);
+        check("E9 潜影壳没被白扣（2 → " + data.amountOf(Items.SHULKER_SHELL) + "）",
+                data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(2)));
+
+        // 菜单入口（点格子取一盒）走的是另一个方法，判据必须同样带着 isBoxPart。
+        // 🔴 这一场必须**同时**放壳和箱子：只放壳时旧写法会先在「盒子材料不够」那里退出、
+        //    一个东西都不拿，于是「没有盒子」这条断言会**假绿**（它是因为别的原因通过的）。
+        //    也要按物品找格子 —— 仓库里有两格时第 0 格是哪一件不由我们决定。
+        // 🔴 第三个参数在 26.x 是 ContainerInput、1.21.11 是 ClickType —— 模板不能写死版本名
+        //    （安装脚本不做版本替换），所以反射从 clicked 自己的签名里取那个枚举的 PICKUP。
+        clearInventory();
+        data.clearContent();
+        stock(Items.SHULKER_SHELL, 1728);
+        stock(Items.CHEST, 1);
+        VoidWarehouseMenu menu = new VoidWarehouseMenu(0, bot.getInventory(), data, bot);
+        ((VoidWarehousePageContainer) menu.getContainer()).setShulkerMode(true);
+        int shellSlot = -1;
+        for (int i = 0; i < VoidWarehouseData.TOTAL_SLOTS; i++) {
+            if (menu.getSlot(i).getItem().is(Items.SHULKER_SHELL)) {
+                shellSlot = i;
+                break;
+            }
+        }
+        check("E10 菜单里能找到潜影壳那一格（slotId=" + shellSlot + "）", shellSlot >= 0);
+
+        Method clicked = null;
+        for (Method m : VoidWarehouseMenu.class.getMethods()) {
+            if (m.getName().equals("clicked") && m.getParameterCount() == 4) {
+                clicked = m;
+                break;
+            }
+        }
+        Object pickup = null;
+        if (clicked != null) {
+            for (Object c : clicked.getParameterTypes()[2].getEnumConstants()) {
+                if (((Enum<?>) c).name().equals("PICKUP")) {
+                    pickup = c;
+                    break;
+                }
+            }
+        }
+        if (clicked == null || pickup == null || shellSlot < 0) {
+            check("E11 菜单盒模式点壳格：也不给盒（找不到 clicked/PICKUP/格子）", false);
+            check("E12 菜单那条按散货给一组 64", false);
+            check("E13 菜单那条没动仓库的箱子", false);
+        } else {
+            try {
+                clicked.invoke(menu, shellSlot, 0, pickup, bot);
+            } catch (ReflectiveOperationException ex) {
+                System.out.println("[ENV] 菜单点击反射失败：" + ex);
+            }
+            check("E11 菜单盒模式点壳格：也不给盒（实测 " + countBoxes() + " 盒）",
+                    countBoxes() == 0);
+            check("E12 菜单那条按散货给一组 64（1728 → "
+                            + data.amountOf(Items.SHULKER_SHELL) + "）",
+                    data.amountOf(Items.SHULKER_SHELL).equals(BigInteger.valueOf(1728 - 64)));
+            check("E13 菜单那条没动仓库的箱子（1 → " + data.amountOf(Items.CHEST) + "）",
+                    data.amountOf(Items.CHEST).equals(BigInteger.ONE));
+        }
+
+        // 「按数量取货」（聊天栏输数字）走的是 executeCore(allowBox = true)，守卫在 executeCore 里。
+        // 🔴 这条必须单独钉：fill 自己的分支守在 executeCore 之前，两条守卫互相掩护 ——
+        //    只摘 executeCore 那一条时，前面 E3–E9 依然全绿（fill 早就拐去散货分支了），
+        //    于是「按数量取货 1728 个壳」这个最初能走通的口子会无声复发。
+        clearInventory();
+        data.clearContent();
+        stock(Items.SHULKER_SHELL, 1728);
+        stock(Items.CHEST, 1);
+        boolean coreOk = false;
+        try {
+            Method core = VoidWarehouseWithdraw.class.getDeclaredMethod("executeCore",
+                    ServerPlayer.class, ItemStack.class, long.class, boolean.class);
+            core.setAccessible(true);
+            core.invoke(null, bot, new ItemStack(Items.SHULKER_SHELL), 1728L, true);
+            coreOk = true;
+        } catch (ReflectiveOperationException ex) {
+            System.out.println("[ENV] executeCore 反射失败：" + ex);
+        }
+        check("E14 按数量取货（allowBox=true）也不给盒（" + (coreOk ? "" : "反射失败，")
+                        + "实测 " + countBoxes() + " 盒）", coreOk && countBoxes() == 0);
+        check("E15 它也没动仓库的箱子（1 → " + data.amountOf(Items.CHEST) + "）",
+                data.amountOf(Items.CHEST).equals(BigInteger.ONE));
+    }
+
     // ================================================================ 工具
 
     private static void makeBot(MinecraftServer server) {
@@ -360,7 +494,10 @@ public final class FillSelfCheck {
                 System.out.println("   × " + s);
             }
         }
-        System.out.println("FILL SELF CHECK RESULT v26.3 checks=" + checks
+        // 🔴 别在这里写死版本号：同一份模板会在五个版本上跑，写死 v26.3 会让 1.21.11 的日志
+        //    看起来像 26.3 的结果（第一版就是这样，差点自己骗自己）。干脆不印版本 —— 打印这行
+        //    的日志本身就在对应版本的 run/ 目录下，不会混。
+        System.out.println("FILL SELF CHECK RESULT checks=" + checks
                 + " failures=" + failures);
         server.halt(false);
     }

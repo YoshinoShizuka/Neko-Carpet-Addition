@@ -11,6 +11,28 @@
 
 ### ✨ Added & Improved / 新增与优化
 
+#### 配方存入前的聊天确认（`voidWarehouseCraft`）
+
+合成**不再**默默写进配方本 —— 合成那一刻只发一句问话，玩家点一下才真的记(This rule now asks before recording; nothing is written until the player clicks.)。
+
+- **三个按钮**：`[记住]` 记这一条、`[不要]` 本次登录内不再问这一条、`[总是记住]` 记下来并本次登录内不再问任何配方(Remember this one / skip it / stop asking for the rest of the session.)。
+- 🔴 **一条指令都不加**：按钮走原版的「自定义点击」（`ClickEvent.Custom` + `ServerboundCustomClickActionPacket`，1.21.6 起**原版客户端自己就会发**），服务端用 `CustomClickMixin` 接住。所以既不用注册指令，也不需要客户端模组(Vanilla's custom-click action carries the payload; a server-side mixin handles it, so no commands are registered.)。
+- **令牌一次一换、只认本人**：令牌是每位玩家每次提问随机生成，玩家身份从连接里取 —— 载荷里没有任何 UUID，伪造一条包只能点自己的待确认(Identity comes from the connection; the payload only holds a random token.)。
+- **同一条只问一次**：Shift 连合同一条配方不会刷屏；每人同时最多挂 3 条，超了丢最旧的；60 秒不点自动过期，点过期的那条会明确回一句「已经处理过了」(One pending per recipe, at most three per player, 60-second lifetime; a stale click says so instead of doing nothing.)。
+- **不问的四种情况**：已经在配方本里、配方本满了、本局点过 `[总是记住]`、本局对这条点过 `[不要]` —— 这四种直接走老路，文案与节流一个字不变(Four cases fall back to the previous behaviour.)。
+- ⚠️ **`[不要]` / `[总是记住]` 只活在本局**：不落盘，重新登录即恢复一条条询问；切换时会在聊天里明写「重新登录后恢复」(Both switches are in-memory only and reset on the next login.)。
+
+#### Ctrl + Alt + 左键：把这一格的物品取出到背包放不下为止
+
+常规模式给**纯散货**，潜影盒模式给**满盒**，都是「能装多少装多少」(Fill the inventory with that slot's item — loose stacks in normal mode, full shulker boxes in box mode.)。
+
+- 🔴 **原版协议里没有修饰键**：容器点击只有 7 种输入（`PICKUP / QUICK_MOVE / SWAP / CLONE / THROW / QUICK_CRAFT / PICKUP_ALL`），一个都带不了 Ctrl / Alt。所以手势由客户端识别，再走一条专用通道 `carpet_neko_addition:fill_request`（载荷只有一个 `int slotId`）(Vanilla container clicks carry no modifiers, so the gesture is recognised client-side and sent over a dedicated channel.)。
+- **服务端不信客户端的任何说法**：是哪件物品由服务端从那一格解析、能装多少由服务端按真实背包现算、玩家身份由连接里取。菜单不是 `VoidWarehouseMenu`、`slotId` 落在导航行或背包格、那一格解析不出物品 —— 一律丢弃(The server re-derives item, capacity and identity; malformed requests are dropped.)。
+- **三个上限取最小**：背包放得下多少 / 仓库有多少 / 盒模式下材料够做几盒。所以它**不会**走 9 合 1 兑换补齐 —— 「有多少给我多少」，与「按数量取货」明确要 N 个是两回事(Three caps: inventory room, stock on hand, box materials — the exchange path is deliberately not used.)。
+- **常规模式一个盒子都不装**：玩家要的是能顺手拿的一片散货，悄悄给成盒子会跟预期对不上(Normal mode never packs anything into boxes.)。
+- **盒模式不够一整盒就不给**，并明确报出「一盒 1728，现有 1000」，而不是塞一个不满的盒子(In box mode a partial box is refused, with both numbers spelled out.)。
+- ⚠️ 需要客户端模组发这条通道；纯原版客户端点不出这个手势，其它行为一个字节不变(The gesture needs the client mod; vanilla clients are unaffected.)。
+
 #### 虚空仓库直接放置（`voidWarehouseDirectPlace`）
 
 打印机缺料时**不再把一整组塞进背包**，而是从仓库预扣**一件**、直接放到目标位置。手上不会出现物品，打印完背包里也不会剩下成堆零头(The printer places blocks straight from the warehouse instead of restocking a full stack into the inventory.)。
@@ -109,6 +131,10 @@
 
 ### 🐛 Fixed / 修复
 
+#### 取货时不再把物品放进副手 / 盔甲槽
+
+「按数量取货」与「填满背包」放产物时用的是 `Inventory#getContainerSize()`，而 26.3 那个值是 **43**（36 格 + 副手 + 身体盔甲 + 鞍）—— 背包塞满时物品会落到副手、甚至盔甲格里。现在统一按 `Inventory.INVENTORY_SIZE`（36）算(Withdrawals used the 43-slot container size and could place items into the offhand or armour slots; only the 36 player slots are used now.)。
+
 #### 满本时 21% 的配方从界面消失（`maxCraftable` 线性退让 → 二分）
 
 配方本装满之后，**五分之一的东西在界面上根本不存在** —— 不是灰的、不是写 0，是那一格压根不出(With a full recipe book, one fifth of the craftable items were simply absent from the UI.).
@@ -191,6 +217,16 @@
 
 ### 🧪 Testing / 测试
 
+- 配方确认提示 **51 条断言 × 5 版本 = 255 条全绿**（`RecipePromptSelfCheck`，真服务端 + 真 `ServerPlayer`）：接线 5、只问不记 9、按钮契约 10、点击回路 27(Fifty-one assertions per version, all green.)。
+  - 🔴 **第一组必须是「mixin 真的挂上了」**：编译通过什么都不能说明 —— `ServerCommonPacketListenerImpl` 懒加载，没有玩家连接就没人碰它，注入失败会**一声不响**。判据是反射到目标类里数方法，而且必须按**名字子串**（Mixin 会把 handler 改名成 `handler$<hash>$carpetAutomending$onCustomClick`，写 `equals` 必假红）(Reflection must match by substring: Mixin prefixes handler names.)。
+  - 🔴 **`B2 合成后配方本里没有它`** 是这一整轮的核心断言：改回「合成就记」立刻变红(B2 is the assertion that encodes the whole feature.)。
+  - **payload 是从组件里抠出来喂回去的**：把聊天行里那三个按钮的 `ClickEvent.Custom` 摘下、原样交给 `handleClick` —— 客户端发出的就是这个 NBT，喂进去能走通才说明契约是通的(The payloads are harvested from the message component and fed back, exactly what a client sends.)。
+  - **先在干净档上跑**：配方本在游戏里没有清空入口，第二次跑时那些「新配方」早就在本里了 ⇒ 提问分支根本不进 ⇒ B 组全红。所以跑之前把 `.dat` 挪走(`install_prompt_selfcheck.py` 负责)(The recipe book has no in-game reset, so the harness moves the save aside first.)。
+- 填满背包 **35 条断言 × 5 版本 = 175 条全绿**（`FillSelfCheck`）：容量算法 6、常规模式 8、盒模式 15、菜单入口 6(Thirty-five assertions per version, all green.)。
+  - 每条断言同时咬**三样**：背包里真有多少、仓库真扣了多少、有没有多出盒子。只咬一头的话扣账错了照样能绿(Each assertion pins inventory contents, warehouse deduction and box count at once.)。
+  - 期望值全是**手算**的物理量：36 格 × 64 = 2304；圆石一盒 27×64 = 1728，36 格 × 1 盒 = 62208。不写「和实现算出来的一样」(All expectations are hand-computed physical quantities.)。
+  - 🔴 **`getContainerSize()` 是 43 不是 36**：第一版容量算法直接沿用，实测算出 2752（= 43 × 64）—— 多出来的 7 格是副手、身体盔甲和鞍。这条错会同时污染「填满背包」和「按数量取货」，见上方 Fixed(`getContainerSize()` is 43; the first version computed 2752 instead of 2304.)。
+- 🔴 **这两套的条数以服务端打出的 `checks=` 为准，不数源码**：三个按钮共用同一个 `for`、`B0` 有三处，所以静态 `grep -c 'check("'` 数出来是 54 / 36，实测是 **51 / 35**。第一版 CHANGELOG 把分组数写成了「4 / 7 / 10 / 18 / 11」——那是按印象凑的，四组全错还多出一个不存在的组。判据只能跑一遍读日志(Assertion counts come from the harness output, not from grepping the source.)。
 - 配方存储与原料兑换的完整覆盖测试 **65 条断言 × 5 版本 = 325 条全绿**（`CraftExchangeAudit`，真服务端、真 `ServerPlayer`、真存档）：持久化 19（含**真落盘**）、兑换数量 18、20 人并发 12、账平 16(A 65-assertion audit over five targets, 325 checks total, all green on a real server.).
 - **真落盘**单独成组（P7a–h）：把当前存档标脏 → `saveAndJoin()` → 从游戏自己写出的 `.dat` 读回来，配方文本按序逐条相同、库存逐格相同（26.3 实测 **1,865 条**：磁盘 == 内存）。P1–P6 只证明编解码器跟自己对得上，碰不到目录规则、外层 `data` 包装和写盘时机 —— 而玩家问的是「关服再开服还在不在」(The disk round trip reads back the file the game itself wrote, which the codec-only round trip cannot prove.)。
 - 🔴 **「文件在」不等于「这次写的」**：旧档也在。唯一能证明「刚刚真落盘」的是 **mtime**，所以加了一条 `P7c 这个档是刚刚写的（mtime 距今 < 120 秒）`。少了它，在 1.21.11 上读到一份三周前的 48 字节空档也会全绿 —— 第一版就是这么假绿的(The mtime check is what distinguishes a fresh write from a stale file.).
@@ -206,18 +242,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 453,408 B | `e5a62ad62cbdfab20c56e5fe8a06dc8d` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 503,912 B | `aadb4d808df8129da197858de36d4963` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 453,544 B | `1346faabf726316d60ee4b4563b88f97` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 504,351 B | `a26a4f436e5abf437056f1ea06c00d82` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 456,811 B | `2cdef7ff07105a57fca0bbb108483065` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 505,362 B | `5c41e91a8752f396a556bf31caa02345` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 456,812 B | `c158fa5583f07c5686d01282c4a10626` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 505,361 B | `377b6fd1a3856d36e19c24a82ceced1f` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 453,878 B | `2c1f2b95908adcf0288eb83f6531cd88` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 505,128 B | `bb9405a3f3238d4cae5d6de9c3455775` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 468,759 B | `1618b75451c54c26c3d16b7da2e6cb7c` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 522,308 B | `c9a3f190f9cb89b5c8d72b573883e5b6` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 468,922 B | `9b7e7b4511ca478b9e1b315458ac1b34` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 522,664 B | `be67efa1d5826714b85c8f6b275d5eb0` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 472,189 B | `af554363733ce29a533787791bd978e7` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 523,675 B | `ec9fa7bdab32c8f942b3a41449e97d3f` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 472,190 B | `ee6abdc6316b6adc524d4f358ad9499c` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 523,674 B | `31e14ca7fb2c3fcdbe6cd7088eb28935` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 469,157 B | `272ffca17724ce78fa2fdf73b6b84674` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 523,476 B | `9dcacf2c4c8ae94d927c2c9d156eb952` |
 
-> **本表已按 2026-11-12 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第九次原地替换**：规则集、配置键、规则名仍然一个字都没动 —— 这次只把用量接进「已记住」那一行（`已记住配方：2 云杉木板 → 4 木棍，目前配方数量：1,845 / 2,048。`）。配方本落盘格式、扣料算法、可兑表口径逐字节不变。主 jar 变大 112 / 112 / 112 / 112 / 113 B，sources jar 变大 230 / 231 / 231 / 231 / 229 B，就是这一处。md5 与前八次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-12; the v1.0.17 assets were replaced in place a ninth time, appending the book usage to the "learned" line. Recipe storage format, cost deduction and the offer table are byte-identical.).
+> **本表已按 2026-11-12 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十次原地替换**：规则集、配置键、规则名仍然一个字都没动（两条新功能都挂在既有规则下面）—— 这次加了「配方存入前的聊天确认」与「Ctrl+Alt+左键填满背包」。配方本落盘格式、扣料算法、可兑表口径逐字节不变。主 jar 变大 15,351 / 15,378 / 15,378 / 15,378 / 15,279 B，sources jar 变大 18,396 / 18,313 / 18,313 / 18,313 / 18,348 B（新增两个类 + `fill/` 包 + 一大段 javadoc）。md5 与之前九次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-12; the v1.0.17 assets were replaced in place a tenth time, adding the recipe confirmation prompt and the Ctrl+Alt+click fill gesture. Recipe storage format, cost deduction and the offer table are byte-identical.).
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 
@@ -228,6 +264,7 @@
 - **新增一条 Carpet 规则**（`voidWarehouseDirectPlace`，默认 `false`），规则集变了，所以版本号升到 1.0.17。配置键与已有规则名**均未变**，直接替换 jar 即可；但**配方本的存档格式在本版内变过一次**，见下一条(One new rule; no config-key change — just swap the jar. The recipe-book storage format did change once within this version, see below.)。
 - 🔴 **配方本的存档格式变了（同版本号内）**：`learned_recipes`（全部配方拼成一个字符串）→ `learned_recipes_lines`（一条配方一个元素）。老档**升级零操作**，第一次写盘时自动迁移；但**降级不行** —— 新版本写过的档，旧版本读不到配方（它只认旧键，而那键已经没了）。要回退版本请先备份存档。顺带把配方本上限从 **512 条放宽到 2048 条**，撞顶时服务端会 `WARN` 一次(The recipe-book field changed from a joined string to a per-recipe list; upgrades migrate on first write, downgrades lose the recipe book, so back up first. The cap also moves from 512 to 2048.).
 - **直放要三条一起开**：服务端 `voidWarehouse` + `voidWarehouseRestock` + `voidWarehouseDirectPlace`，客户端在 `litematica-printer` 配置里也打开 `voidWarehouseDirectPlace`。少一条就退回「补货到背包、手上放」(All three server rules plus the client option are required.)。
+- **两条新功能都不新增规则**，所以版本号仍是 1.0.17：配方确认提示挂在 `voidWarehouseCraft` 下（开了就默认「问了才记」），填满背包挂在 `voidWarehouse` 下（服务端不需要额外开关）。**Ctrl+Alt+左键要客户端也更新**到 `neko-voidwarehouse-search` 0.2.0，纯原版客户端点不出这个手势、其余行为一个字节不变(Both features ride existing rules, so the version stays 1.0.17; the fill gesture additionally needs the client mod 0.2.0.).
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。

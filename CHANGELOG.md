@@ -129,18 +129,29 @@
 - ⚠️ **配方本换版后的第一次重建仍是整批**（`max_ms` 23–73 ms，暖机下比稳态多 3~8 ms），因为依赖集要整张重建。仍在 50 ms 预算内，但余量比稳态小一个数量级。（**下一条把它压到 20.2 ms** —— 那时量出整批的大头不在依赖集，而在「每次探针重新展开一棵配方树」。）
 - ⚠️ **R2 里那句「脏化集合最多省 15%」是错的，已在设计文档里更正**：当时把「按页算」和「脏化集合」归成一类估，「按页算」确实只值 15%，「脏化集合」实测省 93%（733/746）。教训是**估算必须在真实调用序列上量**，不能在脑子里把两条代价结构不同的路线归为一类 —— 那比不做估算更危险，它会让人理直气壮地跳过唯一有效的那条。
 
-#### 满本整批重建 45.4 → 20.2 ms：把配方树编译成下标，库存只快照一次（`voidWarehouseCraft`）
+#### 满本整批重建 45.4 → 22.3 ms：把配方树编译成下标，模拟态改用可复位草稿纸（`voidWarehouseCraft`）
 
 - **现象**：R3 之后稳态增量已经是 1 ms 级，但**配方本换版后的第一次重建仍然是整批**（`max_ms` 23 – 73 ms）。这条路不是只在开服时走一次：玩家在界面里学一条新配方、或把仓库里的东西存进配方本，下一 tick 就得把整棵树重算一遍(The first rebuild after the recipe book changes version was still a full batch; it is hit whenever a recipe is learned or stored.).
 - **根因是「每次探针都重新展开一棵树」**：`plan` / `maxCraftable` 每一层都靠 `Map<String, List<Recipe>>` 现查，每条配方的每个原料槽位现查 `List<ItemStack>`、现算候选 id 字符串。满本 866 条走闭包的配方各自铺一个 40 项 `map`，`amount` 回调合计 **7,478 次** —— 而这一 tick 里库存一个字节都没变，问的都是同一批量(The cost was re-expanding the tree and re-reading the same stock on every probe.)。
-- **改法（AE2 的结构，语义照搬）**：`VoidWarehouseRecipes.Tree` 在配方本换版时**编译一次** —— 每个物品一个槽位（`slotOf`）、每条配方一个 `RecipeNode`（原料槽位的候选压成 `int[]` 下标、`multiParts` 预先分流、`forcedSlots` 预解析），之后 `plan` / `maxCraftable` 全走数组，不再碰任何 `Map` 与字符串。库存由 `stockArray(...)` 打成 `BigInteger[]`：整批共用一个全树数组（1,223 次回调），单次取货只取闭包数组。模拟状态放进可复用的 `Scratch`（AE2 `CraftingSimulationState` 的角色）：世代戳 + 撤销日志，复位只是 `epoch++`，不再给每个分支复制账本(A precompiled recipe tree of slot indices, one shared stock snapshot per batch, and a reusable simulation scratch.).
-- **用户问的那句「先序遍历配方树、到叶子看够不够」正是现在的语义**，所以功能一个字都没动：`Tree` 只是把「问一次查一次」换成「先把下标编好」，遍历顺序、候选顺序、`MAX_DEPTH` / `MAX_CLOSURE` 的截断顺序、`maxCraftable` 的二分判据、`deltas` 的净变化口径全部照旧。`stockArray(rootSlot, ...)` 特意按旧 `stockClosure` 逐条对齐 —— 闭包外的物品必须仍是 0，否则模拟会凭空看见真值(No behaviour change: same traversal, same truncation order, same binary-search predicate and the same net-change convention for `deltas`.).
+- **改法（AE2 的结构，语义照搬）**：`VoidWarehouseRecipes.Tree` 在配方本换版时**编译一次** —— 每个物品一个槽位（`slotOf`）、每条配方一个 `RecipeNode`（原料槽位的候选压成 `int[]` 下标、`multiParts` 预先分流、`forcedSlots` 预解析），之后 `plan` / `maxCraftable` 全走数组，不再碰任何 `Map` 与字符串。库存仍按**一条配方一份闭包**打成 `BigInteger[]`（`stockArray(RecipeNode, amount)`）。模拟状态放进可复用的 `Scratch`（AE2 `CraftingSimulationState` 的角色）：世代戳 + 撤销日志，复位只是 `epoch++`，不再给每个分支复制账本(A precompiled recipe tree of slot indices, a per-recipe closure array, and a reusable simulation scratch.).
+- **用户问的那句「先序遍历配方树、到叶子看够不够」正是现在的语义**，所以功能一个字都没动：`Tree` 只是把「问一次查一次」换成「先把下标编好」，遍历顺序、候选顺序、`MAX_DEPTH` / `MAX_CLOSURE` 的截断顺序、`maxCraftable` 的二分判据、`deltas` 的净变化口径全部照旧(No behaviour change: same traversal, same truncation order, same binary-search predicate and the same net-change convention for `deltas`.).
 - **正确性怎么保证**：还是那台对拍台 —— 改前 / 改后两份源码喂同一语料**对拍 7,416 行**，SHA-256 仍是 `089d6787…8c82e1`，**逐字节相同**。真服务端读数也一致：`offers=747`、`sink=5976` 与改前一字不差（探针先学一条语料外配方把配方本顶到换版，所以是 747 而不是 746）(A byte-identical 7,416-line diff, plus unchanged `offers` and `sink` readings.).
-- **结果**：真服务端同口径探针（同一个 `R4BatchProbe`，先后跑新旧代码，各三轮取中位）满本整批 **45.42 → 20.22 ms（2.25×）**，增量 1.41 → 1.10 ms；离线归因台 39.53 → 15.6 – 18.2 ms（≈2.3×），其中 `maxCraftable` 单项 22.79 → 10.54 – 12.69 ms。拆开看：「预编译树 + 共享快照」占大头，「草稿纸复用」再省一档 —— 关掉 `Scratch` 复用是 **21.39 ms（1.85×）**，所以那 866 次数组分配约值 1.35 – 1.70 ms(The full-batch rebuild halved on a real server; the precompiled tree and the shared snapshot carry most of it, the scratch reuse adds one more step.).
-- **闭包比预想小得多**：`Probe2` 在真实语料上逐条配方数了闭包规模（满本 866 条配方，分布在 746 个产物下），**最大只有 40 个槽位**（`magenta_harness`），分布 `0:596 / 8:88 / 16:71 / 24:89 / 32:21 / 40:1` —— 离 `MAX_CLOSURE=256` 的上限还有六倍余量。所以「单次取货只取闭包」这条捷径是安全的：省下 6.1 倍回调（7,478 → 1,223），而闭包外的部分本来就必须读成 0(Closures top out at 40 slots, far below `MAX_CLOSURE`, which is what makes the per-withdrawal path safe.)。
+- **结果**：真服务端同口径探针（同一个 `R4BatchProbe`，先后跑新旧代码，各三轮取中位）满本整批 **45.42 → 22.25 ms（2.04×）**，增量 1.41 → 1.60 ms；离线归因台 39.53 → 21 ms 量级（`maxCraftable` 单项 22.79 → 12 ms 量级）。收益全部来自「下标化」与「草稿纸复用」——**没有**动「一条配方一份闭包」这条语义线(The full-batch rebuild halved on a real server; the win is the index-based tree plus the reusable scratch, not a different stock snapshot.).
+- ⚠️ **这一版中途试过「整批只取一份全树快照、所有产物共用」**：确实更快（22.25 → 20.22 ms，1,223 次回调），但它**改变了语义** —— 同名产物的多条配方共用一份闭包时，深度预算会互相挤占，深层配方算出来的数量变小。审计当场抓到 1–11 条 `*_cushion` 配方与上一版不一致，于是整条快照路线撤回，见下方 Fixed 那条。**教训：把「回调次数从 7,478 降到 1,223」当成纯收益，是因为只看了次数、没看它读的是不是同一批槽位**(A shared full-tree snapshot was tried and reverted: it was faster but changed the answers for deeply nested recipes.).
+- **闭包比预想小得多**：`Probe2` 在真实语料上逐条配方数了闭包规模（满本 866 条配方，分布在 746 个产物下），**最大只有 40 个槽位**（`magenta_harness`），分布 `0:596 / 8:88 / 16:71 / 24:89 / 32:21 / 40:1` —— 离 `MAX_CLOSURE=256` 的上限还有六倍余量。所以「单次取货只取闭包」这条捷径是安全的：闭包外的部分本来就必须读成 0(Closures top out at 40 slots, far below `MAX_CLOSURE`, which is what makes the per-withdrawal path safe.).
 - ⚠️ **`Tree` 必须与配方本同生共死**：`recipesByOutput` 换版而 `Tree` 没换 ⇒ `RecipeNode` 指向已经不存在的槽位。五个版本全部改成在 `rebuildRecipes()` 与构造函数里同步重建 `craftTree` + `craftScratch`；`usable(tree, scratch)` 另做长度校验，长度不符就新建，防跨版本档读到越界下标(The tree and the scratch are rebuilt together with the recipe book, and a length check guards against stale sizes.).
 
 ### 🐛 Fixed / 修复
+
+#### 同一产物的多条配方共用一份闭包，深层配方会「有原料却算成做不了」（`voidWarehouseCraft`）
+
+- **怎么发现的**：交付前按玩家要求做覆盖审计（离线 1,236 条配方 × 9 种库存分布），把「闭包快照」与「全树快照」的答案逐条对比，发现 1 – 11 条配方两者不一致，全部落在 `*_cushion` 这类四层链上。再拿 R3 源码跑**同一个判据**：R3 只有 0 – 10 条不一致 —— 多出来的那几条正是本轮引入的(This regression was found by the pre-release audit, not by luck.)。
+- **根因**：第一版把「一条配方一份闭包」改成了「一个产物一份闭包」（遍历该产物的**所有**配方）。闭包收集用全局 `seen` 去重：先扫到的那条配方把中间产物标成「已访问」，轮到另一条配方时，即便该物品刚出现在第 0 层也不会再往下钻 —— 深度预算被先扫到的分支吃掉，闭包比逐条取更浅。`blue_cushion` 正好有两条配方（`3× blue_wool_slab` 与 `1× blue_dye + 1× white_cushion`），后者的 `wool → string` 链整段丢掉。
+- **症状**：仓库里明明有原料（尤其是只剩最深层那几种的时候），界面显示「做不了」或可做数量偏小。这正是玩家最常报的一类。
+- **改法**：`Tree#stockArray` **只接受 `RecipeNode`**，遍历起点是「这一条配方」的原料（depth=0），与 R3 的 `stockClosure` 逐条对齐；产品级的重载**直接删掉**（留着就是下一次踩同一个坑的入口），旧签名 API 改用 `arrayOf(Map)` 铺数组。三处调用点（单次取货 `craftStock`、批量 `computeCraftOffer`、增量分支）全部改成逐条取(The closure is now taken per recipe, never per product.)。
+- **验收**：① 离线审计 D 组（闭包 vs 全树）的差异**配方集合**与 R3 逐条相同（9 种库存下合计 21 次差异，全部是同一批 `*_cushion`）；② 新增 H 组把「数组闭包」与「旧 `Map` 闭包」逐键比对 **8 万余条断言**，全同；③ 7,416 行对拍 SHA-256 仍是 `089d6787…8c82e1`。
+- **代价**：整批重建从「共用一份全树快照」的 20.22 ms 回到 **22.25 ms** —— 买回来的是「答案与上一版一模一样」。这个交换必须做：20.22 那版在 `*_cushion` 上给出的数与玩家上一版看到的**不同**。
+- **防复发**：`CraftSelfCheck` 新增 **R 组 7 条**，刻意造出「一个产物两条配方、深层物品在第 4 层 vs 第 0 层」的形状。变异实测（把闭包退回按产物并集）**R3 / R5 / R7 三条当场红** —— 其中 R7 就是「有原料却做不出来」那句原话(Seven new assertions pin the per-recipe closure; a mutation that restores the shared closure turns three of them red.).
 
 #### 盒模式下取「潜影壳 / 箱子」会白得外盒（材料账与货同源）
 
@@ -238,9 +249,11 @@
 
 ### 🧪 Testing / 测试
 
-- 算法改造后的回归 **1,315 条断言零失败**（2026-11-13）：26.3 跑满三套 —— `SystemTest` **209**、`CraftSelfCheck` **217**、`FillSelfCheck` **53**；26.2 / 26.1.2 / 26.1.1 / 1.21.11 各 `SystemTest` **209**。本轮只动 `common/` 的共享算法层与五份 `Data` 的接线（`r4_sync_4.py` 保证五份逐字节一致），所以另外四个版本没有重跑 craft / fill 两套 —— 它们的扣料语义由 7,416 行对拍兜底（改前 / 改后 **SHA-256 相同**）(1,315 assertions green after the rewrite; the four other versions were validated by the system test plus the byte-identical diff harness.).
-  - 🔴 **`CraftSelfCheck` 的条数是 217，不是早前记的 214**：上文那条全量回归总数按 214 算过，而这一版内又给这套加了 3 条（重复合成提示）。**条数以服务端打出的 `checks=` 为准**，按 214 算的总数每个版本少 3 条(Counts come from the harness output; the earlier total undercounted this suite by 3 per version.).
-  - 顺序是「先对拍、再构建」：改完先拿离线对拍台跑同一语料，两边输出逐字节相同才去动五个版本的构建 —— 反过来做就要重跑五遍(Verify offline first, build second.).
+- 算法改造 + 回归修复后的完整验证 **1,322 条断言零失败**（2026-11-13）：26.3 跑满三套 —— `SystemTest` **209**、`CraftSelfCheck` **224**（新增 R 组 7 条）、`FillSelfCheck` **53**；26.2 / 26.1.2 / 26.1.1 / 1.21.11 各 `SystemTest` **209**。扣料语义另由 7,416 行对拍兜底（改前 / 改后 **SHA-256 相同**）(1,322 assertions green after the rewrite and the regression fix.).
+  - **离线覆盖审计 104,707 条断言**（独立台 `C:/tmp/audit`，不进仓库）：A 全覆盖 4,942 条（每条配方都能在树里找到、挂在正确产物下、槽位往返一致）、B 自给自足 4,161 条（只给「这条配方一次所需的原料」，`maxCraftable ≥ 1` 且 `plan` 给得出计划；实测 1,164 条给 1 倍就够、72 条要 2 倍 —— 那 72 条是配方内同一个物品出现在多个原料位）、C 必要性 1,146 条（把某个叶子原料清 0，必须退到 0 且 `plan` 返回 null）、D 闭包 vs 全树 11,124 条、E 空库存 2,472 条、F 单调 2,472 条、G 草稿纸复用 5 条（正序 / 逆序 / 随机三遍，与「每条新建草稿纸」逐条相同）、H 数组闭包 vs 旧 `Map` 闭包 8 万余条(A 104,707-assertion offline audit — from "every recipe is in the tree" to "the reusable scratch leaks nothing".).
+  - 🔴 **A 组没有一条「丢配方」**：1,236 条配方全部能在 `Tree` 里找到，且树里的配方条数与语料**逐条相等**（反向也查了：不能凭空多出配方）。B 组才是「有原料就能做」那句抱怨的机器版本 —— 它比「界面上看得见」更强：直接问「只给这些原料，最多能做几个」。
+  - 🔴 **`CraftSelfCheck` 的条数是 224，不是早前记的 214 / 217**：**条数以服务端打出的 `checks=` 为准**，按旧数算的总数会少算(Counts come from the harness output, not from memory.).
+  - 顺序是「先对拍、再审计、最后构建」：对拍台与审计台都只跑 `common/`，几分钟一轮；反过来先构建再发现语义变了，五个版本要重跑一遍(Verify offline first, build second.).
 - 配方确认提示 **51 条断言 × 5 版本 = 255 条全绿**（`RecipePromptSelfCheck`，真服务端 + 真 `ServerPlayer`）：接线 5、只问不记 9、按钮契约 10、点击回路 27(Fifty-one assertions per version, all green.)。
   - 🔴 **第一组必须是「mixin 真的挂上了」**：编译通过什么都不能说明 —— `ServerCommonPacketListenerImpl` 懒加载，没有玩家连接就没人碰它，注入失败会**一声不响**。判据是反射到目标类里数方法，而且必须按**名字子串**（Mixin 会把 handler 改名成 `handler$<hash>$carpetAutomending$onCustomClick`，写 `equals` 必假红）(Reflection must match by substring: Mixin prefixes handler names.)。
   - 🔴 **`B2 合成后配方本里没有它`** 是这一整轮的核心断言：改回「合成就记」立刻变红(B2 is the assertion that encodes the whole feature.)。
@@ -269,21 +282,20 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 480,503 B | `d768d74025dec3c44dd1f9212ed34095` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 533,247 B | `9257cfa48132c3f08e26a30b566d2504` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 480,615 B | `4376cbd03f3b9c0e372db0dcd50d8571` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 533,605 B | `c4262a548561d1218bed0b1962892c30` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 483,877 B | `c9dda0b78e0ea7e7666c7b028451def5` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 534,615 B | `48e9b67adb520d43c50c9ceabd409de9` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 483,878 B | `5d37c28c6be085b1fc9447aa06d9188a` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 534,614 B | `b7ca364dda1306211379d2783a996b68` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 481,005 B | `84e66f1c9377245da29398d15f28fe09` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 534,447 B | `ae48f3532368d3c74b48863aeba9a44c` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 480,799 B | `357a5a9dfcb3881edab5b69340e047d0` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 533,773 B | `1eb439a1e440fc2b404675235c38ce06` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 480,424 B | `d5a8abf2e16e552ada696063bed7ec7c` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 534,003 B | `adedef1f972a04840bd910a7f9673728` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 483,686 B | `34f0cb16eaebe70357f0954305f6bc98` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 535,013 B | `fc0d8c1a14d205ff9cafaa4ce1730974` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 483,687 B | `577a3a091b9b41b765c3176dc0c737ed` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 535,012 B | `0575a3709d42cec611e2711442291397` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 480,804 B | `67f28e7ac7c94d448592d089627b79ca` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 534,841 B | `595b77d1ae4c9bdba3772188efea3c7d` |
 
-> **本表已按 2026-11-13 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十三次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版把扣料算法换成「预编译配方树 + 共享库存快照 + 可复用模拟草稿纸」—— 满本整批重建 45.42 → 20.22 ms，功能与数据格式逐字节不变。主 jar 比上一版大 10,580 / 10,558 / 10,558 / 10,558 / 10,704 B，sources jar 大 8,242 / 8,287 / 8,287 / 8,287 / 8,283 B（`common` 共享层新增 `Tree` / `Node` / `RecipeNode` / `PartNode` / `Scratch` 五套结构与 953 行改动）。md5 与之前十二次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-13; the v1.0.17 assets were replaced in place a thirteenth time, switching the crafting algorithm to a precompiled tree with a shared stock snapshot. Recipe storage format and every decision rule are byte-identical.)。
+> **本表已按 2026-11-13 22:00 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十四次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版把扣料算法换成「预编译配方树 + 可复位模拟草稿纸」，并修掉「同一产物的多条配方共用一份闭包」导致的深层配方少算。配方本落盘格式、扣料口径、可兑表内容逐字节不变。主 jar 480,799 / 480,424 / 483,686 / 483,687 / 480,804 B（比上一次发布 −191 ~ +296 B：删掉了产品级闭包重载，换成一个 `arrayOf` 与逐条遍历），sources jar 大 394 ~ 526 B。md5 与之前十三次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-13; the v1.0.17 assets were replaced in place a fourteenth time — the precompiled tree plus the scratch, and the per-recipe closure fix. Recipe storage format and every decision rule are byte-identical.)。
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
-
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
 
 ### ⚠️ 升级提示 / Upgrade Notes
@@ -295,7 +307,7 @@
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
-- **v1.0.17 的产物换过十次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建；2026-11-13 换成含「预编译配方树 + 共享库存快照」的本地全量构建。十次都**没改版本号**，只是字节变了。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place ten times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, the book-usage suffix on the learned line, and the precompiled recipe tree — with the version number unchanged.)。
+- **v1.0.17 的产物换过十一次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建；2026-11-13 换成含「预编译配方树 + 可复位草稿纸」的本地全量构建；同日再换成含「逐条配方闭包（修掉深层配方少算）」的本地全量构建。十一次都**没改版本号**，只是字节变了。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place ten times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, the book-usage suffix on the learned line, the precompiled recipe tree, and the per-recipe closure fix — with the version number unchanged.)。
 
 * * *
 

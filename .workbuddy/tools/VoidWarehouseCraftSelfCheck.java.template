@@ -158,6 +158,9 @@ public final class VoidWarehouseCraftSelfCheck {
                 groupP_recipeNotice(server);
                 break;
             case 16:
+                groupR_closureParity();
+                break;
+            case 17:
                 cleanup(server);
                 break;
             default:
@@ -1951,6 +1954,82 @@ public final class VoidWarehouseCraftSelfCheck {
             }
         }
         return n;
+    }
+
+    // ================================================================ R 闭包口径（R4 回归）
+
+    /**
+     * 闭包必须「<b>一条配方一份</b>」。
+     *
+     * <p>反例的形状：产物 {@code t:p} 有两条配方 —— {@code r1} 让深层物品 {@code t:d}
+     * 落在第 4 层（再往下就到 {@code MAX_DEPTH}，不再钻），{@code r2} 让 {@code t:d} 落在第 0 层。
+     * 若两条配方<b>共用一份闭包</b>（按产物取并集），{@code t:d} 会先被 {@code r1} 标成「已访问」，
+     * 轮到 {@code r2} 时就不再往下钻 ⇒ {@code t:d} 的原料 {@code t:ds} 从闭包里消失 ⇒
+     * 表现正是「仓库里明明有原料、却算成做不出来」。R4 第一版就是这么错的（{@code *_cushion}）。</p>
+     *
+     * <p>这条自检钉住三件事：数组闭包与旧 {@code Map} 闭包逐键相同；{@code r2} 的闭包里有
+     * {@code t:ds}；拿 {@code r1} 的闭包去算 {@code r2} 必须做不出来（证明两份闭包不可互换）。</p>
+     */
+    private static void groupR_closureParity() {
+        System.out.println("[R] 闭包口径：数组版 vs 旧 Map 版");
+        VoidWarehouseRecipes.Recipe r1 = recipe("t:p", 1, part("t:i1", 1));
+        VoidWarehouseRecipes.Recipe r2 = recipe("t:p", 1, part("t:d", 1));
+        List<VoidWarehouseRecipes.Recipe> all = List.of(
+                r1, r2,
+                recipe("t:i1", 1, part("t:i2", 1)),
+                recipe("t:i2", 1, part("t:i3", 1)),
+                recipe("t:i3", 1, part("t:i4", 1)),
+                recipe("t:i4", 1, part("t:d", 1)),
+                recipe("t:d", 1, part("t:ds", 1)));
+        Map<String, List<VoidWarehouseRecipes.Recipe>> by = VoidWarehouseRecipes.byOutput(all);
+        VoidWarehouseRecipes.Tree tree = VoidWarehouseRecipes.Tree.compile(by);
+        VoidWarehouseRecipes.RecipeNode n1 = tree.recipeNodeOf(r1);
+        VoidWarehouseRecipes.RecipeNode n2 = tree.recipeNodeOf(r2);
+        check("R1 两条配方都编进树里", n1 != null && n2 != null);
+        if (n1 == null || n2 == null) {
+            return;
+        }
+
+        // 只给最深那层原料：中间产物一个都不给，逼模拟器往下钻
+        Map<String, BigInteger> deepOnly = stock("t:ds", 64, "t:p", 0);
+        BigInteger[] c1 = tree.stockArray(n1, deepOnly::get);
+        BigInteger[] c2 = tree.stockArray(n2, deepOnly::get);
+
+        check("R2 r1 的数组闭包 == 旧 Map 闭包",
+                sameClosure(tree, c1, VoidWarehouseRecipes.stockClosure(r1, by, deepOnly::get)));
+        check("R3 r2 的数组闭包 == 旧 Map 闭包",
+                sameClosure(tree, c2, VoidWarehouseRecipes.stockClosure(r2, by, deepOnly::get)));
+
+        int dsSlot = tree.slotOf("t:ds");
+        check("R4 r1 的闭包不含 t:ds（闭包只往下 4 层，这正是不该共用的原因）",
+                dsSlot >= 0 && c1[dsSlot] == null);
+        check("R5 r2 的闭包里必须有 t:ds", dsSlot >= 0 && c2[dsSlot] != null);
+
+        check("R6 拿 r1 的闭包算 r2 做不出来（共用就会这样）",
+                VoidWarehouseRecipes.maxCraftable(tree, n2, c1, null).signum() == 0);
+        check("R7 用 r2 自己的闭包能做出来",
+                VoidWarehouseRecipes.maxCraftable(tree, n2, c2, null).signum() > 0);
+    }
+
+    /** 数组闭包与旧 Map 闭包：字符串集合相同、数值相同 */
+    private static boolean sameClosure(VoidWarehouseRecipes.Tree tree, BigInteger[] arr,
+                                       Map<String, BigInteger> map) {
+        int filled = 0;
+        for (BigInteger v : arr) {
+            if (v != null) {
+                filled++;
+            }
+        }
+        if (filled != map.size()) {
+            return false;
+        }
+        for (Map.Entry<String, BigInteger> e : map.entrySet()) {
+            int slot = tree.slotOf(e.getKey());
+            if (slot < 0 || !e.getValue().equals(arr[slot])) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static void cleanup(MinecraftServer server) {

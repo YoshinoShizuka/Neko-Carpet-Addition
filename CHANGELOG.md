@@ -126,8 +126,19 @@
 - **顺手多一条捷径**：`Container#setChanged()` 会调 `markChanged()`，而它「什么都没改」。脏集合为空就直接沿用上一份表 —— 满本这条路从 **13.57 ms 降到 0.000 ms**。判据必须带上「清空标志」：`clearContent()` 把库存整体清空却不逐件记账，少了这一项就会把上一份还带着已不存在物品的表当新表返回（这条是写完自检才想到的，M9 专为它补）。
 - **正确性怎么保证**：新增自检 **M 组 11 条**，给每次改动都配一份「整批重算」的对照 —— 原地 `clearContent()` 再灌回同一份库存（配方本一个字不动），把可兑表按字面量摊平**逐字节比对，顺序照原样不排序**。另做**两次变异测试**证明这组有牙：去掉依赖集里的「产物自己」→ **M3/M4 当场红**；去掉快捷路径的清空判据 → **M9 当场红**(An 11-assertion incremental-vs-full equivalence group, validated by two mutation tests that each turn it red.)。
 - **结果**：五版本满本重建 **22.17 / 25.09 / 18.05 / 18.15 / 22.88 → 0.93 / 1.17 / 1.07 / 0.75 / 1.46 ms**（15.7 – 24.2×）；满本「标脏但没变」13.57 → **0.000 ms**。**五版本 14 组套件、1,816 条断言零失败**，而正确性指纹一字未动：判 0 条数仍是 **0/17/43/43**、`lost=0`、`exact=1236 · under=0 · unreachable=0`、货架 `missing=0`、展示序 **727 项**一致、满本 `offers` 仍是 **746/671/652/652/652**(All five versions pass, and every correctness fingerprint is unchanged.)。
-- ⚠️ **配方本换版后的第一次重建仍是整批**（`max_ms` 23–73 ms，暖机下比稳态多 3~8 ms），因为依赖集要整张重建。仍在 50 ms 预算内，但余量比稳态小一个数量级。要压它得把依赖集也做成增量 —— 收益只在「刚学完配方的那一 tick」，暂不做。
-- ⚠️ **R2 里那句「脏化集合最多省 15%」是错的，已在设计文档里更正**：当时把「按页算」和「脏化集合」归成一类估，「按页算」确实只值 15%，「脏化集合」实测省 93%（733/746）。教训是**估算必须在真实调用序列上量**，不能在脑子里把两条代价结构不同的路线归成一类 —— 那比不做估算更危险，它会让人理直气壮地跳过唯一有效的那条。
+- ⚠️ **配方本换版后的第一次重建仍是整批**（`max_ms` 23–73 ms，暖机下比稳态多 3~8 ms），因为依赖集要整张重建。仍在 50 ms 预算内，但余量比稳态小一个数量级。（**下一条把它压到 20.2 ms** —— 那时量出整批的大头不在依赖集，而在「每次探针重新展开一棵配方树」。）
+- ⚠️ **R2 里那句「脏化集合最多省 15%」是错的，已在设计文档里更正**：当时把「按页算」和「脏化集合」归成一类估，「按页算」确实只值 15%，「脏化集合」实测省 93%（733/746）。教训是**估算必须在真实调用序列上量**，不能在脑子里把两条代价结构不同的路线归为一类 —— 那比不做估算更危险，它会让人理直气壮地跳过唯一有效的那条。
+
+#### 满本整批重建 45.4 → 20.2 ms：把配方树编译成下标，库存只快照一次（`voidWarehouseCraft`）
+
+- **现象**：R3 之后稳态增量已经是 1 ms 级，但**配方本换版后的第一次重建仍然是整批**（`max_ms` 23 – 73 ms）。这条路不是只在开服时走一次：玩家在界面里学一条新配方、或把仓库里的东西存进配方本，下一 tick 就得把整棵树重算一遍(The first rebuild after the recipe book changes version was still a full batch; it is hit whenever a recipe is learned or stored.).
+- **根因是「每次探针都重新展开一棵树」**：`plan` / `maxCraftable` 每一层都靠 `Map<String, List<Recipe>>` 现查，每条配方的每个原料槽位现查 `List<ItemStack>`、现算候选 id 字符串。满本 866 条走闭包的配方各自铺一个 40 项 `map`，`amount` 回调合计 **7,478 次** —— 而这一 tick 里库存一个字节都没变，问的都是同一批量(The cost was re-expanding the tree and re-reading the same stock on every probe.)。
+- **改法（AE2 的结构，语义照搬）**：`VoidWarehouseRecipes.Tree` 在配方本换版时**编译一次** —— 每个物品一个槽位（`slotOf`）、每条配方一个 `RecipeNode`（原料槽位的候选压成 `int[]` 下标、`multiParts` 预先分流、`forcedSlots` 预解析），之后 `plan` / `maxCraftable` 全走数组，不再碰任何 `Map` 与字符串。库存由 `stockArray(...)` 打成 `BigInteger[]`：整批共用一个全树数组（1,223 次回调），单次取货只取闭包数组。模拟状态放进可复用的 `Scratch`（AE2 `CraftingSimulationState` 的角色）：世代戳 + 撤销日志，复位只是 `epoch++`，不再给每个分支复制账本(A precompiled recipe tree of slot indices, one shared stock snapshot per batch, and a reusable simulation scratch.).
+- **用户问的那句「先序遍历配方树、到叶子看够不够」正是现在的语义**，所以功能一个字都没动：`Tree` 只是把「问一次查一次」换成「先把下标编好」，遍历顺序、候选顺序、`MAX_DEPTH` / `MAX_CLOSURE` 的截断顺序、`maxCraftable` 的二分判据、`deltas` 的净变化口径全部照旧。`stockArray(rootSlot, ...)` 特意按旧 `stockClosure` 逐条对齐 —— 闭包外的物品必须仍是 0，否则模拟会凭空看见真值(No behaviour change: same traversal, same truncation order, same binary-search predicate and the same net-change convention for `deltas`.).
+- **正确性怎么保证**：还是那台对拍台 —— 改前 / 改后两份源码喂同一语料**对拍 7,416 行**，SHA-256 仍是 `089d6787…8c82e1`，**逐字节相同**。真服务端读数也一致：`offers=747`、`sink=5976` 与改前一字不差（探针先学一条语料外配方把配方本顶到换版，所以是 747 而不是 746）(A byte-identical 7,416-line diff, plus unchanged `offers` and `sink` readings.).
+- **结果**：真服务端同口径探针（同一个 `R4BatchProbe`，先后跑新旧代码，各三轮取中位）满本整批 **45.42 → 20.22 ms（2.25×）**，增量 1.41 → 1.10 ms；离线归因台 39.53 → 15.6 – 18.2 ms（≈2.3×），其中 `maxCraftable` 单项 22.79 → 10.54 – 12.69 ms。拆开看：「预编译树 + 共享快照」占大头，「草稿纸复用」再省一档 —— 关掉 `Scratch` 复用是 **21.39 ms（1.85×）**，所以那 866 次数组分配约值 1.35 – 1.70 ms(The full-batch rebuild halved on a real server; the precompiled tree and the shared snapshot carry most of it, the scratch reuse adds one more step.).
+- **闭包比预想小得多**：`Probe2` 在真实语料上逐条配方数量了闭包规模（满本 866 条配方，分布在 746 个产物下），**最大只有 40 个槽位**（`magenta_harness`），分布 `0:596 / 8:88 / 16:71 / 24:89 / 32:21 / 40:1` —— 离 `MAX_CLOSURE=256` 的上限还有六倍余量。所以「单次取货只取闭包」这条捷径是安全的：省下 6.1 倍回调（7,478 → 1,223），而闭包外的部分本来就必须读成 0(Closures top out at 40 slots, far below `MAX_CLOSURE`, which is what makes the per-withdrawal path safe.)。
+- ⚠️ **`Tree` 必须与配方本同生共死**：`recipesByOutput` 换版而 `Tree` 没换 ⇒ `RecipeNode` 指向已经不存在的槽位。五个版本全部改成在 `rebuildRecipes()` 与构造函数里同步重建 `craftTree` + `craftScratch`；`usable(tree, scratch)` 另做长度校验，长度不符就新建，防跨版本档读到越界下标(The tree and the scratch are rebuilt together with the recipe book, and a length check guards against stale sizes.).
 
 ### 🐛 Fixed / 修复
 
@@ -227,6 +238,9 @@
 
 ### 🧪 Testing / 测试
 
+- 算法改造后的回归 **1,315 条断言零失败**（2026-11-13）：26.3 跑满三套 —— `SystemTest` **209**、`CraftSelfCheck` **217**、`FillSelfCheck` **53**；26.2 / 26.1.2 / 26.1.1 / 1.21.11 各 `SystemTest` **209**。本轮只动 `common/` 的共享算法层与五份 `Data` 的接线（`r4_sync_4.py` 保证五份逐字节一致），所以另外四个版本没有重跑 craft / fill 两套 —— 它们的扣料语义由 7,416 行对拍兜底（改前 / 改后 **SHA-256 相同**）(1,315 assertions green after the rewrite; the four other versions were validated by the system test plus the byte-identical diff harness.).
+  - 🔴 **`CraftSelfCheck` 的条数是 217，不是早前记的 214**：上文那条全量回归总数按 214 算过，而这一版内又给这套加了 3 条（重复合成提示）。**条数以服务端打出的 `checks=` 为准**，按 214 算的总数每个版本少 3 条(Counts come from the harness output; the earlier total undercounted this suite by 3 per version.).
+  - 顺序是「先对拍、再构建」：改完先拿离线对拍台跑同一语料，两边输出逐字节相同才去动五个版本的构建 —— 反过来做就要重跑五遍(Verify offline first, build second.).
 - 配方确认提示 **51 条断言 × 5 版本 = 255 条全绿**（`RecipePromptSelfCheck`，真服务端 + 真 `ServerPlayer`）：接线 5、只问不记 9、按钮契约 10、点击回路 27(Fifty-one assertions per version, all green.)。
   - 🔴 **第一组必须是「mixin 真的挂上了」**：编译通过什么都不能说明 —— `ServerCommonPacketListenerImpl` 懒加载，没有玩家连接就没人碰它，注入失败会**一声不响**。判据是反射到目标类里数方法，而且必须按**名字子串**（Mixin 会把 handler 改名成 `handler$<hash>$carpetAutomending$onCustomClick`，写 `equals` 必假红）(Reflection must match by substring: Mixin prefixes handler names.)。
   - 🔴 **`B2 合成后配方本里没有它`** 是这一整轮的核心断言：改回「合成就记」立刻变红(B2 is the assertion that encodes the whole feature.)。
@@ -255,18 +269,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 469,923 B | `971c7a7441252ed0835c1573ba73034a` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 525,005 B | `149dae46c13e44483de7319bc8a6d3d9` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 470,057 B | `efbf755eea47138eebdb912a197c334f` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 525,318 B | `1d87ab0b7d78064633292b29529b3983` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 473,319 B | `06268080f34ea25803f52cb76f15bdfd` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 526,328 B | `54937412a8b430c358f46a582d705a63` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 473,320 B | `ee4779fccd2c0aa1e7b0adbe0176f107` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 526,327 B | `795788fb80cebc6883f64053f1b247b5` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 470,301 B | `5b22c8c8c5e325372e85a5d428301874` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 526,164 B | `85f7f461726f4f5dab95867f1b685ce7` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 480,503 B | `d768d74025dec3c44dd1f9212ed34095` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 533,247 B | `9257cfa48132c3f08e26a30b566d2504` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 480,615 B | `4376cbd03f3b9c0e372db0dcd50d8571` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 533,605 B | `c4262a548561d1218bed0b1962892c30` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 483,877 B | `c9dda0b78e0ea7e7666c7b028451def5` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 534,615 B | `48e9b67adb520d43c50c9ceabd409de9` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 483,878 B | `5d37c28c6be085b1fc9447aa06d9188a` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 534,614 B | `b7ca364dda1306211379d2783a996b68` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 481,005 B | `84e66f1c9377245da29398d15f28fe09` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 534,447 B | `ae48f3532368d3c74b48863aeba9a44c` |
 
-> **本表已按 2026-11-12 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十二次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版把「壳 / 箱不装盒」改成「壳 / 箱照常装盒、但材料账先预留离库的货」—— 盒子能给的时候仍然给，边界上一盒都不给。配方本落盘格式、扣料算法、可兑表口径逐字节不变。主 jar 比上一版大 1,028 / 998 / 998 / 998 / 996 B，sources jar 大 1,812 / 1,893 / 1,889 / 1,889 / 1,910 B（`Data` 新增四个方法 + 二分判据 + 注释）。md5 与之前十一次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-12; the v1.0.17 assets were replaced in place a twelfth time, switching from "refuse to pack" to "reserve the materials". Recipe storage format, cost deduction and the offer table are byte-identical.)。
+> **本表已按 2026-11-13 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十三次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版把扣料算法换成「预编译配方树 + 共享库存快照 + 可复用模拟草稿纸」—— 满本整批重建 45.42 → 20.22 ms，功能与数据格式逐字节不变。主 jar 比上一版大 10,558 / 10,558 / 10,558 / 10,558 / 10,704 B，sources jar 大 8,242 / 8,287 / 8,287 / 8,287 / 8,283 B（`common` 共享层新增 `Tree` / `Node` / `RecipeNode` / `PartNode` / `Scratch` 五套结构与 953 行改动）。md5 与之前十二次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-13; the v1.0.17 assets were replaced in place a thirteenth time, switching the crafting algorithm to a precompiled tree with a shared stock snapshot. Recipe storage format and every decision rule are byte-identical.)。
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 
@@ -281,7 +295,7 @@
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
-- **v1.0.17 的产物换过九次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建。九次都**没改版本号**，只是字节变了。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place eight times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, and the book-usage suffix on the learned line — with the version number unchanged.)。
+- **v1.0.17 的产物换过十次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建；2026-11-13 换成含「预编译配方树 + 共享库存快照」的本地全量构建。十次都**没改版本号**，只是字节变了。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place ten times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, the book-usage suffix on the learned line, and the precompiled recipe tree — with the version number unchanged.)。
 
 * * *
 

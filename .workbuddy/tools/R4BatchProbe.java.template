@@ -1,0 +1,136 @@
+package neko.voidwarehouse;
+
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * 一次性探针：只量「满本<b>整批</b>重建」那一条路。
+ *
+ * <p>为什么不能直接用 {@code A2StressTest} 的 A2 数：那条判据量的是「改一格之后的重建」，
+ * 走的是 R3 的<b>增量</b>路径（只重算受影响的十几个产物），与「配方本换版后的整批重建」
+ * 差两个数量级。本探针专门补这一格：学一条新配方让 {@code recipeGeneration} 前进，
+ * 于是下一次 {@code exchangeOffers()} 必然走整批。</p>
+ *
+ * <p>数据造法与 {@code A2StressTest#build} 完全相同（同一份语料、每种原料 10000），
+ * 这样两边的数字可以并排看。</p>
+ */
+public final class R4BatchProbe {
+
+    private static final Path CORPUS = Path.of("C:/tmp/nca_recipes_263.txt");
+    private static final BigInteger SCALE_RAW = BigInteger.valueOf(10_000);
+    private static final int ROUNDS = 3;
+
+    private static boolean done;
+    private static long sink;
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        done = true;
+        try {
+            measure();
+        } catch (Throwable ex) {
+            System.out.println("R4BATCH FAILED " + ex);
+            ex.printStackTrace();
+        } finally {
+            System.out.println("R4BATCH DONE sink=" + sink);
+        }
+    }
+
+    private static void measure() throws Exception {
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+
+        List<VoidWarehouseRecipes.Recipe> corpus = new ArrayList<>();
+        for (String line : Files.readAllLines(CORPUS, StandardCharsets.UTF_8)) {
+            if (line.isBlank()) {
+                continue;
+            }
+            VoidWarehouseRecipes.Recipe recipe = VoidWarehouseRecipes.decode(line.trim());
+            if (recipe != null) {
+                corpus.add(recipe);
+            }
+        }
+        Set<String> rawIds = new LinkedHashSet<>();
+        for (VoidWarehouseRecipes.Recipe recipe : corpus) {
+            for (VoidWarehouseRecipes.Part part : recipe.parts()) {
+                rawIds.addAll(part.candidates());
+            }
+        }
+        System.out.println("R4BATCH corpus=" + corpus.size() + " rawKinds=" + rawIds.size());
+
+        VoidWarehouseData data = build(corpus, rawIds);
+        System.out.println("R4BATCH built recipes=" + data.learnedRecipeCount());
+
+        // 学一条语料外的配方 → recipeGeneration 前进 → 下一次读必然整批。
+        // 产物固定、原料数量递增，这样每条的 recipeId 都不同（同产物多配方是允许的）。
+        for (int round = -2; round < ROUNDS; round++) {
+            VoidWarehouseRecipes.Recipe trigger = new VoidWarehouseRecipes.Recipe(
+                    null, "minecraft:bedrock", 1,
+                    List.of(new VoidWarehouseRecipes.Part(List.of("minecraft:dirt"), 1 + round + 2)));
+            data.learn(trigger);
+            data.markChanged();
+            VoidWarehouseData.noteServerTick(9_000 + round);
+            long t0 = System.nanoTime();
+            int offers = data.exchangeOffers().size();
+            long ns = System.nanoTime() - t0;
+            sink += offers;
+            if (round >= 0) {
+                System.out.printf("R4BATCH round=%d batch_ms=%.2f offers=%d%n",
+                        round, ns / 1e6, offers);
+            }
+        }
+
+        // 同一份数据上再量一次「改了库存储存之后」的增量路径，作为对照。
+        for (int round = 0; round < ROUNDS; round++) {
+            data.take(0, 1);
+            VoidWarehouseData.noteServerTick(9_500 + round);
+            long t0 = System.nanoTime();
+            int offers = data.exchangeOffers().size();
+            long ns = System.nanoTime() - t0;
+            sink += offers;
+            System.out.printf("R4BATCH round=%d incremental_ms=%.3f offers=%d%n",
+                    round, ns / 1e6, offers);
+        }
+    }
+
+    private static VoidWarehouseData build(List<VoidWarehouseRecipes.Recipe> corpus,
+                                          Set<String> rawIds) {
+        VoidWarehouseData data = new VoidWarehouseData();
+        for (VoidWarehouseRecipes.Recipe recipe : corpus) {
+            data.learn(recipe);
+        }
+        for (String id : rawIds) {
+            Item item = VoidWarehouseRecipeBook.itemOf(id);
+            if (item == null || item == Items.AIR) {
+                continue;
+            }
+            int max = Math.max(1, new ItemStack(item).getMaxStackSize());
+            BigInteger need = SCALE_RAW.subtract(data.amountOf(item));
+            if (need.signum() <= 0) {
+                continue;
+            }
+            long batches = need.add(BigInteger.valueOf(max)).subtract(BigInteger.ONE)
+                    .divide(BigInteger.valueOf(max)).longValue();
+            for (long i = 0; i < batches; i++) {
+                data.insert(new ItemStack(item, max));
+            }
+        }
+        return data;
+    }
+
+    private R4BatchProbe() {
+    }
+}

@@ -106,7 +106,7 @@ public final class VoidWarehouseRecipes {
      */
     private static final int MAX_NODES = 512;
 
-    /** {@link Tree#stockArray(int, Function)} 最多收集多少种物品（防止病态配方把闭包撑爆） */
+    /** {@link Tree#stockArray(RecipeNode, Function)} 最多收集多少种物品（防止病态配方把闭包撑爆） */
     private static final int MAX_CLOSURE = 256;
 
     /** 没有配方的物品（叶子原料）复用的空数组，省掉每个叶子的一个小对象 */
@@ -366,39 +366,45 @@ public final class VoidWarehouseRecipes {
         }
 
         /**
-         * 把整棵树的库存取成一份数组（每个槽位都问一次 {@code amount}）。
+         * 把一张「物品 id → 数量」的表铺成按槽位对齐的数组（缺键 = 0）。
          *
-         * <p>这是「一次填满、多个产物共享」的那条路：满本 1,223 个槽位问 1,223 次，
-         * 而不是 866 条配方各构造一个 40 项闭包（后者合计 7,478 次回调、866 个 map）。
-         * 取回调本身是 {@code amountOfId}，在服务端要走 {@code Identifier} 解析与注册表查找，
-         * 所以次数从 7,478 降到 1,223 是这条优化里最实的一笔。</p>
-         *
-         * <p>返回值里 {@code null} 表示「这个槽位没有取到」（等价于 0），
-         * 这样稀疏填充也成立。</p>
+         * <p>只给<b>旧签名 API</b> 用（{@link #plan(Recipe, BigInteger, Map, Map)} 与
+         * {@link #maxCraftable(Recipe, Map, Map)} 收到的是 {@code Map}）。生产路径不要用它 ——
+         * 那等于把整棵树 1,223 个槽位都读一遍，真正的热路径应当传
+         * {@link #stockArray(RecipeNode, Function)} 取到的闭包数组。</p>
          */
-        public BigInteger[] stockArray(Function<String, BigInteger> amount) {
+        public BigInteger[] arrayOf(Map<String, BigInteger> stock) {
             BigInteger[] out = new BigInteger[this.ids.length];
+            if (stock == null) {
+                return out;
+            }
             for (int i = 0; i < this.ids.length; i++) {
-                BigInteger got = amount.apply(this.ids[i]);
+                BigInteger got = stock.get(this.ids[i]);
                 out[i] = got == null ? ZERO : got;
             }
             return out;
         }
 
         /**
-         * 只取「从 {@code rootSlot} 出发、按 {@link #MAX_DEPTH} 层能用到」的那些槽位，
-         * 其余留 {@code null}（= 0）。
+         * 取「<b>这一条配方</b>」的闭包库存（其余槽位留 {@code null}，等价于 0）。
          *
-         * <p>给<b>单次取货</b>用：玩家点一下就规划一条配方，没必要把整棵树 1,223 个槽位都问一遍
-         * （那样每次取货要多花约 0.2 ms），闭包通常只有 1~40 项。</p>
+         * <p>口径与旧 {@link #stockClosure(Recipe, Map, Function)} 逐条对齐：同样的遍历起点
+         * （这条配方的原料，depth=0）、同样的 {@link #MAX_DEPTH} 层数、同样的路径去环、
+         * 同样的 {@link #MAX_CLOSURE} 截断顺序 —— 闭包外的物品必须仍然读成 0，
+         * 否则「模拟本来就该看到 0」的地方会突然看见真值。</p>
          *
-         * <p>口径与旧 {@link #stockClosure} 逐条对齐：同样的深度上限、同样的路径去环、
-         * 同样的 {@link #MAX_CLOSURE} 截断顺序 —— 否则「闭包外的物品」会从 0 变成真值，
-         * 而模拟在那种情况下本来就该看到 0。</p>
+         * <p>🔴 <b>不要「顺手」改成从产物节点出发</b>（一次取该产物所有配方的并集）。
+         * 同名产物经常有多条配方（{@code blue_cushion} 就有两条），并集会先把某条分支的
+         * 候选标成「已访问」，等另一条分支走到同一个中间产物时就不再往下钻 ——
+         * 深度预算被先扫到的分支吃掉，闭包因此比逐条取更浅。实测后果是
+         * {@code *_cushion} 这类四层链「仓库里明明有原料却算成做不出来」。
+         * 判据：离线审计的 D 组（闭包 vs 全树）差异集合必须与 R3 <b>完全相同</b>。</p>
+         *
+         * <p>返回值里 {@code null} 表示「这个槽位不在闭包里」（等价于 0），
+         * 模拟器读它就是 0 —— 与旧实现「map 里没有这个键」一致。</p>
          */
-        public BigInteger[] stockArray(int rootSlot, Function<String, BigInteger> amount) {
+        public BigInteger[] stockArray(RecipeNode root, Function<String, BigInteger> amount) {
             BigInteger[] out = new BigInteger[this.ids.length];
-            Node root = this.node(rootSlot);
             if (root == null) {
                 return out;
             }
@@ -408,34 +414,34 @@ public final class VoidWarehouseRecipes {
             return out;
         }
 
-        private void collectStock(Node node, Function<String, BigInteger> amount, BigInteger[] out,
+        private void collectStock(RecipeNode recipe, Function<String, BigInteger> amount, BigInteger[] out,
                                   boolean[] seen, boolean[] onPath, int depth, int[] budget) {
-            for (RecipeNode recipe : node.recipes) {
-                for (PartNode part : recipe.parts) {
-                    for (int candidate : part.candidates) {
-                        if (budget[0] <= 0) {
-                            return;
+            for (PartNode part : recipe.parts) {
+                for (int candidate : part.candidates) {
+                    if (budget[0] <= 0) {
+                        return;
+                    }
+                    if (candidate < 0 || seen[candidate]) {
+                        continue;
+                    }
+                    BigInteger got = amount.apply(this.ids[candidate]);
+                    out[candidate] = got == null ? ZERO : got;
+                    seen[candidate] = true;
+                    budget[0]--;
+                    if (depth >= MAX_DEPTH || onPath[candidate]) {
+                        continue;
+                    }
+                    Node sub = this.nodes[candidate];
+                    if (sub.recipes.length == 0) {
+                        continue;
+                    }
+                    onPath[candidate] = true;
+                    try {
+                        for (RecipeNode subRecipe : sub.recipes) {
+                            this.collectStock(subRecipe, amount, out, seen, onPath, depth + 1, budget);
                         }
-                        if (candidate < 0 || seen[candidate]) {
-                            continue;
-                        }
-                        BigInteger got = amount.apply(this.ids[candidate]);
-                        out[candidate] = got == null ? ZERO : got;
-                        seen[candidate] = true;
-                        budget[0]--;
-                        if (depth >= MAX_DEPTH || onPath[candidate]) {
-                            continue;
-                        }
-                        Node sub = this.nodes[candidate];
-                        if (sub.recipes.length == 0) {
-                            continue;
-                        }
-                        onPath[candidate] = true;
-                        try {
-                            this.collectStock(sub, amount, out, seen, onPath, depth + 1, budget);
-                        } finally {
-                            onPath[candidate] = false;
-                        }
+                    } finally {
+                        onPath[candidate] = false;
                     }
                 }
             }
@@ -631,7 +637,7 @@ public final class VoidWarehouseRecipes {
                 return null;
             }
         }
-        return plan(tree, node, want, tree.stockArray(stock::get));
+        return plan(tree, node, want, tree.arrayOf(stock));
     }
 
     /**
@@ -738,7 +744,7 @@ public final class VoidWarehouseRecipes {
                 return ZERO;
             }
         }
-        return maxCraftable(tree, node, tree.stockArray(stock::get));
+        return maxCraftable(tree, node, tree.arrayOf(stock));
     }
 
     /**
@@ -779,8 +785,9 @@ public final class VoidWarehouseRecipes {
      * 把一条配方<b>整条闭包</b>的库存快照取出来（配方要用到的每一样东西现在有多少）。
      *
      * <p>保留这个 {@code Map} 版本是为了旧调用方与「对拍」；生产路径用
-     * {@link Tree#stockArray(Function)} / {@link Tree#stockArray(int, Function)}
-     * —— 后者返回按槽位对齐的数组，热路径上没有任何字符串哈希。</p>
+     * {@link Tree#stockArray(RecipeNode, Function)} —— 它返回按槽位对齐的数组，
+     * 热路径上没有任何字符串哈希。两者的<b>槽位集合与数值必须逐键相同</b>
+     * （离线审计的 H 组就是比这个）。</p>
      *
      * <p>为什么是闭包而不是「这条配方的原料」：1.0.15 报过一个 bug ——
      * 学过一次「深色橡木原木 → 深色橡木木板」和一次活塞之后，木板用完了、原木还有一堆，

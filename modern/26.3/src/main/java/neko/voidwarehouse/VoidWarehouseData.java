@@ -2028,7 +2028,7 @@ public final class VoidWarehouseData extends SavedData {
                                     BigInteger fromStock) {
         // 闭包版：只问「这条配方用得到的那几十样东西」，而不是整棵树一千多个槽位。
         // 取货是玩家点一下就走的路径，把它变成「每次问一千多样」会白白多花约 0.2 ms。
-        BigInteger[] stock = this.craftTree.stockArray(recipe.outputSlot, this::amountOfId);
+        BigInteger[] stock = this.craftTree.stockArray(recipe, this::amountOfId);
         if (fromStock.signum() > 0) {
             // 只在这个槽位「确实取到了」时才扣 —— 与旧实现「闭包里没有它就不扣」逐条对齐。
             int slot = this.craftTree.slotOf(itemId);
@@ -2449,14 +2449,16 @@ public final class VoidWarehouseData extends SavedData {
             this.craftOffers = new java.util.LinkedHashMap<>(Math.max(16, this.craftDeps.size() * 2));
             // 一次取好整棵树的库存，全部产物共用 —— 这是本版最实的一笔：
             // 旧路径是「每条配方各取一次闭包」，满本合计 7,478 次 amountOfId、866 个 HashMap。
-            BigInteger[] snapshot = this.craftTree.stockArray(this::amountOfId);
+            // 每条配方各取一次闭包（满本 866 次）—— 不能几条配方共用一份：
+            // 同名产物的多条配方共用会让闭包的深度预算互相挤占，深层链会算少。
             for (String itemId : this.craftDeps.keySet()) {
-                this.craftOffers.put(itemId, this.computeCraftOffer(itemId, snapshot));
+                this.craftOffers.put(itemId, this.computeCraftOffer(itemId));
             }
         } else if (this.craftCacheBusted || this.changedItems.size() > CRAFT_DIRTY_LIMIT) {
-            BigInteger[] snapshot = this.craftTree.stockArray(this::amountOfId);
+            // 每条配方各取一次闭包（满本 866 次）—— 不能几条配方共用一份：
+            // 同名产物的多条配方共用会让闭包的深度预算互相挤占，深层链会算少。
             for (String itemId : this.craftDeps.keySet()) {
-                this.craftOffers.put(itemId, this.computeCraftOffer(itemId, snapshot));
+                this.craftOffers.put(itemId, this.computeCraftOffer(itemId));
             }
         } else if (!this.changedItems.isEmpty()) {
             java.util.Set<String> dirty = new java.util.HashSet<>(this.changedItems.size() * 2);
@@ -2476,7 +2478,7 @@ public final class VoidWarehouseData extends SavedData {
                     }
                 }
                 if (hit) {
-                    this.craftOffers.put(entry.getKey(), this.computeCraftOffer(entry.getKey(), null));
+                    this.craftOffers.put(entry.getKey(), this.computeCraftOffer(entry.getKey()));
                 }
             }
         }
@@ -2523,7 +2525,7 @@ public final class VoidWarehouseData extends SavedData {
      * 21% 的配方被判成「做不出」而整格从界面消失。改成二分之后，探针数与虚高多少无关。
      * 详见 {@code docs/配方本满本并发测试报告.md}。</p>
      */
-    private ExchangeOffer computeCraftOffer(String itemId, BigInteger[] snapshot) {
+    private ExchangeOffer computeCraftOffer(String itemId) {
         Item item = VoidWarehouseRecipeBook.itemOf(itemId);
         if (item == null || this.amountOf(item).signum() > 0) {
             return null;
@@ -2532,20 +2534,22 @@ public final class VoidWarehouseData extends SavedData {
         if (node == null || node.recipes.length == 0) {
             return null;
         }
-        // 整批重算时 snapshot 由调用方一次取好、全部产物共用（满本 1,223 次 amountOfId，
-        // 而不是 866 条配方各构造一个闭包）；增量重算只碰十几个产物，为它们各取一次闭包更省。
-        BigInteger[] stock = snapshot != null
-                ? snapshot
-                : this.craftTree.stockArray(node.slot, this::amountOfId);
         // 同一产物可能有多条配方：取「做得最多」的那一条来算上限与账单，
         // 与 planCraft 的「逐条试、第一条能做的就用」不冲突 —— 那边保证能给出至少这么多个。
+        // 🔴 每条配方各取一次闭包，绝不共用：同名产物的多条配方一旦共用一份闭包，
+        // 遍历时先扫到的分支会把中间产物标成「已访问」，后扫到的深层分支因此钻不下去，
+        // 闭包比逐条取更浅 —— 表现就是「仓库里明明有原料却算成做不了」。
+        // 判据见 Tree#stockArray 与离线审计的 D 组（差异集合必须与 R3 完全相同）。
         VoidWarehouseRecipes.RecipeNode best = null;
         BigInteger maxOut = BigInteger.ZERO;
+        BigInteger[] bestStock = null;
         for (VoidWarehouseRecipes.RecipeNode recipe : node.recipes) {
+            BigInteger[] stock = this.craftTree.stockArray(recipe, this::amountOfId);
             BigInteger out = VoidWarehouseRecipes.maxCraftable(this.craftTree, recipe, stock, this.craftScratch);
             if (out.compareTo(maxOut) > 0) {
                 maxOut = out;
                 best = recipe;
+                bestStock = stock;
             }
         }
         if (best == null || maxOut.signum() <= 0) {
@@ -2554,7 +2558,7 @@ public final class VoidWarehouseData extends SavedData {
         // 账单 = 做满 maxOut 个要扣的原料（全部是负数）。余量不入账目：
         // tooltip 的「用 X 12 个」说的是成本，「找回」那一段对配方扣料是噪音
         // （产物多出来的部分会静静回到仓库，玩家不需要为此读一行字）。
-        VoidWarehouseRecipes.Plan plan = VoidWarehouseRecipes.plan(this.craftTree, best, maxOut, stock, this.craftScratch);
+        VoidWarehouseRecipes.Plan plan = VoidWarehouseRecipes.plan(this.craftTree, best, maxOut, bestStock, this.craftScratch);
         if (plan == null) {
             return null;
         }

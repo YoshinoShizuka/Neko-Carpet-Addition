@@ -247,6 +247,9 @@
 - **五版本 1,864 条断言零失败**：`CraftSelfCheck` 161×4 + `SystemTest` 209×5 + `A2StressTest` 35×5。完整数据见 `docs/配方本满本并发测试报告.md` §14(1864 assertions green across five versions.).
 - ⚠️ **`SystemTest` 的 `sink=` 会变**（9,795,079 → 9,901,959）：`sink` 是非负数之和，去重只会让它**变小**，所以这个变化不可能来自本次修复 —— 是新增的 N 组往测试存档里多学了 3 条配方。它因此不再是跨版本指纹，能比的只有断言(`sink` moved for an unrelated reason and is no longer a cross-version fingerprint.).
 
+- 🔴 **1.0.17 的 26.3 产物误带了两行调试打印**：`VoidWarehouseTrigger` 的 `isVoidWarehouse` 与 `interact` 各留了一条 `System.out.println("[VW-DEBUG] …")`（排查「改名工作台右键打不开」时插的探针）。源码回滚了，**dist 却没重出**，于是发出去的 jar 与 `-sources.jar` 都带着 —— 玩家每次右键手持物品都会往日志里写一行。已按当前源码重出 26.3 两个产物（jar 480,799 → 480,312 B，sources 533,773 → 533,646 B），其余四个版本的产物里从来没有这两行（逐个 `grep -a` 验过）(The shipped 1.0.17 26.3 artifacts carried two stray debug printlns; both are rebuilt from the current source, and a byte-level grep confirms the other four versions never had them.)。
+  - **教训**：`grep -c "DEBUG"` 查源码得到 0 **不能**证明产物干净 —— 要先回滚源码、再**重跑 dist**，最后拿 `unzip -p jar …class | grep -a` 咬产物本身（本轮就是这么抓到的）(Checking the source is not enough; grep the artifact.).
+
 ### 🧪 Testing / 测试
 
 - 算法改造 + 回归修复后的完整验证 **1,322 条断言零失败**（2026-11-13）：26.3 跑满三套 —— `SystemTest` **209**、`CraftSelfCheck` **224**（新增 R 组 7 条）、`FillSelfCheck` **53**；26.2 / 26.1.2 / 26.1.1 / 1.21.11 各 `SystemTest` **209**。扣料语义另由 7,416 行对拍兜底（改前 / 改后 **SHA-256 相同**）(1,322 assertions green after the rewrite and the regression fix.).
@@ -282,8 +285,8 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 480,799 B | `357a5a9dfcb3881edab5b69340e047d0` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 533,773 B | `1eb439a1e440fc2b404675235c38ce06` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 480,312 B | `d84b4e3f674b17b4e32b1a330341b943` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 533,646 B | `9e289a438f2c63a3f53776d38549375f` |
 | 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 480,424 B | `d5a8abf2e16e552ada696063bed7ec7c` |
 | 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 534,003 B | `adedef1f972a04840bd910a7f9673728` |
 | 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 483,686 B | `34f0cb16eaebe70357f0954305f6bc98` |

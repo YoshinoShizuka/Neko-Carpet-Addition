@@ -157,6 +157,22 @@
 - **行为变化（要说清楚）**：漏斗里放满盒当分类物，现在**原样出真盒**，但每 tick 要扣「1 个空盒（或 2 壳 + 1 箱）**加上**盒内那 1728 件」；盒里的东西不足一盒时**一件都不出**、一个字节都不扣。玩家的库存会很快见底 —— 这不是 bug，是账算对了。
 - **防复发**：自检 **35 条**（`SpecimenDupeSelfCheck`，临时工具，验证完已摘），每一组同时咬**形态 / 扣了什么 / 总数守恒**三件事 —— 反证组（仓库真存满盒时不许额外收钱）与拒绝组（付不出时一件都不许出）分别堵住上面两个方向。**变异实测**把 ② 段退回「一律交纯净产物」→ **14 条当场红**，反证组保持绿(Thirty-five assertions pinning shape, deduction and conservation at once; a mutation that restores the clean-product shortcut turns fourteen of them red.)。
 
+#### 出料漏斗里的满盒标本，配方本没学过潜影盒时一个都出不来（`voidWarehouse`）
+
+仓库里上百万只空盒、上亿件材料，出料漏斗里放一个满盒当分类物、下方接箱子：箱子**永远收不到东西**。上一版把满盒的结算口径改对了（原样出真盒 + 盒内实物照扣），但那条路被绑在「配方本里学过潜影盒」上(A hopper loaded with a filled shulker box produced nothing whenever the shulker-box recipe was missing from the warehouse recipe book.)。
+
+- **根因**：满装潜影盒在仓库里**永远不可能是一格**（`insert` 会把它拆成内容物 + 2 壳 + 1 箱，只有空盒才整盒入库），所以 `find(满盒)` 必然落空，出料只能走 `withdraw` 第 ② 段；而 ② 段要先 `planExchangeMax` 给出一个计划 —— 九合一表里没有潜影盒，配方本里又没学过，两样都空 ⇒ 计划为 `null` ⇒ 整笔拒绝。**而且完全静默**：每 tick 失败一次，玩家看不到任何理由。
+- 🔴 **这个依赖本身就是错的**：原版往空盒里塞东西**根本不需要配方**，凭什么「有没有学过潜影盒」能决定满盒出不出得去。所以在 ① 与 ② 之间插一段 **①'「现场装一个」**，按「1 个洁净本体 + 身上挂着的实物」计价，不看配方本、不看兑换表(The dependency itself was wrong: filling a shulker box needs no recipe in vanilla, so it must not gate extraction.)。
+  - 本体 = `shellOf(sample)`：同一物品、零组件、1 个（满盒的本体就是那只空盒，颜色由物品本身决定；装填好的弩的本体就是那把空弩）；
+  - **挂着实物** → 交**原样**那一件，本体与实物各扣一份；
+  - **只有装饰**（改名 / 附魔 / 空容器组件）→ 交**洁净本体**，装饰没有材料账可对，与 `produce()` 交纯净产物同一口径；
+  - 付不出就整笔拒绝，绝不交半件、绝不交空壳。
+- **② 段一个字没删**：仓库里没有空盒、只有 2 壳 + 1 箱时，学过的配方照样能把盒子造出来 —— ①' 付不出会自动落到 ②（`takePayload` 先全验再全扣，所以落下去时一个字节都没扣）。
+- **回滚必须分开退**：①' 那笔的「本体」与「盒里实物」是分别扣的，`returnUnplaced` 在 `plan == null` 且 `payload` 非空时也要分别退回。少了这一步，下游一拒收就整盒消失（而那只空壳的账已经扣掉了）。
+- **不再依赖任何一条可选规则**：`voidWarehouseExchange` / `voidWarehouseCraft` 全关也照常出满盒；反过来，规则开着但没有配方本条目也一样出得来。
+- **防复发**：自检 **10 条**（`EjectNoRecipeCheck`，临时工具，验证完已摘）。G1 = 两条规则都开着但没学过配方、G2 = 两条都关掉，两组都要求「5 tick 出 5 个满盒 + 空盒 −5 + 圆石 −8640 + 标本原样」。**改前 G2 一条都出不来（4 条红）**，改后 10/10 全绿(Ten assertions in two groups; the second group runs with both optional rules disabled and still requires five boxes out of five ticks.)。
+- **顺带一条测具教训**：`runServer` 的测试世界是持久的、仓库又是全存档唯一的 —— 上一轮自检留在世界里的漏斗还插着标本，会和新自检**抢同一个仓库**（5 个盒子被打成 2 个，看着像丢东西）。自检收尾现在会把场地拆干净(The dev test world persists and the warehouse is global, so a leftover hopper from a previous run will compete for the same stock.)。
+
 #### 同一产物的多条配方共用一份闭包，深层配方会「有原料却算成做不了」（`voidWarehouseCraft`）
 
 - **怎么发现的**：交付前按玩家要求做覆盖审计（离线 1,236 条配方 × 9 种库存分布），把「闭包快照」与「全树快照」的答案逐条对比，发现 1 – 11 条配方两者不一致，全部落在 `*_cushion` 这类四层链上。再拿 R3 源码跑**同一个判据**：R3 只有 0 – 10 条不一致 —— 多出来的那几条正是本轮引入的(This regression was found by the pre-release audit, not by luck.)。
@@ -304,18 +320,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 482,168 B | `2cdb0acb33b81dbb7977830e7106c71a` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 537,031 B | `d719fb4de3a17597304707de5601f308` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 482,320 B | `e19d7611e157f2cc022ef40d5c511d1f` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 537,346 B | `d6f961a2bf8eae28d1d49599f93c204c` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 485,582 B | `8ed5b07921650b61872e945e7a251b34` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 538,356 B | `9c894e06b7b52004e693610ce52a6dfc` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 485,583 B | `a5d298c46c1d7c9357b1f2cee5067964` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 538,355 B | `a9faf9e5914242c5be866fb6ffcb4d29` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 482,671 B | `a5b056bb76ee6f83a7b0b4672739d42a` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 538,147 B | `317f8880dc1e945bc03f367e73a85999` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 482,518 B | `0dce4eb967528fb1e07b2b06b2da9311` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 538,249 B | `b17908830e515d23ea74edbeb782fa38` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 482,683 B | `eaee7cd337cd234212077a8902e5a124` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 538,583 B | `85c4453e634ffe8dc09aac2c38ba60e3` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 485,945 B | `0888e16ee44be9ed029141be9b6bc18f` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 539,593 B | `7115309052a678a47291e6041b3b877b` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 485,946 B | `2e7dcf89e55d8c96f9412a2e45ed8daf` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 539,592 B | `c1c43f88a0428f3c76ccdd5b360f7a99` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 483,036 B | `f33b10172a787925eef5100da9c91681` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 539,384 B | `981eb99c865b924f41983e51a4fea623` |
 
-> **本表已按 2026-11-15 20:03 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十六次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版改的是「出料漏斗拿装满的潜影盒当分类物」的结算口径 —— 盒子**原样交出**，但盒里的实物也要按「物品 + 数据组件」从仓库扣，付不出就整笔拒绝。配方本落盘格式、扣料口径、可兑表内容逐字节不变。主 jar 482,168 / 482,320 / 485,582 / 485,583 / 482,671 B（比上一次发布 +1,638 ~ +1,678 B：新增 `payloadOf` / `takePayload` 与 `Withdrawal` 的实物退还），sources jar 大 2,084 ~ 2,138 B。md5 与之前十五次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-15; the v1.0.17 assets were replaced in place a sixteenth time — a filled shulker box used as a classifier is now handed out verbatim while its contents are charged to the warehouse. Recipe storage format and every decision rule are byte-identical.)。
+> **本表已按 2026-11-15 20:45 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十七次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版把「出料漏斗拿装满的潜影盒当分类物」的结算口径补完 —— 盒子**原样交出**、盒里的实物按「物品 + 数据组件」从仓库扣，并且这条路径**不再要求配方本里学过潜影盒**：按「1 个洁净本体 + 盒内实物」现场装，付不出才整笔拒绝。配方本落盘格式、扣料口径、可兑表内容逐字节不变。主 jar 482,518 / 482,683 / 485,945 / 485,946 / 483,036 B（比上一次发布 +350 ~ +365 B：新增 `shellOf` / `hasPayload` 与「现场装一个」那条分支），sources jar 大 1,218 ~ 1,237 B。md5 与之前十五次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-15; the v1.0.17 assets were replaced in place a sixteenth time — a filled shulker box used as a classifier is now handed out verbatim while its contents are charged to the warehouse. Recipe storage format and every decision rule are byte-identical.)。
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。

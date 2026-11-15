@@ -2263,13 +2263,32 @@ public final class VoidWarehouseData extends SavedData {
             return new Withdrawal(this, sample, taken, null);
         }
 
-        // ② 成品一件都没有：规则允许时用 9 合 1 兑换
+        // ② 成品一件都没有：规则允许时用 9 合 1 兑换 / 按已学配方扣料
         VoidWarehouseExchange.Plan plan = this.planExchangeMax(sample, limit);
         if (plan == null || plan.amount().signum() <= 0) {
             return new Withdrawal(this, sample, ItemStack.EMPTY, null);
         }
+        // 🔴 交出去的东西必须是**产物本身**，绝不能是 sample 的副本。
+        //
+        // 走到这一段的前提就是 find(sample) 没命中 —— 仓库里压根没有「这种形态」，
+        // sample 只是调用方手里拿着的一件东西（出料漏斗格子里的标本、界面上的一格图标、
+        // 打印机图纸里的一格）。兑换与配方扣料能复现的只有 (物品, 数量)，
+        // **数据组件一个都复现不出来**，所以拿 sample 去 copyWithCount 就等于把它身上
+        // 挂着的东西白送一遍：
+        //   · 装满的潜影盒（CONTAINER 里 1728 个圆石）→ 「1 个空盒」或「2 壳 + 1 箱」
+        //     换 1728 个圆石，出料漏斗 20 次/秒 —— 2026-11 玩家实测的「刷物品」就是这条；
+        //   · 改过名的物品 → 名字被无限复制；
+        //   · 蜂巢里的蜜蜂、弩里的箭，同理。
+        //
+        // 这与 produce() 的「找零本来就是合成产物，不可能带附魔或改名」是同一条口径。
+        // 仓库里真有某种形态时走的是上面 ① 的精确匹配 —— 那条路原样交还，不受影响。
+        Item product = resolveItem(plan.itemId());
+        if (product == null) {
+            // 解析不出产物就**别执行计划**：扣了料却交不出货，比整次拒绝更坏
+            return new Withdrawal(this, sample, ItemStack.EMPTY, null);
+        }
         this.applyExchange(plan);
-        return new Withdrawal(this, sample, sample.copyWithCount(plan.amount().intValue()), plan);
+        return new Withdrawal(this, sample, new ItemStack(product, plan.amount().intValue()), plan);
     }
 
     /**

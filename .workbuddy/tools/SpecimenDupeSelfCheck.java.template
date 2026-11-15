@@ -1,0 +1,665 @@
+package neko.voidwarehouse;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.HopperBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
+
+import java.math.BigInteger;
+import java.util.List;
+
+/**
+ * 【临时自检】出料漏斗 + <b>装满的潜影盒</b> 当分类物时的刷物品（验证完删掉）。
+ *
+ * <h2>要抓的那一条</h2>
+ * <p>仓库按「一格一种形态」存东西，<b>装满的盒子在仓库里根本不可能是一个格子</b>
+ * （{@code insert} 会把它拆成内容物 + 2 壳 + 1 箱，只有<b>空</b>盒才整盒入库），
+ * 所以 {@code find(满盒)} 永远匹配不上 —— 出料路径必然落进
+ * {@link VoidWarehouseData#withdraw} 的<b>第 ② 段</b>（兑换 / 按配方扣料）。</p>
+ * <p>而第 ② 段的成品是 {@code sample.copyWithCount(n)} —— <b>把调用方手里那个盒子整份复制出来</b>。
+ * 于是「1 个空盒」或「2 个潜影壳 + 1 个箱子」换出「1 个装着 1728 个圆石的潜影盒」，
+ * 20 次/秒。这就是「刷物品」。</p>
+ *
+ * <h2>怎么证（真跑 tick，不是手工调 API）</h2>
+ * <p>搭「工作台压漏斗、漏斗口朝下、下方接箱子」，让服务端自己跑 tick。
+ * 判据只有一条 —— <b>下游每个盒子里到底装了没有</b>：合成的产物只可能是「空盒」。</p>
+ *
+ * <h2>🔴 场地必须只有<b>一个</b>出料漏斗</h2>
+ * <p>仓库是<b>全存档唯一</b>的，多摆一个同种标本的漏斗，它就会和本组抢同一个仓库 ——
+ * 上一版自检摆了两个场地（A / B），结果 A 组「每 tick 少 2 个空盒」其实是
+ * B 组漏斗也在取货，把真 bug（盒内 1728 件）和测具自己的串台混在了一起。
+ * 现在改成<b>单场地、组间串行</b>：每组开始前把漏斗与箱子都清干净，测量窗口里
+ * 只有一个漏斗在动。</p>
+ *
+ * <h2>组别</h2>
+ * <table border="1">
+ *   <tr><th>组</th><th>证什么</th><th>修复前</th></tr>
+ *   <tr><td>Z</td><td>不走漏斗，<b>直接</b>调 {@code withdraw(满盒, 1)}：
+ *       交出的堆叠盒内必须是空的（三条分支各一条：先扣库存 / 按配方合成 / 精确匹配）</td>
+ *       <td>两条交出满盒（1728 件）</td></tr>
+ *   <tr><td>A</td><td>仓库有 100 个<b>空盒</b>（走「先扣库存」）：10 tick 出 10 个盒子，
+ *       盒内全空，空盒 100→90，全场圆石一件不许多</td><td>10 个满盒 = 凭空 17280 个圆石</td></tr>
+ *   <tr><td>B</td><td>仓库 0 空盒、100 壳 + 50 箱（走<b>合成</b>）：5 tick 出 5 个空盒，
+ *       壳 100→90、箱 50→45，盒内全空</td><td>5 个满盒 = 凭空 8640 个圆石</td></tr>
+ *   <tr><td>C</td><td><b>反证（修复不能改坏这条）</b>：仓库里真的有 5 个满盒
+ *       （{@code restore} 绕过拆盒塞进去）→ 出的必须是<b>原样满盒</b></td><td>绿（本来就对）</td></tr>
+ *   <tr><td>D</td><td>边界：仓库空 → 一件都不出、账一格不动</td><td>绿（本来就对）</td></tr>
+ * </table>
+ */
+public final class SpecimenDupeSelfCheck {
+
+    private static final int BASE_X = 460;
+    private static final int BASE_Z = 460;
+    private static final int TABLE_Y = 120;      // 终端（工作台）
+    private static final int HOPPER_Y = 119;     // 出料漏斗（口朝下）
+    private static final int CHEST_Y = 118;      // 下游容器
+
+    /** A 组跑多少 tick（不可堆叠物每 tick 出 1 个 ⇒ 期望正好这么多件） */
+    private static final int A_TICKS = 10;
+    private static final int B_TICKS = 5;
+    private static final int C_TICKS = 5;
+    private static final int D_TICKS = 5;
+
+    private static final int BOX_STOCK = 100;
+    private static final int SHELL_STOCK = 100;
+    private static final int CHEST_STOCK = 50;
+    /** 仓库里「真的存着」的满盒个数（C 组） */
+    private static final int SEEDED_FULL_BOXES = 5;
+
+    /** 一满盒圆石 = 27 格 × 64 */
+    private static final int FULL_BOX_COBBLE = VoidWarehouseShulker.capacity(new ItemStack(Items.COBBLESTONE));
+
+    private static boolean done = false;
+    private static int checks = 0;
+    private static int failures = 0;
+
+    private static int stage = 0;
+    private static int waited = 0;
+    private static int tickIndex = 0;
+
+    private static BlockPos table;
+    private static BlockPos hopper;
+    private static BlockPos chest;
+
+    /** 「标本全程都在」的累积结论（有一次被动了就翻红） */
+    private static boolean specimenEverMissing = false;
+    private static int specimenMissingAt = -1;
+
+    private static VoidWarehouseRecipes.Recipe cachedBoxRecipe;
+
+    private SpecimenDupeSelfCheck() {
+    }
+
+    public static void run(MinecraftServer server) {
+        if (done) {
+            return;
+        }
+        // 这条 bug 的两个前提必须显式立住，否则整局自检都在空转：
+        //   · voidWarehouse     → isExtractor 才有意义
+        //   · voidWarehouseCraft → withdraw 的第 ② 段（配方扣料）才会被走到
+        // 9 合 1 明确关掉，把问题<b>隔离在配方扣料这一条路上</b>。
+        VoidWarehouseSettings.voidWarehouse = true;
+        VoidWarehouseSettings.voidWarehouseCraft = true;
+        VoidWarehouseSettings.voidWarehouseExchange = false;
+        try {
+            step(server);
+        } catch (Throwable t) {
+            failures++;
+            System.out.println("!! 自检抛异常: " + t);
+            t.printStackTrace(System.out);
+            finish(server);
+        }
+    }
+
+    private static void step(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        switch (stage) {
+            // ---------------------------------------------------------- 场地
+            case 0:
+                for (int cx = BASE_X >> 4; cx <= (BASE_X + 8) >> 4; cx++) {
+                    for (int cz = BASE_Z >> 4; cz <= (BASE_Z + 8) >> 4; cz++) {
+                        level.setChunkForced(cx, cz, true);
+                    }
+                }
+                break;
+            case 1:
+                if (!level.isLoaded(new BlockPos(BASE_X, HOPPER_Y, BASE_Z))) {
+                    if (++waited > 300) {
+                        System.out.println("!! 区块 300 tick 没加载出来，放弃");
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                System.out.println("DUP 区块就绪");
+                break;
+            case 2:
+                build(server);
+                break;
+            case 3:
+                if (asHopper(level.getBlockEntity(hopper)) == null) {
+                    if (++waited > 100) {
+                        System.out.println("!! 漏斗方块实体没就位 " + level.getBlockEntity(hopper));
+                        stage = 999;
+                        return;
+                    }
+                    return;
+                }
+                System.out.println("DUP 就位（单场地：一个出料漏斗 + 下方箱子）");
+                break;
+
+            // ---------------------------------------------------------- Z 组（不走漏斗，直接问 withdraw）
+            case 4:
+                groupZ_directWithdraw(server);
+                break;
+
+            // ---------------------------------------------------------- A 组（先扣库存那条）
+            case 5:     // A 起点：仓库 100 个空盒，漏斗与箱子先清空（标本下一 case 才放）
+                {
+                    VoidWarehouseData data = VoidWarehouse.data(server);
+                    data.clearContent();
+                    data.learn(boxRecipe());
+                    // insert 会把<b>空</b>盒当普通物品整盒入库（不拆成壳 + 箱）
+                    data.insert(new ItemStack(Items.SHULKER_BOX, BOX_STOCK));
+                    fillHopper(level, hopper, ItemStack.EMPTY);
+                    emptyChest(server, chest);
+                    System.out.println("DUP [A0] 起点：仓库空盒=" + amount(server, Items.SHULKER_BOX)
+                            + "，漏斗=" + describeSlots(server, hopper)
+                            + "，下游=" + describeChest(server, chest));
+                }
+                break;
+            case 6:     // A 主测量 + 结论（同一次 step 内断言，绝不跨 tick）
+                {
+                    if (tickIndex == 0) {
+                        // 测量窗口的第一 tick 才把标本放回去、把箱子清干净 ——
+                        // 这样窗口里正好 A_TICKS 次出料，不会多算一 tick。
+                        setSlot(level, hopper, 0, filledBox());
+                        emptyChest(server, chest);
+                        specimenEverMissing = false;
+                        specimenMissingAt = -1;
+                    }
+                    watchSpecimen(server, hopper, tickIndex);
+                    trace(server, "A", tickIndex);
+                    if (++tickIndex <= A_TICKS) {
+                        return;
+                    }
+                    tickIndex = 0;
+                    int[] c = chestStats(server, chest);
+                    long boxes = amount(server, Items.SHULKER_BOX);
+                    long cobble = amount(server, Items.COBBLESTONE);
+                    System.out.println("DUP [A1] " + A_TICKS + " tick 后：下游 盒数=" + c[0]
+                            + " 盒内共 " + c[1] + " 件（其中圆石 " + c[2] + "）"
+                            + "，仓库空盒=" + boxes + "，仓库圆石=" + cobble
+                            + "，漏斗=" + describeSlots(server, hopper));
+                    check("[A1] 下游每个盒子盒内必须为空（合成的只是一个空盒，实际盒内 "
+                                    + c[1] + " 件）",
+                            c[1] == 0);
+                    check("[A2] 下游恰好出 " + A_TICKS + " 个盒子（实际 " + c[0] + "）",
+                            c[0] == A_TICKS);
+                    check("[A3] 仓库空盒 " + BOX_STOCK + " → " + (BOX_STOCK - A_TICKS)
+                                    + "（出的就是取的，实际 " + boxes + "）",
+                            boxes == BOX_STOCK - A_TICKS);
+                    check("[A4] 全场圆石总数一件都不许多（仓库 " + cobble + " + 盒内 "
+                                    + c[2] + " == 0）",
+                            cobble + c[2] == 0);
+                    check("[A5] 标本全程在格（1 个满盒，盒内仍 " + FULL_BOX_COBBLE + " 个圆石）",
+                            !specimenEverMissing && specimenIntact(server, hopper));
+                }
+                break;
+
+            // ---------------------------------------------------------- B 组（合成那条）
+            case 7:     // B 起点：仓库 0 空盒，只有壳 + 箱
+                {
+                    VoidWarehouseData data = VoidWarehouse.data(server);
+                    data.clearContent();
+                    data.learn(boxRecipe());
+                    data.insert(new ItemStack(Items.SHULKER_SHELL, SHELL_STOCK));
+                    data.insert(new ItemStack(Items.CHEST, CHEST_STOCK));
+                    fillHopper(level, hopper, ItemStack.EMPTY);
+                    emptyChest(server, chest);
+                    System.out.println("DUP [B0] 起点：仓库 空盒=" + amount(server, Items.SHULKER_BOX)
+                            + " 壳=" + amount(server, Items.SHULKER_SHELL)
+                            + " 箱=" + amount(server, Items.CHEST)
+                            + "，下游=" + describeChest(server, chest));
+                }
+                break;
+            case 8:     // B 主测量 + 结论
+                {
+                    if (tickIndex == 0) {
+                        setSlot(level, hopper, 0, filledBox());
+                        emptyChest(server, chest);
+                        specimenEverMissing = false;
+                        specimenMissingAt = -1;
+                    }
+                    watchSpecimen(server, hopper, tickIndex);
+                    trace(server, "B", tickIndex);
+                    if (++tickIndex <= B_TICKS) {
+                        return;
+                    }
+                    tickIndex = 0;
+                    int[] c = chestStats(server, chest);
+                    long shells = amount(server, Items.SHULKER_SHELL);
+                    long chests = amount(server, Items.CHEST);
+                    long boxes = amount(server, Items.SHULKER_BOX);
+                    long cobble = amount(server, Items.COBBLESTONE);
+                    System.out.println("DUP [B1] " + B_TICKS + " tick 后：下游 盒数=" + c[0]
+                            + " 盒内共 " + c[1] + " 件，仓库 壳=" + shells + " 箱=" + chests
+                            + " 空盒=" + boxes + " 圆石=" + cobble);
+                    check("[B1] 合成出来的盒子盒内必须为空（实际盒内 " + c[1] + " 件）", c[1] == 0);
+                    check("[B2] 下游恰好出 " + B_TICKS + " 个盒子（实际 " + c[0] + "）",
+                            c[0] == B_TICKS);
+                    check("[B3] 成本严格是「每盒 2 壳 + 1 箱」：壳 " + SHELL_STOCK + " → "
+                                    + (SHELL_STOCK - 2L * B_TICKS) + "（实际 " + shells + "）",
+                            shells == SHELL_STOCK - 2L * B_TICKS);
+                    check("[B4] 箱 " + CHEST_STOCK + " → " + (CHEST_STOCK - B_TICKS)
+                                    + "（实际 " + chests + "）",
+                            chests == CHEST_STOCK - B_TICKS);
+                    check("[B5] 全场圆石总数一件都不许多（仓库 " + cobble + " + 盒内 "
+                                    + c[1] + " == 0）",
+                            cobble + c[1] == 0);
+                    check("[B6] 空盒库存没有被凭空写出来（实际 " + boxes + "）", boxes == 0);
+                }
+                break;
+
+            // ---------------------------------------------------------- C 组（反证：真实形态必须原样交还）
+            case 9:     // C 起点：用 restore 绕过 insert，把 5 个装满的盒子真的塞进仓库
+                {
+                    VoidWarehouseData data = VoidWarehouse.data(server);
+                    data.clearContent();
+                    // 🔴 restore 会 setCount(0) 吃掉传进去的堆叠，必须每次给一个新的副本
+                    for (int i = 0; i < SEEDED_FULL_BOXES; i++) {
+                        data.restore(filledBox());
+                    }
+                    fillHopper(level, hopper, ItemStack.EMPTY);
+                    emptyChest(server, chest);
+                    System.out.println("DUP [C0] 起点：仓库里真的存着 " + SEEDED_FULL_BOXES
+                            + " 个满盒（amountExact=" + data.amountExact(filledBox()) + "）"
+                            + "，下游=" + describeChest(server, chest));
+                }
+                break;
+            case 10:    // C 主测量 + 结论
+                {
+                    if (tickIndex == 0) {
+                        setSlot(level, hopper, 0, filledBox());
+                        emptyChest(server, chest);
+                        specimenEverMissing = false;
+                        specimenMissingAt = -1;
+                    }
+                    watchSpecimen(server, hopper, tickIndex);
+                    trace(server, "C", tickIndex);
+                    if (++tickIndex <= C_TICKS) {
+                        return;
+                    }
+                    tickIndex = 0;
+                    int[] c = chestStats(server, chest);
+                    long cobble = amount(server, Items.COBBLESTONE);
+                    // 满盒必须用 amountExact 查：amountOf(Item) 只认「纯净」条目
+                    long boxes = VoidWarehouse.data(server).amountExact(filledBox()).longValue();
+                    System.out.println("DUP [C1] " + C_TICKS + " tick 后：下游 盒数=" + c[0]
+                            + " 盒内圆石 " + c[2] + "，仓库 满盒=" + boxes + " 圆石=" + cobble);
+                    check("[C1] 仓库里真有的满盒照样出得来（" + SEEDED_FULL_BOXES + " → "
+                                    + (SEEDED_FULL_BOXES - C_TICKS) + "，实际 " + boxes + "）",
+                            boxes == SEEDED_FULL_BOXES - C_TICKS);
+                    check("[C2] 下游 " + C_TICKS + " 个盒子（实际 " + c[0] + "）", c[0] == C_TICKS);
+                    check("[C3] 🔴 形态原样交还：每个盒子盒内仍是 " + FULL_BOX_COBBLE
+                                    + " 个圆石（实际共 " + c[2] + "）",
+                            c[2] == (long) C_TICKS * FULL_BOX_COBBLE);
+                    check("[C4] 圆石总数守恒：" + ((long) SEEDED_FULL_BOXES * FULL_BOX_COBBLE)
+                                    + "（仓库 " + cobble + " + 盒内 " + c[2] + "）",
+                            cobble + c[2] == (long) SEEDED_FULL_BOXES * FULL_BOX_COBBLE);
+                }
+                break;
+
+            // ---------------------------------------------------------- D 组（什么都没有）
+            case 11:    // D 起点：仓库彻底空
+                {
+                    VoidWarehouse.data(server).clearContent();
+                    fillHopper(level, hopper, ItemStack.EMPTY);
+                    emptyChest(server, chest);
+                    System.out.println("DUP [D0] 起点：仓库已清空");
+                }
+                break;
+            case 12:    // D 主测量 + 结论
+                {
+                    if (tickIndex == 0) {
+                        setSlot(level, hopper, 0, filledBox());
+                    }
+                    if (++tickIndex <= D_TICKS) {
+                        return;
+                    }
+                    tickIndex = 0;
+                    int[] c = chestStats(server, chest);
+                    long cobble = amount(server, Items.COBBLESTONE);
+                    long shells = amount(server, Items.SHULKER_SHELL);
+                    System.out.println("DUP [D1] " + D_TICKS + " tick 后：下游 盒数=" + c[0]
+                            + "（盒内 " + c[1] + "），仓库 圆石=" + cobble + " 壳=" + shells);
+                    check("[D1] 巧妇难为无米之炊：一件都不出（实际盒数 " + c[0] + "）", c[0] == 0);
+                    check("[D2] 仓库一个字节都没动（圆石 " + cobble + " 壳 " + shells + "）",
+                            cobble == 0 && shells == 0);
+                }
+                break;
+
+            case 13:
+                cleanup(server);
+                break;
+            default:
+                finish(server);
+                return;
+        }
+        stage++;
+    }
+
+    // ================================================================ Z 组：直接问 withdraw
+
+    /**
+     * <b>不走漏斗</b>，手工调 {@code withdraw(满盒, 1)}，三条分支各一次。
+     *
+     * <p>这是本 bug 最直接的复现：漏斗那层只是「每 tick 调一次这个」，账错在 {@code withdraw} 里。
+     * 把它单独钉住，将来谁改坏了都会立刻红，不必等到搭漏斗才发现。</p>
+     */
+    private static void groupZ_directWithdraw(MinecraftServer server) {
+        VoidWarehouseData data = VoidWarehouse.data(server);
+
+        // ① 仓库里只有 100 个空盒 → 走「先扣库存」
+        data.clearContent();
+        data.learn(boxRecipe());
+        data.insert(new ItemStack(Items.SHULKER_BOX, BOX_STOCK));
+        long boxesBefore = amount(server, Items.SHULKER_BOX);
+        VoidWarehouseData.Withdrawal viaStock = data.withdraw(filledBox(), BigInteger.ONE);
+        long boxesAfter = amount(server, Items.SHULKER_BOX);
+        int stockInside = contentsOfStack(viaStock.stack());
+        System.out.println("DUP [Z1] withdraw(满盒,1) 库存分支：taken=" + viaStock.taken()
+                + " viaExchange=" + viaStock.viaExchange()
+                + " 空盒 " + boxesBefore + "→" + boxesAfter
+                + " 交出=" + describeStack(viaStock.stack()));
+        check("[Z1] 库存分支：交出的盒子盒内必须为空（实际 " + stockInside + " 件）", stockInside == 0);
+        check("[Z2] 库存分支：只扣 1 个空盒（实际 " + boxesBefore + "→" + boxesAfter + "）",
+                boxesAfter == boxesBefore - 1);
+
+        // ② 仓库 0 空盒、只有壳 + 箱 → 走按配方合成
+        data.clearContent();
+        data.learn(boxRecipe());
+        data.insert(new ItemStack(Items.SHULKER_SHELL, SHELL_STOCK));
+        data.insert(new ItemStack(Items.CHEST, CHEST_STOCK));
+        long shellsBefore = amount(server, Items.SHULKER_SHELL);
+        long chestsBefore = amount(server, Items.CHEST);
+        VoidWarehouseData.Withdrawal viaCraft = data.withdraw(filledBox(), BigInteger.ONE);
+        long shellsAfter = amount(server, Items.SHULKER_SHELL);
+        long chestsAfter = amount(server, Items.CHEST);
+        int craftInside = contentsOfStack(viaCraft.stack());
+        System.out.println("DUP [Z3] withdraw(满盒,1) 合成分支：taken=" + viaCraft.taken()
+                + " viaExchange=" + viaCraft.viaExchange()
+                + " 壳 " + shellsBefore + "→" + shellsAfter
+                + " 箱 " + chestsBefore + "→" + chestsAfter
+                + " 交出=" + describeStack(viaCraft.stack()));
+        check("[Z3] 合成分支：交出的盒子盒内必须为空（实际 " + craftInside + " 件）", craftInside == 0);
+        check("[Z4] 合成分支：成本是 2 壳 + 1 箱（实际 " + (shellsBefore - shellsAfter)
+                        + " 壳 / " + (chestsBefore - chestsAfter) + " 箱）",
+                shellsBefore - shellsAfter == 2 && chestsBefore - chestsAfter == 1);
+
+        // ③ 仓库里真的存着 3 个满盒 → 走「精确匹配」，形态一个字都不能被削平
+        data.clearContent();
+        for (int i = 0; i < 3; i++) {
+            data.restore(filledBox());
+        }
+        long fullBefore = data.amountExact(filledBox()).longValue();
+        VoidWarehouseData.Withdrawal exact = data.withdraw(filledBox(), BigInteger.ONE);
+        long fullAfter = data.amountExact(filledBox()).longValue();
+        int exactInside = contentsOfStack(exact.stack());
+        System.out.println("DUP [Z5] withdraw(满盒,1) 精确分支：taken=" + exact.taken()
+                + " viaExchange=" + exact.viaExchange()
+                + " 满盒 " + fullBefore + "→" + fullAfter
+                + " 交出=" + describeStack(exact.stack()));
+        check("[Z5] 精确分支：仓库真有满盒时，交出的盒内必须还是 " + FULL_BOX_COBBLE
+                        + " 个圆石（实际 " + exactInside + "）",
+                exactInside == FULL_BOX_COBBLE);
+        check("[Z6] 精确分支：只扣 1 个满盒（实际 " + fullBefore + "→" + fullAfter + "）",
+                fullAfter == fullBefore - 1);
+
+        // ④ 第二处入口：按数量取货（VoidWarehouseWithdraw）在动过合成时也要交纯净产物
+        ItemStack synthesizedGoods = VoidWarehouseWithdraw.goodsTemplate(filledBox(), true);
+        ItemStack stockGoods = VoidWarehouseWithdraw.goodsTemplate(filledBox(), false);
+        int synthInside = contentsOfStack(synthesizedGoods);
+        int stockInside2 = contentsOfStack(stockGoods);
+        System.out.println("DUP [Z7] goodsTemplate：合成=" + describeStack(synthesizedGoods)
+                + " 库存=" + describeStack(stockGoods));
+        check("[Z7] 动过合成 → 交纯净产物（盒内必须 0 件，实际 " + synthInside + "）",
+                synthInside == 0);
+        check("[Z8] 没动合成 → 原样保留（盒内必须还是 " + FULL_BOX_COBBLE
+                        + " 件，实际 " + stockInside2 + "）",
+                stockInside2 == FULL_BOX_COBBLE);
+
+        data.clearContent();
+    }
+
+    // ================================================================ 场景搭建
+
+    private static void build(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        table = new BlockPos(BASE_X, TABLE_Y, BASE_Z);
+        hopper = table.below();
+        chest = hopper.below();
+        level.setBlock(table, Blocks.CRAFTING_TABLE.defaultBlockState(), 3);
+        level.setBlock(hopper, Blocks.HOPPER.defaultBlockState()
+                .setValue(HopperBlock.FACING, Direction.DOWN)
+                .setValue(HopperBlock.ENABLED, true), 3);
+        level.setBlock(chest, Blocks.CHEST.defaultBlockState(), 3);
+        setSlot(level, hopper, 0, filledBox());
+
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.learn(boxRecipe());
+        data.insert(new ItemStack(Items.SHULKER_BOX, BOX_STOCK));
+    }
+
+    /** 一个<b>装满</b>圆石的潜影盒（1728 个，走模组自己的打包器造，不手搓组件） */
+    private static ItemStack filledBox() {
+        return VoidWarehouseShulker.pack(new ItemStack(Items.COBBLESTONE), FULL_BOX_COBBLE);
+    }
+
+    /**
+     * 原版那条「2 潜影壳 + 1 箱子 → 1 潜影盒」的配方。
+     *
+     * <p>固定写死、不依赖存档里玩家学过什么 —— 自检必须在干净存档上得到同一个结果。</p>
+     */
+    private static VoidWarehouseRecipes.Recipe boxRecipe() {
+        if (cachedBoxRecipe == null) {
+            cachedBoxRecipe = new VoidWarehouseRecipes.Recipe(null, "minecraft:shulker_box", 1,
+                    List.of(new VoidWarehouseRecipes.Part(List.of("minecraft:shulker_shell"), 2),
+                            new VoidWarehouseRecipes.Part(List.of("minecraft:chest"), 1)));
+        }
+        return cachedBoxRecipe;
+    }
+
+    private static void fillHopper(ServerLevel level, BlockPos pos, ItemStack stack) {
+        BlockEntity be = level.getBlockEntity(pos);
+        if (be instanceof HopperBlockEntity hopperEntity) {
+            for (int i = 0; i < hopperEntity.getContainerSize(); i++) {
+                hopperEntity.setItem(i, stack.copy());
+            }
+            hopperEntity.setChanged();
+        }
+    }
+
+    private static void setSlot(ServerLevel level, BlockPos pos, int slot, ItemStack stack) {
+        BlockEntity be = level.getBlockEntity(pos);
+        if (be instanceof HopperBlockEntity hopperEntity) {
+            hopperEntity.setItem(slot, stack);
+            hopperEntity.setChanged();
+        }
+    }
+
+    // ================================================================ 观察
+
+    /**
+     * 逐 tick 打印一行状态。<b>诊断用</b>：只为看清「每 tick 到底扣了几个、出了几个」，
+     * 正式断言不依赖它。
+     */
+    private static void trace(MinecraftServer server, String tag, int tick) {
+        HopperBlockEntity h = asHopper(server.overworld().getBlockEntity(hopper));
+        int[] c = chestStats(server, chest);
+        System.out.println("DUP   trace " + tag + " tick" + tick
+                + " 漏斗[" + describeSlots(server, hopper) + "]"
+                + " 仓库空盒=" + amount(server, Items.SHULKER_BOX)
+                + " 仓库满盒=" + VoidWarehouse.data(server).amountExact(filledBox())
+                + " 下游盒=" + c[0] + "/内" + c[1]
+                + (h == null ? " <无漏斗>" : ""));
+    }
+
+    /** 每 tick 查一次：标本还在不在（被补成 2 个、或被推走都算“动了”） */
+    private static void watchSpecimen(MinecraftServer server, BlockPos pos, int tick) {
+        if (!specimenIntact(server, pos)) {
+            specimenEverMissing = true;
+            if (specimenMissingAt < 0) {
+                specimenMissingAt = tick;
+                System.out.println("!! 标本在 tick " + tick + " 被动了：" + describeSlots(server, pos));
+            }
+        }
+    }
+
+    /** slot0 是不是「1 个装满 1728 圆石的潜影盒」 */
+    private static boolean specimenIntact(MinecraftServer server, BlockPos pos) {
+        HopperBlockEntity h = asHopper(server.overworld().getBlockEntity(pos));
+        if (h == null) {
+            return false;
+        }
+        ItemStack stack = h.getItem(0);
+        return stack.getCount() == 1 && contentsOfStack(stack) == FULL_BOX_COBBLE;
+    }
+
+    private static int contentsOfStack(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return 0;
+        }
+        int inside = 0;
+        for (ItemStack in : VoidWarehouseShulker.contentsOf(stack)) {
+            inside += in.getCount();
+        }
+        return inside;
+    }
+
+    private static String describeStack(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return "<空>";
+        }
+        return stack.getCount() + " x " + stack.getItem().getDescriptionId()
+                + (VoidWarehouseShulker.isShulkerBox(stack)
+                ? "（盒内 " + contentsOfStack(stack) + " 件）" : "");
+    }
+
+    private static String describeSlots(MinecraftServer server, BlockPos pos) {
+        HopperBlockEntity h = asHopper(server.overworld().getBlockEntity(pos));
+        if (h == null) {
+            return "<无方块实体>";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < h.getContainerSize(); i++) {
+            ItemStack s = h.getItem(i);
+            sb.append(i == 0 ? "" : " ").append(s.isEmpty() ? "-" : describeStack(s));
+        }
+        return sb.toString();
+    }
+
+    private static String describeChest(MinecraftServer server, BlockPos pos) {
+        int[] c = chestStats(server, pos);
+        return "盒" + c[0] + "/内" + c[1] + "（其中圆石 " + c[2] + "）";
+    }
+
+    /**
+     * 下游容器里「潜影盒」的统计：{@code [0]}=盒数，{@code [1]}=盒内物品总件数，
+     * {@code [2]}=盒内<b>圆石</b>件数。
+     *
+     * <p>判据只认盒内件数，不认物品名 —— 「有没有凭空多出东西」的唯一判据是
+     * <b>盒子里到底装了没有</b>。</p>
+     */
+    private static int[] chestStats(MinecraftServer server, BlockPos pos) {
+        Container c = container(server, pos);
+        if (c == null) {
+            return new int[]{-1, -1, -1};
+        }
+        int boxes = 0;
+        int inside = 0;
+        int cobble = 0;
+        for (int i = 0; i < c.getContainerSize(); i++) {
+            ItemStack stack = c.getItem(i);
+            if (!VoidWarehouseShulker.isShulkerBox(stack)) {
+                continue;
+            }
+            boxes += stack.getCount();
+            for (ItemStack in : VoidWarehouseShulker.contentsOf(stack)) {
+                inside += in.getCount();
+                if (in.is(Items.COBBLESTONE)) {
+                    cobble += in.getCount();
+                }
+            }
+        }
+        return new int[]{boxes, inside, cobble};
+    }
+
+    // ================================================================ 计数工具
+
+    private static HopperBlockEntity asHopper(BlockEntity be) {
+        return be instanceof HopperBlockEntity h ? h : null;
+    }
+
+    private static Container container(MinecraftServer server, BlockPos pos) {
+        BlockEntity be = server.overworld().getBlockEntity(pos);
+        return be instanceof Container c ? c : null;
+    }
+
+    private static void emptyChest(MinecraftServer server, BlockPos pos) {
+        Container c = container(server, pos);
+        if (c == null) {
+            return;
+        }
+        for (int i = 0; i < c.getContainerSize(); i++) {
+            c.setItem(i, ItemStack.EMPTY);
+        }
+        c.setChanged();
+    }
+
+    private static long amount(MinecraftServer server, Item item) {
+        BigInteger n = VoidWarehouse.data(server).amountOf(item);
+        return n == null ? -1 : n.longValue();
+    }
+
+    private static void cleanup(MinecraftServer server) {
+        ServerLevel level = server.overworld();
+        BlockPos[] all = {table, hopper, chest};
+        for (BlockPos p : all) {
+            if (p != null) {
+                level.setBlock(p, Blocks.AIR.defaultBlockState(), 3);
+            }
+        }
+        VoidWarehouseData data = VoidWarehouse.data(server);
+        data.clearContent();
+        data.insert(new ItemStack(Items.COBBLESTONE, 1234));
+        data.insert(new ItemStack(Items.DIRT, 5678));
+    }
+
+    private static void finish(MinecraftServer server) {
+        done = true;
+        if (specimenMissingAt >= 0) {
+            System.out.println("!! 标本首次被动的 tick " + specimenMissingAt);
+        }
+        System.out.println("SMOKE RESULT vw-specimen-dupe/26.3 checks=" + checks
+                + " failures=" + failures);
+        server.halt(false);
+    }
+
+    private static void check(String label, boolean ok) {
+        checks++;
+        if (!ok) {
+            failures++;
+            System.out.println("   FAIL: " + label);
+        }
+    }
+}

@@ -284,15 +284,21 @@ public final class VoidWarehouseWithdraw {
         }
 
         // ③ 生成产物：若干满盒 + （散货要么装盒、要么按组拆成散件）
+        // 🔴 走过兑换 / 配方扣料时，新做出来的那部分只是 (物品, 数量) ——
+        //    数据组件一个都复现不出来。继续拿 sample 复制，就等于把它的改名 / 附魔 /
+        //    盒内物品白送一遍（装满的潜影盒在这儿是「1 个空盒换 1728 个圆石」）。
+        //    与 VoidWarehouseData#withdraw 第 ② 段是同一个坑，同一个口径。
+        //    没动过合成时 sample 本来就是仓库里真实的那一格，原样保留。
+        ItemStack goods = goodsTemplate(sample, exchange != null);
         List<ItemStack> outputs = new ArrayList<>();
         for (long i = 0; i < fullBoxes; i++) {
-            outputs.add(VoidWarehouseShulker.pack(sample, capacity));
+            outputs.add(VoidWarehouseShulker.pack(goods, capacity));
         }
         if (packLoose) {
             // 散货装盒：这一盒没装满（loose < capacity），但只占 1 个背包格
-            outputs.add(VoidWarehouseShulker.pack(sample, loose));
+            outputs.add(VoidWarehouseShulker.pack(goods, loose));
         } else {
-            appendLoose(outputs, sample, loose);
+            appendLoose(outputs, goods, loose);
         }
         if (outputs.isEmpty()) {
             return;
@@ -507,6 +513,25 @@ public final class VoidWarehouseWithdraw {
 
     // ------------------------------------------------------------------ 背包
 
+    /**
+     * 交出去的「货」该用哪个样板。
+     *
+     * <p><b>没动过合成</b>（{@code synthesized == false}）→ 就用调用方给的那一格：
+     * 它本来就是仓库里真实存在的东西，数据组件必须原样保留（改过名的、附魔的、
+     * 带盒内物品的，取出来还得是那一件）。</p>
+     *
+     * <p><b>动过合成 / 兑换</b> → <b>只能用纯净产物</b>。因为合成层只认
+     * {@code (物品, 数量)}，数据组件一个都复现不出来；继续拿 {@code sample} 复制
+     * 就等于把它身上挂着的东西白送一遍 —— 装满的潜影盒在这儿是
+     * 「1 个空盒换 1728 个圆石」，改名物品则是名字被无限复制。
+     * 与 {@link VoidWarehouseData#withdraw} 第 ② 段同一条口径。</p>
+     *
+     * <p>抽成包内可见的纯函数是为了<b>能单测</b>：真正的执行路径要一个
+     * {@code ServerPlayer}，而这条判断本身与玩家无关。</p>
+     */
+    static ItemStack goodsTemplate(ItemStack sample, boolean synthesized) {
+        return synthesized ? new ItemStack(sample.getItem()) : sample;
+    }
     /**
      * 把 {@code count} 个散货按该物品的 {@code maxStackSize} 拆成若干<b>满堆叠</b> +
      * 至多一个<b>余数堆叠</b>，追加进 {@code outputs}。

@@ -304,18 +304,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 482,167 B | `0f77ce960905aa193f100b7fcf9f82d1` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 537,000 B | `709318293e6593602da8a45d270ccf13` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 482,318 B | `e477fe3558f404cb0fd7d9c3aced12fa` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 537,316 B | `4c6868e7ed62c36b3db80b30c268efb6` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 485,580 B | `e6e79308cc472720129aa04ac13c3166` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 538,326 B | `793bab20e86689889a2d6d3eff0c5692` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 485,581 B | `bd72a9b2bf1b671e6bbcc6d11d726f30` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 538,325 B | `5ddc0e7736f020c86d35874bfdac6629` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 482,674 B | `606294207898a78495245e3e99f3b00f` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 538,082 B | `54306c100a7af7011842135d179b8a02` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 482,168 B | `2cdb0acb33b81dbb7977830e7106c71a` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 537,031 B | `d719fb4de3a17597304707de5601f308` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 482,320 B | `e19d7611e157f2cc022ef40d5c511d1f` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 537,346 B | `d6f961a2bf8eae28d1d49599f93c204c` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 485,582 B | `8ed5b07921650b61872e945e7a251b34` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 538,356 B | `9c894e06b7b52004e693610ce52a6dfc` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 485,583 B | `a5d298c46c1d7c9357b1f2cee5067964` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 538,355 B | `a9faf9e5914242c5be866fb6ffcb4d29` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 482,671 B | `a5b056bb76ee6f83a7b0b4672739d42a` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 538,147 B | `317f8880dc1e945bc03f367e73a85999` |
 
-> **本表已按 2026-11-15 19:57 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十六次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版改的是「出料漏斗拿装满的潜影盒当分类物」的结算口径 —— 盒子**原样交出**，但盒里的实物也要按「物品 + 数据组件」从仓库扣，付不出就整笔拒绝。配方本落盘格式、扣料口径、可兑表内容逐字节不变。主 jar 482,167 / 482,318 / 485,580 / 485,581 / 482,674 B（比上一次发布 +1,637 ~ +1,676 B：新增 `payloadOf` / `takePayload` 与 `Withdrawal` 的实物退还），sources jar 大 2,019 ~ 2,107 B。md5 与之前十五次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-15; the v1.0.17 assets were replaced in place a sixteenth time — a filled shulker box used as a classifier is now handed out verbatim while its contents are charged to the warehouse. Recipe storage format and every decision rule are byte-identical.)。
+> **本表已按 2026-11-15 20:03 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十六次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版改的是「出料漏斗拿装满的潜影盒当分类物」的结算口径 —— 盒子**原样交出**，但盒里的实物也要按「物品 + 数据组件」从仓库扣，付不出就整笔拒绝。配方本落盘格式、扣料口径、可兑表内容逐字节不变。主 jar 482,168 / 482,320 / 485,582 / 485,583 / 482,671 B（比上一次发布 +1,638 ~ +1,678 B：新增 `payloadOf` / `takePayload` 与 `Withdrawal` 的实物退还），sources jar 大 2,084 ~ 2,138 B。md5 与之前十五次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-15; the v1.0.17 assets were replaced in place a sixteenth time — a filled shulker box used as a classifier is now handed out verbatim while its contents are charged to the warehouse. Recipe storage format and every decision rule are byte-identical.)。
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。

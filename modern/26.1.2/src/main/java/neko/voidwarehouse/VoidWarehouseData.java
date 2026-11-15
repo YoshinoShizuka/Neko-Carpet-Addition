@@ -2335,7 +2335,8 @@ public final class VoidWarehouseData extends SavedData {
      * 这件东西「身上挂着的实物」—— 潜影盒里的东西、弩里装填的弹丸、收纳袋里装的。
      *
      * <p>它们全都要占仓库库存：交出一只装满的盒子，等于同时交出盒里那 1728 件。
-     * 只认 {@code ContainerComponent} 这一族组件，因为只有它们装着<b>别的东西</b>；
+     * 只认「容器类组件」这一族（潜影盒 {@code CONTAINER}、弩 {@code CHARGED_PROJECTILES}、
+     * 收纳袋 {@code BUNDLE_CONTENTS}），因为只有它们装着<b>别的东西</b>；
      * 改名、附魔、lore 没有材料账可对，不在此列（见 {@link #withdraw} 第 ② 段）。</p>
      *
      * <p>同一件物品在盒里占多格时会先<b>合并成一份</b>：后面要按「每份需要多少」逐项验，

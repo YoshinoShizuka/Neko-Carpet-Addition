@@ -165,13 +165,24 @@
 - 🔴 **这个依赖本身就是错的**：原版往空盒里塞东西**根本不需要配方**，凭什么「有没有学过潜影盒」能决定满盒出不出得去。所以在 ① 与 ② 之间插一段 **①'「现场装一个」**，按「1 个洁净本体 + 身上挂着的实物」计价，不看配方本、不看兑换表(The dependency itself was wrong: filling a shulker box needs no recipe in vanilla, so it must not gate extraction.)。
   - 本体 = `shellOf(sample)`：同一物品、零组件、1 个（满盒的本体就是那只空盒，颜色由物品本身决定；装填好的弩的本体就是那把空弩）；
   - **挂着实物** → 交**原样**那一件，本体与实物各扣一份；
-  - **只有装饰**（改名 / 附魔 / 空容器组件）→ 交**洁净本体**，装饰没有材料账可对，与 `produce()` 交纯净产物同一口径；
+  - **只有装饰**（改名 / 附魔 / 空容器组件）→ 当时交的是**洁净本体**；这条口径当天就被玩家否掉了，见下面「带改名 / 附魔的满盒仍会出一个长得像的」——现在一律拒绝；
   - 付不出就整笔拒绝，绝不交半件、绝不交空壳。
 - **② 段一个字没删**：仓库里没有空盒、只有 2 壳 + 1 箱时，学过的配方照样能把盒子造出来 —— ①' 付不出会自动落到 ②（`takePayload` 先全验再全扣，所以落下去时一个字节都没扣）。
 - **回滚必须分开退**：①' 那笔的「本体」与「盒里实物」是分别扣的，`returnUnplaced` 在 `plan == null` 且 `payload` 非空时也要分别退回。少了这一步，下游一拒收就整盒消失（而那只空壳的账已经扣掉了）。
 - **不再依赖任何一条可选规则**：`voidWarehouseExchange` / `voidWarehouseCraft` 全关也照常出满盒；反过来，规则开着但没有配方本条目也一样出得来。
 - **防复发**：自检 **10 条**（`EjectNoRecipeCheck`，临时工具，验证完已摘）。G1 = 两条规则都开着但没学过配方、G2 = 两条都关掉，两组都要求「5 tick 出 5 个满盒 + 空盒 −5 + 圆石 −8640 + 标本原样」。**改前 G2 一条都出不来（4 条红）**，改后 10/10 全绿(Ten assertions in two groups; the second group runs with both optional rules disabled and still requires five boxes out of five ticks.)。
 - **顺带一条测具教训**：`runServer` 的测试世界是持久的、仓库又是全存档唯一的 —— 上一轮自检留在世界里的漏斗还插着标本，会和新自检**抢同一个仓库**（5 个盒子被打成 2 个，看着像丢东西）。自检收尾现在会把场地拆干净(The dev test world persists and the warehouse is global, so a leftover hopper from a previous run will compete for the same stock.)。
+
+#### 出料漏斗里的满盒标本带改名 / 附魔时，仍会「出一个长得像的」（`voidWarehouse`）
+
+漏斗里放一个**改过名**或**带附魔**的满盒当分类物，仓库有货就照常出货 —— 出来的却是**没有名字、没有附魔的干净盒子**，而仓库照扣一份。玩家要的是「这种东西根本不该出去」，不是「出去个长得像的」(A renamed or enchanted box used as a classifier was still handed out as a plain one, with the warehouse charged for it.).
+
+- **两条错法方向相反，所以只能拒绝**：① 交**洁净本体** = 把玩家的单子偷偷换成别的形态，名字与附魔当场蒸发；② 交**原样** = 每个 tick 免费复制一份装饰（出料口 20 次/秒，附魔书能这么刷）。①' 的计价只认「本体 + 挂在身上的实物」，装饰没有材料账可对 —— 两头都站不住，唯一说得过去的答案是**一笔都不做**.
+- **判据是「本体之外还有没有别的东西」**：`hasDecoration(sample)` = 先把三类**实物**（`CONTAINER` / `CHARGED_PROJECTILES` / `BUNDLE_CONTENTS`）从两边都摘掉，再看 `sample` 与 `shellOf(sample)` 剩下的**数据组件**是否还不同。改名（`CUSTOM_NAME`）、附魔（`ENCHANTMENTS`）、`lore`、耐久……沾上任何一样就算装饰.
+- 🔴 **26.x 的潜影盒默认组件表里自带一个空的 `CONTAINER`** —— 第一版只摘 `sample` 那一边，于是**干净的满盒**也被判成「有装饰」，G1 / G2 两组 10 条当场红。两边都 `stripContents` 才等价(26.x ships an empty `CONTAINER` in the default component map, so both sides must be stripped before the comparison means anything.).
+- **拦截点放在 ① 之后、①' 之前**：仓库里**真有这一形态**（玩家整盒存进来过）时，① 的精确匹配原样交还是允许的 —— 那不是复制，是「怎么进怎么出」。只有走到 ①'（要自己现场装一个）时才拒绝(Only the synthesized path refuses; an exact stack that already exists in the warehouse is still handed out verbatim.).
+- **② 段一个字没动**：九合一兑换与配方扣料的产物由配方决定，本来就复现不出名字和附魔.
+- **防复发**：自检 **20 条**（`DecorRefusalCheck`，临时工具，验证完已摘）。G1 = 干净满盒 + 两条规则全开（5 tick 出 5 个满盒、空盒 −5、圆石 −8640）；G2 = 干净满盒 + 两条规则**全关**，同样 5 个；**G3 = 改名满盒、G4 = 改名空盒 → 下游 0 个、仓库空盒与圆石一个字节不减、标本原样还在**。改前 G3 / G4 各 4 条红，改后 20 / 20 全绿(Twenty assertions across four groups; the two renamed-box groups require zero output and zero deduction.).
 
 #### 同一产物的多条配方共用一份闭包，深层配方会「有原料却算成做不了」（`voidWarehouseCraft`）
 
@@ -320,18 +331,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 482,518 B | `0dce4eb967528fb1e07b2b06b2da9311` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 538,249 B | `b17908830e515d23ea74edbeb782fa38` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 482,683 B | `eaee7cd337cd234212077a8902e5a124` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 538,583 B | `85c4453e634ffe8dc09aac2c38ba60e3` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 485,945 B | `0888e16ee44be9ed029141be9b6bc18f` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 539,593 B | `7115309052a678a47291e6041b3b877b` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 485,946 B | `2e7dcf89e55d8c96f9412a2e45ed8daf` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 539,592 B | `c1c43f88a0428f3c76ccdd5b360f7a99` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 483,036 B | `f33b10172a787925eef5100da9c91681` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 539,384 B | `981eb99c865b924f41983e51a4fea623` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 482,682 B | `1a122426652e14fb147ff0585a463b21` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 538,833 B | `0d7523f62606dba3f0cfe4614c318799` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 482,843 B | `e47c634f56fa0be7402ef73e3e565863` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 539,169 B | `7093a0ff25fef805872e0dff4bd0520a` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 486,105 B | `8a6dc58ad250b48d02da701397d8c24c` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 540,179 B | `93b14bfe977e4b41c811c006fe9e68b8` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 486,106 B | `515347f13d6816f0dfb1124fec3ba3f7` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 540,178 B | `4d904fc1a474c597abf6a90be8797151` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 483,203 B | `29c77d75a30c87a87acd1237af0919bb` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 539,974 B | `7b13009f8e3c1cc3666204fcf0ec2891` |
 
-> **本表已按 2026-11-15 20:45 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十七次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版把「出料漏斗拿装满的潜影盒当分类物」的结算口径补完 —— 盒子**原样交出**、盒里的实物按「物品 + 数据组件」从仓库扣，并且这条路径**不再要求配方本里学过潜影盒**：按「1 个洁净本体 + 盒内实物」现场装，付不出才整笔拒绝。配方本落盘格式、扣料口径、可兑表内容逐字节不变。主 jar 482,518 / 482,683 / 485,945 / 485,946 / 483,036 B（比上一次发布 +350 ~ +365 B：新增 `shellOf` / `hasPayload` 与「现场装一个」那条分支），sources jar 大 1,218 ~ 1,237 B。md5 与之前十五次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-15; the v1.0.17 assets were replaced in place a sixteenth time — a filled shulker box used as a classifier is now handed out verbatim while its contents are charged to the warehouse. Recipe storage format and every decision rule are byte-identical.)。
+> **本表已按 2026-11-15 21:00 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十八次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版把「带装饰的标本」堵死 —— 漏斗里放**改过名 / 带附魔**的盒子当分类物时，**一个物品都不出、仓库零扣减**；上一版会交一个「洁净本体」充数（= 把玩家的单子偷偷换成别的形态）。判据 `hasDecoration` 只拦「现场装一个」那条路，仓库里真有这一形态时精确匹配照样原样交。配方本落盘格式、扣料口径、可兑表内容逐字节不变。主 jar 482,682 / 482,843 / 486,105 / 486,106 / 483,203 B（比上一次发布 +160 ~ +167 B：新增 `hasDecoration` / `stripContents` 两个私有静态方法），sources jar 大 584 ~ 590 B。md5 与之前十七次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-15; the v1.0.17 assets were replaced in place an eighteenth time — a renamed or enchanted box used as a classifier now yields nothing at all, and the warehouse is not charged. Recipe storage format and every decision rule are byte-identical.)。
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
@@ -345,7 +356,7 @@
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
-- **v1.0.17 的产物换过十六次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建；2026-11-13 换成含「预编译配方树 + 可复位草稿纸」的本地全量构建；同日再换成含「逐条配方闭包（修掉深层配方少算）」的本地全量构建；同日又重出过一次 26.3 的两个产物（去掉误带的 `[VW-DEBUG]` 调试打印）；2026-11-15 换成含「出料漏斗满盒分类物交纯净产物」的本地全量构建；同日再换成含「满盒原样交出 + 盒内实物计价」的本地全量构建（前一版把盒内物品倒进了虚空）。十六次都**没改版本号**，只是字节变了（其中两次只替换了部分版本的产物，未单列）。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place sixteen times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, the book-usage suffix on the learned line, the precompiled recipe tree, the per-recipe closure fix, the rebuilt 26.3 artifacts without the stray debug printlns, the clean-product extraction fix and its replacement with the verbatim-plus-contents-pricing one — with the version number unchanged.)。
+- **v1.0.17 的产物换过十八次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建；2026-11-13 换成含「预编译配方树 + 可复位草稿纸」的本地全量构建；同日再换成含「逐条配方闭包（修掉深层配方少算）」的本地全量构建；同日又重出过一次 26.3 的两个产物（去掉误带的 `[VW-DEBUG]` 调试打印）；2026-11-15 换成含「出料漏斗满盒分类物交纯净产物」的本地全量构建；同日再换成含「满盒原样交出 + 盒内实物计价」的本地全量构建（前一版把盒内物品倒进了虚空）；同日再换成含「满盒出货不再依赖配方本（①' 现场装一个）」的本地全量构建；同日最后换成含「带装饰的标本一律拒绝」的本地全量构建。十八次都**没改版本号**，只是字节变了（其中两次只替换了部分版本的产物，未单列）。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place sixteen times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, the book-usage suffix on the learned line, the precompiled recipe tree, the per-recipe closure fix, the rebuilt 26.3 artifacts without the stray debug printlns, the clean-product extraction fix, its replacement with the verbatim-plus-contents-pricing one, the recipe-book-independent full-box path, and the refusal of decorated classifiers — with the version number unchanged.)。
 
 * * *
 

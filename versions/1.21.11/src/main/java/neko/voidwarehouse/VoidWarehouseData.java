@@ -2305,24 +2305,26 @@ public final class VoidWarehouseData extends SavedData {
         // 2026-11-15 玩家实测，仓库里上百万只空盒 + 上亿件材料，满盒照样一个都出不来，
         // 因为配方本里没有潜影盒那一条（九合一表里也没有潜影盒）。
         //
-        // 计价口径与 ② 完全一致，只是「本体」一律取洁净形态（同一物品、零组件、1 个）：
-        //   · 挂着实物 → 交原样那一件，本体与实物各扣一份；
-        //   · 只有装饰（改名 / 附魔 / 空容器组件）→ 交洁净本体，装饰没有材料账可对。
-        // 付不出就整批拒绝（与 ② 同一条规矩），绝不交半件。
+        // 🔴 带装饰的形态（改名 / 附魔 / 耐久 / 药水 / lore…）**一笔都不做**。
+        //
+        // 仓库只认 (物品, 数量)，装饰一个都复现不出来：
+        //   · 交白板（洁净本体）= 偷偷把玩家的单子换成别的形态；
+        //   · 交原样 = 每个 tick 免费复制一份装饰（出料口 20 次/秒）。
+        // 两条都是错的，所以这里直接拒绝 —— 玩家要的是「不出来」，不是「出来个像的」。
+        // 注意：只在 ① 之后拦（仓库里真有这一形态时，精确匹配原样交还是允许的）。
+        if (hasDecoration(sample)) {
+            return new Withdrawal(this, sample, ItemStack.EMPTY, null);
+        }
+
+        // 干净的容器 + 装着实物 → 现场装一个：本体与实物各扣一份。
+        // （干净的样本没有实物可挂，压根走不到这里 —— 那是 ② 的普通兑换 / 配方路径。）
         ItemStack clean = shellOf(sample);
-        if (!ItemStack.isSameItemSameComponents(sample, clean)) {
-            List<ItemStack> attached = payloadOf(sample);
-            if (this.amountExact(clean).signum() > 0) {
-                if (attached.isEmpty()) {
-                    this.takeExact(clean, 1);
-                    return new Withdrawal(this, clean, clean.copy(), null);
-                }
-                if (this.hasPayload(attached, 1)) {
-                    this.takeExact(clean, 1);
-                    this.takePayload(attached, 1);
-                    return new Withdrawal(this, sample, sample.copyWithCount(1), null, attached);
-                }
-            }
+        List<ItemStack> attached = payloadOf(sample);
+        if (!attached.isEmpty() && this.amountExact(clean).signum() > 0
+                && this.hasPayload(attached, 1)) {
+            this.takeExact(clean, 1);
+            this.takePayload(attached, 1);
+            return new Withdrawal(this, sample, sample.copyWithCount(1), null, attached);
         }
 
         // ② 成品一件都没有：规则允许时用 9 合 1 兑换 / 按已学配方扣料
@@ -2457,6 +2459,41 @@ public final class VoidWarehouseData extends SavedData {
             }
         }
         return true;
+    }
+
+    /**
+     * 这个形态身上是不是挂着「仓库复现不出来」的东西。
+     *
+     * <p>判据很直白：把<b>装着的东西</b>（{@code CONTAINER} /
+     * {@code CHARGED_PROJECTILES} / {@code BUNDLE_CONTENTS}）全部摘掉之后，
+     * 还和洁净本体不一致吗 —— 不一致就说明剩下的都是装饰（改名、附魔、耐久、
+     * 药水、lore…），而装饰没有材料账可对。</p>
+     *
+     * <p>干净的满盒<b>不算</b>：它唯一的差异就是那条容器组件，摘掉之后与本体逐字节相同。</p>
+     */
+    private static boolean hasDecoration(ItemStack sample) {
+        if (sample == null || sample.isEmpty()) {
+            return false;
+        }
+        ItemStack bare = stripContents(sample.copy());
+        bare.setCount(1);
+        ItemStack base = stripContents(shellOf(sample));
+        return !ItemStack.isSameItemSameComponents(bare, base);
+    }
+
+    /**
+     * 把「装着的东西」全部摘掉 —— {@code CONTAINER} / {@code CHARGED_PROJECTILES} /
+     * {@code BUNDLE_CONTENTS}。
+     *
+     * <p>🔴 <b>空容器组件也要摘</b>：26.x 里潜影盒的默认组件表本来就带一个空的
+     * {@code CONTAINER}，所以「摘掉容器的满盒」与「新建的空盒」永远不相等 ——
+     * 两个都摘掉之后才比得出「装饰」。</p>
+     */
+    private static ItemStack stripContents(ItemStack stack) {
+        stack.remove(DataComponents.CONTAINER);
+        stack.remove(DataComponents.CHARGED_PROJECTILES);
+        stack.remove(DataComponents.BUNDLE_CONTENTS);
+        return stack;
     }
 
     /**

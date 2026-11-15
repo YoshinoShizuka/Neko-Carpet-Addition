@@ -143,15 +143,19 @@
 
 ### 🐛 Fixed / 修复
 
-#### 装满的潜影盒当分类物会把盒内 1728 个东西白送（`voidWarehouse`）
+#### 装满的潜影盒当分类物：要么白送盒内 1728 件，要么把盒里的东西倒进虚空（`voidWarehouse`）
 
-出料漏斗里放一个**装满圆石的潜影盒**当分类物、下方接箱子：漏斗每 tick 从仓库取 1 个「潜影盒」塞进箱子，但塞进去的是**那只满盒本身**（盒内 1728 个圆石）。成本照收 —— 1 个空盒，或者 2 个潜影壳 + 1 个箱子。净效果 = **2 壳 + 1 箱换 1728 个圆石**，20 次/秒(The extraction hopper handed out the full shulker box it was using as a classifier: one empty box was charged, 1728 items came out, every tick.)。
+出料漏斗里放一个**装满圆石的潜影盒**当分类物、下方接箱子：漏斗每 tick 从仓库取 1 个「潜影盒」塞进箱子，但塞进去的是**那只满盒本身**（盒内 1728 个圆石），而仓库只按「1 个空盒」或「2 壳 + 1 箱」收钱。净效果 = **2 壳 + 1 箱换 1728 个圆石**，20 次/秒(The extraction hopper handed out the full shulker box it was using as a classifier: one empty box was charged, 1728 items came out, every tick.)。
 
-- **根因**：`VoidWarehouseData#withdraw` 第 ② 段（成品没货 → 9 合 1 兑换 / 按已学配方扣料）交出去的是 `sample.copyWithCount(n)` —— **把调用方手里那个样板整份复制出去**。而仓库按「一格一种形态」存东西，装满的盒子**根本不可能是一个格子**（`insert` 会把它拆成内容物 + 2 壳 + 1 箱，只有空盒才整盒入库），所以 `find(满盒)` 永远不命中，出料路径必然落进这一段。合成层只认 `(物品, 数量)`，数据组件一个都复现不出来 —— 拿 sample 复制就等于把它身上挂着的东西白送一遍。
-- **不止潜影盒**：改过名的物品名字会被无限复制，蜂巢里的蜜蜂、弩里的箭同理。同一个根因还有第二处入口 ——「按数量取货」在走过兑换之后仍用 sample 铺散货，这次一并收口成 `goodsTemplate(sample, synthesized)`。
-- **改法**：第 ② 段一律交**纯净产物**（`new ItemStack(resolveItem(plan.itemId()), n)`），与 `produce()` 的「找零本来就是合成产物，不可能带附魔或改名」同一条口径；解析不出产物时**直接不执行计划**（扣了料却交不出货，比整次拒绝更坏）。仓库里真有某种形态时走的是上面 ① 的精确匹配，**那条路一个字节没动** —— 改名 / 附魔 / 盒内物品照样原样取回。
-- **行为变化（要说清楚）**：漏斗里放满盒当分类物，现在出的是**空盒** —— 仓库有空盒就扣 1 个空盒，只有壳 + 箱就扣 2 壳 + 1 箱。想把盒内东西一起拿出来请用「按数量取货」或盒模式，那两条是**装盒**，材料账由 `planBoxMaterials` 单独算、本来就是守恒的。
-- **防复发**：新增自检 25 条（`SpecimenDupeSelfCheck`，临时工具，验证完已摘）。修复前 **6 条红**（10 tick 凭空 17,280 个圆石、5 tick 凭空 8,640 个），修复后全绿；其中一组是**反证** —— 仓库里真的存着满盒时出的必须还是满盒，修完这条仍是绿的，证明没有被「一律清空」误伤(Twenty-five assertions, six red before the fix; the control group proves genuine filled boxes still come out intact.)。
+- **根因**：`VoidWarehouseData#withdraw` 第 ② 段（成品没货 → 9 合 1 兑换 / 按已学配方扣料）交出去的是 `sample.copyWithCount(n)` —— **把调用方手里那个样板整份复制出去**。而仓库按「一格一种形态」存东西，装满的盒子**根本不可能是一个格子**（`insert` 会把它拆成内容物 + 2 壳 + 1 箱，只有空盒才整盒入库），所以 `find(满盒)` 永远不命中，出料路径必然落进这一段。合成层只认 `(物品, 数量)`，数据组件一个都复现不出来 —— 拿 sample 复制就等于把它身上挂着的东西白送一遍：盒内 1728 件、`CUSTOM_NAME`（名字无限复制）、`BEES` / `CHARGED_PROJECTILES`。
+- 🔴 **这个 bug 修错过一次，方向正好相反**：第一版改成交**纯净空盒** —— 账平了、自检 25 条全绿，但满盒进漏斗、空盒出来，那 1728 件被倒进了虚空。**「没有凭空多出东西」不等于「没有丢东西」**，第一版自检只咬了「不许白送」这一头，那个方向的全绿毫无意义。玩家要的也不是这个，是「盒子怎么进就该怎么出」。
+- **最终口径：盒子怎么进就怎么出**。判据是「身上有没有挂着**实物**」——
+  - 有（潜影盒 `CONTAINER`、弩 `CHARGED_PROJECTILES`、收纳袋 `BUNDLE_CONTENTS`）→ **原样交出那一件**，代价是盒里那些实物也按「物品 + 数据组件」逐份扣掉（`payloadOf` / `takePayload`，**先全验、再全扣**）；付不出就**整笔拒绝**，绝不交一个空盒充数。
+  - 没有（空盒、改过名的、附魔的）→ 仍交**纯净产物**，与 `produce()` 的「找零本来就是合成产物，不可能带附魔或改名」同一口径：改名与附魔没有材料账可对，照抄就是凭空复制。
+- **回滚也要把实物退回去**：`Withdrawal` 多带一份 `payload`，`returnUnplaced` 反向执行兑换计划之后按份退回。少这一步，下游一拒收就凭空少掉一整盒（而外盒的材料却退了回来）。
+- 🔴 **五版本的容器组件方法名不同，这是本轮唯一的分叉**：26.3 三种都叫 `itemCopies()` / `nonEmptyItemCopyStream()`；26.2 与 26.1.x 的收纳袋是 `itemCopyStream()`；1.21.11 **没有 `ContainerComponent` 接口**，盒子是 `nonEmptyStream()`、弩是 `getItems()`。第一版照 `ContainerComponent` 写，1.21.11 当场编译不过。
+- **行为变化（要说清楚）**：漏斗里放满盒当分类物，现在**原样出真盒**，但每 tick 要扣「1 个空盒（或 2 壳 + 1 箱）**加上**盒内那 1728 件」；盒里的东西不足一盒时**一件都不出**、一个字节都不扣。玩家的库存会很快见底 —— 这不是 bug，是账算对了。
+- **防复发**：自检 **35 条**（`SpecimenDupeSelfCheck`，临时工具，验证完已摘），每一组同时咬**形态 / 扣了什么 / 总数守恒**三件事 —— 反证组（仓库真存满盒时不许额外收钱）与拒绝组（付不出时一件都不许出）分别堵住上面两个方向。**变异实测**把 ② 段退回「一律交纯净产物」→ **14 条当场红**，反证组保持绿(Thirty-five assertions pinning shape, deduction and conservation at once; a mutation that restores the clean-product shortcut turns fourteen of them red.)。
 
 #### 同一产物的多条配方共用一份闭包，深层配方会「有原料却算成做不了」（`voidWarehouseCraft`）
 
@@ -262,12 +266,11 @@
 
 ### 🧪 Testing / 测试
 
-- **出料漏斗满盒分类物刷物品：25 条断言全绿**（2026-11-15，`SpecimenDupeSelfCheck`，真服务端 + 真 `VoidWarehouseData`）：Z 组 8 条（不走漏斗，直接打三条分支 —— 先扣库存 / 配方合成 / 精确匹配，外加 `goodsTemplate` 双向断言）、A 组 10 tick、B 组 5 tick、C 组满盒反证、D 组一件不出。**修复前 `checks=23 failures=6`，修复后 `checks=25 failures=0`**；修复前那 6 条红全是实测出来的物理量 —— 10 tick 凭空 **17,280** 个圆石、5 tick 凭空 **8,640** 个，而成本一分不差照收（1 空盒，或 2 壳 + 1 箱）(Twenty-five assertions; six were red before the fix, and every one of them was a measured quantity, not a guess.)。
-  - 🔴 **C 组（反证）是这套的定盘星**：仓库里真的存着满盒时，出的必须还是满盒、1728 件一件不少。只写「不再是满盒」的话，把装盒功能整个删掉也能全绿 —— 与 E 组（盒子材料预留）同一条教训(The control group keeps the fix from being "just empty everything".)。
-  - 🔴 **测具自己差点冤枉被测代码**：初版摆了两个场地（`x=460` 与 `x=466`），两个漏斗的标本都是满盒 ⇒ **两个漏斗每 tick 都在从同一个全局仓库取货**。A 组读数变成「少 2 个空盒、10 tick 只出 10 个」，C 组变成「5 个满盒只交出 2 个」，看起来像重复扣费。在主代码临时插一行 `[DUP-DBG] … pos=` 打印坐标，一眼看到两个调用点，三分钟定位。改成**单场地、组间串行**后全部符合预期(Two concurrent hoppers read from the one global warehouse and fabricated a phantom double-charge bug.)。
-  - 🔴 **读数的标签也会骗自己**：用 `amountOf(Items.SHULKER_BOX)` 数「仓库满盒」恒为 **0** —— `amountOf(Item)` 内部走 `find(new ItemStack(item))`，**只认纯净条目**，带 `CONTAINER` 的满盒永远不命中，于是得出「5 个满盒全丢了」的荒谬结论。改用 `amountExact(filledBox())`(Counting filled boxes needs `amountExact`, not `amountOf`.)。
-  - **计数窗口差 1**：`VoidWarehouseExtension#onTick` 跑在漏斗 tick **之前**，`if (++tickIndex < N)` 只能跑到第 N−1 次出料（实测 9 个盒子、空盒 100→91）。改成 `<=` 后四组各回正(The tick hook runs before the hopper tick, so the window needs `<=`.)。
-- 修复后回归 **1,369 条断言零失败**（全部真服务端）：`SpecimenDupeSelfCheck` **25** + `UnstackableOutputSelfCheck` **22** + `FillSelfCheck` **53** + `CraftSelfCheck` **224**（以上均 26.3）+ `SystemTest` **209 × 5 版本**（26.3 / 26.2 / 26.1.2 / 26.1.1 / 1.21.11）(1,369 assertions green across five versions after the fix.)。
+- **出料漏斗满盒分类物：35 条断言全绿**（2026-11-15，`SpecimenDupeSelfCheck`，真服务端 + 真漏斗 tick）：Z 组 14（不走漏斗，直接打三条分支 + 两条拒绝路径）、A 组 5 tick、B 组 5 tick、C 组反证、D 组空仓库、E 组付不出。**三代口径的读数都留在** `docs/出料漏斗满盒分类物刷物品事故与修复.md` §2：白送版 `checks=23 failures=6`、倒进虚空版 `checks=25 failures=0`、最终版 `checks=35 failures=0`(Three generations of the fix, three sets of readings.)
+  - 🔴 **「全绿」本身证明不了什么**：中间那一版把盒内物品改成交纯净空盒，25 条全绿 —— 因为它只咬了「不许白送」。最终每一组同时咬三件事：交出去的**形态**、仓库**扣了什么**、**总数守恒**。
+  - 🔴 **变异实测 14 条红**：把 ② 段退回「一律交纯净产物」，`Z1 / Z3 / Z4 / Z6 / Z11 / Z12 / Z13 / Z14 / A2 / A4 / B2 / B5 / E1 / E2` 同时红，其中 `E1 / E2` 抓的是「付不出也照样给了 5 个空盒」。**C 组保持绿** —— 精确匹配那条路没被碰到，反证组是独立的。
+  - 🔴 **测具自己差点冤枉被测代码**：两个场地共用同一个全局仓库 ⇒ 两个漏斗每 tick 都在取货，读数像重复扣费；`amountOf(Item)` 只认纯净条目 ⇒ 数满盒恒为 0；`onTick` 跑在漏斗 tick 之前 ⇒ `< N` 会少算最后一 tick。三条都写进文档 §6(Two concurrent hoppers, a wrong counting helper and an off-by-one window — all in the harness, none in the product.)
+- 修复后回归 **1,379 条断言零失败**（全部真服务端）：`SpecimenDupeSelfCheck` **35** + `UnstackableOutputSelfCheck` **22** + `FillSelfCheck` **53** + `VoidWarehouseCraftSelfCheck` **224**（以上均 26.3）+ `SystemTest` **209 × 5 版本**（26.3 / 26.2 / 26.1.2 / 26.1.1 / 1.21.11）(1,379 assertions green across five versions after the fix.)
 - 算法改造 + 回归修复后的完整验证 **1,322 条断言零失败**（2026-11-13）：26.3 跑满三套 —— `SystemTest` **209**、`CraftSelfCheck` **224**（新增 R 组 7 条）、`FillSelfCheck` **53**；26.2 / 26.1.2 / 26.1.1 / 1.21.11 各 `SystemTest` **209**。扣料语义另由 7,416 行对拍兜底（改前 / 改后 **SHA-256 相同**）(1,322 assertions green after the rewrite and the regression fix.).
   - **离线覆盖审计 104,707 条断言**（独立台 `C:/tmp/audit`，不进仓库）：A 全覆盖 **5,988** 条（每条配方都能在树里找到、挂在正确产物下、槽位往返一致、产物下的配方条数一致）、B 自给自足 **5,686** 条（只给「这条配方一次所需的原料」，`maxCraftable ≥ 1` 且 `plan` 给得出计划；实测 1,164 条给 1 倍就够、72 条要 2 倍 —— 那 72 条是配方内同一个物品出现在多个原料位）、C 必要性 **2,383** 条（把某个叶子原料清 0，必须退到 0 且 `plan` 返回 null）、D 闭包 vs 全树 **9** 条（每个库存分布一条，内部覆盖 1,236 条配方）、E 空库存 **2,472** 条、F 单调 **1,236** 条、G 草稿纸复用 **5** 条（正序 / 逆序 / 随机三遍，与「每条新建」逐条相同）、H 数组闭包 vs 旧 `Map` 闭包 **86,928** 条(A 104,707-assertion offline audit — from "every recipe is in the tree" to "the reusable scratch leaks nothing".).
   - 🔴 **A 组没有一条「丢配方」**：1,236 条配方全部能在 `Tree` 里找到，且树里的配方条数与语料**逐条相等**（反向也查了：不能凭空多出配方）。B 组才是「有原料就能做」那句抱怨的机器版本 —— 它比「界面上看得见」更强：直接问「只给这些原料，最多能做几个」。
@@ -301,18 +304,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 480,530 B | `1345fa6f84770c13992114ce7ddf8689` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 534,893 B | `eeaa31d9a6a6649fd6aa16c84d066015` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 480,642 B | `e04a30889ac126aa1167b384a637fb04` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 535,215 B | `bb9329f53c974a327aec08e97c8982aa` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 483,904 B | `37cec8cefe68ebf1984f6333bf97ca65` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 536,225 B | `bd35c045927cffd6c2051ef1ec8918a5` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 483,905 B | `d2ae58837dbfd733adb5b0a412d4284f` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 536,224 B | `e8560766c161ab7fd210fa3dea8fbaef` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 481,022 B | `5c465010a0fb5d7949326e9f2373e30a` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 536,063 B | `458498595cc96e26bcf4eea769a0ade8` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 482,167 B | `0f77ce960905aa193f100b7fcf9f82d1` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 537,000 B | `709318293e6593602da8a45d270ccf13` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 482,318 B | `e477fe3558f404cb0fd7d9c3aced12fa` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 537,316 B | `4c6868e7ed62c36b3db80b30c268efb6` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 485,580 B | `e6e79308cc472720129aa04ac13c3166` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 538,326 B | `793bab20e86689889a2d6d3eff0c5692` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 485,581 B | `bd72a9b2bf1b671e6bbcc6d11d726f30` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 538,325 B | `5ddc0e7736f020c86d35874bfdac6629` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 482,674 B | `606294207898a78495245e3e99f3b00f` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 538,082 B | `54306c100a7af7011842135d179b8a02` |
 
-> **本表已按 2026-11-15 19:35 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十五次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版修掉「出料漏斗把装满的潜影盒当分类物 ⇒ 2 壳 + 1 箱换走盒内 1728 个圆石」——兑换 / 配方扣料交出去的必须是**纯净产物**，绝不能是调用方那件样板的副本。配方本落盘格式、扣料口径、可兑表内容逐字节不变。主 jar 480,530 / 480,642 / 483,904 / 483,905 / 481,022 B（比上一次发布**五版本一律 +218 B**：新增一个 `goodsTemplate` 与一段产物解析），sources jar 大 1,212 ~ 1,247 B。md5 与之前十四次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-15; the v1.0.17 assets were replaced in place a fifteenth time — exchange and recipe withdrawals now hand out the clean product instead of a copy of the caller's sample stack. Recipe storage format and every decision rule are byte-identical; every main jar grew by exactly 218 B.)。
+> **本表已按 2026-11-15 19:57 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十六次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版改的是「出料漏斗拿装满的潜影盒当分类物」的结算口径 —— 盒子**原样交出**，但盒里的实物也要按「物品 + 数据组件」从仓库扣，付不出就整笔拒绝。配方本落盘格式、扣料口径、可兑表内容逐字节不变。主 jar 482,167 / 482,318 / 485,580 / 485,581 / 482,674 B（比上一次发布 +1,637 ~ +1,676 B：新增 `payloadOf` / `takePayload` 与 `Withdrawal` 的实物退还），sources jar 大 2,019 ~ 2,107 B。md5 与之前十五次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-15; the v1.0.17 assets were replaced in place a sixteenth time — a filled shulker box used as a classifier is now handed out verbatim while its contents are charged to the warehouse. Recipe storage format and every decision rule are byte-identical.)。
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
@@ -326,7 +329,7 @@
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
-- **v1.0.17 的产物换过十五次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建；2026-11-13 换成含「预编译配方树 + 可复位草稿纸」的本地全量构建；同日再换成含「逐条配方闭包（修掉深层配方少算）」的本地全量构建；同日又重出过一次 26.3 的两个产物（去掉误带的 `[VW-DEBUG]` 调试打印）；2026-11-15 换成含「出料漏斗满盒分类物不再白送盒内物品」的本地全量构建。十五次都**没改版本号**，只是字节变了（其中两次只替换了部分版本的产物，未单列）。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place fifteen times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, the book-usage suffix on the learned line, the precompiled recipe tree, the per-recipe closure fix, the rebuilt 26.3 artifacts without the stray debug printlns, and the filled-shulker extraction fix — with the version number unchanged.)。
+- **v1.0.17 的产物换过十六次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建；2026-11-13 换成含「预编译配方树 + 可复位草稿纸」的本地全量构建；同日再换成含「逐条配方闭包（修掉深层配方少算）」的本地全量构建；同日又重出过一次 26.3 的两个产物（去掉误带的 `[VW-DEBUG]` 调试打印）；2026-11-15 换成含「出料漏斗满盒分类物交纯净产物」的本地全量构建；同日再换成含「满盒原样交出 + 盒内实物计价」的本地全量构建（前一版把盒内物品倒进了虚空）。十六次都**没改版本号**，只是字节变了（其中两次只替换了部分版本的产物，未单列）。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place sixteen times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, the book-usage suffix on the learned line, the precompiled recipe tree, the per-recipe closure fix, the rebuilt 26.3 artifacts without the stray debug printlns, the clean-product extraction fix and its replacement with the verbatim-plus-contents-pricing one — with the version number unchanged.)。
 
 * * *
 

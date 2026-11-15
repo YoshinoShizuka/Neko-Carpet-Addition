@@ -15,6 +15,9 @@ import net.minecraft.util.datafix.DataFixTypes;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.BundleContents;
+import net.minecraft.world.item.component.ChargedProjectiles;
+import net.minecraft.world.item.component.ItemContainerContents;
 import net.minecraft.world.item.component.ItemLore;
 import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraft.world.level.saveddata.SavedDataType;
@@ -2173,13 +2176,21 @@ public final class VoidWarehouseData extends SavedData {
         private final ItemStack sample;
         private final ItemStack stack;
         private final VoidWarehouseExchange.Plan plan;
+        /** 原样交出时替「盒里那些实物」付过的账（<b>单份</b>；同一件物品已合并计数） */
+        private final List<ItemStack> payload;
 
         Withdrawal(VoidWarehouseData data, ItemStack sample, ItemStack stack,
                    VoidWarehouseExchange.Plan plan) {
+            this(data, sample, stack, plan, List.of());
+        }
+
+        Withdrawal(VoidWarehouseData data, ItemStack sample, ItemStack stack,
+                   VoidWarehouseExchange.Plan plan, List<ItemStack> payload) {
             this.data = data;
             this.sample = sample;
             this.stack = stack;
             this.plan = plan;
+            this.payload = payload == null ? List.of() : payload;
         }
 
         /** 一件都没取到 */
@@ -2222,6 +2233,16 @@ public final class VoidWarehouseData extends SavedData {
             // 再按「真正用掉的 keep 个」重新规划并执行一次。
             // 库存完全相同 ⇒ 规划是确定性的 ⇒ 重新算出来的账和刚才那笔一字不差。
             this.data.applyExchange(this.plan.negate());
+            // 🔴 原样交出的那笔还要把盒里的实物一起退回去：那是按件付过钱的。
+            // 少了这一步，下游一拒收就凭空少掉一整盒东西（而外盒的材料却退了回来）。
+            // 放在反向执行之后：一个是纯净物品的加减，一个是带组件的归还，互不影响，
+            // 但先退大账、再退零头，读起来不会让人误以为实物是从兑换计划里出来的。
+            for (ItemStack part : this.payload) {
+                long n = (long) part.getCount() * back;
+                if (n > 0) {
+                    this.data.restore(part.copyWithCount((int) Math.min(Integer.MAX_VALUE, n)));
+                }
+            }
             if (keep <= 0) {
                 return;
             }
@@ -2268,27 +2289,124 @@ public final class VoidWarehouseData extends SavedData {
         if (plan == null || plan.amount().signum() <= 0) {
             return new Withdrawal(this, sample, ItemStack.EMPTY, null);
         }
-        // 🔴 交出去的东西必须是**产物本身**，绝不能是 sample 的副本。
+        // 🔴 「收什么价」与「给什么货」必须对上号 —— 照抄 sample 有两种错法，方向相反。
         //
         // 走到这一段的前提就是 find(sample) 没命中 —— 仓库里压根没有「这种形态」，
         // sample 只是调用方手里拿着的一件东西（出料漏斗格子里的标本、界面上的一格图标、
-        // 打印机图纸里的一格）。兑换与配方扣料能复现的只有 (物品, 数量)，
-        // **数据组件一个都复现不出来**，所以拿 sample 去 copyWithCount 就等于把它身上
-        // 挂着的东西白送一遍：
-        //   · 装满的潜影盒（CONTAINER 里 1728 个圆石）→ 「1 个空盒」或「2 壳 + 1 箱」
-        //     换 1728 个圆石，出料漏斗 20 次/秒 —— 2026-11 玩家实测的「刷物品」就是这条；
-        //   · 改过名的物品 → 名字被无限复制；
-        //   · 蜂巢里的蜜蜂、弩里的箭，同理。
+        // 打印机图纸里的一格）。兑换与配方扣料能复现的只有 (物品, 数量)：
         //
-        // 这与 produce() 的「找零本来就是合成产物，不可能带附魔或改名」是同一条口径。
+        //   · 身上**挂着实物**的（装满的潜影盒 1728 件、装填好的弩、装了东西的收纳袋）：
+        //     整份复制 = 盒里那些实物白送。出料漏斗 20 次/秒，这就是 2026-11
+        //     玩家实测的「刷物品」；
+        //   · 身上**没有实物**的（空盒、改过名的、附魔的）：整份复制 = 把改名与附魔
+        //     白送一遍，那部分没有任何材料账可以对，等于凭空复制。
+        //
+        // 所以按「身上有没有挂着实物」分两种交法：
+        //   · 有 → **原样交出那一件**，代价是盒里那些实物也要从仓库里扣（见 takePayload）。
+        //     这是玩家要的口径：盒子怎么进漏斗就怎么出，账一分不差；
+        //   · 没有 → 交**纯净产物**，与 produce() 的「找零本来就是合成产物，
+        //     不可能带附魔或改名」同一条口径。
+        //
         // 仓库里真有某种形态时走的是上面 ① 的精确匹配 —— 那条路原样交还，不受影响。
         Item product = resolveItem(plan.itemId());
         if (product == null) {
             // 解析不出产物就**别执行计划**：扣了料却交不出货，比整次拒绝更坏
             return new Withdrawal(this, sample, ItemStack.EMPTY, null);
         }
+        int amount = plan.amount().intValue();
+        List<ItemStack> payload = payloadOf(sample);
         this.applyExchange(plan);
-        return new Withdrawal(this, sample, new ItemStack(product, plan.amount().intValue()), plan);
+        if (payload.isEmpty()) {
+            return new Withdrawal(this, sample, new ItemStack(product, amount), plan);
+        }
+        // 盒里的实物按「物品 + 数据组件」逐份扣：装的可能是附魔书、改过名的物品，
+        // 只按物品扣会把别人的账算到它头上。扣不出来就整笔退回 ——
+        // 交一个空盒出去等于把玩家的盒子吞了，比整次拒绝更坏。
+        if (!this.takePayload(payload, amount)) {
+            this.applyExchange(plan.negate());
+            return new Withdrawal(this, sample, ItemStack.EMPTY, null);
+        }
+        // 原样交出：这份副本身上每一件东西都付过钱了
+        return new Withdrawal(this, sample, sample.copyWithCount(amount), plan, payload);
+    }
+
+    /**
+     * 这件东西「身上挂着的实物」—— 潜影盒里的东西、弩里装填的弹丸、收纳袋里装的。
+     *
+     * <p>它们全都要占仓库库存：交出一只装满的盒子，等于同时交出盒里那 1728 件。
+     * 只认 {@code ContainerComponent} 这一族组件，因为只有它们装着<b>别的东西</b>；
+     * 改名、附魔、lore 没有材料账可对，不在此列（见 {@link #withdraw} 第 ② 段）。</p>
+     *
+     * <p>同一件物品在盒里占多格时会先<b>合并成一份</b>：后面要按「每份需要多少」逐项验，
+     * 分成两份各 64 个去验，仓库有 64 个时两条都能过，实际却要 128 个 ——
+     * 那会扣出一个半截状态。合并之后「需要多少」才是一个数。</p>
+     *
+     * <p>返回的每一份都是<b>拷贝</b>，调用方拿去扣账不会改到标本本身。</p>
+     */
+    static List<ItemStack> payloadOf(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return List.of();
+        }
+        List<ItemStack> merged = new ArrayList<>();
+        ItemContainerContents container = stack.get(DataComponents.CONTAINER);
+        if (container != null) {
+            container.nonEmptyItemCopyStream().forEach(part -> mergePayload(part, merged));
+        }
+        ChargedProjectiles charged = stack.get(DataComponents.CHARGED_PROJECTILES);
+        if (charged != null) {
+            charged.itemCopies().forEach(part -> mergePayload(part, merged));
+        }
+        BundleContents bundle = stack.get(DataComponents.BUNDLE_CONTENTS);
+        if (bundle != null) {
+            bundle.itemCopies().forEach(part -> mergePayload(part, merged));
+        }
+        return merged;
+    }
+
+    /** 并进 {@code out}：同物品 + 同数据组件合并计数（同一个物品在盒里占多格时只留一份） */
+    private static void mergePayload(ItemStack part, List<ItemStack> out) {
+        if (part == null || part.isEmpty()) {
+            return;
+        }
+        for (ItemStack known : out) {
+            if (ItemStack.isSameItemSameComponents(known, part)) {
+                known.grow(part.getCount());
+                return;
+            }
+        }
+        out.add(part.copy());
+    }
+
+    /**
+     * 按 {@link #payloadOf} 的结果扣账：{@code units} 份，每份都照单全收。
+     *
+     * <p><b>先全验、再全扣</b>：扣了圆石才发现附魔书不够，这种半截状态与
+     * 「扣了料交不出货」一样不可接受。数量按「物品 + 数据组件」精确匹配
+     * （与 {@link #amountExact} / {@link #takeExact} 同一口径）。</p>
+     *
+     * @param units 要交出几份（潜影盒恒为 1 —— 盒子的堆叠上限就是 1）
+     * @return {@code false} = 有一份不够，此时<b>一个字节都没扣</b>
+     */
+    private boolean takePayload(List<ItemStack> payload, int units) {
+        if (units <= 0 || payload.isEmpty()) {
+            return false;
+        }
+        for (ItemStack part : payload) {
+            if (this.amountExact(part).compareTo(payloadNeed(part, units)) < 0) {
+                return false;
+            }
+        }
+        for (ItemStack part : payload) {
+            int need = payloadNeed(part, units)
+                    .min(BigInteger.valueOf(Integer.MAX_VALUE)).intValue();
+            this.takeExact(part, need);
+        }
+        return true;
+    }
+
+    /** {@code units} 份里，某一份实物一共要多少个 */
+    private static BigInteger payloadNeed(ItemStack part, int units) {
+        return BigInteger.valueOf(part.getCount()).multiply(BigInteger.valueOf(units));
     }
 
     /**

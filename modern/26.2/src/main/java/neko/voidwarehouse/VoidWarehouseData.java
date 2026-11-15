@@ -2226,8 +2226,20 @@ public final class VoidWarehouseData extends SavedData {
                 return;
             }
             if (this.plan == null) {
-                // 直接扣成品那条：把剩下的原样放回去（归还语义，不受任何筛选规则影响）
-                this.data.restore(this.sample.copyWithCount(back));
+                if (this.payload.isEmpty()) {
+                    // 直接扣成品那条：把剩下的原样放回去（归还语义，不受任何筛选规则影响）
+                    this.data.restore(this.sample.copyWithCount(back));
+                    return;
+                }
+                // ①' 现场装的那条：本体与盒内实物是**分开付过钱**的，必须分开退。
+                // 少了这一步，下游一拒收就整盒消失（而那只空壳的账已经扣掉了）。
+                this.data.restore(shellOf(this.sample).copyWithCount(back));
+                for (ItemStack part : this.payload) {
+                    long n = (long) part.getCount() * back;
+                    if (n > 0) {
+                        this.data.restore(part.copyWithCount((int) Math.min(Integer.MAX_VALUE, n)));
+                    }
+                }
                 return;
             }
             // 兑换那条：先把整笔账反向执行（此时仓库回到取货前的状态），
@@ -2283,6 +2295,35 @@ public final class VoidWarehouseData extends SavedData {
             int ask = limit.min(BigInteger.valueOf(Integer.MAX_VALUE)).intValue();
             ItemStack taken = this.takeStack(sample, ask);
             return new Withdrawal(this, sample, taken, null);
+        }
+
+        // ①' 仓库里没有「这个形态」，但它是「本体 + 挂着的东西」—— 现场装一个。
+        //
+        // 为什么必须排在 ② 之前：满装潜影盒、装填好的弩、装了东西的收纳袋，
+        // 它们**永远不可能在仓库里是一格**（insert 会把盒子拆成内容物 + 2 壳 + 1 箱，
+        // 只有空盒才整盒入库），所以 ① 一定错过。而 ② 要求「配方本里学过潜影盒」——
+        // 原版把东西塞进盒子**根本不需要配方**，这个依赖没有任何道理：
+        // 2026-11-15 玩家实测，仓库里上百万只空盒 + 上亿件材料，满盒照样一个都出不来，
+        // 因为配方本里没有潜影盒那一条（九合一表里也没有潜影盒）。
+        //
+        // 计价口径与 ② 完全一致，只是「本体」一律取洁净形态（同一物品、零组件、1 个）：
+        //   · 挂着实物 → 交原样那一件，本体与实物各扣一份；
+        //   · 只有装饰（改名 / 附魔 / 空容器组件）→ 交洁净本体，装饰没有材料账可对。
+        // 付不出就整批拒绝（与 ② 同一条规矩），绝不交半件。
+        ItemStack clean = shellOf(sample);
+        if (!ItemStack.isSameItemSameComponents(sample, clean)) {
+            List<ItemStack> attached = payloadOf(sample);
+            if (this.amountExact(clean).signum() > 0) {
+                if (attached.isEmpty()) {
+                    this.takeExact(clean, 1);
+                    return new Withdrawal(this, clean, clean.copy(), null);
+                }
+                if (this.hasPayload(attached, 1)) {
+                    this.takeExact(clean, 1);
+                    this.takePayload(attached, 1);
+                    return new Withdrawal(this, sample, sample.copyWithCount(1), null, attached);
+                }
+            }
         }
 
         // ② 成品一件都没有：规则允许时用 9 合 1 兑换 / 按已学配方扣料
@@ -2390,6 +2431,24 @@ public final class VoidWarehouseData extends SavedData {
      * @return {@code false} = 有一份不够，此时<b>一个字节都没扣</b>
      */
     private boolean takePayload(List<ItemStack> payload, int units) {
+        if (!this.hasPayload(payload, units)) {
+            return false;
+        }
+        for (ItemStack part : payload) {
+            int need = payloadNeed(part, units)
+                    .min(BigInteger.valueOf(Integer.MAX_VALUE)).intValue();
+            this.takeExact(part, need);
+        }
+        return true;
+    }
+
+    /**
+     * 只验不扣：{@code units} 份里每一份实物都够吗。
+     *
+     * <p>抽出来是因为 ①' 段要「先验壳体、再验实物、两样都够才一起扣」——
+     * 先扣壳体再发现实物不够，就会留下一笔扣了壳却没交货的死账。</p>
+     */
+    private boolean hasPayload(List<ItemStack> payload, int units) {
         if (units <= 0 || payload.isEmpty()) {
             return false;
         }
@@ -2398,12 +2457,22 @@ public final class VoidWarehouseData extends SavedData {
                 return false;
             }
         }
-        for (ItemStack part : payload) {
-            int need = payloadNeed(part, units)
-                    .min(BigInteger.valueOf(Integer.MAX_VALUE)).intValue();
-            this.takeExact(part, need);
-        }
         return true;
+    }
+
+    /**
+     * 这件东西「本体」的洁净形态：同一个物品、零组件、1 个。
+     *
+     * <p>满装潜影盒的本体就是那只空盒（颜色由物品本身决定），装填好的弩就是那把空弩。
+     * 用 {@code new ItemStack(item, 1)} 而不是「copy 一份再去掉某个组件」，是为了把
+     * 改名 / 附魔 / 耐久 / 空容器组件这些<b>没有材料账可对</b>的东西一次抹干净 ——
+     * 与兑换交纯净产物是同一条口径。</p>
+     */
+    static ItemStack shellOf(ItemStack sample) {
+        if (sample == null || sample.isEmpty()) {
+            return ItemStack.EMPTY;
+        }
+        return new ItemStack(sample.getItem(), 1);
     }
 
     /** {@code units} 份里，某一份实物一共要多少个 */

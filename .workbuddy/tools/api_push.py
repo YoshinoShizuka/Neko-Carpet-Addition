@@ -111,6 +111,9 @@ def main():
     ap.add_argument("--from", dest="base", metavar="LOCAL_SHA",
                     help="远端 HEAD 对应的本地提交。只有上个提交是用本脚本推的、SHA 已经不同时才需要给；"
                          "给了它会先校验两边的 tree 完全一致，再把这些提交重放到远端 HEAD 之上")
+    ap.add_argument("--parent", dest="parent", metavar="REMOTE_SHA",
+                    help="续推用：上一次跑到一半被中断时，从远端这个已建好的提交之上继续。"
+                         "必须同时给 --from 指明它对应的本地提交（默认仍以远端 ref 为父）")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -132,13 +135,14 @@ def main():
     # 「远端 HEAD 对应本地哪个提交」，改为校验**两边的 tree 完全一致**。
     if args.base:
         base_sha = sh("git", "rev-parse", args.base)
+        root = args.parent or remote_sha
         local_tree = sh("git", "rev-parse", base_sha + "^{tree}")
-        remote_tree = call("GET", "%s/repos/%s/git/commits/%s" % (API, args.repo, remote_sha), token)[1]["tree"]["sha"]
+        remote_tree = call("GET", "%s/repos/%s/git/commits/%s" % (API, args.repo, root), token)[1]["tree"]["sha"]
         if local_tree != remote_tree:
             raise SystemExit("!! --from %s 的 tree 与远端 %s 不一致 —— 说明本地基线与远端内容已经不同，"
-                             "别硬推，先查清楚" % (base_sha[:7], remote_sha[:7]))
+                             "别硬推，先查清楚" % (base_sha[:7], root[:7]))
         print("[ok] 基线校验通过：%s 与远端 %s 内容一致（tree %s）"
-              % (base_sha[:7], remote_sha[:7], local_tree[:7]))
+              % (base_sha[:7], root[:7], local_tree[:7]))
         commits = sh("git", "rev-list", "--reverse", "%s..%s" % (base_sha, local_sha)).split()
     else:
         try:
@@ -148,7 +152,7 @@ def main():
         commits = sh("git", "rev-list", "--reverse", "%s..%s" % (remote_sha, local_sha)).split()
     print("要搬 %d 个提交：%s" % (len(commits), " ".join(c[:7] for c in commits)))
 
-    parent = remote_sha
+    parent = args.parent or remote_sha
     for c in commits:
         subject = sh("git", "log", "-1", "--format=%s", c)
         changes = entries_for(c)

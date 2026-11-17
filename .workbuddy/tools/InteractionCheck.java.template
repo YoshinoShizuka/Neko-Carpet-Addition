@@ -21,6 +21,9 @@ import java.util.List;
  *   <li><b>点击目标 = 实际拿到</b>：数量排序下连点同一格，后台数量序早就换人了，
  *       界面这一格<b>不许跟着换</b>；取空之后留空洞，再点不许误取顶上来的那一件；
  *       只有停手满 {@code IDLE_TICKS} 才归位。</li>
+ *   <li><b>界面标题不跟手持物走</b>：右键已放置的终端 / 接了漏斗的工作台<b>空手也能开</b>，
+ *       标题不许拿手里那件东西兜底（空手时 {@code ItemStack.EMPTY} 的名字在客户端渲染成
+ *       「空气」，界面左上角就写着「空气」）。见 G7。</li>
  * </ol>
  *
  * <p>判据全部落在<b>玩家能看到的那一格</b>（{@code Container#getItem}）与
@@ -84,6 +87,7 @@ public final class VoidWarehouseInteractionCheck {
             case 4 -> g4();
             case 5 -> g5();
             case 6 -> g6();
+            case 7 -> g7();
             default -> {
                 finish();
                 return;
@@ -326,6 +330,54 @@ public final class VoidWarehouseInteractionCheck {
         check("G6 boxed 不超过一盒容量", boxed.compareTo(BigInteger.valueOf(
                 VoidWarehouseShulker.capacity(new ItemStack(Items.IRON_INGOT)))) <= 0);
         System.out.println("INT trace G6 可兑=" + ingot.obtainable() + " bulk=" + bulk + " boxed=" + boxed);
+    }
+
+    // ================================================================ G7 界面标题
+
+    /**
+     * 标题<b>不许</b>默认拿「手里那件东西」。
+     *
+     * <p>三条触发入口里有两条<b>根本不看手持物</b>：右键已放置的仓库终端、右键接了漏斗的
+     * 原版工作台 —— 空手也能开。老实现一律用 {@code player.getItemInHand(hand).getHoverName()}
+     * 当标题，于是空手时 {@code ItemStack.EMPTY} 的名字被客户端渲染成「空气」，
+     * 界面左上角就写着「空气」；手里拿着钻石剑去开终端则写着「钻石剑」。</p>
+     *
+     * <p>标题只活在 {@code ClientboundOpenScreenPacket} 里（菜单不留副本），事后读不回来，
+     * 所以这里咬的是那条纯函数 {@code VoidWarehouseTrigger#titleFor(boolean, ItemStack)}。
+     * 断言口径取 {@code getString()}：跑自检的 JVM 落的是默认语言表（{@code en_us}），
+     * {@code ItemStack.EMPTY} 的名字解析成 {@code Air}（中文客户端就是「空气」），
+     * 拿钻石剑则是 {@code Diamond Sword} —— 老实现在这里都不可能等于「虚空仓库」，
+     * 因此下面几条对老代码是红的。2026-11-17 实测：把判定还原成旧行为 → 4 红 1 绿
+     * （绿的是英文别名那条正向对照）。</p>
+     *
+     * <p>第 4 条是<b>正向对照</b>（旧码也绿）：英文别名 "Void Warehouse" 本身是合法触发名，
+     * 它的标题必须是英文那个名字 —— 证明「跟随触发名」这一路没被兜底顺手改掉。</p>
+     */
+    private static void g7() {
+        ItemStack empty = ItemStack.EMPTY;
+        check("G7 空手开终端 → 标题是「虚空仓库」（老实现给的是 \""
+                        + empty.getHoverName().getString() + "\"，客户端渲染成「空气」）",
+                VoidWarehouseTrigger.titleFor(false, empty).getString().equals("虚空仓库"));
+
+        ItemStack sword = new ItemStack(Items.DIAMOND_SWORD);
+        check("G7 手持钻石剑开终端 → 标题仍是「虚空仓库」（不是 \""
+                        + sword.getHoverName().getString() + "\"）",
+                VoidWarehouseTrigger.titleFor(false, sword).getString().equals("虚空仓库"));
+
+        check("G7 英文玩家空手 → 标题是 \"Void Warehouse\"",
+                VoidWarehouseTrigger.titleFor(true, empty).getString().equals("Void Warehouse"));
+
+        ItemStack alias = new ItemStack(Items.CRAFTING_TABLE);
+        alias.set(DataComponents.CUSTOM_NAME, Component.literal("Void Warehouse"));
+        check("G7 正向对照：手持英文触发物 → 标题就是玩家敲的 \""
+                        + alias.getHoverName().getString() + "\"（跟随触发名没被兜底改掉）",
+                VoidWarehouseTrigger.titleFor(false, alias).getString().equals("Void Warehouse"));
+
+        ItemStack other = new ItemStack(Items.CRAFTING_TABLE);
+        other.set(DataComponents.CUSTOM_NAME, Component.literal("仓库终端"));
+        check("G7 手持「不是触发名」的工作台 → 回落到默认标题（不是它自己的名字 \""
+                        + other.getHoverName().getString() + "\"）",
+                VoidWarehouseTrigger.titleFor(false, other).getString().equals("虚空仓库"));
     }
 
     // ================================================================ 工具

@@ -124,8 +124,10 @@ public final class VoidWarehouse {
     /**
      * 给玩家打开虚空仓库界面，标题由调用方给（跟随触发名），成功返回 true。
      *
-     * <p>双语版：触发入口传玩家改名时敲的名字（{@code getHoverName()}），
-     * 按数量取货结束重开时按玩家语言传对应标题。</p>
+     * <p>双语版：触发入口传玩家改名时敲的名字（{@code getHoverName()}）；
+     * 手里不是仓库时（右键已放置的终端 / 接了漏斗的工作台，空手也能开）改传
+     * 按语言取的默认标题，见 {@code VoidWarehouseTrigger#titleFor}。
+     * 按数量取货结束重开时同样按玩家语言传对应标题。</p>
      */
     public static boolean open(ServerPlayer player, Component title) {
         MinecraftServer server = player.level().getServer();

@@ -152,11 +152,9 @@ public final class VoidWarehouseWithdraw {
      * 玩家不会丢失自己翻到的那一页。</p>
      */
     private static void reopenWarehouse(ServerPlayer player) {
-        // 标题跟随玩家语言：英文玩家重开的界面也该是英文标题（与触发名对应）
-        boolean en = VoidWarehouseText.isEnglish(player);
-        VoidWarehouse.open(player, Component.literal(
-                VoidWarehouseText.tr(en,
-                        VoidWarehouseProvider.TITLE_TEXT, VoidWarehouseText.TITLE_TEXT_EN)));
+        // 标题按玩家语言取默认值：英文玩家重开的界面也该是英文标题（与触发名对应）。
+        // 与触发入口「手里不是仓库」时走同一条兜底，标题口径只有一个来源。
+        VoidWarehouse.open(player, VoidWarehouseProvider.defaultTitle(player));
     }
 
     /** 玩家有没有一条待处理请求 */

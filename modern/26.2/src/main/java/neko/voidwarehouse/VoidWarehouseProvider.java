@@ -1,6 +1,7 @@
 package neko.voidwarehouse;
 
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.MenuProvider;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
@@ -30,6 +31,33 @@ public record VoidWarehouseProvider(VoidWarehouseData data, Component title) imp
 
     /** 缺省标题（中文）：给没有触发物上下文的旧调用路径兜底 */
     public static final Component DEFAULT_TITLE = Component.literal(TITLE_TEXT);
+
+    /**
+     * 按玩家语言取<b>默认标题</b>（「虚空仓库」/ {@code Void Warehouse}）。
+     *
+     * <p>两处用它：</p>
+     * <ul>
+     *   <li>{@code VoidWarehouseTrigger#interact} 里「手里不是仓库」的那两条入口 ——
+     *       右键已放置的终端、右键接了漏斗的工作台，<b>空手也能开</b>，
+     *       因此不能拿手里的东西当标题（空手时 {@code ItemStack.EMPTY.getHoverName()}
+     *       是「空气」，界面标题就显示成「空气」）；</li>
+     *   <li>按数量取货结束后重开界面（{@code VoidWarehouseWithdraw}）。</li>
+     * </ul>
+     */
+    public static Component defaultTitle(ServerPlayer player) {
+        return defaultTitle(VoidWarehouseText.isEnglish(player));
+    }
+
+    /**
+     * 同上，语言直接给（{@code true} = 英文）。
+     *
+     * <p>拆出这一层是为了让自检<b>不依赖假玩家</b>：{@code openMenu} 之后标题只活在
+     * {@code ClientboundOpenScreenPacket} 里，菜单本身不留副本、事后读不回来 ——
+     * 唯一能直接断言的就是「给定语言 + 手持物 → 标题」这个纯函数。</p>
+     */
+    static Component defaultTitle(boolean en) {
+        return Component.literal(VoidWarehouseText.tr(en, TITLE_TEXT, VoidWarehouseText.TITLE_TEXT_EN));
+    }
 
     @Override
     public Component getDisplayName() {

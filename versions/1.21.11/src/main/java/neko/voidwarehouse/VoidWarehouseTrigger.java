@@ -61,6 +61,9 @@ public final class VoidWarehouseTrigger {
      *
      * <p>服务端权威：客户端只返回一个「已处理」用来抑制原版的方块预放置预测，
      * 真正的开界面动作只在服务端发生。</p>
+     *
+     * <p><b>标题不一定是手持物的名字</b>：右键已放置的终端 / 接了漏斗的工作台
+     * 这两条入口空手也能进，见 {@link #titleFor(ServerPlayer, ItemStack)}。</p>
      */
     public static InteractionResult interact(Level level, Player player, InteractionHand hand) {
         // 规则关掉时完全交还原版（改名的工作台恢复成普通工作台）
@@ -73,14 +76,43 @@ public final class VoidWarehouseTrigger {
         if (!(player instanceof ServerPlayer serverPlayer)) {
             return InteractionResult.PASS;
         }
-        // GUI 标题跟随触发名：玩家把工作台改成什么名字，打开的界面就叫什么
-        // （中文玩家看到「虚空仓库」，英文玩家看到他敲的 "Void Warehouse" 大小写原样）。
-        // 只有 mixins 判定 isVoidWarehouse 通过才会走到这里，手里的必然是触发物。
-        ItemStack triggerStack = player.getItemInHand(hand);
-        Component title = triggerStack.getHoverName();
+        Component title = titleFor(serverPlayer, player.getItemInHand(hand));
         if (!VoidWarehouse.open(serverPlayer, title)) {
             return InteractionResult.PASS;
         }
         return InteractionResult.SUCCESS_SERVER;
+    }
+
+    /**
+     * 开界面时用的标题。
+     *
+     * <p>手持物<b>确实是仓库</b>时跟随触发名：玩家把工作台改成什么名字，界面就叫什么
+     * （中文玩家看到「虚空仓库」，英文玩家看到他敲的 {@code Void Warehouse}，大小写原样）。</p>
+     *
+     * <p>手里不是仓库时<b>必须</b>回落到按语言取的默认标题。这不是小题大做：
+     * {@code ServerPlayerGameModeMixin} 还有两条<b>根本不看手持物</b>的入口 ——
+     * 右键已放置的仓库终端、右键接了漏斗的原版工作台，空手也能开。此时
+     * {@code getItemInHand} 给的是 {@link ItemStack#EMPTY}，而它的
+     * {@code getHoverName()} 是「空气」，界面标题就会显示成「空气」；
+     * 手里拿着钻石剑去开终端则会显示「钻石剑」。</p>
+     *
+     * <p>抽成静态方法是为了让自检能直接断言：{@code openMenu} 之后标题只活在
+     * 发包数据里，菜单本身不留副本，事后无法读回。</p>
+     */
+    static Component titleFor(ServerPlayer player, ItemStack held) {
+        return titleFor(VoidWarehouseText.isEnglish(player), held);
+    }
+
+    /**
+     * 同上，语言直接给（{@code true} = 英文）。
+     *
+     * <p>{@code en} 只影响<b>兜底</b>那一路；手持物确实是仓库时，标题永远是玩家敲的名字，
+     * 不翻译 —— 那是玩家自己起的名。</p>
+     */
+    static Component titleFor(boolean en, ItemStack held) {
+        if (isVoidWarehouse(held)) {
+            return held.getHoverName();
+        }
+        return VoidWarehouseProvider.defaultTitle(en);
     }
 }

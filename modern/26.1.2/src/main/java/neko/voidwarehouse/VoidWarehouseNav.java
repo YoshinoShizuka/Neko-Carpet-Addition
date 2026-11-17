@@ -15,7 +15,7 @@ import java.util.List;
  * 第 6 行（容器下标 45..53）的固定导航图标。
  *
  * <pre>
- *   45 红玻璃片   46 红玻璃片    47 潜影盒模式   48 上一页◀   49 页码
+ *   45 合成台     46 红玻璃片    47 潜影盒模式   48 上一页◀   49 页码
  *   50 下一页▶    51 数量排序    52 红玻璃片     53 红玻璃片
  * </pre>
  *
@@ -38,7 +38,7 @@ import java.util.List;
  * 去掉之后腾出来的格子正好用来做对称。</p>
  *
  * <h2>空位用红色染色玻璃片占位</h2>
- * <p>空着的位置（45 / 46 / 52 / 53）放<b>红色染色玻璃片</b>（26.3 里染色物品统一收进了
+ * <p>空着的位置（46 / 52 / 53）放<b>红色染色玻璃片</b>（26.3 里染色物品统一收进了
  * {@code ColorCollection}，所以是 {@code Items.RED_STAINED_GLASS_PANE}，
  * 没有 {@code Items.RED_STAINED_GLASS_PANE} 这个字段了）。点它是<b>完全的空操作</b>：
  * 它既不在 {@link #isButton(int)} 里，槽位本身也是不可拾取、不可放置的 {@code NavSlot}。</p>
@@ -51,12 +51,13 @@ import java.util.List;
  */
 final class VoidWarehouseNav {
     /** 行内下标（0..8），绝对槽位 = {@link VoidWarehouseData#NAV_START} + 该值 */
+    static final int SLOT_SCREEN = 0;     //    合成台 / 返回仓库（界面切换，2026-11-17 新增）
     static final int SLOT_SHULKER = 2;    //    潜影盒模式开关
     static final int SLOT_PREV = 3;       // ◀  上一页
     static final int SLOT_INDICATOR = 4;  //    第 N / M 页（整行的对称轴）
     static final int SLOT_NEXT = 5;       //    下一页 ▶
     static final int SLOT_SORT = 6;       //    数量排序开关（罗盘）
-    // 0、1、7、8 是红色玻璃片占位格
+    // 1、7、8 仍是红色玻璃片占位格
 
     private VoidWarehouseNav() {
     }
@@ -76,9 +77,15 @@ final class VoidWarehouseNav {
         return rowIndex == SLOT_SORT;
     }
 
+    /** 该格是不是「界面切换按钮」（仓库页 ↔ 合成页） */
+    static boolean isScreenToggle(int rowIndex) {
+        return rowIndex == SLOT_SCREEN;
+    }
+
     /** 该格是不是「可点击的按钮」（页码指示格与占位用的红玻璃都不是） */
     static boolean isButton(int rowIndex) {
-        return isPageButton(rowIndex) || isShulkerToggle(rowIndex) || isSortToggle(rowIndex);
+        return isScreenToggle(rowIndex) || isPageButton(rowIndex)
+                || isShulkerToggle(rowIndex) || isSortToggle(rowIndex);
     }
 
     /**
@@ -96,8 +103,10 @@ final class VoidWarehouseNav {
      *                    导航行由 {@link VoidWarehousePageContainer#getItem} 按菜单打开者的语言生成）
      */
     static ItemStack build(int rowIndex, int page, int pageCount, int entryCount, BigInteger totalAmount,
-                           int offerCount, boolean shulkerMode, boolean amountSort, boolean en) {
+                           int offerCount, boolean shulkerMode, boolean amountSort, boolean craftScreen,
+                           boolean en) {
         return switch (rowIndex) {
+            case SLOT_SCREEN -> screenToggle(craftScreen, offerCount, en);
             case SLOT_SHULKER -> shulkerToggle(shulkerMode, en);
             case SLOT_PREV -> button(Items.ARROW,
                     VoidWarehouseText.tr(en, "◀  上一页", "◀  Prev Page"),
@@ -105,7 +114,8 @@ final class VoidWarehouseNav {
                     page > 0,
                     VoidWarehouseText.tr(en, "已经在第一页", "Already on the first page"),
                     en);
-            case SLOT_INDICATOR -> indicator(page, pageCount, entryCount, totalAmount, offerCount, amountSort, en);
+            case SLOT_INDICATOR -> indicator(page, pageCount, entryCount, totalAmount, offerCount,
+                    amountSort, craftScreen, en);
             case SLOT_NEXT -> button(Items.ARROW,
                     VoidWarehouseText.tr(en, "下一页  ▶", "Next Page  ▶"),
                     VoidWarehouseText.tr(en, "往后翻一页", "Go forward one page"),
@@ -115,6 +125,45 @@ final class VoidWarehouseNav {
             case SLOT_SORT -> amountSortToggle(amountSort, en);
             default -> filler(en);
         };
+    }
+
+    /**
+     * 界面切换按钮（2026-11-17 新增，固定在第 45 格）。
+     *
+     * <p>以前「可兑 / 可合成」的条目是<b>混在库存格里</b>的，合成入口因此被仓库存量绑住：
+     * 仓库里只要有 1 个某物品，那件东西的合成条目就整体消失。把它们搬到独立的一张页面之后，
+     * 合成页列的是<b>全部可做的东西</b>（与存量无关），仓库页只列真有货的。</p>
+     *
+     * <p>两个方向共用<b>同一个格子</b>：进去是「合成台」，在合成页里它就是「返回仓库」。
+     * 位置永远不变，玩家只需要记一个位置，也不必在整行里找。</p>
+     */
+    private static ItemStack screenToggle(boolean craftScreen, int offerCount, boolean en) {
+        ItemStack stack = new ItemStack(craftScreen ? Items.CHEST : Items.CRAFTING_TABLE);
+        stack.set(DataComponents.CUSTOM_NAME, VoidWarehouseText.line(
+                craftScreen
+                        ? VoidWarehouseText.tr(en, "返回仓库", "Back to Storage")
+                        : VoidWarehouseText.tr(en, "合成台", "Crafting Table"),
+                VoidWarehouseText.VALUE));
+        List<Component> lore = new ArrayList<>(3);
+        if (craftScreen) {
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en, "回到仓库物品列表", "Back to the stored-item list"),
+                    VoidWarehouseText.FACT));
+        } else {
+            lore.add(VoidWarehouseText.line(en
+                            ? "Open the crafting page — " + offerCount + " kinds craftable"
+                            : "打开合成页 —— 共 " + offerCount + " 种可合成 / 可兑换",
+                    VoidWarehouseText.FACT));
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en, "列的是「还能做多少」，与仓库里有没有货无关",
+                            "Lists what you can still craft, regardless of what is stored"),
+                    VoidWarehouseText.NOTE));
+        }
+        lore.add(VoidWarehouseText.line(
+                VoidWarehouseText.tr(en, "左键切换，不可取出", "Left-click to switch; cannot be taken"),
+                VoidWarehouseText.NOTE));
+        stack.set(DataComponents.LORE, new ItemLore(lore));
+        return stack;
     }
 
     /** 占位格：红色染色玻璃片，带一行说明，点了什么都不会发生 */
@@ -239,26 +288,40 @@ final class VoidWarehouseNav {
     }
 
     private static ItemStack indicator(int page, int pageCount, int entryCount, BigInteger totalAmount,
-                                       int offerCount, boolean amountSort, boolean en) {
+                                       int offerCount, boolean amountSort, boolean craftScreen, boolean en) {
         ItemStack stack = new ItemStack(Items.PAPER);
         stack.set(DataComponents.CUSTOM_NAME,
-                VoidWarehouseText.name(VoidWarehouseText.tr(en, "第 ", "Page ")
+                VoidWarehouseText.name((craftScreen
+                                ? VoidWarehouseText.tr(en, "合成 · 第 ", "Craft · Page ")
+                                : VoidWarehouseText.tr(en, "第 ", "Page "))
                         + (page + 1) + " / " + pageCount
                         + VoidWarehouseText.tr(en, " 页", ""), null));
         List<Component> lore = new ArrayList<>(4);
-        // 最关心的两个数字合并成一行：多少种 + 多少个
-        lore.add(VoidWarehouseText.line(en
-                        ? "Stored " + entryCount + " kinds · "
-                        + VoidWarehouseText.count(totalAmount) + " items total"
-                        : "已存 " + entryCount + " 种 · 合计 "
-                        + VoidWarehouseText.count(totalAmount) + " 个",
-                VoidWarehouseText.VALUE));
-        // 有「可兑」条目时补一行：不写的话玩家会以为那些灰格子是仓库里真有的东西
-        if (offerCount > 0) {
+        if (craftScreen) {
+            // 合成页：这一页讲的是「还能做多少个」，与库存无关
             lore.add(VoidWarehouseText.line(en
-                            ? offerCount + " of them are exchange-craftable (marked as exch.)"
-                            : "其中 " + offerCount + " 种可用合成兑换取出（格子上标着「可兑」）",
-                    VoidWarehouseText.FACT));
+                            ? offerCount + " craftable kinds in total"
+                            : "一共有 " + offerCount + " 种可合成 / 可兑换",
+                    VoidWarehouseText.VALUE));
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en, "左键取 1 组，右键按数量取货",
+                            "Left-click: one stack; right-click: withdraw by amount"),
+                    VoidWarehouseText.NOTE));
+        } else {
+            // 最关心的两个数字合并成一行：多少种 + 多少个
+            lore.add(VoidWarehouseText.line(en
+                            ? "Stored " + entryCount + " kinds · "
+                            + VoidWarehouseText.count(totalAmount) + " items total"
+                            : "已存 " + entryCount + " 种 · 合计 "
+                            + VoidWarehouseText.count(totalAmount) + " 个",
+                    VoidWarehouseText.VALUE));
+            // 合成入口已经搬到另一张页面：这里只是指路，不再和库存混排
+            if (offerCount > 0) {
+                lore.add(VoidWarehouseText.line(en
+                                ? offerCount + " more kinds are craftable — see the crafting table"
+                                : "另有 " + offerCount + " 种可合成 / 可兑换 —— 点左侧合成台",
+                        VoidWarehouseText.FACT));
+            }
         }
         lore.add(VoidWarehouseText.line(
                 VoidWarehouseText.tr(en, "每种物品一格，数量无上限", "One kind per slot, no cap"),

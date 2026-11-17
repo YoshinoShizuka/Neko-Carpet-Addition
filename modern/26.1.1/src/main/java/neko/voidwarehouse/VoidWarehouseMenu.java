@@ -377,7 +377,9 @@ public class VoidWarehouseMenu extends ChestMenu {
         if (slotId >= VoidWarehouseData.NAV_START) {
             int rowIndex = slotId - VoidWarehouseData.NAV_START;
             if (input == ContainerInput.PICKUP && button == 0) {
-                if (VoidWarehouseNav.isShulkerToggle(rowIndex)) {
+                if (VoidWarehouseNav.isScreenToggle(rowIndex)) {
+                    this.switchScreen(player);
+                } else if (VoidWarehouseNav.isShulkerToggle(rowIndex)) {
                     this.toggleShulkerMode(player);
                 } else if (VoidWarehouseNav.isSortToggle(rowIndex)) {
                     this.toggleAmountSort(player);
@@ -389,9 +391,12 @@ public class VoidWarehouseMenu extends ChestMenu {
             return;
         }
 
-        // ---- 第 1..5 行：本页仓库内容 ----
+        // ---- 第 1..5 行：本页内容（仓库格 / 合成页条目）----
+        // 先记一笔「玩家动手了」：位置钉住的空闲重排在等这个计时器归零，
+        // 手没停的时候一格都不会挪（见 VoidWarehousePageContainer#IDLE_TICKS）。
+        this.pageContainer.noteInteraction();
         // 「这一格是谁」只解析这一次，后面渲染 / 取出 / 存入全都用这一个值 ——
-        // 数量排序、以及「可兑条目会随库存出现 / 消失」，都会让两次解析给出不同结果。
+        // 数量排序、以及条目会随库存出现 / 消失，都会让两次解析给出不同结果。
         VoidWarehouseData.DisplaySlot target = this.slotAt(slotId);
         if (target.isEmpty()) {
             // 空格子（屏障占位符）：任何输入都无响应，纯占位，直接返回、不做任何重发
@@ -401,11 +406,19 @@ public class VoidWarehouseMenu extends ChestMenu {
         // 「存入」的路径（数字键、Shift 点背包格）完全不受影响。
         boolean boxMode = this.pageContainer.shulkerMode();
 
+        // 🔴 合成页的动作口径与仓库页不同：左键一次给一组（盒模式一盒），
+        //    右键才走「按数量取货」。合成本来就是批量动作，一次一个要点几十下。
+        boolean catalog = this.pageContainer.craftScreen();
+
         switch (input) {
             case PICKUP -> {
                 if (button == 0) {
                     if (boxMode) {
                         this.withdrawShulkerBox(target, player);
+                    } else if (catalog) {
+                        // 合成页左键：一组。取多少由规划器给（offer.bulk），不是写死的 64
+                        this.withdrawFrom(target, target.offer() != null
+                                ? target.offer().bulk().intValue() : 1, player);
                     } else {
                         this.withdrawFrom(target, 1, player);
                     }
@@ -419,6 +432,12 @@ public class VoidWarehouseMenu extends ChestMenu {
                         // syncAllViewers 就是对着一个已关闭的菜单发包。
                         // 取完货由 VoidWarehouseWithdraw 自己把界面开回来（页码/开关都还在）。
                         // 「可兑」虚拟条目走的是同一条路 —— 区别只在 execute 里改用兑换扣账。
+                        if (player instanceof ServerPlayer serverPlayer) {
+                            VoidWarehouseWithdraw.request(serverPlayer, target.template());
+                        }
+                        return;
+                    } else if (catalog) {
+                        // 合成页右键：按数量取货（复用聊天栏输入的那套）
                         if (player instanceof ServerPlayer serverPlayer) {
                             VoidWarehouseWithdraw.request(serverPlayer, target.template());
                         }
@@ -493,7 +512,8 @@ public class VoidWarehouseMenu extends ChestMenu {
         if (slotId < 0 || slotId >= VoidWarehouseData.NAV_START) {
             return;
         }
-        // ② 这一格现在到底是什么，只解析一次（数量排序 / 可兑条目都会让它随时间变）
+        this.pageContainer.noteInteraction();
+        // ② 这一格现在到底是什么，只解析一次（数量排序 / 条目都会让它随时间变）
         VoidWarehouseData.DisplaySlot target = this.slotAt(slotId);
         if (target.isEmpty()) {
             return;
@@ -538,6 +558,28 @@ public class VoidWarehouseMenu extends ChestMenu {
      * <p>状态存在<b>按玩家持久化的</b> {@link VoidWarehouseViews.View} 里：
      * 别人开了开关不会影响我，而我关掉界面再打开、甚至重连回来，开关还是我离开时的样子。</p>
      */
+    /**
+     * 底栏第 45 格：仓库页 ↔ 合成页。
+     *
+     * <p>两个界面共用同一个菜单、同一套 54 格 —— 只是内容源与页码不同
+     * （见 {@link VoidWarehousePageContainer}）。所以这里不需要开关界面，
+     * 改一下视图状态再全量重发就够了；玩家的背包、光标、潜影盒模式一样都不动。</p>
+     *
+     * <p>页码各自存一份（合成页七百多条，与库存页数根本不是一个量级），
+     * 来回切不会把对方顶到越界。</p>
+     */
+    private void switchScreen(Player player) {
+        boolean craft = !this.pageContainer.craftScreen();
+        this.pageContainer.setCraftScreen(craft);
+        if (player instanceof ServerPlayer serverPlayer) {
+            // 文案交给 switchMessage 自己按语言取词：它内部就是 tr(this.en, 中文, 英文)，
+            // 这里再套一层 tr 只会让人以为「传进去的是已经翻译好的字符串」。
+            serverPlayer.sendSystemMessage(this.switchMessage("合成页", craft ? "已打开" : "已关闭",
+                    "Crafting Page", craft ? "opened" : "closed"));
+        }
+        this.syncAllViewers(player);
+    }
+
     private void toggleShulkerMode(Player player) {
         boolean enabled = !this.pageContainer.shulkerMode();
         this.pageContainer.setShulkerMode(enabled);
@@ -673,7 +715,8 @@ public class VoidWarehouseMenu extends ChestMenu {
         if (exchange != null) {
             this.data.applyExchange(exchange);
         } else {
-            this.data.take(target.realIndex(), (int) available);
+            // 按格子对象扣：界面「位置钉住」之后那一页记的是 Entry 本身，没有稳定下标
+            this.data.takeEntry(target.entry(), (int) available);
         }
         this.data.consumeBoxMaterials(plan);
     }

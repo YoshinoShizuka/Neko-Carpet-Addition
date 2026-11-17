@@ -1184,11 +1184,11 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * 总页数，空仓库也算 1 页。
+     * 仓库页总页数，空仓库也算 1 页。
      *
-     * <p>按 {@link #displayCount()}（真实格 + 可兑虚拟条目）算，不是按物品种类数 ——
-     * 少算一页的话，落在最后一页的可兑条目会<b>永远翻不到</b>：
-     * 那不仅是个死格，玩家还会以为「这里明明说能兑，界面里却没有」。</p>
+     * <p>按 {@link #displayCount()}（= 真实库存格数）算。合成页的页数<b>另算一份</b>：
+     * 它按 {@link #exchangeOfferCount()} 分页，且页码独立持久化 ——
+     * 两个界面的页数根本不是一个量级，共用一份必然越界（见 {@link VoidWarehousePageContainer}）。</p>
      */
     public int pageCount() {
         return Math.max(1, (this.displayCount() + PAGE_SIZE - 1) / PAGE_SIZE);
@@ -1786,11 +1786,84 @@ public final class VoidWarehouseData extends SavedData {
      * 而单价是「铁块 −1、铁锭 +8」，乘 9 会得到「铁块 −9」这种明显荒谬的消耗 ——
      * 拿它去显示，玩家一眼就看出数字对不上。所以这里直接存规划器给出的那一份真账。</p>
      */
-    public record ExchangeOffer(String itemId, ItemStack template, BigInteger obtainable, BigInteger bulk,
-                                BigInteger boxed, List<VoidWarehouseExchange.Delta> totalCost,
-                                boolean craft) {
-        public ExchangeOffer {
-            totalCost = List.copyOf(totalCost);
+    public static final class ExchangeOffer {
+        private final String itemId;
+        private final ItemStack template;
+        private final BigInteger obtainable;
+        private final List<VoidWarehouseExchange.Delta> totalCost;
+        private final boolean craft;
+
+        /**
+         * {@link #bulk} / {@link #boxed} 的<b>算源</b>：第一次被问到时才算，算完缓存。
+         *
+         * <p>🔴 这两个数<b>必须问规划器</b>（见字段注释里的 63 vs 64），而一次规划就是一次
+         * {@code planMax}。它们以前在<b>建表时</b>就算掉：一张 84 条的表 = 168 次多余规划，
+         * 实测占「重算一次可兑表」的 <b>70%（6.8 ms → 2.6 ms）</b> —— 而绝大多数重算
+         * 根本不画合成页（仓库页一格可兑条目都没有，补货提示与取货路径也不读它们）。</p>
+         *
+         * <p>改成惰性之后：仓库页零成本、合成页只算<b>真正画出来的那 45 格</b>、
+         * 点击时算那一格。数值与建表时算的完全一样（同一次快照、同一个规划器）。</p>
+         */
+        private final java.util.function.Supplier<BigInteger> bulkSource;
+        private final java.util.function.Supplier<BigInteger> boxedSource;
+
+        private BigInteger bulk;
+        private BigInteger boxed;
+
+        public ExchangeOffer(String itemId, ItemStack template, BigInteger obtainable,
+                             java.util.function.Supplier<BigInteger> bulkSource,
+                             java.util.function.Supplier<BigInteger> boxedSource,
+                             List<VoidWarehouseExchange.Delta> totalCost, boolean craft) {
+            this.itemId = itemId;
+            this.template = template;
+            this.obtainable = obtainable;
+            this.bulkSource = bulkSource;
+            this.boxedSource = boxedSource;
+            this.totalCost = List.copyOf(totalCost);
+            this.craft = craft;
+        }
+
+        /** 兼容入口：已经把两个数算好的调用方（配方扣料那条路、以及各套自检）直接传值 */
+        public ExchangeOffer(String itemId, ItemStack template, BigInteger obtainable, BigInteger bulk,
+                             BigInteger boxed, List<VoidWarehouseExchange.Delta> totalCost,
+                             boolean craft) {
+            this(itemId, template, obtainable, () -> bulk, () -> boxed, totalCost, craft);
+        }
+
+        public String itemId() {
+            return this.itemId;
+        }
+
+        public ItemStack template() {
+            return this.template;
+        }
+
+        public BigInteger obtainable() {
+            return this.obtainable;
+        }
+
+        /** 普通模式右键「取一组」实际能取到的量（惰性算一次，之后命中缓存） */
+        public BigInteger bulk() {
+            if (this.bulk == null) {
+                this.bulk = this.bulkSource.get();
+            }
+            return this.bulk;
+        }
+
+        /** 潜影盒模式左键「交出 1 盒」实际能装进去的量（惰性算一次） */
+        public BigInteger boxed() {
+            if (this.boxed == null) {
+                this.boxed = this.boxedSource.get();
+            }
+            return this.boxed;
+        }
+
+        public List<VoidWarehouseExchange.Delta> totalCost() {
+            return this.totalCost;
+        }
+
+        public boolean craft() {
+            return this.craft;
         }
     }
 
@@ -1816,6 +1889,16 @@ public final class VoidWarehouseData extends SavedData {
         /** 空的展示格 */
         public static DisplaySlot empty() {
             return EMPTY;
+        }
+
+        /** 真实库存格（{@code realIndex} = 它在 {@link #entries} 里的下标；-1 表示「只认对象」） */
+        public static DisplaySlot ofEntry(Entry entry, int realIndex) {
+            return entry == null ? EMPTY : new DisplaySlot(realIndex, entry, null);
+        }
+
+        /** 「可兑 / 可合成」虚拟条目（只出现在合成页） */
+        public static DisplaySlot ofOffer(ExchangeOffer offer) {
+            return offer == null ? EMPTY : new DisplaySlot(-1, null, offer);
         }
 
         /** 这个是空的吗 */
@@ -2518,16 +2601,17 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * 当前所有「虚拟条目」（9 合 1 可兑 + 已学配方可合成），按创造模式物品栏顺序排好
+     * 合成页的全部内容（9 合 1 可兑 + 已学配方可合成），按创造模式物品栏顺序排好
      * （缓存，任何改动即失效）。
      *
-     * <p>入选条件两条，缺一不可：</p>
-     * <ol>
-     *   <li>这件物品<b>仓库里一件都没有</b> —— 有货就不该出现虚拟格，
-     *       否则玩家会看到一个假的库存量，而且点下去会意外消耗别的东西；</li>
-     *   <li>现有库存<b>真的能拿出至少 1 个</b> —— 只列「理论上能」会把兑换表里几十个物品
-     *       加配方本里几百条全列出来，其中绝大多数当前做不动，纯属噪音。</li>
-     * </ol>
+     * <p>入选条件<b>只有一条</b>：现有库存<b>真的能拿出至少 1 个</b> —— 只列「理论上能」
+     * 会把兑换表里几十个物品加配方本里几百条全列出来，其中绝大多数当前做不动，纯属噪音。</p>
+     *
+     * <p>🔴 <b>「这件物品仓库里已经有了」不再让它消失</b>（2026-11-17）。老版本有这条，
+     * 结果玩家存了两块铁锭就再也看不到「铁锭」的合成条目 —— 想再做六十块也做不到，
+     * 而合成页存在的理由恰恰是「我已经有了一点，还想做更多」。
+     * 当初加这条是为了避免同一件东西占两格（玩家会以为能拿两份），这个顾虑现在由
+     * <b>页面分离</b>解决：仓库页只画真实格，合成页只画这一份清单，两格永远不会同页出现。</p>
      *
      * <p><b>两类的先后与去重</b>：9 合 1 先算，配方扣料后算，且<b>已有 9 合 1 条目的物品
      * 不再生成配方条目</b> —— 同一件东西在界面上出现两格（一格写「可兑」一格写「可合成」）
@@ -2611,13 +2695,29 @@ public final class VoidWarehouseData extends SavedData {
         VoidWarehouseData.serverTick = serverTick;
     }
 
+    /**
+     * 当前服务端 tick（只读）。
+     *
+     * <p>界面用它实现「位置钉住」的空闲重排（见 {@code VoidWarehousePageContainer}）：
+     * 玩家停手 {@code IDLE_TICKS} 之后才把顺序归位，动手期间一格都不挪。</p>
+     */
+    public static long nowTick() {
+        return serverTick;
+    }
+
     /** 收集 9 合 1 的「可兑」条目（原 {@code exchangeOffers} 的主体） */
     private void collectNineInOneOffers(List<ExchangeOffer> built) {
         VoidWarehouseExchange.Table table = VoidWarehouseExchange.active();
         VoidWarehouseExchange.Stock stock = VoidWarehouseExchange.Stock.of(this.exchangeStock());
         for (String itemId : table.items()) {
             Item item = VoidWarehouseExchangeBootstrap.itemOf(itemId);
-            if (item == null || this.amountOf(item).signum() > 0) {
+            // 🔴 这里曾经还有一条 `amountOf(item) > 0 → continue`：仓库里只要有 1 个，
+            //    这一条「可兑」就整体消失。它本来是为了避免同一件东西占两格
+            //    （真实格 + 可兑格，玩家以为能拿两份）—— 可「已经有两块铁锭，
+            //    想再做六十块」也被一起堵死了，而合成页正是为这件事存在的。
+            //    现在仓库页只画真实格（见 unifiedOrder），两格根本不会同时出现在同一页，
+            //    这条早退没有存在理由。
+            if (item == null) {
                 continue;
             }
             // 可兑数量的上限<b>由本族库存推出来</b>，不是一个固定值。
@@ -2638,11 +2738,15 @@ public final class VoidWarehouseData extends SavedData {
             // 见 VoidWarehouseExchange#drain 第 ③ 条路）。这两个数写反就是「tooltip 说 64、
             // 实际给 63」—— 跟玩家连着报两次的「凭空常数」是同一类毛病。
             ItemStack sample = new ItemStack(item);
-            BigInteger bulk = takeAmount(table, itemId, plan.amount(),
-                    Math.max(1, sample.getMaxStackSize()), stock);
-            BigInteger boxed = takeAmount(table, itemId, plan.amount(),
-                    VoidWarehouseShulker.capacity(sample), stock);
-            built.add(new ExchangeOffer(itemId, sample, plan.amount(), bulk, boxed, plan.deltas(), false));
+            // 两个「一次能取多少」交给惰性算源（见 ExchangeOffer#bulkSource 的说明）：
+            // 建表时不问规划器，只有真正要画 / 真正要取货的时候才问，且只问一次。
+            BigInteger obtainable = plan.amount();
+            int bulkCap = Math.max(1, sample.getMaxStackSize());
+            int boxCap = VoidWarehouseShulker.capacity(sample);
+            built.add(new ExchangeOffer(itemId, sample, obtainable,
+                    () -> takeAmount(table, itemId, obtainable, bulkCap, stock),
+                    () -> takeAmount(table, itemId, obtainable, boxCap, stock),
+                    plan.deltas(), false));
         }
     }
 
@@ -2772,7 +2876,9 @@ public final class VoidWarehouseData extends SavedData {
      */
     private ExchangeOffer computeCraftOffer(String itemId) {
         Item item = VoidWarehouseRecipeBook.itemOf(itemId);
-        if (item == null || this.amountOf(item).signum() > 0) {
+        // 与 collectNineInOneOffers 同一条口径：不再因为「仓库里已经有」而返回 null。
+        // 合成页要回答的是「我现在还能再做几个」，那是个与存量无关的问题。
+        if (item == null) {
             return null;
         }
         VoidWarehouseRecipes.Node node = this.craftTree.node(itemId);
@@ -2846,50 +2952,45 @@ public final class VoidWarehouseData extends SavedData {
     // ------------------------------------------------------------------ 统一展示序
 
     /**
-     * 统一展示序：把「真实库存格」与「可兑虚拟条目」<b>按创造模式物品栏顺序合并</b>成一条序列。
+     * 仓库页的展示序：<b>只有真实库存格</b>，按创造模式物品栏顺序排好。
      *
-     * <p>编码：值 {@code >= 0} = {@link #entries} 的下标；值 {@code < 0} = 可兑条目
-     * {@code -(下标 + 1)}。用一个 {@code int[]} 而不是对象数组，是因为界面每渲染一帧
-     * 就要问 45 次「这一格是谁」，走基本类型数组没有装箱开销。</p>
+     * <p>值 = {@link #entries} 的下标（也就是恒等序列 {@code 0..n-1}）。
+     * 用一个 {@code int[]} 而不是对象数组，是因为界面每渲染一帧就要问 45 次
+     * 「这一格是谁」，走基本类型数组没有装箱开销。</p>
      *
-     * <p><b>为什么要合并而不是把虚拟条目接在末尾</b>：库里只有铁粒时，
-     * 「铁锭（可兑）」这一格应该出现在铁粒附近、按创造栏的位次排，而不是被挤到第 7 页去。
-     * 两边的输入都已经是有序的（{@code entries} 由 {@link #ensureSorted()} 保证、
-     * 可兑条目在 {@link #exchangeOffers()} 里排过），所以这就是一次 O(n) 归并。</p>
+     * <p>🔴 <b>「可兑 / 可合成」条目已经从这里搬走了</b>（2026-11-17）。它以前和真实格
+     * 归并成一条序列混排，两个后果都不好受：① 合成入口被仓库存量绑住 ——
+     * 仓库里只要有 1 个，那件东西的合成条目就整体消失；② 混排让页码变多、
+     * 也让玩家分不清「这是我存的，还是我能做的」。现在它们统一由底栏的
+     * 「合成台」按钮进 {@link #exchangeOffers()} 那一页看，本方法只负责库存。
+     *
+     * <p><b>为什么还留着一个恒等映射</b>：{@code entries} 本身已经是创造栏顺序，
+     * 这个数组存在的意义只是「给界面一个<b>不可变、可做引用比较</b>的序列快照」——
+     * 仓库一变它就整体重建，{@link VoidWarehousePageContainer} 拿引用一比就知道
+     * 该不该重算自己的过滤视图，不需要自己的失效时钟。
+     * 哪天真的要做「按某种方式归并（比如把可兑条目插回去）」的视图，改的就只有这里。</p>
      */
     private int[] unifiedOrder() {
-        this.revalidateExchangeCache();
         this.ensureSorted();
         if (this.unifiedOrder != null) {
             return this.unifiedOrder;
         }
-        List<ExchangeOffer> offers = this.exchangeOffers();
         int real = this.entries.size();
-        int[] order = new int[real + offers.size()];
-        int i = 0;
-        int j = 0;
-        int k = 0;
-        while (i < real && j < offers.size()) {
-            int realRank = VoidWarehouseSort.rankOf(this.entries.get(i).template());
-            int offerRank = VoidWarehouseSort.rankOf(offers.get(j).template());
-            // 位次相同时真实格优先（真实格代表「真有货」）
-            if (realRank <= offerRank) {
-                order[k++] = i++;
-            } else {
-                order[k++] = -(j++) - 1;
-            }
-        }
-        while (i < real) {
-            order[k++] = i++;
-        }
-        while (j < offers.size()) {
-            order[k++] = -(j++) - 1;
+        int[] order = new int[real];
+        for (int i = 0; i < real; i++) {
+            order[i] = i;
         }
         this.unifiedOrder = order;
         return order;
     }
 
-    /** 一共要画几格 = 真实库存格 + 可兑虚拟条目（分页按这个数算） */
+    /**
+     * 仓库页一共要画几格 = 真实库存格数（分页按这个数算）。
+     *
+     * <p>「可兑 / 可合成」条目<b>不算在这里</b>：它们在合成页，页数按
+     * {@link #exchangeOfferCount()} 另算一份。两个界面各存一个页码，理由见
+     * {@link VoidWarehouseViews.View#craftPage()}。</p>
+     */
     public int displayCount() {
         return this.unifiedOrder().length;
     }
@@ -2912,15 +3013,10 @@ public final class VoidWarehouseData extends SavedData {
             return DisplaySlot.empty();
         }
         int code = order[displayIndex];
-        if (code >= 0) {
-            return new DisplaySlot(code, this.entries.get(code), null);
-        }
-        List<ExchangeOffer> offers = this.exchangeOffers();
-        int offerIndex = -code - 1;
-        if (offerIndex < 0 || offerIndex >= offers.size()) {
+        if (code < 0 || code >= this.entries.size()) {
             return DisplaySlot.empty();
         }
-        return new DisplaySlot(-1, null, offers.get(offerIndex));
+        return new DisplaySlot(code, this.entries.get(code), null);
     }
 
     /** 展示序里一共有几个可兑条目（界面提示用） */
@@ -2931,9 +3027,12 @@ public final class VoidWarehouseData extends SavedData {
     /**
      * 「按数量从大到小」的<b>展示</b>顺序：视图下标 → 展示序号。
      *
-     * <p>真实格用库存数量、可兑条目用「现在能兑出多少」当排序键 ——
-     * 两者都是「这一格现在能给我多少个东西」，口径是一致的。
-     * 数量相同的格<b>保持创造栏顺序</b>（用展示序号当第二关键字），所以不会互相抖动。</p>
+     * <p>排序键是库存数量。数量相同的格<b>保持创造栏顺序</b>（用展示序号当第二关键字），
+     * 所以不会互相抖动。</p>
+     *
+     * <p>🔴 <b>这个序只该用来「摆好一格」</b>，绝不能当成「这一格现在是谁」的实时答案：
+     * 它的键（数量）会随着玩家每一次取出而变化，点一下就可能整页换人。界面侧的
+     * {@link VoidWarehousePageContainer} 因此把顺序<b>钉住</b>，只在玩家停手 2 秒后才跟它。</p>
      *
      * <p><b>只影响显示</b>：{@link #entries} 本身一个字都不动。</p>
      */
@@ -2960,13 +3059,10 @@ public final class VoidWarehouseData extends SavedData {
         return order;
     }
 
-    /** 某个展示格「现在能给出多少个东西」：真实格 = 库存数量，可兑条目 = 能兑出的数量 */
+    /** 某个展示格现在有多少个（{@link #displaySlotAt} 只给真实格，所以这里也就只剩这一种情况） */
     private BigInteger amountAtDisplay(int displayIndex) {
         DisplaySlot slot = this.displaySlotAt(displayIndex);
-        if (slot.entry() != null) {
-            return slot.entry().amount();
-        }
-        return slot.offer() == null ? BigInteger.ZERO : slot.offer().obtainable();
+        return slot.entry() == null ? BigInteger.ZERO : slot.entry().amount();
     }
 
     /**
@@ -3092,6 +3188,63 @@ public final class VoidWarehouseData extends SavedData {
                 "Not in stock: taken via crafting exchange"),
                 VoidWarehouseText.NOTE));
 
+        stack.set(DataComponents.LORE, new ItemLore(lore));
+        return stack;
+    }
+
+    /**
+     * <b>合成页</b>专用的渲染：同一个「可兑 / 可合成」条目，但动作口径换成合成页那一套。
+     *
+     * <p>与 {@link #buildExchangeDisplay} 的差别只有两处：</p>
+     * <ul>
+     *   <li>左键是<b>取 1 组</b>（盒模式下 1 满盒），不是取 1 个 ——
+     *       合成本来就是个批量动作，一次一个要点六十多下；</li>
+     *   <li>不再写「仓库里没有这种物品」那一行 —— 合成页的内容<b>与存量无关</b>，
+     *       很多条目现在仓库里就有，照抄那句话会是假的。</li>
+     * </ul>
+     *
+     * <p>数量、账单、一次能拿多少仍然全部来自 {@link #exchangeSummary} 与
+     * {@code offer.bulk()} / {@code offer.boxed()}（规划器算出来的真值），
+     * 没有在这里重新推一遍算式。</p>
+     */
+    public static ItemStack buildCatalogDisplay(ExchangeOffer offer, boolean boxMode, long inStock, boolean en) {
+        String verb = offer.craft() ? VoidWarehouseText.tr(en, "合成", "craft")
+                : VoidWarehouseText.tr(en, "兑换", "exchange");
+        String tag = offer.craft() ? VoidWarehouseText.tr(en, "（可合成）", " (craftable)")
+                : VoidWarehouseText.tr(en, "（可兑）", " (exch.)");
+
+        ItemStack stack = offer.template().copyWithCount(1);
+        stack.set(DataComponents.CUSTOM_NAME,
+                VoidWarehouseText.tinted(offer.template().getHoverName(), VoidWarehouseText.FACT)
+                        .append(VoidWarehouseText.line(tag, VoidWarehouseText.FACT)));
+
+        List<Component> lore = new ArrayList<>(6);
+        lore.addAll(exchangeSummary(offer, en));
+
+        if (boxMode) {
+            lore.add(VoidWarehouseText.line(en
+                            ? "Left-click: hand out 1 box (" + VoidWarehouseText.count(offer.boxed()) + " items)"
+                            : "左键：交出 1 盒（" + VoidWarehouseText.count(offer.boxed()) + " 个）",
+                    VoidWarehouseText.ACTION_RGB));
+        } else {
+            long bulk = offer.bulk().longValue();
+            lore.add(VoidWarehouseText.line(en
+                            ? "Left-click: " + verb + " " + VoidWarehouseText.count(bulk) + " (one stack)"
+                            : "左键：" + verb + " " + VoidWarehouseText.count(bulk) + " 个（一组）",
+                    VoidWarehouseText.ACTION_RGB));
+        }
+        lore.add(VoidWarehouseText.line(
+                VoidWarehouseText.tr(en, "右键：按数量取货", "Right-click: withdraw by amount"),
+                VoidWarehouseText.ACTION_RGB));
+        // 仓库里真有这个物品时补一行存量：合成页列的是「还能做多少」，
+        // 不写清「现在已经有多少」，玩家会以为手里那些凭空没了。
+        // 存量由调用方（界面容器）从仓库读，静态方法这里不碰数据实例。
+        if (inStock > 0) {
+            lore.add(VoidWarehouseText.line(en
+                            ? "Already stored: " + VoidWarehouseText.count(BigInteger.valueOf(inStock))
+                            : "仓库已有 " + VoidWarehouseText.count(BigInteger.valueOf(inStock)),
+                    VoidWarehouseText.VALUE));
+        }
         stack.set(DataComponents.LORE, new ItemLore(lore));
         return stack;
     }
@@ -3277,7 +3430,17 @@ public final class VoidWarehouseData extends SavedData {
      * <p>取空的那一格会被移除，后面的格子整体前移（「一种物品一格」，不留空洞）。</p>
      */
     public int take(int index, int wanted) {
-        Entry entry = this.entryAt(index);
+        return this.takeEntry(this.entryAt(index), wanted);
+    }
+
+    /**
+     * 按<b>格子对象</b>扣减（不经过下标）。
+     *
+     * <p>界面上「位置钉住」的那一页记的就是 {@link Entry} 本身：仓库的 {@code entries}
+     * 是一个会增删、会重排的 List，下标今天稳定不代表点击那一刻还稳定 ——
+     * 而对象身份只要没被扣到 0 就一直有效。所以钉住的路径一律走这里。</p>
+     */
+    public int takeEntry(Entry entry, int wanted) {
         if (entry == null || wanted <= 0) {
             return 0;
         }

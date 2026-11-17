@@ -8,7 +8,9 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemLore;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -16,61 +18,61 @@ import java.util.Set;
  *
  * <p>它<b>不是</b>全局共享的那一份：每个玩家可以停在不同的页码、也可以各自开关
  * 「潜影盒模式」与「数量排序」，所以每个 {@link VoidWarehouseMenu} 各持有一个本类实例。
- * 真正共享的是背后的 {@link VoidWarehouseData}。多人实时同步依然免费 ——
- * 不同菜单读的是同一份数据，原版 {@code ServerPlayer} 每 tick 的
- * {@code broadcastChanges()} 会各自把差异推给对应玩家。</p>
+ * 真正共享的是背后的 {@link VoidWarehouseData}。</p>
  *
- * <h2>状态存在哪：{@link VoidWarehouseViews.View}</h2>
- * <p>页码与两个开关<b>不是本类的字段</b>，而是委托给玩家自己的那份
- * {@link VoidWarehouseViews.View}。这一点很关键：本类实例是<b>跟着菜单一起创建、一起销毁</b>的，
- * 状态如果放在这里，玩家「开一下数量排序 → 关掉界面 → 再打开」就会发现开关被复位了
- * （这是一个真实修过的 bug）。放到按玩家 UUID 持久化的 {@code View} 上之后，
- * <b>关界面、重连、重启服务器都保留，而 A 的状态永远不影响 B</b>。</p>
- *
- * <p>页码仍然在这里做「按实际页数夹取」——存在 {@code View} 里的原始页码可能超出范围
- * （仓库被取空之后页数会变小），读的时候夹一下即可，不回写。</p>
- *
- * <h2>容器下标 → 展示序号 →（真实格 / 可兑条目）</h2>
+ * <h2>两个界面：仓库页 / 合成页</h2>
+ * <p>2026-11-17 起，同一个 54 格容器有两种内容：</p>
  * <ul>
- *   <li>0..44：本页内容。先经 {@link #displayIndexOf(int)} 算出<b>展示序号</b>
- *       （默认排序时就是「页码 × 45 + 下标」；开了「数量排序」还要过一层
- *       {@link VoidWarehouseData#displayAmountOrder() 数量降序视图}），
- *       所以结果可能是 {@code -1}（该位置没有东西）；</li>
- *   <li>再把展示序号交给 {@link #slotAt(int)}，得到这一格到底是
- *       <b>真实库存格</b>、<b>9 合 1 可兑虚拟条目</b>还是<b>空</b>；</li>
- *   <li>45..53：导航行，由 {@link VoidWarehouseNav} 实时生成，<b>不可写、不入存档</b>。</li>
+ *   <li><b>仓库页</b>（第 1 张）：真实库存，一格一种，顺序按创造栏；</li>
+ *   <li><b>合成页</b>（第 2 张）：{@link VoidWarehouseData#exchangeOffers()} 的全部「可兑 / 可合成」
+ *       条目，<b>与仓库里有没有货无关</b>。</li>
  * </ul>
- * {@link #getContainerSize()} 恒为 54，这样原版客户端才会套用大箱子界面（GUI 尺寸不变）。
+ * <p>以前这两样是<b>混在同一条序列里</b>的，后果是：仓库里只要有 1 个某物品，那件东西的
+ * 合成条目就整体消失（合成入口被库存绑住），而且混排既占页码又让人分不清「这是我存的，
+ * 还是我能做的」。现在底栏第 45 格固定是「合成台 / 返回仓库」的切换按钮，
+ * 两个世界各占一张，互不干扰。</p>
  *
- * <p>{@link #slotAt(int)} 是本类里唯一一处「这一格是谁」的换算，
- * 菜单里所有取物品的路径都经过它，所以数量排序也不会点错格，
- * 更不会出现「渲染时是可兑条目、点击时却按真实格处理」这种错位。</p>
+ * <h2>🔴 位置钉住：一页的顺序在玩家动手期间不重排</h2>
+ * <p>「数量排序」的排序键是<b>数量</b>，而玩家每取走一组，数量就变、名次就变。
+ * 于是老实现里出现过这种事：点第 12 格拿走一组圆石 → 下一 tick 45 格几乎全变 →
+ * 玩家几十毫秒后的第二击落在<b>另一件物品</b>上。创造序之所以稳，是因为它的键只有
+ * 「物品身份」，与数量和存取历史都无关。</p>
+ *
+ * <p>所以这一页现在是<b>钉住</b>的：{@link #pin} 记住「这一格是谁」（真实格记
+ * {@link VoidWarehouseData.Entry} 本身，合成页记 itemId），顺序只在四个时机重建 ——
+ * 打开界面、翻页、切排序 / 搜索、以及<b>停手满 {@link #IDLE_TICKS} tick</b> 之后。
+ * 动手期间一格都不挪；格子被取空了就留一个<b>空洞</b>（不左移），
+ * 等下一次重排再补上。点一个已经空掉的格子是<b>空操作</b> ——
+ * 绝不会把现在占着这个位置的另一件东西交出去。</p>
+ *
+ * <p>数量本身照常实时刷新（格子上写的数字会变），只有<b>名次</b>冻结。</p>
  *
  * <h2>为什么这里几乎全是「只读」的</h2>
  * <p>仓库的写操作只有一种正确姿势：{@link VoidWarehouseData#insert(ItemStack)}（数量累加）和
- * {@link VoidWarehouseData#take(int, int)}（数量扣减）。原版那些直接往槽位里写物品的路径
+ * 扣减原语（见 {@link VoidWarehouseData#takeEntry}）。原版那些直接往槽位里写物品的路径
  * （Shift 点击、拖拽、双击取物）如果绕过这两条，就会把「一种物品一格、数量无上限」的账目写乱，
  * 甚至凭空生造物品。所以：</p>
  * <ul>
- *   <li>{@link #canPlaceItem(int, ItemStack)} 对<b>所有</b>格子都返回 false ——
- *       原版的行为都先问 {@code mayPlace}，返回 false 就不会有任何原版路径写进本容器；</li>
- *   <li>{@link #setItem(int, ItemStack)} 直接忽略写入，宁可什么都不做也不破坏账目；</li>
- *   <li>{@link #removeItem(int, int)} / {@link #removeItemNoUpdate(int)} 仍然按真实数量扣减，
- *       万一真有原版路径从仓库里取东西，也只会按规矩扣，不会丢也不会多。</li>
+ *   <li>{@link #canPlaceItem(int, ItemStack)} 对<b>所有</b>格子都返回 false；</li>
+ *   <li>{@link #setItem(int, ItemStack)} 直接忽略写入；</li>
+ *   <li>{@link #removeItem(int, int)} / {@link #removeItemNoUpdate(int)} 仍按真实数量扣减。</li>
  * </ul>
  */
 final class VoidWarehousePageContainer implements Container {
     /**
-     * 空格子的占位图标（屏障方块），<b>按语言各缓存一份</b>（「空位」提示要跟着玩家语言走）。
+     * 停手多少 tick 之后才允许「归位」（重排）。
+     *
+     * <p>20 tick = 1 秒，这里取 2 秒：连点取货的手速通常在 3~6 次/秒，
+     * 2 秒的空隙足够把「连点」和「停下来看看」分开。太短会重新引入抖动，
+     * 太长则取空之后界面上挂着一片空洞。</p>
+     */
+    static final int IDLE_TICKS = 40;
+
+    /**
+     * 空格子的占位图标（屏障方块），<b>按语言各缓存一份</b>。
      *
      * <p>只在<b>展示层</b>出现：{@link #getItem(int)} 对「本页该位置没有物品」的内容格返回它，
-     * 客户端（纯原版大箱子）就会画一个屏障图标。它<b>永不被读 / 写 / 取</b>——
-     * 所有取物路径都走 {@link VoidWarehouseData#entryAt(int)}（空位返回 {@code null}），
-     * 所以点击屏障永远是空操作；一旦有物品入库，同一个槽位下一帧就换成真物品，屏障自然消失。</p>
-     *
-     * <p>屏障原版自带一个不可见的名字（带前导空格的「 Barrier」），这里用
-     * {@code CUSTOM_NAME} / {@code LORE} 覆盖成可见的「空位（占位符）」提示，
-     * 鼠标移上去能一眼看出这是占位、点击无意义。</p>
+     * 客户端（纯原版大箱子）就会画一个屏障图标。它<b>永不被读 / 写 / 取</b>。</p>
      */
     private static final ItemStack PLACEHOLDER_ZH = buildPlaceholder(false);
     private static final ItemStack PLACEHOLDER_EN = buildPlaceholder(true);
@@ -92,17 +94,14 @@ final class VoidWarehousePageContainer implements Container {
     /**
      * 打开这个界面的玩家客户端语言是不是英语。
      *
-     * <p>双语版（方案 B）新增：本容器是<b>每个菜单一份</b>（= 每个看界面的玩家一份），
-     * 所以「这份视图该发哪种语言的 tooltip」在这里定死一次就够了 ——
-     * 导航行、占位符、物品格 tooltip 的构建都按它取词。
-     * 共享的 {@link VoidWarehouseData} 里的 tooltip 缓存按语言各存一份
-     * （见 {@code VoidWarehouseData.Entry#display(boolean)}），
-     * 中文玩家与英文玩家看同一个仓库格互不干扰。</p>
+     * <p>本容器是<b>每个菜单一份</b>（= 每个看界面的玩家一份），所以「这份视图该发哪种语言的
+     * tooltip」在这里定死一次就够了。共享的 {@link VoidWarehouseData} 里的 tooltip 缓存按语言
+     * 各存一份（见 {@code VoidWarehouseData.Entry#display(boolean)}）。</p>
      */
     private final boolean en;
 
     /**
-     * 这个玩家自己的视图状态（页码 + 两个开关）。
+     * 这个玩家自己的视图状态（页码 + 两个开关 + 停在哪个界面）。
      *
      * <p>它<b>不跟着菜单走</b>：在 {@link VoidWarehouseViews} 里按玩家 UUID 持久化，
      * 所以关掉界面再打开（甚至重启服务器）都还是他离开时的样子。</p>
@@ -110,46 +109,107 @@ final class VoidWarehousePageContainer implements Container {
     private final VoidWarehouseViews.View view;
 
     // ------------------------------------------------------------------ 搜索过滤
-    // 以下三个字段是「客户端搜索框」的服务端落点：搜索是会话级状态，
-    // 刻意不进 VoidWarehouseViews（不持久化）—— 关掉界面过滤自然消失，
-    // 重开界面是干净的一页，也不给存档 schema 增加任何字段。
 
     /**
      * 搜索过滤集合（{@code null} = 不过滤）：只展示集合内物品的那几格。
      *
-     * <p>由客户端模组把「中文 / 拼音命中」的物品 id 集合通过
-     * {@code search_apply} 通道发上来（中文匹配只能在客户端做 —— 专用服务器
-     * 没有中文语言文件），经 {@code VoidWarehouseMenu#applySearchFilter} 写到这里。
-     * 纯原版客户端永远不发这条通道，集合恒为 {@code null}，行为与从前完全一致。</p>
+     * <p>由客户端模组把「中文 / 拼音命中」的物品 id 集合通过 {@code search_apply} 通道发上来。
+     * 纯原版客户端永远不发这条通道，集合恒为 {@code null}，行为与从前完全一致。
+     * <b>两个界面都吃这一层过滤</b> —— 合成页满本有七百多条，没有搜索基本没法用。</p>
      */
     private Set<Item> searchFilter;
 
-    /** 过滤后的展示序（展示序号数组）；{@code searchFilter == null} 时恒为 {@code null} */
+    /** 过滤后的<b>内容序号</b>数组（仓库页 = 库存格下标；合成页 = 可兑条目下标） */
     private int[] filteredOrder;
 
     /** 计算 {@link #filteredOrder} 时所依据的底层序列（引用比较，仓库一变就重算） */
-    private int[] filteredBase;
+    private Object filteredBase;
 
-    /** 计算 {@link #filteredOrder} 时的过滤集合与排序开关（防同引用不同语义的重算遗漏） */
+    /** 计算 {@link #filteredOrder} 时的过滤集合与排序开关 / 界面（防同引用不同语义的重算遗漏） */
     private Set<Item> filteredFor;
     private boolean filteredSort;
+    private boolean filteredCraft;
+
+    // ------------------------------------------------------------------ 位置钉住
+
+    /**
+     * 本页 45 个位置各是谁：{@link VoidWarehouseData.Entry}（仓库页）/
+     * {@link String} 形式的 itemId（合成页）/ {@code null}（该位置本来就没东西）。
+     *
+     * <p>它是<b>会话级</b>的：不进存档、不跨菜单，玩家关掉界面就丢掉。</p>
+     */
+    private final Object[] pin = new Object[VoidWarehouseData.PAGE_SIZE];
+
+    private boolean pinValid;
+
+    /** 钉住时的上下文 —— 任何一项变了都必须立刻重建（这是「玩家主动换视角」） */
+    private int pinPage;
+    private boolean pinSort;
+    private boolean pinCraft;
+    private Set<Item> pinFilter;
+
+    /** 钉住时所依据的底层序列引用：它变了说明仓库 / 清单动过，但要不要跟，得看手停没停 */
+    private Object pinBase;
+
+    /** 本菜单最后一次「玩家自己动手」的 tick（点击 / 取满 / 翻页），空闲重排的基准 */
+    private long touchTick;
+
+    /** 合成页的有序下标缓存（跟着清单引用与排序开关失效） */
+    private int[] craftOrder;
+    private Object craftOrderBase;
+    private boolean craftOrderSort;
+
+    /** 合成页的 itemId → 条目索引（跟着清单引用失效，避免每格线性扫七百条） */
+    private Map<String, VoidWarehouseData.ExchangeOffer> offerIndex;
+    private Object offerIndexBase;
 
     VoidWarehousePageContainer(VoidWarehouseData data, VoidWarehouseViews.View view, boolean english) {
         this.data = data;
         this.view = view;
         this.en = english;
+        this.touchTick = VoidWarehouseData.nowTick();
     }
+
+    // ------------------------------------------------------------------ 界面切换
+
+    /** 这个界面收件人用的是不是英语（聊天提示也要按它取词） */
+    boolean isEnglish() {
+        return this.en;
+    }
+
+    /** 现在是不是「合成页」 */
+    boolean craftScreen() {
+        return this.view.craftScreen();
+    }
+
+    /**
+     * 切到另一个界面，并把页码各自复位。
+     *
+     * <p>两个界面的页数完全不同（仓库页按库存种类、合成页按可合成条目），
+     * 共用一份页码必然越界，所以 {@link VoidWarehouseViews.View} 里各存一个。</p>
+     */
+    void setCraftScreen(boolean craft) {
+        this.view.setCraftScreen(craft);
+        this.invalidatePin();
+    }
+
+    /** 玩家刚动过手（点格子 / 翻页 / 取满）：把空闲计时清零，这一下不重排 */
+    void noteInteraction() {
+        this.touchTick = VoidWarehouseData.nowTick();
+    }
+
+    // ------------------------------------------------------------------ 搜索过滤
 
     /**
      * 挂上 / 清除搜索过滤（空集合 = 清除），并把页码回到第一页。
      *
-     * <p>调用方（菜单 → 网络 → 客户端）负责之后做全量重发；
-     * 这里只管状态本身。</p>
+     * <p>调用方（菜单 → 网络 → 客户端）负责之后做全量重发；这里只管状态本身。</p>
      */
     void setSearchFilter(Set<Item> filter) {
         this.searchFilter = (filter == null || filter.isEmpty()) ? null : filter;
-        // 过滤视图整体作废；页码回第一页 —— 搜索结果从第一页看起是唯一合理的起点
         this.filteredOrder = null;
+        this.invalidatePin();
+        // 搜索结果从第一页看起是唯一合理的起点
         this.setPage(0);
     }
 
@@ -158,28 +218,26 @@ final class VoidWarehousePageContainer implements Container {
         return this.searchFilter != null;
     }
 
-    /**
-     * 本页数：有过滤时按<b>过滤后</b>的格数算，否则与仓库总页数一致。
-     *
-     * <p>菜单的翻页（{@code VoidWarehouseMenu#flipPage}）与导航行页码
-     * 都改读这一个 —— 过滤生效时「第 x / y 页」说的必须是过滤后的世界。</p>
-     */
+    /** 本界面的内容格总数：仓库页 = 库存种类数；合成页 = 可合成条目数 */
+    private int contentCount() {
+        return this.craftScreen() ? this.data.exchangeOffers().size() : this.data.displayCount();
+    }
+
+    /** 本页数（有过滤时按过滤后的格数算） */
     int pageCount() {
         int[] filtered = this.filteredView();
-        int count = filtered != null ? filtered.length : this.data.displayCount();
+        int count = filtered != null ? filtered.length : this.orderedView().length;
         return Math.max(1, (count + VoidWarehouseData.PAGE_SIZE - 1) / VoidWarehouseData.PAGE_SIZE);
     }
 
     /**
-     * 过滤后的展示序：一串<b>展示序号</b>（与 {@code displayAmountOrder} 同一编码），
-     * 只是跳过了不命中搜索集合的格子。
+     * 过滤后的内容序号：一串<b>内容下标</b>（仓库页 = {@code entries} 的下标，
+     * 合成页 = 清单下标），只是跳过了不命中搜索集合的格子。
      *
-     * <p>底层序列换了（仓库变了 / 排序切了 / 过滤集合换了）就整体重算 ——
+     * <p>底层序列换了（仓库变了 / 排序切了 / 过滤集合换了 / 换了界面）就整体重算 ——
      * 与底层序列的缓存作废机制天然对齐：仓库任何变动都会让
-     * {@code VoidWarehouseData} 生成新的 {@code unifiedOrder} / {@code displayAmountOrder}
-     * 数组，引用一变这里就跟着重算，<b>没有自己的失效时钟</b>，也就没有
-     * 「数量变了顺序没变」这类漂移。重算是 O(格数) 的数组遍历，只发生在
-     * 仓库真的变动的那一帧，其余时候是一次引用比较。</p>
+     * {@code VoidWarehouseData} 生成新的数组，引用一变这里就跟着重算，
+     * <b>没有自己的失效时钟</b>，也就没有「数量变了顺序没变」这类漂移。</p>
      */
     private int[] filteredView() {
         if (this.searchFilter == null) {
@@ -188,52 +246,110 @@ final class VoidWarehousePageContainer implements Container {
             this.filteredFor = null;
             return null;
         }
-        boolean sort = this.view.amountSort();
-        // 无排序时底层序就是「展示序号 = 下标」的单位序，用它自己的 unifiedOrder 当失效基准；
-        // 有排序时底层序是 displayAmountOrder（元素本身就是展示序号）
-        int[] base = sort ? this.data.displayAmountOrder() : this.data.unifiedOrderRef();
-        int length = sort ? base.length : this.data.displayCount();
+        boolean craft = this.craftScreen();
+        int[] ordered = this.orderedView();
         if (this.filteredOrder != null && this.filteredFor == this.searchFilter
-                && this.filteredSort == sort && this.filteredBase == base) {
+                && this.filteredCraft == craft && this.filteredBase == ordered) {
             return this.filteredOrder;
         }
-        int[] picked = new int[length];
+        int[] picked = new int[ordered.length];
         int n = 0;
-        for (int i = 0; i < length; i++) {
-            int displayIndex = sort ? base[i] : i;
-            if (this.matchesFilter(displayIndex)) {
-                picked[n++] = displayIndex;
+        for (int index : ordered) {
+            if (this.matchesFilterAt(craft, index)) {
+                picked[n++] = index;
             }
         }
-        this.filteredOrder = n == length ? picked : java.util.Arrays.copyOf(picked, n);
-        this.filteredBase = base;
+        this.filteredOrder = n == ordered.length ? picked : java.util.Arrays.copyOf(picked, n);
+        this.filteredBase = ordered;
         this.filteredFor = this.searchFilter;
-        this.filteredSort = sort;
+        this.filteredCraft = craft;
         return this.filteredOrder;
     }
 
-    /** 展示序号 {@code displayIndex} 那一格的物品是否命中搜索集合（解析不出来 = 不命中） */
-    private boolean matchesFilter(int displayIndex) {
-        VoidWarehouseData.DisplaySlot slot = this.data.displaySlotAt(displayIndex);
-        var template = slot.entry() != null ? slot.entry().template()
-                : slot.offer() != null ? slot.offer().template() : null;
+    /**
+     * 本界面的<b>有序内容下标</b>（过滤之前）：仓库页按创造栏 / 数量，合成页按可合成数量 / 创造栏。
+     *
+     * <p>「内容下标」在仓库页 = {@code entries} 的下标，在合成页 = {@code exchangeOffers()} 的下标。
+     * 分开只是因为两者是两条完全不同的序列，取值规则没必要统一。</p>
+     */
+    private int[] orderedView() {
+        if (this.craftScreen()) {
+            return this.craftOrder();
+        }
+        if (!this.view.amountSort()) {
+            int n = this.data.displayCount();
+            int[] order = new int[n];
+            for (int i = 0; i < n; i++) {
+                order[i] = i;
+            }
+            return order;
+        }
+        return this.data.displayAmountOrder();
+    }
+
+    /**
+     * 合成页的排列：关闭数量排序时按创造栏，打开时按「还能做多少个」从大到小。
+     *
+     * <p>与仓库页同一套口径 —— 排序键是「这一格现在能给我多少个东西」。
+     * 结果按清单引用缓存：清单每 tick 至多重算一次，而这个方法在渲染一帧里会被问好几次
+     * （导航行、翻页、钉住重建），不缓存就是每帧排 746 条。</p>
+     */
+    private int[] craftOrder() {
+        List<VoidWarehouseData.ExchangeOffer> offers = this.data.exchangeOffers();
+        if (this.craftOrder != null && this.craftOrderBase == offers
+                && this.craftOrderSort == this.view.amountSort()) {
+            return this.craftOrder;
+        }
+        int n = offers.size();
+        Integer[] boxed = new Integer[n];
+        for (int i = 0; i < n; i++) {
+            boxed[i] = i;
+        }
+        if (this.view.amountSort()) {
+            java.util.Arrays.sort(boxed, (a, b) -> {
+                int byAmount = offers.get(b).obtainable().compareTo(offers.get(a).obtainable());
+                return byAmount != 0 ? byAmount : Integer.compare(a, b);
+            });
+        }
+        int[] order = new int[n];
+        for (int i = 0; i < n; i++) {
+            order[i] = boxed[i];
+        }
+        this.craftOrder = order;
+        this.craftOrderBase = offers;
+        this.craftOrderSort = this.view.amountSort();
+        return order;
+    }
+
+    /** 内容序号 {@code index} 那一格的物品是否命中搜索集合（解析不出来 = 不命中） */
+    private boolean matchesFilterAt(boolean craft, int index) {
+        ItemStack template;
+        if (craft) {
+            List<VoidWarehouseData.ExchangeOffer> offers = this.data.exchangeOffers();
+            template = index >= 0 && index < offers.size() ? offers.get(index).template() : null;
+        } else {
+            VoidWarehouseData.DisplaySlot slot = this.data.displaySlotAt(index);
+            template = slot.entry() != null ? slot.entry().template() : null;
+        }
         return template != null && !template.isEmpty()
                 && this.searchFilter.contains(template.getItem());
     }
 
-    /**
-     * 当前页码：把存着的页码按<b>实际页数</b>夹一下再返回。
-     *
-     * <p>仓库会被取空、页数会变小（搜索过滤也会让可见页数变小），
-     * 所以不能直接相信存下来的值；这里只在读的时候夹，不回写，
-     * 免得一次无意的读取就把玩家原本的页码改掉。</p>
-     */
+    // ------------------------------------------------------------------ 页码
+
+    /** 当前页码：把存着的页码按<b>实际页数</b>夹一下再返回（只在读的时候夹，不回写） */
     int page() {
-        return Math.max(0, Math.min(this.view.page(), this.pageCount() - 1));
+        int raw = this.craftScreen() ? this.view.craftPage() : this.view.page();
+        return Math.max(0, Math.min(raw, this.pageCount() - 1));
     }
 
     void setPage(int page) {
-        this.view.setPage(page);
+        if (this.craftScreen()) {
+            this.view.setCraftPage(page);
+        } else {
+            this.view.setPage(page);
+        }
+        this.invalidatePin();
     }
 
     boolean shulkerMode() {
@@ -242,6 +358,7 @@ final class VoidWarehousePageContainer implements Container {
 
     void setShulkerMode(boolean enabled) {
         this.view.setShulkerMode(enabled);
+        // 盒模式只改渲染，不改顺序；但格子里的说明换了，客户端要看新的 —— 由调用方重发
     }
 
     boolean amountSort() {
@@ -250,41 +367,90 @@ final class VoidWarehousePageContainer implements Container {
 
     void setAmountSort(boolean enabled) {
         this.view.setAmountSort(enabled);
+        // 「玩家主动换视角」⇒ 立刻重排，不等空闲
+        this.invalidatePin();
+    }
+
+    // ------------------------------------------------------------------ 位置钉住
+
+    /** 下一次询问必须重建（换页 / 换排序 / 换过滤 / 换界面） */
+    private void invalidatePin() {
+        this.pinValid = false;
     }
 
     /**
-     * 本页第 {@code slot} 格对应<b>展示序里的第几格</b>（会随页码、「数量排序」与搜索过滤变化）。
+     * 保证本页的 45 个位置是钉住的，必要时重建。
      *
-     * <p>默认排序时就是 {@code 页码 × 45 + slot}；开了数量排序则还要翻译一层
-     * {@link VoidWarehouseData#displayAmountOrder() 数量降序视图}；
-     * 搜索过滤生效时再走一层<b>过滤后的展示序</b>（{@code filteredView}）。
-     * 该位置没有东西时返回 {@code -1} ——
-     * {@link VoidWarehouseData#displaySlotAt(int)} 认这个值（直接当「空格」处理），
-     * 所以调用方不需要额外判空。</p>
-     *
-     * <h2>为什么返回的是「展示序号」而不是「仓库格号」</h2>
-     * <p>加上 9 合 1 兑换之后，「这一页第 3 格是谁」有三种可能：<b>真实库存格</b>、
-     * <b>可兑虚拟条目</b>、空。三者混在一条序列里（见 {@link VoidWarehouseData#unifiedOrder()}），
-     * 所以这一层给出的必须是<b>那条序列的下标</b>，再由
-     * {@link #slotAt(int)} 翻译成「真实格还是可兑条目」。
-     * 如果这里仍旧返回 {@code entries} 的格号，虚拟条目就没有任何一格能指向它 ——
-     * 那正是「明明说能兑、界面里却找不到」的来源。</p>
+     * <p>重建的判据只有两条：① 玩家自己换了视角（翻页 / 排序 / 搜索 / 界面）；
+     * ② 底层序动过 <b>且</b> 玩家已经停手超过 {@link #IDLE_TICKS}。
+     * 第二条就是「连点不重排、停下来才归位」的全部实现。</p>
      */
-    int displayIndexOf(int slot) {
-        if (slot < 0 || slot >= VoidWarehouseData.PAGE_SIZE) {
-            return -1;
+    private void ensurePin() {
+        boolean craft = this.craftScreen();
+        int page = this.page();
+        boolean sort = this.view.amountSort();
+        Object base = craft ? this.data.exchangeOffers() : this.data.unifiedOrderRef();
+
+        boolean rebuild = !this.pinValid
+                || this.pinPage != page
+                || this.pinSort != sort
+                || this.pinCraft != craft
+                || this.pinFilter != this.searchFilter;
+
+        if (!rebuild && base != this.pinBase) {
+            // 底层动过，但只在手停下来之后才跟
+            rebuild = VoidWarehouseData.nowTick() - this.touchTick >= IDLE_TICKS;
         }
-        int view = this.page() * VoidWarehouseData.PAGE_SIZE + slot;
-        // 搜索过滤生效时走过滤后的展示序（含数量排序的情况，见 filteredView）
-        if (this.searchFilter != null) {
-            int[] filtered = this.filteredView();
-            return view < filtered.length ? filtered[view] : -1;
+        if (!rebuild) {
+            return;
         }
-        if (!this.view.amountSort()) {
-            return view < this.data.displayCount() ? view : -1;
+
+        int[] filtered = this.filteredView();
+        int[] ordered = filtered != null ? filtered : this.orderedView();
+        int from = page * VoidWarehouseData.PAGE_SIZE;
+        for (int i = 0; i < VoidWarehouseData.PAGE_SIZE; i++) {
+            int at = from + i;
+            if (at >= ordered.length) {
+                this.pin[i] = null;
+                continue;
+            }
+            int content = ordered[at];
+            this.pin[i] = craft ? this.offerIdAt(content) : this.entryAt(content);
         }
-        int[] order = this.data.displayAmountOrder();
-        return view < order.length ? order[view] : -1;
+        this.pinBase = base;
+        this.pinPage = page;
+        this.pinSort = sort;
+        this.pinCraft = craft;
+        this.pinFilter = this.searchFilter;
+        this.pinValid = true;
+    }
+
+    /** 仓库页：内容序号 → 库存格（越界 / 空位返回 null） */
+    private VoidWarehouseData.Entry entryAt(int contentIndex) {
+        return this.data.displaySlotAt(contentIndex).entry();
+    }
+
+    /** 合成页：内容序号 → itemId（越界返回 null） */
+    private String offerIdAt(int contentIndex) {
+        List<VoidWarehouseData.ExchangeOffer> offers = this.data.exchangeOffers();
+        return contentIndex >= 0 && contentIndex < offers.size() ? offers.get(contentIndex).itemId() : null;
+    }
+
+    /** 合成页：itemId → 当前那一份条目（数量 / 成本跟着实时刷新，位置仍是钉住的） */
+    private VoidWarehouseData.ExchangeOffer offerById(String itemId) {
+        if (itemId == null) {
+            return null;
+        }
+        List<VoidWarehouseData.ExchangeOffer> offers = this.data.exchangeOffers();
+        if (this.offerIndex == null || this.offerIndexBase != offers) {
+            Map<String, VoidWarehouseData.ExchangeOffer> built = new HashMap<>(offers.size() * 2);
+            for (VoidWarehouseData.ExchangeOffer offer : offers) {
+                built.put(offer.itemId(), offer);
+            }
+            this.offerIndex = built;
+            this.offerIndexBase = offers;
+        }
+        return this.offerIndex.get(itemId);
     }
 
     /**
@@ -292,15 +458,27 @@ final class VoidWarehousePageContainer implements Container {
      *
      * <p><b>界面层唯一一处「这一格是谁」的答案</b>：渲染它、点击它、Shift 点它，
      * 全都先问这里一次、把结果存进局部变量，绝不允许「先解析一次渲染、再解析一次扣账」——
-     * 数量排序与「库存变了之后可兑条目会消失」都会让两次解析给出不同结果。</p>
+     * 数量排序与「条目会随库存出现 / 消失」都会让两次解析给出不同结果。</p>
      */
     VoidWarehouseData.DisplaySlot slotAt(int slot) {
-        int index = this.displayIndexOf(slot);
-        if (index < 0) {
+        if (slot < 0 || slot >= VoidWarehouseData.PAGE_SIZE) {
             return VoidWarehouseData.DisplaySlot.empty();
         }
-        return this.data.displaySlotAt(index);
+        this.ensurePin();
+        Object ref = this.pin[slot];
+        if (ref == null) {
+            return VoidWarehouseData.DisplaySlot.empty();
+        }
+        if (ref instanceof VoidWarehouseData.Entry entry) {
+            // 钉住之后才被取空：留空洞，绝不让后面那件东西顶上来
+            return entry.amount().signum() <= 0
+                    ? VoidWarehouseData.DisplaySlot.empty()
+                    : VoidWarehouseData.DisplaySlot.ofEntry(entry, -1);
+        }
+        return VoidWarehouseData.DisplaySlot.ofOffer(this.offerById((String) ref));
     }
+
+    // ------------------------------------------------------------------ Container
 
     @Override
     public int getContainerSize() {
@@ -327,16 +505,20 @@ final class VoidWarehousePageContainer implements Container {
                     this.data.exchangeOfferCount(),
                     this.view.shulkerMode(),
                     this.view.amountSort(),
+                    this.craftScreen(),
                     this.en);
         }
         VoidWarehouseData.DisplaySlot target = this.slotAt(slot);
         if (target.isEmpty()) {
-            // 空格子用屏障方块作临时占位图标：纯展示、不可交互，有东西之后由本方法换成真物品
             return this.en ? PLACEHOLDER_EN : PLACEHOLDER_ZH;
         }
         if (target.isExchange()) {
-            // 「可兑」虚拟条目：仓库里没有这种物品，但能靠 9 合 1 兑换拿出来。
-            // 两种模式各给一套说明，与真实格的显示口径保持一致。
+            // 合成页与仓库页共用「可兑 / 可合成」条目，但动作口径不同：
+            // 合成页左键取一组（盒模式一盒），仓库页历史上是取 1 个。
+            if (this.craftScreen()) {
+                long inStock = this.data.amountOf(target.offer().template().getItem()).longValue();
+                return VoidWarehouseData.buildCatalogDisplay(target.offer(), this.view.shulkerMode(), inStock, this.en);
+            }
             return VoidWarehouseData.buildExchangeDisplay(target.offer(), this.view.shulkerMode(), this.en);
         }
         return this.view.shulkerMode()
@@ -354,8 +536,7 @@ final class VoidWarehousePageContainer implements Container {
     }
 
     /**
-     * 取出「一格」。因为一格可能装着远超一组的数量，这里只交出一组，
-     * 剩下的留在仓库里 —— 绝不整格清空（那会把上万件物品一次性丢出去）。
+     * 取出「一格」。因为一格可能装着远超一组的数量，这里只交出一组 —— 绝不整格清空。
      */
     @Override
     public ItemStack removeItemNoUpdate(int slot) {
@@ -374,27 +555,23 @@ final class VoidWarehousePageContainer implements Container {
     /**
      * 真实格才按真实数量扣减；<b>可兑虚拟条目一律返回空</b>。
      *
-     * <h2>为什么虚拟条目在这里什么都不做</h2>
-     * <p>{@code removeItem} / {@code removeItemNoUpdate} 是原版<b>绕过菜单</b>直接往容器里取东西的
-     * 两条小路（拖拽、Shift、双击取物的收尾都会走到）。真实格走它们没问题 ——
-     * 扣的就是这一格里存的那件东西，口径唯一。</p>
-     *
-     * <p>而虚拟条目背后<b>根本没有一格</b>：它的「取出」是一笔可能跨好几种物品的兑换
+     * <p>虚拟条目背后<b>根本没有一格</b>：它的「取出」是一笔可能跨好几种物品的兑换
      * （扣 9 个铁粒、还可能退回 8 个铁锭）。从这里放行等于把一笔复杂的账塞进一个
-     * 「取出 n 个」的接口里，一旦半途失败就没有任何地方能补偿。
-     * 所以虚拟条目的取出<b>只认 {@link VoidWarehouseMenu#clicked} 这一条路</b> ——
-     * 那条路有完整的规划、提交、回滚三步。这里返回空，客户端那次预测会被
-     * {@code sendAllDataToRemote()} 全量覆盖掉，玩家看到的只是这一格没反应（与空格子一致）。</p>
+     * 「取出 n 个」的接口里，一旦半途失败就没有任何地方能补偿。所以虚拟条目的取出
+     * <b>只认 {@link VoidWarehouseMenu#clicked} 这一条路</b>。</p>
+     *
+     * <p>扣减走 {@link VoidWarehouseData#takeEntry}（按格子对象），不是按格号 ——
+     * 钉住的那一页记的是 {@code Entry} 本身，仓库的下标随时会变。</p>
      */
     private ItemStack takeDisplayed(int slot, int amount) {
         VoidWarehouseData.DisplaySlot target = this.slotAt(slot);
         if (target.entry() == null) {
             return ItemStack.EMPTY;
         }
-        int index = target.realIndex();
+        VoidWarehouseData.Entry entry = target.entry();
         // 必须在 take 之前记住样板：整格取空时那一格会被移除
-        ItemStack template = target.entry().template();
-        int actual = this.data.take(index, amount);
+        ItemStack template = entry.template();
+        int actual = this.data.takeEntry(entry, amount);
         return actual <= 0 ? ItemStack.EMPTY : template.copyWithCount(actual);
     }
 
@@ -411,8 +588,7 @@ final class VoidWarehousePageContainer implements Container {
      * 关键闸门：<b>一律 false</b>（内容格也一样）。
      *
      * <p>原版的 Shift 点击、拖拽分配、双击取物在动某个槽位之前都会先问
-     * {@code slot.mayPlace(...)}，这里返回 false 就等于把「原版直接写容器」这条路彻底封死。
-     * 入库由菜单调 {@code data.insert()} 完成，不依赖 {@code canPlaceItem}。</p>
+     * {@code slot.mayPlace(...)}，这里返回 false 就等于把「原版直接写容器」这条路彻底封死。</p>
      */
     @Override
     public boolean canPlaceItem(int slot, ItemStack stack) {

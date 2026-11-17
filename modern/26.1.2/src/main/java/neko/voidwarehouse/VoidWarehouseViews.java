@@ -44,6 +44,12 @@ public final class VoidWarehouseViews extends SavedData {
     private static final String SHULKER_FIELD = "shulker";
     private static final String SORT_FIELD = "sort";
 
+    /** 停在哪个界面：0 = 仓库页，1 = 合成页（2026-11-17 新增，缺省 0 兼容旧存档） */
+    private static final String SCREEN_FIELD = "screen";
+
+    /** 合成页自己的页码（两个界面页数完全不同，共用一份必然越界） */
+    private static final String CRAFT_PAGE_FIELD = "craftPage";
+
     /**
      * 一个玩家的视图状态（可变，界面直接改这一份）。
      *
@@ -53,7 +59,9 @@ public final class VoidWarehouseViews extends SavedData {
         static final Codec<View> CODEC = RecordCodecBuilder.create(instance -> instance.group(
                 Codec.INT.optionalFieldOf(PAGE_FIELD, 0).forGetter(View::page),
                 Codec.BOOL.optionalFieldOf(SHULKER_FIELD, false).forGetter(View::shulkerMode),
-                Codec.BOOL.optionalFieldOf(SORT_FIELD, false).forGetter(View::amountSort)
+                Codec.BOOL.optionalFieldOf(SORT_FIELD, false).forGetter(View::amountSort),
+                Codec.INT.optionalFieldOf(SCREEN_FIELD, 0).forGetter(View::screen),
+                Codec.INT.optionalFieldOf(CRAFT_PAGE_FIELD, 0).forGetter(View::craftPage)
         ).apply(instance, View::new));
 
         /** 创建它的那份存档；{@code null} = 兜底用的临时对象（不持久化，但绝不会 NPE） */
@@ -63,13 +71,21 @@ public final class VoidWarehouseViews extends SavedData {
         private boolean shulkerMode;
         private boolean amountSort;
 
+        /** 0 = 仓库页，1 = 合成页 */
+        private int screen;
+
+        /** 合成页的页码 */
+        private int craftPage;
+
         View() {
         }
 
-        View(int page, boolean shulkerMode, boolean amountSort) {
+        View(int page, boolean shulkerMode, boolean amountSort, int screen, int craftPage) {
             this.page = Math.max(0, page);
             this.shulkerMode = shulkerMode;
             this.amountSort = amountSort;
+            this.screen = screen == 1 ? 1 : 0;
+            this.craftPage = Math.max(0, craftPage);
         }
 
         /** 存档里的原始页码（还没按实际页数夹取） */
@@ -97,6 +113,29 @@ public final class VoidWarehouseViews extends SavedData {
 
         public void setAmountSort(boolean enabled) {
             this.amountSort = enabled;
+            this.touch();
+        }
+
+        /** 存档里的界面编号（0 = 仓库页，1 = 合成页） */
+        public int screen() {
+            return this.screen;
+        }
+
+        public boolean craftScreen() {
+            return this.screen == 1;
+        }
+
+        public void setCraftScreen(boolean craft) {
+            this.screen = craft ? 1 : 0;
+            this.touch();
+        }
+
+        public int craftPage() {
+            return this.craftPage;
+        }
+
+        public void setCraftPage(int page) {
+            this.craftPage = Math.max(0, page);
             this.touch();
         }
 

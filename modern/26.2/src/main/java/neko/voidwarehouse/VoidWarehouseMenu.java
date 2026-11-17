@@ -959,6 +959,22 @@ public class VoidWarehouseMenu extends ChestMenu {
         this.sendAllDataToRemote();
     }
 
+    /**
+     * 配方本被删过：钉住的那一页<b>立刻</b>作废并全量重发
+     * （{@code neko.voidwarehouse.recipe} 通道调到这里）。
+     *
+     * <p>不能等 {@code IDLE_TICKS}（2 秒）：合成页那一格挂着的 {@code ExchangeOffer}
+     * 是惰性算源，闭包捕获的是<b>删除前</b>的配方树 —— 窗口内点它仍会按旧表出料，
+     * 等于「删掉的配方还能用」。所以删除成功后必须马上重建这一页。</p>
+     *
+     * <p>走 {@link #sendAllDataToRemote()} 而不是发差异，理由与翻页 / 排序 / 搜索过滤
+     * 同一条：整页 45 格可能整体换人，差异包不足以表达。</p>
+     */
+    public void refreshAfterRecipesChanged() {
+        this.pageContainer.invalidatePin();
+        this.sendAllDataToRemote();
+    }
+
     /** 搜索通道建目录用：当前菜单背后那份仓库数据（{@code SearchNetwork} 调用） */
     public VoidWarehouseData data() {
         return this.data;

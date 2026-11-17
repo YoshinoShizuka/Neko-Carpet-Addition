@@ -791,6 +791,19 @@ public final class VoidWarehouseData extends SavedData {
     private int recipeGeneration;
 
     /**
+     * {@link #recipeOutputs()} 的缓存。
+     *
+     * <p>与 {@link #recipeOrdered()} 一样按 {@link #recipeGeneration} 作废 ——
+     * 两个都是「配方本的纯函数」，配方本一变就必须重算，但不必每问一次都重算。</p>
+     */
+    private List<String> recipeOutputsCache = List.of();
+    private int recipeOutputsGeneration = -1;
+
+    /** {@link #recipeOrdered()} 的缓存：浏览分页要的那个「产物 → recipeId」全序 */
+    private List<VoidWarehouseRecipes.Recipe> recipeOrderCache = List.of();
+    private int recipeOrderGeneration = -1;
+
+    /**
      * 「配方本满了」的告警打过了吗。
      *
      * <p>满本是一个<b>持续状态</b>，不是一次事件：玩家之后每合成一次都会再撞到一次上限。
@@ -1059,6 +1072,110 @@ public final class VoidWarehouseData extends SavedData {
     /** 这个产物有没有已学会的配方（界面判断「这一格该不该显示成可合成」用） */
     public boolean hasRecipeFor(String itemId) {
         return itemId != null && this.recipesByOutput.containsKey(itemId);
+    }
+
+    // ------------------------------------------------------------------ 配方本浏览 / 删除
+
+    /**
+     * 配方本被改过几次：学一条 +1、删一条 +1。
+     *
+     * <p>客户端拿它当缓存键 —— 数字一变，正在看的那一页就该重取。
+     * 服务端内部也用同一个数给下面两个派生缓存作废。</p>
+     */
+    public int recipeGeneration() {
+        return this.recipeGeneration;
+    }
+
+    /**
+     * 可浏览的配方快照：<b>解码成功</b>的那些，顺序 = 学习序。
+     *
+     * <p>返回的是内部那份不可变列表，别改它。它与 {@link #recipeBookUsed()} 的区别：
+     * 这个数不含「解码失败的残行」，那个含 —— 界面上「共 N 条」用这个，
+     * 「已用 N / 2048」用那个。</p>
+     */
+    public List<VoidWarehouseRecipes.Recipe> recipeSnapshot() {
+        return this.recipes;
+    }
+
+    /**
+     * 按「产物 id → recipeId」定死的全序（浏览分页用）。
+     *
+     * <p>两个键都是<b>内容派生</b>的，不随插入顺序漂移，所以「第 2 页」在两次查询之间
+     * 指的是同一批条目 —— 这正是分页能成立的前提。按 {@link #recipeGeneration} 缓存，
+     * 配方本一变就重排（2048 条排序在微秒级，但没必要每问一页都排一次）。</p>
+     */
+    public List<VoidWarehouseRecipes.Recipe> recipeOrdered() {
+        if (this.recipeOrderGeneration == this.recipeGeneration) {
+            return this.recipeOrderCache;
+        }
+        List<VoidWarehouseRecipes.Recipe> sorted = new ArrayList<>(this.recipes);
+        sorted.sort(Comparator.comparing(VoidWarehouseRecipes.Recipe::output)
+                .thenComparing(VoidWarehouseRecipes.Recipe::recipeId));
+        this.recipeOrderCache = List.copyOf(sorted);
+        this.recipeOrderGeneration = this.recipeGeneration;
+        return this.recipeOrderCache;
+    }
+
+    /** 本子里出现过的产物 id，去重后按字典序（索引包用；同样按代缓存） */
+    public List<String> recipeOutputs() {
+        if (this.recipeOutputsGeneration == this.recipeGeneration) {
+            return this.recipeOutputsCache;
+        }
+        java.util.TreeSet<String> outputs = new java.util.TreeSet<>();
+        for (VoidWarehouseRecipes.Recipe recipe : this.recipes) {
+            outputs.add(recipe.output());
+        }
+        this.recipeOutputsCache = List.copyOf(outputs);
+        this.recipeOutputsGeneration = this.recipeGeneration;
+        return this.recipeOutputsCache;
+    }
+
+    /** 这条 id 现在还在本子里吗（删除前逐条校验用；只查不改） */
+    public boolean knowsRecipeId(String recipeId) {
+        return recipeId != null && this.recipeTexts.contains(recipeId);
+    }
+
+    /**
+     * 删掉一批配方，<b>一次</b>完成移除 + 重建 + 落盘。
+     *
+     * <p>收尾动作逐条对齐 {@link #learnWithResult}（那是「增」的版本）：重建四件套、
+     * {@code recipeGeneration++}、三处展示缓存置空、标脏。少任何一步都会掉进
+     * 「删了还能合成」或「重启后删掉的又回来」。</p>
+     *
+     * <p>⚠️ 其中 {@code offers = null} 这一句<b>实际上是冗余的</b>：
+     * {@link #revalidateExchangeCache()} 的指纹里已经含 {@code recipeGeneration << 2}，
+     * 配方本一变，下一次取表就会把 {@code offers} 整体作废。变异自检实测过 ——
+     * 只删掉这一句，删完立刻不可得那 12 条仍全绿。留着它是为了让「增」与「删」两条收尾
+     * 能<b>逐行对照着读</b>；但别因此以为少写别的一句也无妨，真正兜底的是那个指纹。</p>
+     *
+     * <p>为什么不让调用方循环「一条一删」：每删一条都重建一次整本，
+     * 2048 条就会变成 2048 次解码 + 树编译。批量一次只付一次代价。</p>
+     *
+     * @return 实际被删掉的 id（本来就不存在的不会出现在里面）
+     */
+    public List<String> forgetRecipes(java.util.Collection<String> recipeIds) {
+        if (recipeIds == null || recipeIds.isEmpty()) {
+            return List.of();
+        }
+        List<String> removed = new ArrayList<>(recipeIds.size());
+        for (String id : recipeIds) {
+            if (id != null && this.recipeTexts.remove(id)) {
+                removed.add(id);
+            }
+        }
+        if (removed.isEmpty()) {
+            return List.of();
+        }
+        this.rebuildRecipes();
+        this.recipeGeneration++;
+        // 删过之后就腾出空间了：下次再撞上限要重新提醒，
+        // 不能因为「这辈子报过一次」就永久沉默。
+        this.capWarned = false;
+        this.offers = null;
+        this.unifiedOrder = null;
+        this.amountOrder = null;
+        this.setDirty();
+        return List.copyOf(removed);
     }
 
     /**

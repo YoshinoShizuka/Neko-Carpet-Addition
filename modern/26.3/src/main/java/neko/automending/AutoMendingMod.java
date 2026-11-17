@@ -5,6 +5,7 @@ import neko.cooking.CookingExtension;
 import neko.voidwarehouse.VoidWarehouseExtension;
 import neko.voidwarehouse.VoidWarehouseRecipePrompt;
 import neko.voidwarehouse.fill.FillNetwork;
+import neko.voidwarehouse.recipe.RecipeNetwork;
 import neko.voidwarehouse.restock.PrinterQueryNetwork;
 import neko.voidwarehouse.restock.PrinterRestockNetwork;
 import neko.voidwarehouse.restock.PrinterPlaceNetwork;
@@ -41,6 +42,10 @@ public class AutoMendingMod implements ModInitializer {
         // ④ 搜索（只读 + 视图过滤）：客户端搜索框的目录下发与匹配集合回传。
         // 三条独立通道（hello / catalog / apply），限流各一张表；纯原版客户端不发不收，零影响。
         SearchNetwork.init();
+        // ⑤ 配方本浏览 / 删除（{@code voidWarehouseCraft}）：服务端出索引与分页明细，
+        //    客户端（neko-client）做界面与中文匹配。七条通道，删除要重建整本并落盘，
+        //    所以单独一张 1 秒的限流表。
+        RecipeNetwork.init();
         // ⑤ 一键填满背包（Ctrl+Alt+左键）：客户端识别手势、服务端只收一个 slotId。
         // 有副作用（扣仓库、动背包），50ms 限流；纯原版客户端永远不发这条包。
         FillNetwork.init();

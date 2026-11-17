@@ -373,8 +373,14 @@ final class VoidWarehousePageContainer implements Container {
 
     // ------------------------------------------------------------------ 位置钉住
 
-    /** 下一次询问必须重建（换页 / 换排序 / 换过滤 / 换界面） */
-    private void invalidatePin() {
+    /**
+     * 下一次询问必须重建（换页 / 换排序 / 换过滤 / 换界面 / <b>配方本被删</b>）。
+     *
+     * <p>包内可见是为了让 {@code VoidWarehouseMenu#refreshAfterRecipesChanged()} 能
+     * <b>立刻</b>作废这一页 —— 删除之后等 {@code IDLE_TICKS} 的那 2 秒里，
+     * 旧 {@code ExchangeOffer} 仍会按删除前的配方树出料。</p>
+     */
+    void invalidatePin() {
         this.pinValid = false;
     }
 

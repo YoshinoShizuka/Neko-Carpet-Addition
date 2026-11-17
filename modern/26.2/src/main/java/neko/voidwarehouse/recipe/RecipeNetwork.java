@@ -1,5 +1,6 @@
 package neko.voidwarehouse.recipe;
 
+import neko.voidwarehouse.VoidWarehouse;
 import neko.voidwarehouse.VoidWarehouseData;
 import neko.voidwarehouse.VoidWarehouseMenu;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
@@ -26,17 +27,29 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <tr><td>{@code recipe_changed}</td><td>S2C</td><td>版本号变了，重取当前页</td><td>只发浏览者</td></tr>
  * </table>
  *
- * <h2>三道闸门（缺一不可）</h2>
+ * <h2>两道闸门</h2>
  * <ol>
  *   <li><b>规则</b>：{@code voidWarehouse} + {@code voidWarehouseCraft} 都开
  *       （{@link VoidWarehouseData#craftEnabled()}）—— 规则关着时连读都不给，
  *       保持「关着的规则不碰存档」这条不变式；</li>
- *   <li><b>会话</b>：{@code player.containerMenu} 必须是 {@link VoidWarehouseMenu} ——
- *       照抄搜索通道的既有边界：能问的前提是<b>自己正开着仓库界面</b>；</li>
  *   <li><b>权限</b>：按产品决定，规则开启后<b>视为所有玩家都有删除权</b>，
  *       所以这里没有额外的 op 判断；{@code canDelete} 字段仍然回 {@code true}，
  *       留着是为了将来收紧时不用改协议。</li>
  * </ol>
+ *
+ * <h2>不要求开着仓库界面（2026-11-17 改）</h2>
+ * <p>原先照抄搜索通道的边界：能问的前提是 {@code player.containerMenu} 必须是
+ * {@link VoidWarehouseMenu}。但配方本本来就不属于「某个容器会话」—— 它是全服唯一的一份
+ * （{@link VoidWarehouse#data(MinecraftServer)} 取到的就是那个单例），而它的浏览界面
+ * 由客户端模组自己提供、不在仓库界面里。要求先开仓库，等于强迫玩家先点开一个与配方本
+ * 无关的界面，删一条还得专门跑回仓库前再开一次。
+ *
+ * <p>所以现在只剩规则这一道闸门。开着仓库界面时多做一件事：删完顺手把<b>自己</b>那个菜单
+ * 全量重发（{@code VoidWarehouseMenu#refreshAfterRecipesChanged}），否则他手里那页
+ * 还留着删之前的格子。
+ *
+ * <p>⚠️ 这次放宽<b>不动权限口径</b>：「规则开着 = 所有人可删」是拍板结果，原来那道
+ * 「开着界面」从来不是权限检查，只是一条会话边界。
  *
  * <h2>线程安全</h2>
  * <p>Fabric 保证 {@code PlayPayloadHandler} 跑在服务端主线程，可以直接读
@@ -114,49 +127,53 @@ public final class RecipeNetwork {
 
     // ------------------------------------------------------------------ 三个接收端
 
-    /** hello：回索引。规则关着 / 没开仓库界面 ⇒ 静默忽略（不向可疑客户端确认什么） */
+    /** hello：回索引。规则关着 ⇒ 静默忽略（不向可疑客户端确认什么）；不需要开着仓库界面 */
     private static void handleHello(RecipeHelloPayload payload, ServerPlayNetworking.Context context) {
         ServerPlayer player = context.player();
-        VoidWarehouseMenu menu = openedMenu(player);
-        if (menu == null) {
+        VoidWarehouseData data = dataOf(player);
+        if (data == null) {
             return;
         }
         if (throttled(LAST_HELLO_AT, HELLO_INTERVAL_MS, player)) {
             return;
         }
         touchBrowser(player);
-        send(player, RecipeService.index(menu.data()));
+        send(player, RecipeService.index(data));
     }
 
-    /** query：切一页。同样只在「开着仓库界面 + 规则开着」时回应 */
+    /** query：切一页。同样只看规则开着，不需要开着仓库界面 */
     private static void handleQuery(RecipeQueryPayload payload, ServerPlayNetworking.Context context) {
         ServerPlayer player = context.player();
-        VoidWarehouseMenu menu = openedMenu(player);
-        if (menu == null) {
+        VoidWarehouseData data = dataOf(player);
+        if (data == null) {
             return;
         }
         if (throttled(LAST_QUERY_AT, QUERY_INTERVAL_MS, player)) {
             return;
         }
         touchBrowser(player);
-        send(player, RecipeService.page(menu.data(), payload));
+        send(player, RecipeService.page(data, payload));
     }
 
     /**
-     * delete：删一批，然后立刻刷新自己和其它浏览者。
+     * delete：删一批，然后刷新自己（如果他正开着仓库）并通知其它浏览者。
      *
-     * <p>顺序是刻意的：<b>先重建这一页</b>（{@code refreshAfterRecipesChanged}），
-     * 再发回执、再广播。原因见 {@code VoidWarehouseMenu#refreshAfterRecipesChanged}：
-     * 钉住的那一页上挂着的 {@code ExchangeOffer} 惰性闭包捕获的是删除前的配方树，
-     * 不立刻重建的话，2 秒内点它仍会按旧表出料。</p>
+     * <p>顺序是刻意的：<b>先重建自己那页</b>（{@code refreshAfterRecipesChanged}），
+     * 再发回执、再广播 —— 客户端拿到回执后会重取当前页，指望的就是「列表已经是新的」。</p>
+     *
+     * <p>至于「删完立刻不可得」这条正确性，<b>不靠</b>这里的刷新：删除推进
+     * {@code recipeGeneration}，而 {@code exchangeOffers()} 取表前先比
+     * {@code virtualEntrySignature()}（内含 {@code recipeGeneration << 2}）⇒ 整张可兑表
+     * 同一 tick 内就作废。详见 {@code VoidWarehouseData#forgetRecipes} 的注释。</p>
+     *
+     * <p>没开仓库界面时没有任何页要重建 —— 那也不影响删除本身。</p>
      */
     private static void handleDelete(RecipeDeletePayload payload, ServerPlayNetworking.Context context) {
         ServerPlayer player = context.player();
-        VoidWarehouseMenu menu = openedMenu(player);
-        if (menu == null) {
+        VoidWarehouseData data = dataOf(player);
+        if (data == null) {
             return;
         }
-        VoidWarehouseData data = menu.data();
         if (throttled(LAST_DELETE_AT, DELETE_INTERVAL_MS, player)) {
             send(player, RecipeDeleteResultPayload.refused(
                     RecipeDeleteResultPayload.THROTTLED, data.recipeGeneration(),
@@ -172,8 +189,10 @@ public final class RecipeNetwork {
 
         RecipeService.DeleteOutcome outcome = RecipeService.delete(data, payload.recipeIds());
         if (!outcome.removed().isEmpty()) {
-            // ① 自己的界面立刻重建（不能等 IDLE_TICKS），② 再通知其它浏览者
-            menu.refreshAfterRecipesChanged();
+            // ① 自己开着仓库才需要重建那一页（没开就没有页可言），② 再通知其它浏览者
+            if (player.containerMenu instanceof VoidWarehouseMenu menu) {
+                menu.refreshAfterRecipesChanged();
+            }
             broadcastDeleted(player, data, outcome.removed().size());
         }
         send(player, new RecipeDeleteResultPayload(
@@ -190,7 +209,8 @@ public final class RecipeNetwork {
     /**
      * 通知「正在看配方本的人」：版本号变了，重取当前页。
      *
-     * <p>只发给浏览会话还有效、且此刻仍开着仓库界面、且装了对应客户端模组的玩家。
+     * <p>只发给浏览会话还有效、且装了对应客户端模组的玩家 —— <b>不要求他此刻开着仓库界面</b>
+     * （自从「不开仓库也能看」之后，浏览会话就是唯一的判据）。
      * <b>不发给全服</b>：配方本是全服一份，但「正在浏览」是少数；
      * 学一条配方都全服广播的代价远大于收益（这也是当前不广播「学习」的原因）。</p>
      */
@@ -207,9 +227,6 @@ public final class RecipeNetwork {
             if (seen == null || now - seen > SESSION_TTL_MS) {
                 continue;
             }
-            if (!(viewer.containerMenu instanceof VoidWarehouseMenu)) {
-                continue;
-            }
             send(viewer, new RecipeChangedPayload(
                     generation, RecipeChangedPayload.REASON_DELETED, actorName, removed));
         }
@@ -218,15 +235,35 @@ public final class RecipeNetwork {
     // ------------------------------------------------------------------ 工具
 
     /**
-     * 三道闸门的前两道：规则开着，且玩家正开着自己的仓库界面。
+     * 规则这一道闸门 + 取数据：{@code null} = 规则关着 / 拿不到服务端，本次请求不作数。
      *
-     * @return 通过时返回那个菜单（省得调用方再 cast 一次），否则 {@code null}
+     * <p>不要求玩家开着仓库界面（见类注释「不要求开着仓库界面」）。取到的实例与
+     * {@code player.containerMenu} 那个菜单拿到的是<b>同一个单例</b>（全存档唯一），
+     * 所以两种入口的数据天然一致。</p>
+     *
+     * <p>{@link VoidWarehouse#data(MinecraftServer)} 的稳态开销只有<b>一次 map 查表</b>：
+     * 读盘自检（{@code diskCountChecked}）与写盘前快照（{@code backupDone}）都是进程级一次性。</p>
+     *
+     * <p>🔴 <b>必须接住它的异常</b>：{@code VoidWarehouse.data} 在「读到空壳」时会抛
+     * {@link IllegalStateException} 拒绝服务（防空仓库写盘覆盖存档）。老路径上这个异常在
+     * <b>开界面</b>那一刻就抛了，玩家看得见；现在浏览不需要开界面，若不接住，就是每次翻页
+     * 在包处理器里抛一次 —— 那个位置会把玩家连接踢掉，而玩家只是在翻配方本。
+     * 所以这里吞掉并返回 {@code null}（本次请求不作数）：空壳的告警
+     * {@code VoidWarehouse} 已经打过一次，不必每包再刷一遍日志。</p>
      */
-    private static VoidWarehouseMenu openedMenu(ServerPlayer player) {
+    private static VoidWarehouseData dataOf(ServerPlayer player) {
         if (player == null || !VoidWarehouseData.craftEnabled()) {
             return null;
         }
-        return player.containerMenu instanceof VoidWarehouseMenu menu ? menu : null;
+        MinecraftServer server = player.level().getServer();
+        if (server == null) {
+            return null;
+        }
+        try {
+            return VoidWarehouse.data(server);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /** 记一次「这个人在看配方本」；登录 / 下线 / 掉线时清掉（见 DISCONNECT 注册） */

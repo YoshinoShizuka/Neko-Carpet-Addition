@@ -330,7 +330,9 @@
 - 🔴 **删掉之后必须当场不可得**：删除会推进 `recipeGeneration`，而 `exchangeOffers()` 取表前先比指纹（`virtualEntrySignature` 里含 `recipeGeneration << 2`）⇒ `offers` 整体作废、同一 tick 内合成页就少一格，**不需要等位置钉住的 2 秒窗口**(Deletion bumps the generation, so the offer table is invalidated within the same tick.).
   - 设计稿里原来写的是「钉住窗口内仍会按旧表出料」，实测**不成立**：钉住数组存的是 `itemId` 字符串、不是 `ExchangeOffer` 对象，`slotAt` 每次都用它现查当前清单。变异实测（同时拆掉指纹与 `forgetRecipes` 里那句 `offers = null`）→ 自检红 4 条，说明判据咬的是真机制；而只拆后一句时**全绿** ⇒ 那一句本身是冗余的（留着只为与 `learnWithResult` 逐行对照）。这条错判断原样留在 `docs/方案-配方本浏览与删除（服务端）.md` 里并标注，避免下次再推错(The original "2-second window" claim was wrong; the doc keeps it, struck through, with the measurement that disproved it.).
 - 🔴 **只强刷动作发起者的界面**：删完先 `sendAllDataToRemote()` 给那个人的客户端（否则他手里那份「删之前的幽灵格」要留到下次交互），再给**正在浏览的其他人**发一条 `recipe_changed`。别人的 `pin` **故意不 invalidate** —— 那会在别人连点的时候把页重排，正是上一版修掉的「点错物品」(Only the actor's menu is force-resynced; other browsers just get a change notice, because invalidating their pin would reorder the page under their finger.).
-- **三道闸门**：规则要开（`voidWarehouse` + `voidWarehouseCraft`）、自己得**正开着仓库界面**（`containerMenu instanceof VoidWarehouseMenu`）、以及按拍板结果「规则开着 = 所有玩家都有删除权」（不做 op 判断，但 `canDelete` 字段留着，将来收紧不用改协议）(Three gates: rule on, own warehouse screen open, and no extra permission check by decision.).
+- **不开仓库也能看**：闸门只剩「规则要开」（`voidWarehouse` + `voidWarehouseCraft`）＋按拍板结果「规则开着 = 所有玩家都有删除权」（不做 op 判断，但 `canDelete` 字段留着，将来收紧不用改协议）。数据由 `VoidWarehouse.data(server)` 取，与菜单拿到的是**同一个单例**(Browsing no longer requires the warehouse screen to be open — the only gate left is the rule itself.)。
+  - 原本照抄搜索通道的「`containerMenu` 必须是仓库界面」已取消：配方本不属于任何容器会话，浏览界面由客户端模组自己提供，要求先开仓库等于逼玩家多点一次。
+  - 🔴 **顺带堵了一个新洞**：`VoidWarehouse.data(...)` 读到空壳会抛 `IllegalStateException`（防空仓库写盘覆盖存档）。老路径上它在**开界面**那一刻就抛、玩家看得见；现在浏览不经过界面，不接住的话就是每次翻页在**包处理器**里抛 —— 那个位置会踢掉玩家连接。⇒ `dataOf` 里吞掉并返回 `null`（本次请求不作数），空壳告警 `VoidWarehouse` 已经打过一次，不每包刷屏(The shell-gate exception is caught here: without the screen-opening path to surface it, an uncaught throw would disconnect the player mid-page-turn.)。
 - **限流各一张表**：`hello` 100 ms / `query` 50 ms / `delete` 1000 ms；下线时连浏览会话一起清掉，长期运行的服务器不攒离线玩家 UUID(Per-player throttle tables, cleared on disconnect.).
 - **零影响面**：不加指令、不加规则、不改存档格式、纯原版客户端一个字节都不变（`canSend == false` ⇒ 入口不出现）。所以版本号仍是 1.0.17(No commands, no new rules, no storage change; vanilla clients are unaffected.).
 - **验证**：`VoidWarehouseRecipeBrowseCheck` **100 条 × 5 版本 = 500 条全绿**；`SystemTest` 209 条零失败。其中 R8 组 12 条咬「删完同一 tick 内那一格解析为空」、R7 组 12 条咬「两个派生缓存真的被作废 + 落盘数据里真的消失 + 删了能重新学」(500 assertions across five versions, plus the 209-assertion system test.).
@@ -378,18 +380,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 516,128 B | `d3730142011757e77203b70328a46507` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 567,612 B | `a7c0e4faf405c10a6abe4f1e1bf18f7c` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 516,308 B | `9eaeeb3681f18ede69085dbb6429c5c8` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 568,096 B | `e0cdea587387d58db7bb0fe734dd9593` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 519,576 B | `1a61b5dd3e1236a6319e79ea8314be06` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 569,113 B | `e98cc24eef177d17efd0c1904754b7b7` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 519,577 B | `4f8e19110d863ebaf9fea14a1e1211c9` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 569,112 B | `519cd9ddcaabfddcd7e1d8f70252bfcc` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 516,291 B | `12f235df584d060499649349d0592b04` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 568,725 B | `61739f043c23c94613477778772b908b` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 516,183 B | `dd3af924734eb37868d61bdd5aa1b946` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 568,713 B | `6e314495330b336f1d9a352621bf52f8` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 516,363 B | `f2ce1e843bdc531cd5cfa89587744c72` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 569,201 B | `2f063c34a7d5a5322ea385195094f2e5` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 519,631 B | `3565ea59462ec10b2bd54c92173a5ef3` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 570,218 B | `9c13d620847c0ada19f595df7e0964a0` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 519,632 B | `8927702441edc44d04a6d82e83bcfb8a` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 570,217 B | `4b97f7b52f1a5644ac43896d85129b06` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 516,336 B | `7295543254412d0c5be235fad2f23271` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 569,831 B | `f179db0c116c83499d4a995f7146b274` |
 
-> **本表已按 2026-11-17 12:20 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第二十一次原地替换**：规则集、配置键、规则名仍然一个字都没动，这一版加的是**配方本的浏览与删除通道**（9 个新类：7 个 payload + `RecipeService` + `RecipeNetwork`，五版本各一份）。主 jar 516,128 / 516,308 / 519,576 / 519,577 / 516,291 B（比上一次发布 +27,736 ~ +28,050 B：9 个新类 + 4 处接线），sources jar 大 21,981 ~ 22,146 B。md5 与之前二十次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-17; the v1.0.17 assets were replaced in place a twenty-first time — this round adds the recipe-book browse/delete channels (nine new classes per version). Every decision rule and the storage format are byte-identical.)。
+> **本表已按 2026-11-17 13:22 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第二十二次原地替换**：规则集、配置键、规则名、存档格式仍然一个字都没动。这一版只改一处闸门 —— **配方本不开仓库也能看**（取消 `containerMenu` 那道会话边界，数据改由 `VoidWarehouse.data(server)` 取，并接住它的空壳闸门异常）。主 jar 516,183 / 516,363 / 519,631 / 519,632 / 516,336 B（比上一次 +45 ~ +55 B），sources jar 大 1,101 ~ 1,106 B。md5 与之前二十一次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-17; the v1.0.17 assets were replaced in place a twenty-second time — browsing the recipe book no longer requires the warehouse screen to be open. Every decision rule and the storage format are byte-identical.)。
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。

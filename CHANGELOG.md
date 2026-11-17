@@ -24,7 +24,7 @@
 - **扣账按格子对象、不按下标**：钉住的一页记的是 `Entry` 本身，`entries` 的增删与前移不再影响「我刚点的到底是哪一格」(Deductions go through the entry object rather than its index.)。
 - **两个界面页码各记一份**（`screen` / `craftPage`，`optionalFieldOf(..., 0)`）：旧存档读进来就是仓库页第 1 页，不需要迁移(Either page keeps its own page number; old saves load as storage page 1 with no migration.)。
 - **可兑表的两项「一次取货量」改成惰性算**：`bulk` / `boxed` 以前在**建表时**就各做一次规划，一张 84 条的表 = 168 次多余规划，实测占「重算一次可兑表」的 **70%（6.8 ms → 2.6 ms）** —— 而绝大多数重算根本不画合成页（仓库页一格可兑条目都没有，补货提示与取货路径也不读它们）。现在只有真正画出来的那 45 格与真正点的那一格才问规划器，数值逐位不变(Two per-offer planning calls moved from table build time to first use: measured 70% of a full offer-table rebuild, and most rebuilds never render the crafting page.)。20 人同 tick 的最坏峰值因此从 6.38 ms 降到 **1.93 ms**（改这个功能之前是 2.11 ms）。
-- 新增自检 `VoidWarehouseInteractionCheck`：**51 条 × 5 版本 = 255 条**，其中一条是**对照组** —— 连点 3 次之后后台数量序的第一名已经是铁锭，而界面第 0 格仍是圆石，证明这条判据真的在拦一件会发生的事(A 255-assertion self-check across five versions, including a control assertion proving the reorder really would have happened, and one proving the lazy values still come from the planner.)。
+- 新增自检 `VoidWarehouseInteractionCheck`：**56 条 × 5 版本 = 280 条**，其中一条是**对照组** —— 连点 3 次之后后台数量序的第一名已经是铁锭，而界面第 0 格仍是圆石，证明这条判据真的在拦一件会发生的事；G7 那 5 条是后补的（界面标题不许回落到「手里那件东西」，见下方同名修复条目）(A 280-assertion self-check across five versions, including a control assertion proving the reorder really would have happened, and a group proving the GUI title never falls back to whatever is in hand.)。
 
 #### 配方存入前的聊天确认（`voidWarehouseCraft`）
 
@@ -306,6 +306,17 @@
 - 🔴 **1.0.17 的 26.3 产物误带了两行调试打印**：`VoidWarehouseTrigger` 的 `isVoidWarehouse` 与 `interact` 各留了一条 `System.out.println("[VW-DEBUG] …")`（排查「改名工作台右键打不开」时插的探针）。源码回滚了，**dist 却没重出**，于是发出去的 jar 与 `-sources.jar` 都带着 —— 玩家每次右键手持物品都会往日志里写一行。已按当前源码重出 26.3 两个产物（jar 480,799 → 480,312 B，sources 533,773 → 533,646 B），其余四个版本的产物里从来没有这两行（逐个 `grep -a` 验过）(The shipped 1.0.17 26.3 artifacts carried two stray debug printlns; both are rebuilt from the current source, and a byte-level grep confirms the other four versions never had them.)。
   - **教训**：`grep -c "DEBUG"` 查源码得到 0 **不能**证明产物干净 —— 要先回滚源码、再**重跑 dist**，最后拿 `unzip -p jar …class | grep -a` 咬产物本身（本轮就是这么抓到的）(Checking the source is not enough; grep the artifact.).
 
+#### 界面标题：空手右键已放置的终端，左上角写着「空气」
+
+界面标题一直无条件取「手里那件东西」的名字（`player.getItemInHand(hand).getHoverName()`），但三条触发入口里有两条**根本不看手持物** —— 右键已放置的仓库终端、右键接了漏斗的原版工作台，**空手也能开**。空手时拿到的是 `ItemStack.EMPTY`，它的名字在客户端渲染成「空气」，于是界面左上角就写着「空气」；手里拿着钻石剑去开终端，标题就变成「钻石剑」(The screen title was taken from whatever was in hand, but two of the three entry points never look at the held item — right-clicking a placed terminal or a hopper-linked crafting table opens the warehouse bare-handed, so the title read "Air".)。
+
+- **为什么长期没暴露**：手上那条路（`isVoidWarehouse` 通过才开）永远有触发物；只有「不靠手持物开界面」的那两条路才踩得到，而它们是后加的
+- **改法**：判定抽成 `VoidWarehouseTrigger#titleFor(boolean, ItemStack)` 一个纯函数 —— 手持物**确实是仓库**才跟随触发名（玩家敲的 `Void Warehouse` 原样保留、不翻译），否则 `VoidWarehouseProvider#defaultTitle(boolean)` 按玩家语言给「虚空仓库」/ `Void Warehouse`
+- **顺手合并一处重复**：按数量取货结束后重开界面（`VoidWarehouseWithdraw#reopenWarehouse`）原本自己拼一遍 `Component.literal(tr(...))`，现在与兜底同一入口 ⇒ 标题口径只有一个来源
+- 🔴 **标题在服务端读不回来**：`openMenu` 之后它只活在 `ClientboundOpenScreenPacket` 里，菜单本身不留副本 ⇒ 断言只能咬那个纯函数；把语言拆成 `boolean en` 参数就是为了不造假玩家
+- **验证**：`VoidWarehouseInteractionCheck` 新增 **G7 组 5 条**（51 → 56），五版本 **56 × 5 = 280 条全绿**；`SystemTest` 209 条零失败（`B10 Provider 标题 = 触发名` 走的是显式传标题，未受影响）
+- 🔴 **负向对照实测 4 红 1 绿**：把判定还原成旧行为 → `空手开终端` / `手持钻石剑` / `英文玩家空手` / `不是触发名的工作台` 四条红，**正向对照**（英文别名 `Void Warehouse` 本身是合法触发名，标题必须是那个英文名）仍绿 ⇒ 断言咬的是真代码，不是自己在自说自话
+
 ### 🧪 Testing / 测试
 
 - **出料漏斗满盒分类物：35 条断言全绿**（2026-11-15，`SpecimenDupeSelfCheck`，真服务端 + 真漏斗 tick）：Z 组 14（不走漏斗，直接打三条分支 + 两条拒绝路径）、A 组 5 tick、B 组 5 tick、C 组反证、D 组空仓库、E 组付不出。**三代口径的读数都留在** `docs/出料漏斗满盒分类物刷物品事故与修复.md` §2：白送版 `checks=23 failures=6`、倒进虚空版 `checks=25 failures=0`、最终版 `checks=35 failures=0`(Three generations of the fix, three sets of readings.)
@@ -346,18 +357,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 487,815 B | `bb6c45d97d05361f14e103064c8ea2f4` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 544,320 B | `d4c4e59f3a6cc9f5c64f9f214a26e441` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 487,997 B | `ebd863b3a01cd37ef2677de3cf83dfba` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 544,681 B | `310a92c20cd3df0d9ca6450af88c6575` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 491,265 B | `37c561cdf6917d9cf8b183ec4dc79dfc` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 545,698 B | `f1e8e95efb14b4cac67013382e86ec6e` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 491,266 B | `ea4b5381b1fd2bdbd4b1a0a8737d19c8` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 545,697 B | `e3687efb14590122e8d5aa866a6803a6` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 488,417 B | `1772296ff9e46e8b02f6b3da22cd42d2` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 545,456 B | `1b1a1530b5906b27fe16a2667d41200c` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 488,078 B | `1f9f54f38bde4edc5a8c85844f9da221` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 545,589 B | `543fdb544cea9b473f5fd9fbb98b6c23` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 488,260 B | `607073e45f9b6b19e53b6f2a506317e5` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 545,950 B | `50672c017d05352834d453e8db34a27a` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 491,528 B | `f0898b8721fbf1d2f61d6edaf7c81dda` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 546,967 B | `e02e7973732339a53a4605084f7a4912` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 491,529 B | `7bc4cd9a4200cc4829a6b15140fa28c1` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 546,966 B | `e639a8a8197e56d9549e2b9e8f415aa5` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 488,730 B | `14bf996145ea6a19c02c215115836b0d` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 546,744 B | `56fdcc248ba1b7f083e702c66987d956` |
 
-> **本表已按 2026-11-17 10:48 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十九次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版给仓库界面加了**第二张纸** —— 底栏第 `45` 格在「仓库页 / 合成页」之间切换，可兑条目整体搬到合成页、并且**不再因为仓库里已有该物品而消失**；同时数量排序改成**位置钉住**（停手 2 秒才重排，取空留空洞、不左移），连点同一个格子拿到的一定还是那件东西。这一版还顺手把可兑表里两个「一次取货量」改成惰性算（占重算成本 70%），20 人同 tick 的最坏峰值 2.11 → 1.93 ms（若按老写法在建表时算，会顶到 6.38 ms）。主 jar 487,815 / 487,997 / 491,265 / 491,266 / 488,417 B（比上一次发布 +5,133 ~ +5,214 B：新增一个独立界面的渲染与钉住逻辑、`ExchangeOffer` 从 `record` 改成带惰性算源的 `final class`），sources jar 大 5,384 ~ 5,433 B。md5 与之前十八次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-17; the v1.0.17 assets were replaced in place a nineteenth time — the warehouse GUI gained a dedicated crafting page and a pinned ordering, and two per-offer planning calls became lazy. Every decision rule and the storage format are byte-identical.)。
+> **本表已按 2026-11-17 11:46 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第二十次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版只改了一处标题口径 —— 界面标题不再无条件取「手里那件东西」：空手右键已放置的终端（或接了漏斗的工作台）时不再显示成「空气」，而是按玩家语言给「虚空仓库」/ `Void Warehouse`；手里确实拿着触发物时仍跟随玩家用铁砧敲的名字。主 jar 488,078 / 488,260 / 491,528 / 491,529 / 488,730 B（比上一次发布 +263 ~ +313 B：两处标题判定各多一个布尔重载），sources jar 大 1,269 ~ 1,288 B。md5 与之前十九次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-17; the v1.0.17 assets were replaced in place a twentieth time — the GUI title no longer falls back to whatever is in hand, so opening a placed terminal bare-handed shows the warehouse name instead of "Air". Every decision rule and the storage format are byte-identical.)。
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。
@@ -371,7 +382,7 @@
 - **不再需要 Servux**。装了也不会冲突，只是变成「借它的解码器做交叉验证」的次要角色；之前因为它被 Fabric Loader 静默跳过而失效的存档，换 jar 后直接就能用(Servux is no longer required; if present it is only used for cross-checking.)。
 - **半砖合并需要配套的打印机版本**：客户端侧要含 [Yur1Ca/litematica-printer#29](https://github.com/Yur1Ca/litematica-printer/pull/29)（2026-11-07 已合并进上游 `master`）。截至本版发布，最新的 `Beta3.0`（2026-11-03）**还不含**这个修复，用它时台阶仍会退回取货；用 `master` 自编或等下一个打印机构建(The slab merge case needs the companion printer fix from PR #29, merged upstream on 2026-11-07 but not yet in `Beta3.0`.)。
 - **服务端不再为「Servux 缺席」拒绝结构化直放**，所以以前日志里那句 `inventory:servux-state-channel-missing` 不会再出现；取而代之的是 `capabilities enabled=true stateChannel=true`(The `servux-state-channel-missing` fallback reason is gone.)。
-- **v1.0.17 的产物换过十八次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建；2026-11-13 换成含「预编译配方树 + 可复位草稿纸」的本地全量构建；同日再换成含「逐条配方闭包（修掉深层配方少算）」的本地全量构建；同日又重出过一次 26.3 的两个产物（去掉误带的 `[VW-DEBUG]` 调试打印）；2026-11-15 换成含「出料漏斗满盒分类物交纯净产物」的本地全量构建；同日再换成含「满盒原样交出 + 盒内实物计价」的本地全量构建（前一版把盒内物品倒进了虚空）；同日再换成含「满盒出货不再依赖配方本（①' 现场装一个）」的本地全量构建；同日最后换成含「带装饰的标本一律拒绝」的本地全量构建；2026-11-17 换成含「合成页独立入口 + 位置钉住」的本地全量构建。十九次都**没改版本号**，只是字节变了（其中两次只替换了部分版本的产物，未单列）。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place nineteen times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, the book-usage suffix on the learned line, the precompiled recipe tree, the per-recipe closure fix, the rebuilt 26.3 artifacts without the stray debug printlns, the clean-product extraction fix, its replacement with the verbatim-plus-contents-pricing one, the recipe-book-independent full-box path, the refusal of decorated classifiers, and the dedicated crafting page with a pinned ordering — with the version number unchanged.)。
+- **v1.0.17 的产物换过二十次**：2026-11-08 换成含 [PR #2](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/2) 的 CI 构建；2026-11-10 换成含「配方本逐条列表」的本地全量构建；同日再换成含「`maxCraftable` 二分」的本地全量构建；同日又换成含「`Model` 去复制（性能）」与「sources jar 含共享层源码」的本地全量构建；同日再换成含「可兑表增量重算」的本地全量构建；同日再换成含「可兑表去重口径修正」的本地全量构建；同日最后换成含「配方本聊天提示」的本地全量构建；2026-11-12 换成含「重复合成不再静默 + 翻译契约」的本地全量构建；同日再换成含「用量接在已记住那行尾」的本地全量构建；2026-11-13 换成含「预编译配方树 + 可复位草稿纸」的本地全量构建；同日再换成含「逐条配方闭包（修掉深层配方少算）」的本地全量构建；同日又重出过一次 26.3 的两个产物（去掉误带的 `[VW-DEBUG]` 调试打印）；2026-11-15 换成含「出料漏斗满盒分类物交纯净产物」的本地全量构建；同日再换成含「满盒原样交出 + 盒内实物计价」的本地全量构建（前一版把盒内物品倒进了虚空）；同日再换成含「满盒出货不再依赖配方本（①' 现场装一个）」的本地全量构建；同日最后换成含「带装饰的标本一律拒绝」的本地全量构建；2026-11-17 换成含「合成页独立入口 + 位置钉住」的本地全量构建；同日再换成含「界面标题兜底（空手开终端不再显示『空气』）」的本地全量构建。二十次都**没改版本号**，只是字节变了（其中两次只替换了部分版本的产物，未单列）。已经下过的按上方 md5 表核一下；不一样就是旧的，重下即可(The v1.0.17 assets were replaced in place twenty times — PR #2, the per-recipe string list, the binary search, the ledger-copy removal, the incremental offer rebuild, the dedup-convention fix, the recipe-book chat notices, the duplicate-notice plus translation-contract fix, the book-usage suffix on the learned line, the precompiled recipe tree, the per-recipe closure fix, the rebuilt 26.3 artifacts without the stray debug printlns, the clean-product extraction fix, its replacement with the verbatim-plus-contents-pricing one, the recipe-book-independent full-box path, the refusal of decorated classifiers, the dedicated crafting page with a pinned ordering, and the GUI title fallback (no more "Air" when opening a terminal bare-handed) — with the version number unchanged.)。
 
 * * *
 

@@ -11,6 +11,21 @@
 
 ### ✨ Added & Improved / 新增与优化
 
+#### 合成页与位置钉住
+
+仓库界面多了**第二张纸**：底栏第 `45` 格固定是「合成台 / 返回仓库」，点一下就在「我存了什么」与「我还能做多少」之间切换；同时**数量排序不再边取边重排** —— 连点同一个格子，拿到的一定还是那件东西(The warehouse GUI gained a second page behind the fixed slot-45 button, and the amount-sorted order is pinned while you are clicking.)。
+
+- 🔴 **合成入口不再被库存绑住**：老版本的可兑条目有一条「这件物品仓库里一件都没有」的入选条件，于是**存着 2 个铁锭就再也看不到「铁锭」这一格** —— 想从 2 个做到 60 个，得先把 2 个全取出来、等它归零再回来(The old filter hid any offer whose item you already had, so you could never craft more of something you already owned.)。现在两个世界分页：仓库页只画真实库存，合成页列全部**做得出**的条目、与存量无关；tooltip 多一行 `仓库已有 N`，不再让人以为手里那些凭空没了(Storage lists what you have, the crafting page lists what you can still make, and the tooltip spells out how many are already stored.)。
+- **「现在做得出」这条筛选保留**：满本 746 条配方若全列出来，绝大多数当前做不动 —— 那是噪音，不是功能(The "materials actually available" filter is kept; listing 746 impossible recipes is noise.)。
+- **合成页左键 = 取一组**（`offer.bulk()`，盒模式下一盒），右键仍是「按数量取货」。合成本来就是批量动作，一次一个要点几十下(Left-click on the crafting page hands out one stack — one box in box mode; right-click keeps the by-amount prompt.)。
+- 🔴 **「连点拿错物品」的根因是「排序键就是玩家正在改的那个量」**：取走一组 → 数量变 → 名次变 → 下一帧「第 12 格」就换了人，而一次点击要解析两遍「这一格是谁」，两遍落在不同帧上(The amount sort key is the very value the player changes, so each pickup reshuffled the page between the two lookups of a single click.)。现在一页的 45 个位置**钉住**：只在打开界面、翻页、切排序 / 搜索、以及**停手满 40 tick（2 秒）**之后才重建(Positions are pinned and rebuilt only on open, page turn, toggle change, or 40 ticks of idling.)。
+- **取空留空洞、不左移**：那一格取到 0 之后渲染成屏障占位符，后面那件东西不许顶上来；点空洞是**空操作**，绝不会把顶上来的另一件交给你(An emptied slot keeps a hole; clicking it does nothing instead of handing over whatever moved up.)。
+- **冻的是名次，不是数字**：格子里写的 `数量：580` 每次取出后立刻刷新(The counts still update live; only the ordering is frozen.)。
+- **扣账按格子对象、不按下标**：钉住的一页记的是 `Entry` 本身，`entries` 的增删与前移不再影响「我刚点的到底是哪一格」(Deductions go through the entry object rather than its index.)。
+- **两个界面页码各记一份**（`screen` / `craftPage`，`optionalFieldOf(..., 0)`）：旧存档读进来就是仓库页第 1 页，不需要迁移(Either page keeps its own page number; old saves load as storage page 1 with no migration.)。
+- **可兑表的两项「一次取货量」改成惰性算**：`bulk` / `boxed` 以前在**建表时**就各做一次规划，一张 84 条的表 = 168 次多余规划，实测占「重算一次可兑表」的 **70%（6.8 ms → 2.6 ms）** —— 而绝大多数重算根本不画合成页（仓库页一格可兑条目都没有，补货提示与取货路径也不读它们）。现在只有真正画出来的那 45 格与真正点的那一格才问规划器，数值逐位不变(Two per-offer planning calls moved from table build time to first use: measured 70% of a full offer-table rebuild, and most rebuilds never render the crafting page.)。20 人同 tick 的最坏峰值因此从 6.38 ms 降到 **1.93 ms**（改这个功能之前是 2.11 ms）。
+- 新增自检 `VoidWarehouseInteractionCheck`：**51 条 × 5 版本 = 255 条**，其中一条是**对照组** —— 连点 3 次之后后台数量序的第一名已经是铁锭，而界面第 0 格仍是圆石，证明这条判据真的在拦一件会发生的事(A 255-assertion self-check across five versions, including a control assertion proving the reorder really would have happened, and one proving the lazy values still come from the planner.)。
+
 #### 配方存入前的聊天确认（`voidWarehouseCraft`）
 
 合成**不再**默默写进配方本 —— 合成那一刻只发一句问话，玩家点一下才真的记(This rule now asks before recording; nothing is written until the player clicks.)。
@@ -331,18 +346,18 @@
 
 | MC 版本 | 文件 | 体积 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 482,682 B | `1a122426652e14fb147ff0585a463b21` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 538,833 B | `0d7523f62606dba3f0cfe4614c318799` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 482,843 B | `e47c634f56fa0be7402ef73e3e565863` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 539,169 B | `7093a0ff25fef805872e0dff4bd0520a` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 486,105 B | `8a6dc58ad250b48d02da701397d8c24c` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 540,179 B | `93b14bfe977e4b41c811c006fe9e68b8` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 486,106 B | `515347f13d6816f0dfb1124fec3ba3f7` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 540,178 B | `4d904fc1a474c597abf6a90be8797151` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 483,203 B | `29c77d75a30c87a87acd1237af0919bb` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 539,974 B | `7b13009f8e3c1cc3666204fcf0ec2891` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 487,815 B | `bb6c45d97d05361f14e103064c8ea2f4` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 544,320 B | `d4c4e59f3a6cc9f5c64f9f214a26e441` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 487,997 B | `ebd863b3a01cd37ef2677de3cf83dfba` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 544,681 B | `310a92c20cd3df0d9ca6450af88c6575` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 491,265 B | `37c561cdf6917d9cf8b183ec4dc79dfc` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 545,698 B | `f1e8e95efb14b4cac67013382e86ec6e` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 491,266 B | `ea4b5381b1fd2bdbd4b1a0a8737d19c8` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 545,697 B | `e3687efb14590122e8d5aa866a6803a6` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 488,417 B | `1772296ff9e46e8b02f6b3da22cd42d2` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 545,456 B | `1b1a1530b5906b27fe16a2667d41200c` |
 
-> **本表已按 2026-11-15 21:00 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十八次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版把「带装饰的标本」堵死 —— 漏斗里放**改过名 / 带附魔**的盒子当分类物时，**一个物品都不出、仓库零扣减**；上一版会交一个「洁净本体」充数（= 把玩家的单子偷偷换成别的形态）。判据 `hasDecoration` 只拦「现场装一个」那条路，仓库里真有这一形态时精确匹配照样原样交。配方本落盘格式、扣料口径、可兑表内容逐字节不变。主 jar 482,682 / 482,843 / 486,105 / 486,106 / 483,203 B（比上一次发布 +160 ~ +167 B：新增 `hasDecoration` / `stripContents` 两个私有静态方法），sources jar 大 584 ~ 590 B。md5 与之前十七次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-15; the v1.0.17 assets were replaced in place an eighteenth time — a renamed or enchanted box used as a classifier now yields nothing at all, and the warehouse is not charged. Recipe storage format and every decision rule are byte-identical.)。
+> **本表已按 2026-11-17 10:48 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第十九次原地替换**：规则集、配置键、规则名仍然一个字都没动。这一版给仓库界面加了**第二张纸** —— 底栏第 `45` 格在「仓库页 / 合成页」之间切换，可兑条目整体搬到合成页、并且**不再因为仓库里已有该物品而消失**；同时数量排序改成**位置钉住**（停手 2 秒才重排，取空留空洞、不左移），连点同一个格子拿到的一定还是那件东西。这一版还顺手把可兑表里两个「一次取货量」改成惰性算（占重算成本 70%），20 人同 tick 的最坏峰值 2.11 → 1.93 ms（若按老写法在建表时算，会顶到 6.38 ms）。主 jar 487,815 / 487,997 / 491,265 / 491,266 / 488,417 B（比上一次发布 +5,133 ~ +5,214 B：新增一个独立界面的渲染与钉住逻辑、`ExchangeOffer` 从 `record` 改成带惰性算源的 `final class`），sources jar 大 5,384 ~ 5,433 B。md5 与之前十八次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-17; the v1.0.17 assets were replaced in place a nineteenth time — the warehouse GUI gained a dedicated crafting page and a pinned ordering, and two per-offer planning calls became lazy. Every decision rule and the storage format are byte-identical.)。
 
 > ✅ **sources jar 现在含共享层源码**（R2 起）：`common/` 那三份 `.java`（`VoidWarehouseRecipes` / `VoidWarehouseExchange` / `VoidWarehouseSettings`）已经打进去了 —— 此前只打版本树，打开 sources jar 根本找不到真正在跑的那份扣料算法。抽检方式：`unzip -l` 应能看到 `neko/voidwarehouse/VoidWarehouseRecipes.java`(The sources jar now bundles the shared `common/` sources; this gap was closed in R2.)。
 > 只需要能跑的 jar：下 `-1.0.17.jar` 那五个，按服务端的 MC 版本选一个。`-sources.jar` 是给开发者的源码包，可不下。

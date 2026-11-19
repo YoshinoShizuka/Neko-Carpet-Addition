@@ -1529,6 +1529,33 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
+     * 仓库里这种物品的<b>所有数据组件变体</b>合计多少个。
+     *
+     * <p>与 {@link #amountOf(Item)} 的区别：{@code amountOf} 走 {@link #find(ItemStack)}，
+     * 按「物品 + 数据组件」精确匹配，纯净样板只可能命中纯净那一格；
+     * 而取消 NBT 限制之后同一 Item 可能散在多格 —— 附魔书、药水、带自定义名的装备各占一格。
+     * 「按物品问有多少」的场景（材料列表、容器填充排队）要的是合计，
+     * 否则「仓库里有两百本附魔书却显示 0」。</p>
+     *
+     * <p>用增量维护的 {@link #index} 桶来查：命中桶时只遍历这一种物品的那几格，
+     * 复杂度 O(桶内变体数)，不摊全仓；桶不存在就说明仓库里根本没有这种物品。</p>
+     */
+    public BigInteger amountOfAllVariants(Item item) {
+        if (item == null || item == Items.AIR) {
+            return BigInteger.ZERO;
+        }
+        List<Entry> bucket = this.index.get(item);
+        if (bucket == null || bucket.isEmpty()) {
+            return BigInteger.ZERO;
+        }
+        BigInteger total = BigInteger.ZERO;
+        for (Entry entry : bucket) {
+            total = total.add(entry.amount());
+        }
+        return total;
+    }
+
+    /**
      * 按「物品 + 数据组件」精确查数量（与 {@link #takeExact} 同一口径）。
      *
      * <p>取消 NBT 限制之后，仓库里同一 Item 可能有多格（不同数据组件各一格），

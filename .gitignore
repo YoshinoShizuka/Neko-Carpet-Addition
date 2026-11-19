@@ -25,3 +25,9 @@ out/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ===== 仅本地留存，不进远端（2026-11-19 立）=====
+# 内部自检工具 / 发布产物 / 设计与事故文档一律不上传 GitHub。
+/.workbuddy/
+/dist/
+/docs/

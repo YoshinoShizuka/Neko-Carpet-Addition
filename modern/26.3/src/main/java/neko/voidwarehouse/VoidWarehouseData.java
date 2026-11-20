@@ -130,6 +130,19 @@ public final class VoidWarehouseData extends SavedData {
     /** 容器总格数：必须保持 54，才能让原版客户端套用大箱子界面（GUI 尺寸不变） */
     public static final int TOTAL_SLOTS = COLUMNS * (CONTENT_ROWS + 1);
 
+    /**
+     * <b>一次左键取几个</b> —— 仓库页的库存格与合成页的可兑 / 可合成条目<b>共用这一个数字</b>。
+     *
+     * <h2>为什么是一个常量而不是两处各写一遍</h2>
+     * <p>曾经合成页左键给一组（{@code offer.bulk()}），仓库页给 1 个：同一个「点一下」
+     * 换个页签拿到的数量就变了（2026-11-20 明确要求两边一致）。现在行为与 tooltip 文案
+     * 都引用这一个常量 —— 谁改它，两处一起变，界面写的和实际给的<b>不可能</b>对不上。</p>
+     *
+     * <p>批量取货仍然有两条路：Shift（一组）与右键「按数量取货」。
+     * 「一次最多能拿多少」属于那两条路的语义，不该挂在左键上。</p>
+     */
+    public static final int LEFT_CLICK_AMOUNT = 1;
+
     private static final String ITEMS_KEY = "items";
     private static final String ITEM_FIELD = "item";
     private static final String COUNT_FIELD = "count";
@@ -3481,19 +3494,17 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * <b>合成页</b>专用的渲染：同一个「可兑 / 可合成」条目，但动作口径换成合成页那一套。
+     * <b>合成页</b>专用的渲染：同一个「可兑 / 可合成」条目，动作行换成合成页那一套。
      *
-     * <p>与 {@link #buildExchangeDisplay} 的差别只有两处：</p>
-     * <ul>
-     *   <li>左键是<b>取 1 组</b>（盒模式下 1 满盒），不是取 1 个 ——
-     *       合成本来就是个批量动作，一次一个要点六十多下；</li>
-     *   <li>不再写「仓库里没有这种物品」那一行 —— 合成页的内容<b>与存量无关</b>，
-     *       很多条目现在仓库里就有，照抄那句话会是假的。</li>
-     * </ul>
+     * <p>与 {@link #buildExchangeDisplay} 的差别只有一处：不再写「仓库里没有这种物品」
+     * 那一行 —— 合成页的内容<b>与存量无关</b>，很多条目现在仓库里就有，照抄那句话会是假的。</p>
      *
-     * <p>数量、账单、一次能拿多少仍然全部来自 {@link #exchangeSummary} 与
-     * {@code offer.bulk()} / {@code offer.boxed()}（规划器算出来的真值），
-     * 没有在这里重新推一遍算式。</p>
+     * <p><b>取货数量两边完全一致</b>：左键 1 个、Shift 一组、盒模式一盒。曾经这里左键写「一组」，
+     * 于是同一个动作在仓库页给 1 个、在合成页给 64 个 —— 数量不该跟着页签变
+     * （2026-11-20 明确要求）。原来那个「一组」的数字没有丢，挪到右键那行当上限写出来。</p>
+     *
+     * <p>数量、账单仍然全部来自 {@link #exchangeSummary} 与 {@code offer.obtainable()} /
+     * {@code offer.boxed()}（规划器算出来的真值），没有在这里重新推一遍算式。</p>
      */
     public static ItemStack buildCatalogDisplay(ExchangeOffer offer, boolean boxMode, long inStock, boolean en) {
         String verb = offer.craft() ? VoidWarehouseText.tr(en, "合成", "craft")
@@ -3516,7 +3527,7 @@ public final class VoidWarehouseData extends SavedData {
         lore.addAll(exchangeSummary(offer, en));
 
         if (!craftable) {
-            // 0 个的时候「左键：合成 0 个（一组）」是无意义的噪音，还会让人以为点了能拿到东西。
+            // 0 个的时候「左键：合成 0 个」是无意义的噪音，还会让人以为点了能拿到东西。
             // 换成一句下一步该做什么 —— 缺料清单就在上面几行，标红的那几项就是答案。
             lore.add(VoidWarehouseText.line(
                     VoidWarehouseText.tr(en,
@@ -3529,15 +3540,22 @@ public final class VoidWarehouseData extends SavedData {
                             : "左键：交出 1 盒（" + VoidWarehouseText.count(offer.boxed()) + " 个）",
                     VoidWarehouseText.ACTION_RGB));
         } else {
-            long bulk = offer.bulk().longValue();
-            lore.add(VoidWarehouseText.line(en
-                            ? "Left-click: " + verb + " " + VoidWarehouseText.count(bulk) + " (one stack)"
-                            : "左键：" + verb + " " + VoidWarehouseText.count(bulk) + " 个（一组）",
+            // 🔴 左键恒为 LEFT_CLICK_AMOUNT 个，与仓库页逐条一致 —— 这里<b>不许</b>再写「一组」。
+            //    数字与 {@code VoidWarehouseMenu#clicked} 引用同一个常量，界面写的和实际给的
+            //    不可能对不上（2026-11-20 明确要求两个界面数量一致）。
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en,
+                            "左键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
+                            "Left-click: " + verb + " " + LEFT_CLICK_AMOUNT),
                     VoidWarehouseText.ACTION_RGB));
         }
         if (craftable) {
-            lore.add(VoidWarehouseText.line(
-                    VoidWarehouseText.tr(en, "右键：按数量取货", "Right-click: withdraw by amount"),
+            // 批量取的两条路：Shift（一组）与右键（自定数量）。右键的上限写「一共能拿多少」，
+            // 不是「一组」—— 那正是从左键上摘下来的那个数字，摘下来就该挂到真用得着它的地方。
+            lore.add(VoidWarehouseText.line(en
+                            ? "Right-click: withdraw by amount (up to "
+                            + VoidWarehouseText.count(offer.obtainable()) + ")"
+                            : "右键：按数量取货（最多 " + VoidWarehouseText.count(offer.obtainable()) + " 个）",
                     VoidWarehouseText.ACTION_RGB));
         }
         // 仓库里真有这个物品时补一行存量：合成页列的是「还能做多少」，

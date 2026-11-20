@@ -406,26 +406,31 @@ public class VoidWarehouseMenu extends ChestMenu {
         // 「存入」的路径（数字键、Shift 点背包格）完全不受影响。
         boolean boxMode = this.pageContainer.shulkerMode();
 
-        // 🔴 合成页的动作口径与仓库页不同：左键一次给一组（盒模式一盒），
-        //    右键才走「按数量取货」。合成本来就是批量动作，一次一个要点几十下。
+        // 🔴 合成页的<b>取货数量</b>与仓库页逐条一致：左键 1 个、双击 1 个、Shift 一组、
+        //    盒模式一律一盒。差别只在「从哪儿拿」—— 合成页的配方条目走强制合成。
+        //
+        //    曾经这里左键给一组（`offer.bulk()`），理由是「合成本来是批量动作」。
+        //    结果同一个「点一下」在仓库页给 1 个、在合成页给 64 个，玩家换个页签
+        //    拿到的数量就变了（2026-11-20 明确要求两边一致）。批量取仍有两条路：
+        //    Shift 取一组、右键「按数量取货」。
         boolean catalog = this.pageContainer.craftScreen();
 
         switch (input) {
             case PICKUP -> {
                 if (button == 0) {
                     if (boxMode) {
-                        // 合成页的「可合成」条目在盒模式下也必须走合成（见下方 catalog 分支）
+                        // 合成页的「可合成」条目在盒模式下也必须走合成（见下面 forceCraft 的说明）
                         this.withdrawShulkerBox(target, player, catalog && isCraftOffer(target));
-                    } else if (catalog) {
-                        // 合成页左键：一组。取多少由规划器给（offer.bulk），不是写死的 64。
-                        // 🔴 这一格是配方条目时<b>强制走合成</b>：即使仓库里有现货，
-                        //    也扣原料、交新做的 —— 否则「可合成 N 个」点下去只是把库存扣掉，
-                        //    原料一个没动，数字与行为对不上（2026-11-20 玩家实测）。
-                        this.withdrawFrom(target, target.offer() != null
-                                ? target.offer().bulk().intValue() : 1, player,
-                                isCraftOffer(target));
                     } else {
-                        this.withdrawFrom(target, 1, player);
+                        // 🔴 <b>两个界面同一个答案</b>：左键取 VoidWarehouseData.LEFT_CLICK_AMOUNT 个。
+                        //    以前这里按页签分成两条（仓库页 1 个 / 合成页一组），
+                        //    于是「点一下」换个页签拿到的数量就变了（2026-11-20 明确要求一致）。
+                        //    现在只剩一条路径：数量同源，差别只在 forceCraft ——
+                        //    合成页的配方条目<b>强制走合成</b>：即使仓库里有现货，也扣原料、
+                        //    交新做的；否则「可合成 N 个」点下去只是把库存扣掉，原料一个没动，
+                        //    数字与行为对不上（2026-11-20 玩家实测）。
+                        this.withdrawFrom(target, VoidWarehouseData.LEFT_CLICK_AMOUNT, player,
+                                catalog && isCraftOffer(target));
                     }
                 } else if (button == 1) {
                     if (boxMode) {

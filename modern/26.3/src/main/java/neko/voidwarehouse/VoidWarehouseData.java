@@ -326,7 +326,7 @@ public final class VoidWarehouseData extends SavedData {
                 // 材料账本身没变，说明留在「潜影盒模式」开关那个图标的 tooltip 上（VoidWarehouseNav）。
             } else if (max > 1) {
                 lore.add(VoidWarehouseText.line(
-                        VoidWarehouseText.tr(en, "左键：取出 1 个", "Left-click: take 1"),
+                        VoidWarehouseText.tr(en, "左键：取出 " + LEFT_CLICK_AMOUNT + " 个", "Left-click: take " + LEFT_CLICK_AMOUNT),
                         VoidWarehouseText.ACTION_RGB));
                 // 直接写数字而不是「1 组（64 个）」：玩家真正要读的是「右键给我多少个」，
                 // 括号里那个数字和「组」说的是同一件事，绕一道反而更慢。
@@ -3443,14 +3443,17 @@ public final class VoidWarehouseData extends SavedData {
             // 照抄那个算式就是在数量后面又写一个跟仓库无关的常数。
             long bulk = offer.bulk().longValue();
             if (bulk <= 1) {
+                // 这一格一共只兑得出 1 个，左右键结果相同，所以合成一行说。
+                // 这里的 1 来自「bulk ≤ 1」这个前提，<b>不是</b>左键口径的复述：
+                // 左键那个数在能拿多个的那三个分支里，走 LEFT_CLICK_AMOUNT。
                 lore.add(VoidWarehouseText.line(
                         VoidWarehouseText.tr(en, "左键 / 右键：" + verb + " 1 个",
                                 "Left-click / Right-click: " + verb + " 1"),
                         VoidWarehouseText.ACTION_RGB));
             } else if (bulk >= max) {
                 lore.add(VoidWarehouseText.line(
-                        VoidWarehouseText.tr(en, "左键：" + verb + " 1 个",
-                                "Left-click: " + verb + " 1"),
+                        VoidWarehouseText.tr(en, "左键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
+                                "Left-click: " + verb + " " + LEFT_CLICK_AMOUNT),
                         VoidWarehouseText.ACTION_RGB));
                 lore.add(VoidWarehouseText.line(
                         VoidWarehouseText.tr(en, "右键：" + verb + " " + max + " 个",
@@ -3459,8 +3462,8 @@ public final class VoidWarehouseData extends SavedData {
             } else if (bulk >= offer.obtainable().longValue()) {
                 // 仓库里一共就这么多可兑 —— 一次就能全拿走
                 lore.add(VoidWarehouseText.line(
-                        VoidWarehouseText.tr(en, "左键：" + verb + " 1 个",
-                                "Left-click: " + verb + " 1"),
+                        VoidWarehouseText.tr(en, "左键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
+                                "Left-click: " + verb + " " + LEFT_CLICK_AMOUNT),
                         VoidWarehouseText.ACTION_RGB));
                 lore.add(VoidWarehouseText.line(en
                         ? "Right-click: " + verb + " " + VoidWarehouseText.count(bulk)
@@ -3471,8 +3474,8 @@ public final class VoidWarehouseData extends SavedData {
             } else {
                 // 仓库里能兑更多，但一次取不到一组 —— 因为上级只能按整块拆
                 lore.add(VoidWarehouseText.line(
-                        VoidWarehouseText.tr(en, "左键：" + verb + " 1 个",
-                                "Left-click: " + verb + " 1"),
+                        VoidWarehouseText.tr(en, "左键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
+                                "Left-click: " + verb + " " + LEFT_CLICK_AMOUNT),
                         VoidWarehouseText.ACTION_RGB));
                 lore.add(VoidWarehouseText.line(en
                         ? "Right-click: " + verb + " " + VoidWarehouseText.count(bulk)

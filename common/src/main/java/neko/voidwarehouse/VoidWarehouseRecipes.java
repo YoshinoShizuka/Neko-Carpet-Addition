@@ -194,6 +194,58 @@ public final class VoidWarehouseRecipes {
         }
     }
 
+    /**
+     * 一次「缺料诊断」的结果：<b>要什么</b> + <b>其中哪些仓库给不出</b>。
+     *
+     * <p>它只服务于界面：合成页要把「现在做不出」的产物也列出来，并在 tooltip 里把
+     * 缺料的那几行标红。所以它<b>不参与任何判断</b>，也不该被取货路径使用 ——
+     * 取货只认 {@link Plan}，规划失败就是整次拒绝。</p>
+     *
+     * @param need    做一次这条配方要用到的全部物品（叶子原料 + 凑不出的中间项，值恒为正）。
+     *                中间项只在「它自己也做不出来」时才出现，正常可合成的中间产物会被展开成叶子
+     * @param missing need 里<b>仓库现库存不够</b>的那部分（值恒为正，且必为 need 的子集）
+     */
+    public record Shortfall(Map<String, BigInteger> need, Map<String, BigInteger> missing) {
+        public Shortfall {
+            need = Map.copyOf(need);
+            missing = Map.copyOf(missing);
+        }
+    }
+
+    /**
+     * 诊断「做一次这条配方，缺什么料」。
+     *
+     * <h2>为什么复用同一个模拟器，而不是另写一套「算需求」</h2>
+     * <p>另写一套必然与 {@link #plan} 分叉：候选配方的选择顺序、往下钻的层数、
+     * 中间产物的余量抵消、成环与预算截断 —— 任何一处不一致，界面就会说「缺 A」
+     * 而实际缺的是 B。这里只是把同一个 {@code simulate} 的失败出口换成
+     * 「记下差额、继续走」（{@link Model#lenient}），所以诊断出的缺料
+     * <b>按定义</b>就是规划器判定失败的那几项。</p>
+     *
+     * <p>诊断模式下所有分支都会「成功」，因此一次遍历就能收集全部缺料；
+     * 但这也意味着它<b>不能</b>用来判断「做得出来」—— 那个问题只有 {@link Plan} 能回答。</p>
+     *
+     * @param crafts 做几次（界面用 1：问的是「做一次缺什么」，不是「做满缺什么」）
+     * @return 诊断结果；参数非法时返回 {@code null}
+     */
+    public static Shortfall shortfall(Tree tree, RecipeNode recipe, BigInteger crafts,
+                                      BigInteger[] stock, Scratch scratch) {
+        if (tree == null || recipe == null || crafts == null || crafts.signum() <= 0 || stock == null) {
+            return null;
+        }
+        Model model = new Model(tree, stock, true, usable(tree, scratch));
+        model.lenient();
+        // 返回值必然是 true（诊断模式下没有失败出口），所以不检查它。
+        simulate(tree, recipe, crafts, model, 0, new int[]{MAX_NODES});
+        Map<String, BigInteger> need = new LinkedHashMap<>(model.consumedView());
+        for (Map.Entry<String, BigInteger> entry : model.missingView().entrySet()) {
+            // 缺的那部分也要算进「这条配方要什么」：玩家看到的是完整账单，
+            // 红色只是标出其中哪几项还没凑齐。
+            need.merge(entry.getKey(), entry.getValue(), BigInteger::add);
+        }
+        return new Shortfall(need, model.missingView());
+    }
+
     // ================================================================== 预编译的配方树
 
     /**
@@ -896,6 +948,19 @@ public final class VoidWarehouseRecipes {
          */
         private final boolean trackBooks;
 
+        /**
+         * 「缺料诊断」模式：<b>只给 {@link #shortfall} 用</b>，主路径恒为 {@code false}。
+         *
+         * <p>打开之后 {@code supply} 在「真的凑不出来」时不再整项失败，而是把差额记进
+         * {@link #missing} 并<b>当作已经满足</b>继续往下走 —— 这样一次遍历就能把
+         * 「这条配方一共要什么、其中哪些仓库给不出」全部收集齐。正常规划绝不能开它：
+         * 那会把「做不出」伪装成「做得出来」。</p>
+         */
+        private boolean lenient;
+
+        /** 缺料表：物品 id → 还差多少个（只在 {@link #lenient} 下写） */
+        private final Map<String, BigInteger> missing = new LinkedHashMap<>();
+
         // 撤销日志用平行数组，不用对象 —— 每次探针要压上万条，装箱会把 GC 拖进来。
         private int[] undoBook = new int[64];
         private int[] undoSlot = new int[64];
@@ -1025,12 +1090,52 @@ public final class VoidWarehouseRecipes {
             this.surplus.put(id, old == null ? delta : old.add(delta));
         }
 
+        /** 打开缺料诊断模式（只给 {@link #shortfall} 用，主路径绝不调用） */
+        void lenient() {
+            this.lenient = true;
+        }
+
+        /**
+         * 记一笔「这个槽位还差多少个」。
+         *
+         * <p>只在诊断模式下调用；主路径进来直接忽略（防御性：万一将来有人误调，
+         * 也不会往一张没人读的 map 里写东西）。</p>
+         */
+        void addMissing(int slot, BigInteger amount) {
+            if (!this.lenient || amount == null || amount.signum() <= 0) {
+                return;
+            }
+            String id = this.tree.idOf(slot);
+            if (id == null) {
+                return;
+            }
+            this.missing.merge(id, amount, BigInteger::add);
+        }
+
+        /**
+         * {@code supply} 的统一失败出口：诊断模式下记下差额并假装满足，正常模式直接失败。
+         *
+         * @return 诊断模式给 {@code true}（父项继续走，好把其它缺料一并收集），否则 {@code false}
+         */
+        boolean failSupply(int slot, BigInteger rest) {
+            if (!this.lenient) {
+                return false;
+            }
+            this.addMissing(slot, rest);
+            return true;
+        }
+
         Map<String, BigInteger> consumedView() {
             return this.consumed;
         }
 
         Map<String, BigInteger> surplusView() {
             return this.surplus;
+        }
+
+        /** 缺料表（只在诊断模式下非空） */
+        Map<String, BigInteger> missingView() {
+            return this.missing;
         }
 
         private void journal(int book, int slot, BigInteger old, int oldStamp) {
@@ -1105,15 +1210,17 @@ public final class VoidWarehouseRecipes {
             return true;
         }
         // 剩下的从库存里拿不到 —— 只能往下钻。四条硬约束依次过一遍。
+        // 失败出口统一走 failSupply：诊断模式记下「这个槽位还差 rest 个」并假装满足，
+        // 正常模式原样返回 false（一个字节的行为都不变）。
         if (depth >= MAX_DEPTH || model.onPath(slot)) {
-            return false;
+            return model.failSupply(slot, rest);
         }
         Node node = tree.node(slot);
         if (node == null || node.recipes.length == 0) {
-            return false;
+            return model.failSupply(slot, rest);
         }
         if (--budget[0] < 0) {
-            return false;
+            return model.failSupply(slot, rest);
         }
         model.pushPath(slot);
         try {
@@ -1132,7 +1239,8 @@ public final class VoidWarehouseRecipes {
                 }
                 model.rollback(mark);
             }
-            return false;
+            // 所有候选配方都做不出来：记下这一项的差额（诊断模式），或直接失败。
+            return model.failSupply(slot, rest);
         } finally {
             model.popPath(slot);
         }

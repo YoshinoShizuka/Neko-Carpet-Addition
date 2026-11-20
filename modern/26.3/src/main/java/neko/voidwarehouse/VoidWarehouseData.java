@@ -1952,13 +1952,35 @@ public final class VoidWarehouseData extends SavedData {
         private final java.util.function.Supplier<BigInteger> bulkSource;
         private final java.util.function.Supplier<BigInteger> boxedSource;
 
+        /**
+         * 「做一次缺什么」的<b>惰性算源</b>：只有真正画 tooltip 时才问一次。
+         *
+         * <p>为什么惰性：满本配方本里绝大多数产物当前都做不出，若在建表时逐个诊断，
+         * 一次整批重建要多跑几百次模拟（那是 20 ms 级预算里最不该花的钱）。
+         * 而一屏最多画 45 格，真正被看到的通常只有几格。</p>
+         *
+         * <p>只有 {@code obtainable == 0} 的配方条目才有非空结果；9 合 1 条目恒 {@code null}。</p>
+         */
+        private final java.util.function.Supplier<VoidWarehouseRecipes.Shortfall> shortfallSource;
+
         private BigInteger bulk;
         private BigInteger boxed;
+        private VoidWarehouseRecipes.Shortfall shortfall;
+        private boolean shortfallAsked;
 
         public ExchangeOffer(String itemId, ItemStack template, BigInteger obtainable,
                              java.util.function.Supplier<BigInteger> bulkSource,
                              java.util.function.Supplier<BigInteger> boxedSource,
                              List<VoidWarehouseExchange.Delta> totalCost, boolean craft) {
+            this(itemId, template, obtainable, bulkSource, boxedSource, totalCost, craft, null);
+        }
+
+        /** 完整版：多带一个「缺料诊断」算源（只有 0 可合成的配方条目会给） */
+        public ExchangeOffer(String itemId, ItemStack template, BigInteger obtainable,
+                             java.util.function.Supplier<BigInteger> bulkSource,
+                             java.util.function.Supplier<BigInteger> boxedSource,
+                             List<VoidWarehouseExchange.Delta> totalCost, boolean craft,
+                             java.util.function.Supplier<VoidWarehouseRecipes.Shortfall> shortfallSource) {
             this.itemId = itemId;
             this.template = template;
             this.obtainable = obtainable;
@@ -1966,6 +1988,7 @@ public final class VoidWarehouseData extends SavedData {
             this.boxedSource = boxedSource;
             this.totalCost = List.copyOf(totalCost);
             this.craft = craft;
+            this.shortfallSource = shortfallSource;
         }
 
         /** 兼容入口：已经把两个数算好的调用方（配方扣料那条路、以及各套自检）直接传值 */
@@ -2009,6 +2032,19 @@ public final class VoidWarehouseData extends SavedData {
 
         public boolean craft() {
             return this.craft;
+        }
+
+        /**
+         * 做一次这条配方「缺什么」；没有诊断信息（9 合 1 条目、或还能做得出来的配方）返回 {@code null}。
+         *
+         * <p>第一次问才真正算，算完缓存 —— 与 {@link #bulk()} / {@link #boxed()} 同一套惰性口径。</p>
+         */
+        public VoidWarehouseRecipes.Shortfall shortfall() {
+            if (!this.shortfallAsked) {
+                this.shortfallAsked = true;
+                this.shortfall = this.shortfallSource == null ? null : this.shortfallSource.get();
+            }
+            return this.shortfall;
         }
     }
 
@@ -2120,6 +2156,22 @@ public final class VoidWarehouseData extends SavedData {
         return this.planExchange(sample, limit, true);
     }
 
+    /**
+     * 规划「<b>不管成品库存、纯靠扣原料</b>最多做 {@code limit} 个」—— 合成页左键专用。
+     *
+     * <p>与 {@link #planExchangeMax} 的差别是<b>两条都不走</b>：既不看成品库存（不抵现成货），
+     * 也不走 9 合 1 兑换（那会把「合成」偷偷变成「换算」）。只剩配方扣料一条路。</p>
+     *
+     * <p>返回 {@code null} 表示做不出来（含配方本里没有这件物品、或缺料）——
+     * 调用方据此整次拒绝，仓库一个字节都不动。</p>
+     */
+    public VoidWarehouseExchange.Plan planCraftedMax(ItemStack sample, BigInteger limit) {
+        if (!craftEnabled()) {
+            return null;
+        }
+        return this.planCraft(sample, limit, true, true);
+    }
+
     private VoidWarehouseExchange.Plan planExchange(ItemStack sample, BigInteger amount, boolean allowPartial) {
         if (sample == null || sample.isEmpty() || amount == null || amount.signum() <= 0) {
             return null;
@@ -2178,6 +2230,20 @@ public final class VoidWarehouseData extends SavedData {
      * <p>三笔合起来净值恰好是「仓库少了原料、多了余量，玩家拿到 amount 个」，一个字节不差。</p>
      */
     private VoidWarehouseExchange.Plan planCraft(ItemStack sample, BigInteger amount, boolean allowPartial) {
+        return this.planCraft(sample, amount, allowPartial, false);
+    }
+
+    /**
+     * {@link #planCraft(ItemStack, BigInteger, boolean)} 的完整版。
+     *
+     * @param ignoreStock {@code true} = <b>完全不看成品库存</b>，{@code amount} 全部靠扣原料做出来。
+     *                    合成页左键要的就是这个口径：玩家站在「合成页」上按左键，
+     *                    意思是「替我合成」，不是「从仓库里拿现货」。老口径会把仓库里
+     *                    那 64 个直接交出去 —— 界面写着「可合成 580」，点一下只少了 64 个库存，
+     *                    原料一个没动，玩家看到的数与拿到的货对不上（2026-11-20 玩家实测反馈）。
+     */
+    private VoidWarehouseExchange.Plan planCraft(ItemStack sample, BigInteger amount, boolean allowPartial,
+                                                 boolean ignoreStock) {
         String itemId = VoidWarehouseRecipeBook.idOf(sample.getItem());
         if (itemId == null) {
             return null;
@@ -2192,8 +2258,10 @@ public final class VoidWarehouseData extends SavedData {
         if (product == null) {
             return null;
         }
+        // ignoreStock = 合成页的「强制合成」：现成库存<b>一个都不许抵</b>。
+        // 其余调用方（补货 / 按量取货 / 漏斗）仍然走「先吃库存、缺的才做」，行为不变。
         BigInteger have = this.amountOf(product);
-        BigInteger fromStock = have.min(amount);
+        BigInteger fromStock = ignoreStock ? BigInteger.ZERO : have.min(amount);
         BigInteger need = amount.subtract(fromStock);
 
         // 成品本身已经够（或刚好够）—— 不需要做任何合成，只把库存这几笔记进账里。
@@ -2601,6 +2669,50 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
+     * <b>只走合成</b>地取出最多 {@code want} 个 {@code sample}：合成页左键专用。
+     *
+     * <h2>为什么不能复用 {@link #withdraw}</h2>
+     * <p>{@code withdraw} 的第一条规则是「成品有货就直接扣成品」—— 那条规则对补货、
+     * 漏斗、按量取货都是对的（现成的东西没有理由再做一遍），但<b>合成页的左键</b>
+     * 语义恰好相反：玩家点的是「可合成 580 个」那一格，要的就是「扣原料、给我新做的」。
+     * 复用旧路径会出现「界面写 580、点一下只交 64 个库存、原料一个没动」——
+     * 数字与行为对不上（2026-11-20 玩家实测）。所以这里<b>跳过 ① 与 ①'</b>，
+     * 也不走 9 合 1，只问 {@link #planCraftedMax}。</p>
+     *
+     * <h2>为什么不做装饰 / 现场装那两条</h2>
+     * <p>合成页条目的样板恒为 {@code new ItemStack(item)}（无数据组件），配方扣料也只能
+     * 复现「物品 + 数量」。带装饰的样本一笔都不做，与 {@link #withdraw} 第 ①' 段同一条口径：
+     * 交白板是偷换形态，交原样是白送装饰。</p>
+     *
+     * <p>做不出来（缺料、配方本没学过、规则没开）时返回 {@link Withdrawal#isEmpty()}，
+     * 仓库零变化 —— 界面那边是无操作，不会报错也不会扣一半。</p>
+     */
+    public Withdrawal withdrawCrafted(ItemStack sample, BigInteger want) {
+        if (sample == null || sample.isEmpty() || want == null || want.signum() <= 0) {
+            return new Withdrawal(this, sample, ItemStack.EMPTY, null);
+        }
+        if (!craftEnabled() || hasDecoration(sample)) {
+            return new Withdrawal(this, sample, ItemStack.EMPTY, null);
+        }
+        int cap = Math.max(1, sample.getMaxStackSize());
+        BigInteger limit = want.min(BigInteger.valueOf(cap));
+        VoidWarehouseExchange.Plan plan = this.planCraftedMax(sample, limit);
+        if (plan == null || plan.amount().signum() <= 0) {
+            return new Withdrawal(this, sample, ItemStack.EMPTY, null);
+        }
+        Item product = resolveItem(plan.itemId());
+        if (product == null) {
+            // 解析不出产物就别执行计划：扣了料却交不出货，比整次拒绝更坏
+            return new Withdrawal(this, sample, ItemStack.EMPTY, null);
+        }
+        int amount = plan.amount().intValue();
+        this.applyExchange(plan);
+        // 合成产物恒为纯净物品（配方只能复现「物品 + 数量」），不带 payload，
+        // 所以这里不需要 takePayload 那一套；计划本身已经把原料扣干净了。
+        return new Withdrawal(this, sample, new ItemStack(product, amount), plan);
+    }
+
+    /**
      * 这件东西「身上挂着的实物」—— 潜影盒里的东西、弩里装填的弹丸、收纳袋里装的。
      *
      * <p>它们全都要占仓库库存：交出一只装满的盒子，等于同时交出盒里那 1728 件。
@@ -2747,8 +2859,14 @@ public final class VoidWarehouseData extends SavedData {
      * 合成页的全部内容（9 合 1 可兑 + 已学配方可合成），按创造模式物品栏顺序排好
      * （缓存，任何改动即失效）。
      *
-     * <p>入选条件<b>只有一条</b>：现有库存<b>真的能拿出至少 1 个</b> —— 只列「理论上能」
-     * 会把兑换表里几十个物品加配方本里几百条全列出来，其中绝大多数当前做不动，纯属噪音。</p>
+     * <p><b>入选条件（2026-11-20 改）</b>：9 合 1 条目仍然是「现在真的兑得出至少 1 个」；
+     * 但<b>配方条目不再要求做得出来</b> —— 有配方的产物一律列出，做不出的那几条
+     * {@code obtainable == 0}，由 tooltip 把缺料的行标红。玩家明确要求「缺原料不要隐藏」：
+     * 藏起来他既不知道这件东西有配方，也不知道到底差什么。代价是清单变长（满本约 746 条），
+     * 但合成页本来就是「我还能做多少」的目录，而不是「现在立刻能拿什么」的清单。</p>
+     *
+     * <p>旧口径（截至 2026-11-17）是「只列现在真的做得出的」，理由是会混进几百条做不动的噪音；
+     * 现在用「红色缺料提示」替代「隐藏」，噪音换成了可行动的信息。</p>
      *
      * <p>🔴 <b>「这件物品仓库里已经有了」不再让它消失</b>（2026-11-17）。老版本有这条，
      * 结果玩家存了两块铁锭就再也看不到「铁锭」的合成条目 —— 想再做六十块也做不到，
@@ -2894,7 +3012,10 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * 把缓存里<b>此刻做不出来</b>（{@code null}）的产物滤掉，其余按遍历序交给上层排序。
+     * 把缓存里<b>根本没有配方</b>（{@code null}）的产物滤掉，其余按遍历序交给上层排序。
+     *
+     * <p>⚠️ 2026-11-20 起「此刻做不出来」不再等于 {@code null}：那种条目现在是
+     * {@code obtainable == 0} 的正常条目，必须留在清单里（缺料行要在 tooltip 里标红）。</p>
      *
      * <p>{@code taken} 是本次 9 合 1 已经占掉的物品 id —— 同一件东西在界面上出现两格
      * 会让玩家以为能拿两份，优先级给 9 合 1（理由见 {@link #exchangeOffers()}）。</p>
@@ -3047,7 +3168,18 @@ public final class VoidWarehouseData extends SavedData {
             }
         }
         if (best == null || maxOut.signum() <= 0) {
-            return null;
+            // 🔴 现在<b>不再隐藏</b>：做不出来的产物照样进清单（obtainable = 0），
+            // 由 tooltip 把缺料的行标红。玩家要求「缺原料不要藏起来」——
+            // 藏起来的话他既不知道这件东西有配方，也不知道到底差什么。
+            //
+            // 诊断取「学会顺序里的第一条」：{@link #planCraft} 的精确请求正是按这个顺序
+            // 逐条试，两处口径一致，于是界面说缺的料，就是真点下去会走的那条配方缺的料。
+            // 诊断本身是惰性的（ExchangeOffer#shortfall），建表时只挂一个算源，不跑模拟。
+            VoidWarehouseRecipes.RecipeNode chosen = node.recipes[0];
+            ItemStack sample = new ItemStack(item);
+            return new ExchangeOffer(itemId, sample, BigInteger.ZERO,
+                    () -> BigInteger.ZERO, () -> BigInteger.ZERO, List.of(), true,
+                    () -> this.missingOf(chosen));
         }
         // 账单 = 做满 maxOut 个要扣的原料（全部是负数）。余量不入账目：
         // tooltip 的「用 X 12 个」说的是成本，「找回」那一段对配方扣料是噪音
@@ -3070,6 +3202,20 @@ public final class VoidWarehouseData extends SavedData {
         BigInteger bulk = maxOut.min(BigInteger.valueOf(maxStack));
         BigInteger boxed = maxOut.min(BigInteger.valueOf(Math.max(1, VoidWarehouseShulker.capacity(sample))));
         return new ExchangeOffer(itemId, sample, maxOut, bulk, boxed, cost, true);
+    }
+
+    /**
+     * 「做一次这条配方缺什么」—— 只为 tooltip 服务，<b>惰性调用</b>。
+     *
+     * <p>库存快照必须与规划时同一口径：{@code stockArray} 取整条闭包，
+     * 与 {@link #computeCraftOffer} 里算 {@code maxCraftable} 用的是同一个方法。
+     * 缺料诊断跑的是同一个模拟器（见 {@code VoidWarehouseRecipes#shortfall}），
+     * 所以「界面标红的那几项」与「规划器判定失败的那几项」按定义一致。</p>
+     */
+    private VoidWarehouseRecipes.Shortfall missingOf(VoidWarehouseRecipes.RecipeNode recipe) {
+        BigInteger[] stock = this.craftTree.stockArray(recipe, this::amountOfId);
+        return VoidWarehouseRecipes.shortfall(this.craftTree, recipe, BigInteger.ONE,
+                stock, this.craftScratch);
     }
 
     /**
@@ -3352,18 +3498,32 @@ public final class VoidWarehouseData extends SavedData {
     public static ItemStack buildCatalogDisplay(ExchangeOffer offer, boolean boxMode, long inStock, boolean en) {
         String verb = offer.craft() ? VoidWarehouseText.tr(en, "合成", "craft")
                 : VoidWarehouseText.tr(en, "兑换", "exchange");
-        String tag = offer.craft() ? VoidWarehouseText.tr(en, "（可合成）", " (craftable)")
-                : VoidWarehouseText.tr(en, "（可兑）", " (exch.)");
+        // 做不出来的条目：角标直接写「缺料」并且用红色 —— 名字那一行是玩家扫列表时
+        // 唯一一定会读到的位置，缺料信息不能只藏在 tooltip 的第二屏。
+        boolean craftable = offer.obtainable().signum() > 0;
+        String tag = !craftable
+                ? VoidWarehouseText.tr(en, "（缺料）", " (missing)")
+                : (offer.craft() ? VoidWarehouseText.tr(en, "（可合成）", " (craftable)")
+                : VoidWarehouseText.tr(en, "（可兑）", " (exch.)"));
+        ChatFormatting tagColor = craftable ? VoidWarehouseText.FACT : VoidWarehouseText.COST;
 
         ItemStack stack = offer.template().copyWithCount(1);
         stack.set(DataComponents.CUSTOM_NAME,
-                VoidWarehouseText.tinted(offer.template().getHoverName(), VoidWarehouseText.FACT)
-                        .append(VoidWarehouseText.line(tag, VoidWarehouseText.FACT)));
+                VoidWarehouseText.tinted(offer.template().getHoverName(), tagColor)
+                        .append(VoidWarehouseText.line(tag, tagColor)));
 
         List<Component> lore = new ArrayList<>(6);
         lore.addAll(exchangeSummary(offer, en));
 
-        if (boxMode) {
+        if (!craftable) {
+            // 0 个的时候「左键：合成 0 个（一组）」是无意义的噪音，还会让人以为点了能拿到东西。
+            // 换成一句下一步该做什么 —— 缺料清单就在上面几行，标红的那几项就是答案。
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en,
+                            "凑齐上面标红的原料后，左键即可合成",
+                            "Gather the red ingredients above, then left-click to craft"),
+                    VoidWarehouseText.NOTE));
+        } else if (boxMode) {
             lore.add(VoidWarehouseText.line(en
                             ? "Left-click: hand out 1 box (" + VoidWarehouseText.count(offer.boxed()) + " items)"
                             : "左键：交出 1 盒（" + VoidWarehouseText.count(offer.boxed()) + " 个）",
@@ -3375,9 +3535,11 @@ public final class VoidWarehouseData extends SavedData {
                             : "左键：" + verb + " " + VoidWarehouseText.count(bulk) + " 个（一组）",
                     VoidWarehouseText.ACTION_RGB));
         }
-        lore.add(VoidWarehouseText.line(
-                VoidWarehouseText.tr(en, "右键：按数量取货", "Right-click: withdraw by amount"),
-                VoidWarehouseText.ACTION_RGB));
+        if (craftable) {
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en, "右键：按数量取货", "Right-click: withdraw by amount"),
+                    VoidWarehouseText.ACTION_RGB));
+        }
         // 仓库里真有这个物品时补一行存量：合成页列的是「还能做多少」，
         // 不写清「现在已经有多少」，玩家会以为手里那些凭空没了。
         // 存量由调用方（界面容器）从仓库读，静态方法这里不碰数据实例。
@@ -3421,6 +3583,11 @@ public final class VoidWarehouseData extends SavedData {
      * <p><b>账目里一项都解析不出来</b>时只留「可合成 N 个」，不留孤零零的「，用 」。</p>
      */
     private static List<Component> exchangeSummary(ExchangeOffer offer, boolean en) {
+        // 做不出来的配方条目：首行说明状态，下面列完整原料清单，缺料的行整行红色。
+        // 这条路不参与「可合成 N 个」的排版 —— 0 个写出来只会让人以为界面坏了。
+        if (offer.obtainable().signum() <= 0) {
+            return shortfallSummary(offer, en);
+        }
         boolean split = splitsFromAbove(offer);
         List<MutableComponent> costs = ledgerChunks(offer, true, en);
         List<MutableComponent> refunds = ledgerChunks(offer, false, en);
@@ -3456,6 +3623,63 @@ public final class VoidWarehouseData extends SavedData {
         String refundTag = VoidWarehouseText.tr(en, "找回 ", "refund ");
         for (MutableComponent chunk : refunds) {
             lines.add(ledgerLine(refundTag, chunk));
+        }
+        return lines;
+    }
+
+    /**
+     * 「现在做不出」条目的账目：首行说明状态，下面逐行列出这条配方要什么，
+     * <b>仓库给不出的那几行整行标红</b>，并在行尾写出还差多少。
+     *
+     * <h2>为什么不是「只列缺的那几项」</h2>
+     * <p>玩家问的是「为什么做不出」。只列缺的三项，他不知道这条配方本来还要什么，
+     * 也不知道差的量占总需求多少；列全量、把缺的标红，一眼就能分清
+     * 「我有大半、只差一点」和「我什么都没有」。这也是玩家明确要求的形态：
+     * <b>缺料的那一行红色高亮</b>，而不是把缺料单独抽出来。</p>
+     *
+     * <h2>数量口径</h2>
+     * <p>{@code need} 是「做<b>一次</b>」的总需求（中间产物已经按库存展开成叶子）。
+     * 缺料量是其中仓库现库存不够的那部分，两者都由同一个模拟器给出
+     * （见 {@code VoidWarehouseRecipes#shortfall}），不存在第二个算法。</p>
+     */
+    private static List<Component> shortfallSummary(ExchangeOffer offer, boolean en) {
+        List<Component> lines = new ArrayList<>(8);
+        lines.add(VoidWarehouseText.line(
+                VoidWarehouseText.tr(en, "缺少原料，暂时做不出", "Missing ingredients — cannot craft yet"),
+                VoidWarehouseText.COST));
+        VoidWarehouseRecipes.Shortfall shortfall = offer.shortfall();
+        if (shortfall == null || shortfall.need().isEmpty()) {
+            // 连诊断都拿不到（理论上走不到）：至少把状态说清楚，不留一条空清单。
+            return lines;
+        }
+        for (Map.Entry<String, BigInteger> entry : shortfall.need().entrySet()) {
+            Item item = resolveItem(entry.getKey());
+            if (item == null) {
+                continue;
+            }
+            BigInteger lacking = shortfall.missing().getOrDefault(entry.getKey(), BigInteger.ZERO);
+            Component name = new ItemStack(item).getHoverName();
+            String amount = VoidWarehouseText.count(entry.getValue());
+            if (lacking.signum() > 0) {
+                // 整行红：标签、物品名、需求数量、差额全都用 COST 语义色。
+                // 数量也在这里退成红色（而不是保留亮金）—— 这一行要传达的是「不够」，
+                // 混两种颜色会让玩家以为只有数字部分是问题。
+                lines.add(VoidWarehouseText.tinted(Component.literal("- "), VoidWarehouseText.COST)
+                        .append(VoidWarehouseText.tinted(name, VoidWarehouseText.COST))
+                        .append(VoidWarehouseText.tinted(
+                                Component.literal(" " + amount + VoidWarehouseText.tr(en, " 个", " pc")
+                                        + VoidWarehouseText.tr(en,
+                                        "（缺 " + VoidWarehouseText.count(lacking) + " 个）",
+                                        " (short " + VoidWarehouseText.count(lacking) + ")")),
+                                VoidWarehouseText.COST)));
+            } else {
+                MutableComponent line = VoidWarehouseText.body("- ");
+                line.append(VoidWarehouseText.body(name));
+                line.append(VoidWarehouseText.body(" "));
+                line.append(VoidWarehouseText.key(amount));
+                line.append(VoidWarehouseText.body(en ? " pc" : " 个"));
+                lines.add(line);
+            }
         }
         return lines;
     }

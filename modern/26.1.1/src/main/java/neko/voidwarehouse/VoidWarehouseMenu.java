@@ -11,9 +11,9 @@ import net.minecraft.world.inventory.ChestMenu;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.MenuType;
 import net.minecraft.world.inventory.Slot;
-import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.level.Level;
 
 import java.math.BigInteger;
@@ -414,11 +414,16 @@ public class VoidWarehouseMenu extends ChestMenu {
             case PICKUP -> {
                 if (button == 0) {
                     if (boxMode) {
-                        this.withdrawShulkerBox(target, player);
+                        // 合成页的「可合成」条目在盒模式下也必须走合成（见下方 catalog 分支）
+                        this.withdrawShulkerBox(target, player, catalog && isCraftOffer(target));
                     } else if (catalog) {
-                        // 合成页左键：一组。取多少由规划器给（offer.bulk），不是写死的 64
+                        // 合成页左键：一组。取多少由规划器给（offer.bulk），不是写死的 64。
+                        // 🔴 这一格是配方条目时<b>强制走合成</b>：即使仓库里有现货，
+                        //    也扣原料、交新做的 —— 否则「可合成 N 个」点下去只是把库存扣掉，
+                        //    原料一个没动，数字与行为对不上（2026-11-20 玩家实测）。
                         this.withdrawFrom(target, target.offer() != null
-                                ? target.offer().bulk().intValue() : 1, player);
+                                ? target.offer().bulk().intValue() : 1, player,
+                                isCraftOffer(target));
                     } else {
                         this.withdrawFrom(target, 1, player);
                     }
@@ -455,10 +460,12 @@ public class VoidWarehouseMenu extends ChestMenu {
                 // 客户端对同一槽位 <250ms 的快速连点会判定成「双击」，如果这里取一组，
                 // 玩家想连点取几个「1 个」时会莫名其妙被掏走一整组。想取一组用右键或 Shift。
                 // 潜影盒模式交出一盒。
+                // 双击同样遵守「合成页 = 合成」：合成页上的配方条目一律扣原料
+                boolean craftPick = catalog && isCraftOffer(target);
                 if (boxMode) {
-                    this.withdrawShulkerBox(target, player);
+                    this.withdrawShulkerBox(target, player, craftPick);
                 } else {
-                    this.withdrawFrom(target, 1, player);
+                    this.withdrawFrom(target, 1, player, craftPick);
                 }
                 this.syncAllViewers(player);
             }
@@ -494,13 +501,13 @@ public class VoidWarehouseMenu extends ChestMenu {
 
     /**
      * Ctrl + Alt + 左键（由客户端识别后走 {@code fill_request} 通道发来）：把这一格的物品
-     * <b>取出到背包放不下为止</b>。逻辑本身在 {@code VoidWarehouseWithdraw#fill}，
+     * <b>取出到背包放不下为止</b>。逻辑本身在 {@link VoidWarehouseWithdraw#fill}，
      * 这里只负责三件事：<b>校验 slotId</b>、<b>解析这一格是什么</b>、<b>取完刷新给所有人</b>。
      *
      * <h2>为什么校验放在菜单里</h2>
      * <p>{@code slotId} 是客户端说的，<b>必须当成不可信输入</b>。而「哪些 slotId 是仓库内容格」
-     * 只有菜单自己知道（导航行从 {@code VoidWarehouseData#NAV_START} 开始、
-     * 后面还有玩家背包格）。放在这里就与 {@code clicked} 用<b>同一套边界</b>，
+     * 只有菜单自己知道（导航行从 {@link VoidWarehouseData#NAV_START} 开始、
+     * 后面还有玩家背包格）。放在这里就与 {@link #clicked} 用<b>同一套边界</b>，
      * 不会出现「点击能走的格子，这条通道能走到别的格子」这种错位。</p>
      *
      * <h2>为什么取完要 {@code syncAllViewers}</h2>
@@ -626,6 +633,16 @@ public class VoidWarehouseMenu extends ChestMenu {
      * 「一个都没放进去」两种结果，所以「放完不为空」就等于「一点都没放进去」。</p>
      */
     private void withdrawShulkerBox(VoidWarehouseData.DisplaySlot target, Player player) {
+        this.withdrawShulkerBox(target, player, false);
+    }
+
+    /**
+     * @param forceCraft {@code true} = 合成页的配方条目：这一盒的货必须<b>靠扣原料做出来</b>，
+     *                   不许拿仓库现成的那几个抵数（口径见
+     *                   {@link VoidWarehouseData#withdrawCrafted}）。盒材料与外盒的账不变。
+     */
+    private void withdrawShulkerBox(VoidWarehouseData.DisplaySlot target, Player player,
+                                    boolean forceCraft) {
         if (target.isEmpty()) {
             return;
         }
@@ -641,8 +658,11 @@ public class VoidWarehouseMenu extends ChestMenu {
         //    实测：仓库 5 个空盒 → 交出「1 个装着 5 个空盒的盒子」（实收 6 个）→ 送回仓库
         //    变成 5 个空盒 + 2 壳 + 1 箱，来回几轮壳和箱就无限增长（2026-11 事故）。
         //    盒子本来就是盒子，没有再装一道的理由。见 VoidWarehouseShulker#isBoxable。
+        //
+        //    ⚠️ 「格子本身是做盒子的材料」（潜影壳 / 箱子）<b>不在这条里</b>：它们可以装盒，
+        //    但材料账必须先把「马上要交出去的那批」刨掉，见下面 ② 的预留。见 isBoxPart。
         if (!VoidWarehouseShulker.isBoxable(template)) {
-            this.withdrawFrom(target, 0, player);
+            this.withdrawFrom(target, 0, player, forceCraft);
             return;
         }
 
@@ -660,7 +680,10 @@ public class VoidWarehouseMenu extends ChestMenu {
         if (target.entry() != null) {
             available = target.entry().amount().min(BigInteger.valueOf(capacity)).longValue();
         } else {
-            exchange = this.data.planExchangeMax(target.template(), BigInteger.valueOf(capacity));
+            // 合成页的配方条目：盒子里这 N 个必须靠扣原料做出来，不能拿库存抵
+            exchange = forceCraft
+                    ? this.data.planCraftedMax(target.template(), BigInteger.valueOf(capacity))
+                    : this.data.planExchangeMax(target.template(), BigInteger.valueOf(capacity));
             available = exchange == null
                     ? 0L
                     : exchange.amount().min(BigInteger.valueOf(capacity)).longValue();
@@ -744,6 +767,16 @@ public class VoidWarehouseMenu extends ChestMenu {
     }
 
     /**
+     * 合成页里这一格是不是「配方合成」条目。
+     *
+     * <p>只有它才谈得上「强制合成」；9 合 1 条目背后没有配方，只能按兑换走。
+     * 仓库页的条目 {@code offer() == null}，恒为 {@code false}。</p>
+     */
+    private static boolean isCraftOffer(VoidWarehouseData.DisplaySlot target) {
+        return target != null && target.offer() != null && target.offer().craft();
+    }
+
+    /**
      * 取出到<b>玩家背包</b>（不经过光标，物品不会悬浮在鼠标上）。
      *
      * <p>走 {@link VoidWarehouseData#withdraw}：成品有货就直接扣成品，
@@ -754,12 +787,24 @@ public class VoidWarehouseMenu extends ChestMenu {
      * @param wanted 想要几个（{@code <= 0} 时按「该物品一组」算）
      */
     private void withdrawFrom(VoidWarehouseData.DisplaySlot target, int wanted, Player player) {
+        this.withdrawFrom(target, wanted, player, false);
+    }
+
+    /**
+     * @param forceCraft {@code true} = 合成页左键：<b>跳过成品库存与 9 合 1，只按配方扣原料</b>。
+     *                   语义是「替我合成」，不是「从仓库拿现货」—— 见
+     *                   {@link VoidWarehouseData#withdrawCrafted} 的说明。
+     */
+    private void withdrawFrom(VoidWarehouseData.DisplaySlot target, int wanted, Player player,
+                              boolean forceCraft) {
         if (target.isEmpty() || player == null) {
             return;
         }
         ItemStack template = target.template();
         int ask = wanted > 0 ? wanted : Math.max(1, template.getMaxStackSize());
-        VoidWarehouseData.Withdrawal withdrawal = this.data.withdraw(template, BigInteger.valueOf(ask));
+        VoidWarehouseData.Withdrawal withdrawal = forceCraft
+                ? this.data.withdrawCrafted(template, BigInteger.valueOf(ask))
+                : this.data.withdraw(template, BigInteger.valueOf(ask));
         if (withdrawal.isEmpty()) {
             return;
         }
@@ -839,15 +884,17 @@ public class VoidWarehouseMenu extends ChestMenu {
             if (target.isEmpty()) {
                 return ItemStack.EMPTY;
             }
+            // Shift 点击同样遵守「合成页 = 合成」：配方条目扣原料，9 合 1 条目照旧兑换
+            boolean craftPick = this.pageContainer.craftScreen() && isCraftOffer(target);
             // 潜影盒模式：Shift 点击同样是「交出 1 个满潜影盒」
             if (this.pageContainer.shulkerMode()) {
-                this.withdrawShulkerBox(target, player);
+                this.withdrawShulkerBox(target, player, craftPick);
                 this.syncAllViewers(player);
                 return ItemStack.EMPTY;
             }
             // ---- 仓库 → 玩家背包：取出一组 ----
             // 这一格是谁只解析这一次（数量排序 + 可兑条目都让视图↔数据是动态映射）
-            this.withdrawFrom(target, 0, player);
+            this.withdrawFrom(target, 0, player, craftPick);
             this.syncAllViewers(player);
             return ItemStack.EMPTY;
         }

@@ -407,14 +407,14 @@ public class VoidWarehouseMenu extends ChestMenu {
         // 「存入」的路径（数字键、Shift 点背包格）完全不受影响。
         boolean boxMode = this.pageContainer.shulkerMode();
 
-        // 🔴 合成页的<b>取货数量</b>：普通模式左键 / 右键<b>各 1 个</b>（2026-11-21 玩家要求），
+        // 🔴 合成页的<b>取货数量</b>：普通模式左键 1 个、右键<b>一组</b>（2026-11-21 玩家要求），
         //    双击 1 个、Shift 一组；盒模式左键一盒、右键输入数量。
         //    差别只在「从哪儿拿」—— 合成页的配方条目一律强制合成（扣原料，不吃成品库存）。
         //
         //    曾经这里左键给一组（`offer.bulk()`），理由是「合成本来是批量动作」。
         //    结果同一个「点一下」在仓库页给 1 个、在合成页给 64 个，玩家换个页签
-        //    拿到的数量就变了（2026-11-20 明确要求两边一致）。批量取仍有两条路：
-        //    Shift 取一组；盒模式下右键「按数量取货」（2026-11-21 起普通模式右键也是 1 个）。
+        //    拿到的数量就变了（2026-11-20 明确要求两边一致）。批量取有三条路：
+        //    右键（一组）、Shift（一组）、盒模式右键（输入数量）。
         boolean catalog = this.pageContainer.craftScreen();
 
         switch (input) {
@@ -451,11 +451,11 @@ public class VoidWarehouseMenu extends ChestMenu {
                         }
                         return;
                     } else if (catalog) {
-                        // 合成页普通模式：右键与左键<b>同量</b>（都是 LEFT_CLICK_AMOUNT 个）。
-                        // 2026-11-21 玩家要求：普通模式左右键各取 1 个，批量交给 Shift 与
-                        // 盒模式的「输入数量」。所以这里不再发起聊天栏输入、也不关界面。
-                        this.withdrawFrom(target, VoidWarehouseData.LEFT_CLICK_AMOUNT, player,
-                                catalog && isCraftOffer(target));
+                        // 合成页普通模式：右键<b>取一组</b>（2026-11-21 玩家要求）。
+                        // 与仓库页右键、Shift 同一口径：一次尽量给到一组。wanted = 0 就是
+                        //「该物品一组」—— 具体给多少由 withdrawCrafted 按原料收敛，不写死 64。
+                        // 仍然不发起聊天栏输入、也不关界面：想按数量取是盒模式那条路。
+                        this.withdrawFrom(target, 0, player, catalog && isCraftOffer(target));
                     } else {
                         this.withdrawOrStore(target, player);
                     }
@@ -467,7 +467,7 @@ public class VoidWarehouseMenu extends ChestMenu {
             case PICKUP_ALL -> {
                 // 双击（PICKUP_ALL）在普通模式下<b>仍只取 1 个</b>，和左键一致：
                 // 客户端对同一槽位 <250ms 的快速连点会判定成「双击」，如果这里取一组，
-                // 玩家想连点取几个「1 个」时会莫名其妙被掏走一整组。想取一组用 Shift（或仓库页的右键）。
+                // 玩家想连点取几个「1 个」时会莫名其妙被掏走一整组。想取一组用右键或 Shift。
                 // 潜影盒模式交出一盒。
                 // 双击同样遵守「合成页 = 合成」：合成页上的配方条目一律扣原料
                 boolean craftPick = catalog && isCraftOffer(target);
@@ -802,7 +802,8 @@ public class VoidWarehouseMenu extends ChestMenu {
     }
 
     /**
-     * @param forceCraft {@code true} = 合成页左键：<b>跳过成品库存与 9 合 1，只按配方扣原料</b>。
+     * @param forceCraft {@code true} = 合成页取货（左键 / 右键 / 双击 / Shift）：
+     *                    <b>跳过成品库存与 9 合 1，只按配方扣原料</b>。
      *                   语义是「替我合成」，不是「从仓库拿现货」—— 见
      *                   {@link VoidWarehouseData#withdrawCrafted} 的说明。
      */

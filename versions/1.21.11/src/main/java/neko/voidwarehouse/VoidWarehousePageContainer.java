@@ -519,8 +519,8 @@ final class VoidWarehousePageContainer implements Container {
             return this.en ? PLACEHOLDER_EN : PLACEHOLDER_ZH;
         }
         if (target.isExchange()) {
-            // 合成页与仓库页共用「可兑 / 可合成」条目，但动作口径不同：
-            // 合成页左键取一组（盒模式一盒），仓库页历史上是取 1 个。
+            // 合成页与仓库页共用「可兑 / 可合成」条目，动作行两边同源
+            // （左键 1 个 / 右键一组；盒模式下换成交出一盒 + 按数量取货）。
             if (this.craftScreen()) {
                 long inStock = this.data.amountOf(target.offer().template().getItem()).longValue();
                 return VoidWarehouseData.buildCatalogDisplay(target.offer(), this.view.shulkerMode(), inStock, this.en);

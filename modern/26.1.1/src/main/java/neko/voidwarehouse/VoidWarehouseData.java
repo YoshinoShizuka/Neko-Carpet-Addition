@@ -138,7 +138,7 @@ public final class VoidWarehouseData extends SavedData {
      * 换个页签拿到的数量就变了（2026-11-20 明确要求两边一致）。现在行为与 tooltip 文案
      * 都引用这一个常量 —— 谁改它，两处一起变，界面写的和实际给的<b>不可能</b>对不上。</p>
      *
-     * <p>批量取货仍然有两条路：Shift（一组）与右键「按数量取货」。
+     * <p>批量取货仍然有两条路：右键与 Shift（都是一组）；盒模式下右键是「按数量取货」。
      * 「一次最多能拿多少」属于那两条路的语义，不该挂在左键上。</p>
      */
     public static final int LEFT_CLICK_AMOUNT = 1;
@@ -2170,7 +2170,7 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * 规划「<b>不管成品库存、纯靠扣原料</b>最多做 {@code limit} 个」—— 合成页左键专用。
+     * 规划「<b>不管成品库存、纯靠扣原料</b>最多做 {@code limit} 个」—— 合成页专用。
      *
      * <p>与 {@link #planExchangeMax} 的差别是<b>两条都不走</b>：既不看成品库存（不抵现成货），
      * 也不走 9 合 1 兑换（那会把「合成」偷偷变成「换算」）。只剩配方扣料一条路。</p>
@@ -2250,7 +2250,7 @@ public final class VoidWarehouseData extends SavedData {
      * {@link #planCraft(ItemStack, BigInteger, boolean)} 的完整版。
      *
      * @param ignoreStock {@code true} = <b>完全不看成品库存</b>，{@code amount} 全部靠扣原料做出来。
-     *                    合成页左键要的就是这个口径：玩家站在「合成页」上按左键，
+     *                    合成页要的就是这个口径：玩家站在「合成页」上取货，
      *                    意思是「替我合成」，不是「从仓库里拿现货」。老口径会把仓库里
      *                    那 64 个直接交出去 —— 界面写着「可合成 580」，点一下只少了 64 个库存，
      *                    原料一个没动，玩家看到的数与拿到的货对不上（2026-11-20 玩家实测反馈）。
@@ -2682,7 +2682,8 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
-     * <b>只走合成</b>地取出最多 {@code want} 个 {@code sample}：合成页左键专用。
+     * <b>只走合成</b>地取出最多 {@code want} 个 {@code sample}：合成页专用
+     * （左键 1 个、右键一组、双击 1 个、Shift 一组，全都走这一条）。
      *
      * <h2>为什么不能复用 {@link #withdraw}</h2>
      * <p>{@code withdraw} 的第一条规则是「成品有货就直接扣成品」—— 那条规则对补货、
@@ -3423,7 +3424,6 @@ public final class VoidWarehouseData extends SavedData {
         lore.addAll(exchangeSummary(offer, en));
 
         // 操作行：与普通格一样的说法，口径统一（盒模式下就换成盒模式那一套）
-        int max = Math.max(1, offer.template().getMaxStackSize());
         if (boxMode) {
             // 盒里实际能装多少：同样来自规划器（offer.boxed），不是「容量」也不是
             // 「min(可兑数量, 容量)」。可兑数量可能远超一盒（上限由库存推出来，不是固定值），
@@ -3437,53 +3437,9 @@ public final class VoidWarehouseData extends SavedData {
                     VoidWarehouseText.tr(en, "右键：按数量取货", "Right-click: withdraw by amount"),
                     VoidWarehouseText.ACTION_RGB));
         } else {
-            // 右键一次「取一组」，但一次实际能拿走多少必须问规划器（offer.bulk），
-            // 不能写 min(一组, 可兑数量)：仓库里只有铜块时那个算式给 64，
-            // 而真值是 63（拆 7 块 = 63；要 64 就得拆 8 块、仓库里留下 8 个零头）。
-            // 照抄那个算式就是在数量后面又写一个跟仓库无关的常数。
-            long bulk = offer.bulk().longValue();
-            if (bulk <= 1) {
-                // 这一格一共只兑得出 1 个，左右键结果相同，所以合成一行说。
-                // 这里的 1 来自「bulk ≤ 1」这个前提，<b>不是</b>左键口径的复述：
-                // 左键那个数在能拿多个的那三个分支里，走 LEFT_CLICK_AMOUNT。
-                lore.add(VoidWarehouseText.line(
-                        VoidWarehouseText.tr(en, "左键 / 右键：" + verb + " 1 个",
-                                "Left-click / Right-click: " + verb + " 1"),
-                        VoidWarehouseText.ACTION_RGB));
-            } else if (bulk >= max) {
-                lore.add(VoidWarehouseText.line(
-                        VoidWarehouseText.tr(en, "左键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
-                                "Left-click: " + verb + " " + LEFT_CLICK_AMOUNT),
-                        VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line(
-                        VoidWarehouseText.tr(en, "右键：" + verb + " " + max + " 个",
-                                "Right-click: " + verb + " " + max),
-                        VoidWarehouseText.ACTION_RGB));
-            } else if (bulk >= offer.obtainable().longValue()) {
-                // 仓库里一共就这么多可兑 —— 一次就能全拿走
-                lore.add(VoidWarehouseText.line(
-                        VoidWarehouseText.tr(en, "左键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
-                                "Left-click: " + verb + " " + LEFT_CLICK_AMOUNT),
-                        VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line(en
-                        ? "Right-click: " + verb + " " + VoidWarehouseText.count(bulk)
-                        + " (as many as " + (offer.craft() ? "craftable" : "available") + ")"
-                        : "右键：" + verb + " " + VoidWarehouseText.count(bulk)
-                        + " 个（最多" + (offer.craft() ? "做得出" : "兑得出") + "这么多）",
-                        VoidWarehouseText.ACTION_RGB));
-            } else {
-                // 仓库里能兑更多，但一次取不到一组 —— 因为上级只能按整块拆
-                lore.add(VoidWarehouseText.line(
-                        VoidWarehouseText.tr(en, "左键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
-                                "Left-click: " + verb + " " + LEFT_CLICK_AMOUNT),
-                        VoidWarehouseText.ACTION_RGB));
-                lore.add(VoidWarehouseText.line(en
-                        ? "Right-click: " + verb + " " + VoidWarehouseText.count(bulk)
-                        + " (whole blocks only, no leftovers)"
-                        : "右键：" + verb + " " + VoidWarehouseText.count(bulk)
-                        + " 个（按整块拆，不留零头）",
-                        VoidWarehouseText.ACTION_RGB));
-            }
+            // 普通模式的两行（左键 1 个 / 右键一组）与合成页<b>同一份实现</b>：
+            // 以前这里另抄了一遍，2026-11-21 改口径时就得改两处 —— 现在只剩一处。
+            normalActionLines(lore, offer, verb, en);
         }
         lore.add(VoidWarehouseText.line(offer.craft()
                 ? VoidWarehouseText.tr(en, "仓库里没有这种物品，靠已学会的配方扣原料取出",
@@ -3497,14 +3453,63 @@ public final class VoidWarehouseData extends SavedData {
     }
 
     /**
+     * 普通模式的操作行：<b>左键 1 个、右键一组</b> —— 合成页与仓库页共用这一份。
+     *
+     * <p>「一组」不写死 64：一次到底能拿多少必须问规划器（{@link ExchangeOffer#bulk()}）。
+     * 仓库里只有 9 个铁粒时它给 1（此时左右键结果相同，合成一行说；
+     * 分开写两行「左键 1 个 / 右键 1 个」只会占地方），只有上级可拆时它给 63
+     * （拆 7 块正好 63；要 64 就得拆 8 块、仓库里留下零头）。
+     * 照抄 {@code min(堆叠上限, 可兑数量)} 会在这些情况下高估 —— 那是 1.0.15 修过的老毛病。</p>
+     */
+    private static void normalActionLines(List<Component> lore, ExchangeOffer offer, String verb, boolean en) {
+        int max = Math.max(1, offer.template().getMaxStackSize());
+        long bulk = offer.bulk().longValue();
+        if (bulk <= 1) {
+            // 这一格一共只兑得出 1 个：左右键结果相同，合并一行说，别让人以为右键能多拿。
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en, "左键 / 右键：" + verb + " 1 个",
+                            "Left-click / Right-click: " + verb + " 1"),
+                    VoidWarehouseText.ACTION_RGB));
+            return;
+        }
+        lore.add(VoidWarehouseText.line(
+                VoidWarehouseText.tr(en, "左键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
+                        "Left-click: " + verb + " " + LEFT_CLICK_AMOUNT),
+                VoidWarehouseText.ACTION_RGB));
+        if (bulk >= max) {
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en, "右键：" + verb + " " + max + " 个",
+                            "Right-click: " + verb + " " + max),
+                    VoidWarehouseText.ACTION_RGB));
+        } else if (bulk >= offer.obtainable().longValue()) {
+            // 仓库里一共就这么多可兑 —— 一次就能全拿走
+            lore.add(VoidWarehouseText.line(en
+                    ? "Right-click: " + verb + " " + VoidWarehouseText.count(bulk)
+                    + " (as many as " + (offer.craft() ? "craftable" : "available") + ")"
+                    : "右键：" + verb + " " + VoidWarehouseText.count(bulk)
+                    + " 个（最多" + (offer.craft() ? "做得出" : "兑得出") + "这么多）",
+                    VoidWarehouseText.ACTION_RGB));
+        } else {
+            // 仓库里能兑更多，但一次取不到一组 —— 因为上级只能按整块拆
+            lore.add(VoidWarehouseText.line(en
+                    ? "Right-click: " + verb + " " + VoidWarehouseText.count(bulk)
+                    + " (whole blocks only, no leftovers)"
+                    : "右键：" + verb + " " + VoidWarehouseText.count(bulk)
+                    + " 个（按整块拆，不留零头）",
+                    VoidWarehouseText.ACTION_RGB));
+        }
+    }
+
+    /**
      * <b>合成页</b>专用的渲染：同一个「可兑 / 可合成」条目，动作行换成合成页那一套。
      *
      * <p>与 {@link #buildExchangeDisplay} 的差别只有一处：不再写「仓库里没有这种物品」
      * 那一行 —— 合成页的内容<b>与存量无关</b>，很多条目现在仓库里就有，照抄那句话会是假的。</p>
      *
-     * <p><b>取货数量两边完全一致</b>：左键 1 个、Shift 一组、盒模式一盒。曾经这里左键写「一组」，
-     * 于是同一个动作在仓库页给 1 个、在合成页给 64 个 —— 数量不该跟着页签变
-     * （2026-11-20 明确要求）。原来那个「一组」的数字没有丢，挪到右键那行当上限写出来。</p>
+     * <p><b>取货数量两边完全一致</b>：左键 1 个、右键一组、Shift 一组、盒模式一盒（右键改输入数量）。
+     * 曾经这里左键写「一组」，于是同一个动作在仓库页给 1 个、在合成页给 64 个 ——
+     * 数量不该跟着页签变（2026-11-20 明确要求）；「一组」这个量挪到右键才合理，
+     * 因为仓库页的右键本来就是取一组（2026-11-21 玩家指出）。</p>
      *
      * <p>数量、账单仍然全部来自 {@link #exchangeSummary} 与 {@code offer.obtainable()} /
      * {@code offer.boxed()}（规划器算出来的真值），没有在这里重新推一遍算式。</p>
@@ -3547,14 +3552,9 @@ public final class VoidWarehouseData extends SavedData {
                     VoidWarehouseText.tr(en, "右键：按数量取货", "Right-click: withdraw by amount"),
                     VoidWarehouseText.ACTION_RGB));
         } else {
-            // 🔴 普通模式<b>左右键同量</b>，都是 LEFT_CLICK_AMOUNT 个（2026-11-21 玩家要求）。
+            // 🔴 普通模式：<b>左键 1 个、右键一组</b>（2026-11-21 玩家要求）。
             //    这里不许再写「按数量取货」：同一页两套口径，玩家点右键会被界面骗去输数字。
-            //    批量仍有两条路 —— Shift（一组）与盒模式右键（输入数量）。
-            lore.add(VoidWarehouseText.line(
-                    VoidWarehouseText.tr(en,
-                            "左键 / 右键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
-                            "Left-click / Right-click: " + verb + " " + LEFT_CLICK_AMOUNT),
-                    VoidWarehouseText.ACTION_RGB));
+            normalActionLines(lore, offer, verb, en);
         }
         // 仓库里真有这个物品时补一行存量：合成页列的是「还能做多少」，
         // 不写清「现在已经有多少」，玩家会以为手里那些凭空没了。

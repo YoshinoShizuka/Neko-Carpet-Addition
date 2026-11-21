@@ -406,13 +406,14 @@ public class VoidWarehouseMenu extends ChestMenu {
         // 「存入」的路径（数字键、Shift 点背包格）完全不受影响。
         boolean boxMode = this.pageContainer.shulkerMode();
 
-        // 🔴 合成页的<b>取货数量</b>与仓库页逐条一致：左键 1 个、双击 1 个、Shift 一组、
-        //    盒模式一律一盒。差别只在「从哪儿拿」—— 合成页的配方条目走强制合成。
+        // 🔴 合成页的<b>取货数量</b>：普通模式左键 / 右键<b>各 1 个</b>（2026-11-21 玩家要求），
+        //    双击 1 个、Shift 一组；盒模式左键一盒、右键输入数量。
+        //    差别只在「从哪儿拿」—— 合成页的配方条目一律强制合成（扣原料，不吃成品库存）。
         //
         //    曾经这里左键给一组（`offer.bulk()`），理由是「合成本来是批量动作」。
         //    结果同一个「点一下」在仓库页给 1 个、在合成页给 64 个，玩家换个页签
         //    拿到的数量就变了（2026-11-20 明确要求两边一致）。批量取仍有两条路：
-        //    Shift 取一组、右键「按数量取货」。
+        //    Shift 取一组；盒模式下右键「按数量取货」（2026-11-21 起普通模式右键也是 1 个）。
         boolean catalog = this.pageContainer.craftScreen();
 
         switch (input) {
@@ -441,17 +442,19 @@ public class VoidWarehouseMenu extends ChestMenu {
                         // 所以这里必须直接 return：菜单此刻已经不存在了，再往下走
                         // syncAllViewers 就是对着一个已关闭的菜单发包。
                         // 取完货由 VoidWarehouseWithdraw 自己把界面开回来（页码/开关都还在）。
-                        // 「可兑」虚拟条目走的是同一条路 —— 区别只在 execute 里改用兑换扣账。
+                        // 合成页的条目必须走强制合成（扣原料），普通格照旧先吃现货 ——
+                        // 判据与左键 / Shift 完全相同，只是这条路的记账在 Withdraw 里做。
                         if (player instanceof ServerPlayer serverPlayer) {
-                            VoidWarehouseWithdraw.request(serverPlayer, target.template());
+                            VoidWarehouseWithdraw.request(serverPlayer, target.template(),
+                                    catalog && isCraftOffer(target));
                         }
                         return;
                     } else if (catalog) {
-                        // 合成页右键：按数量取货（复用聊天栏输入的那套）
-                        if (player instanceof ServerPlayer serverPlayer) {
-                            VoidWarehouseWithdraw.request(serverPlayer, target.template());
-                        }
-                        return;
+                        // 合成页普通模式：右键与左键<b>同量</b>（都是 LEFT_CLICK_AMOUNT 个）。
+                        // 2026-11-21 玩家要求：普通模式左右键各取 1 个，批量交给 Shift 与
+                        // 盒模式的「输入数量」。所以这里不再发起聊天栏输入、也不关界面。
+                        this.withdrawFrom(target, VoidWarehouseData.LEFT_CLICK_AMOUNT, player,
+                                catalog && isCraftOffer(target));
                     } else {
                         this.withdrawOrStore(target, player);
                     }
@@ -463,7 +466,7 @@ public class VoidWarehouseMenu extends ChestMenu {
             case PICKUP_ALL -> {
                 // 双击（PICKUP_ALL）在普通模式下<b>仍只取 1 个</b>，和左键一致：
                 // 客户端对同一槽位 <250ms 的快速连点会判定成「双击」，如果这里取一组，
-                // 玩家想连点取几个「1 个」时会莫名其妙被掏走一整组。想取一组用右键或 Shift。
+                // 玩家想连点取几个「1 个」时会莫名其妙被掏走一整组。想取一组用 Shift（或仓库页的右键）。
                 // 潜影盒模式交出一盒。
                 // 双击同样遵守「合成页 = 合成」：合成页上的配方条目一律扣原料
                 boolean craftPick = catalog && isCraftOffer(target);
@@ -531,7 +534,9 @@ public class VoidWarehouseMenu extends ChestMenu {
             return;
         }
         // ③ 模式由<b>服务端</b>自己读（跟着这个玩家的界面走），不听客户端的
-        VoidWarehouseWithdraw.fill(player, target.template(), this.pageContainer.shulkerMode());
+        // 合成页的条目同样要扣原料 —— 否则「Ctrl+Alt 填满」在这一页会退化成吃成品库存
+        VoidWarehouseWithdraw.fill(player, target.template(), this.pageContainer.shulkerMode(),
+                this.pageContainer.craftScreen() && isCraftOffer(target));
         this.syncAllViewers(player);
     }
 

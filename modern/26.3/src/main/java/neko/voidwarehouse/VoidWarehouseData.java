@@ -3542,23 +3542,18 @@ public final class VoidWarehouseData extends SavedData {
                             ? "Left-click: hand out 1 box (" + VoidWarehouseText.count(offer.boxed()) + " items)"
                             : "左键：交出 1 盒（" + VoidWarehouseText.count(offer.boxed()) + " 个）",
                     VoidWarehouseText.ACTION_RGB));
+            // 盒模式的右键仍是「输入数量」：一盒一盒拿太粗，玩家常常只差几百个。
+            lore.add(VoidWarehouseText.line(
+                    VoidWarehouseText.tr(en, "右键：按数量取货", "Right-click: withdraw by amount"),
+                    VoidWarehouseText.ACTION_RGB));
         } else {
-            // 🔴 左键恒为 LEFT_CLICK_AMOUNT 个，与仓库页逐条一致 —— 这里<b>不许</b>再写「一组」。
-            //    数字与 {@code VoidWarehouseMenu#clicked} 引用同一个常量，界面写的和实际给的
-            //    不可能对不上（2026-11-20 明确要求两个界面数量一致）。
+            // 🔴 普通模式<b>左右键同量</b>，都是 LEFT_CLICK_AMOUNT 个（2026-11-21 玩家要求）。
+            //    这里不许再写「按数量取货」：同一页两套口径，玩家点右键会被界面骗去输数字。
+            //    批量仍有两条路 —— Shift（一组）与盒模式右键（输入数量）。
             lore.add(VoidWarehouseText.line(
                     VoidWarehouseText.tr(en,
-                            "左键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
-                            "Left-click: " + verb + " " + LEFT_CLICK_AMOUNT),
-                    VoidWarehouseText.ACTION_RGB));
-        }
-        if (craftable) {
-            // 批量取的两条路：Shift（一组）与右键（自定数量）。右键的上限写「一共能拿多少」，
-            // 不是「一组」—— 那正是从左键上摘下来的那个数字，摘下来就该挂到真用得着它的地方。
-            lore.add(VoidWarehouseText.line(en
-                            ? "Right-click: withdraw by amount (up to "
-                            + VoidWarehouseText.count(offer.obtainable()) + ")"
-                            : "右键：按数量取货（最多 " + VoidWarehouseText.count(offer.obtainable()) + " 个）",
+                            "左键 / 右键：" + verb + " " + LEFT_CLICK_AMOUNT + " 个",
+                            "Left-click / Right-click: " + verb + " " + LEFT_CLICK_AMOUNT),
                     VoidWarehouseText.ACTION_RGB));
         }
         // 仓库里真有这个物品时补一行存量：合成页列的是「还能做多少」，

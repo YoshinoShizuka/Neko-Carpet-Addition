@@ -5,7 +5,7 @@
 
 ## Carpet Neko Addition 1.0.18
 
-> 这一版只做**客户端协作**，不加规则、不加指令：给 [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search)（0.5.9）开了「按键打开虚空仓库」的服务端 C2S 通道，并把原版 `THROW` 的仓库格分支接上以便快速丢弃。仓库数据、规则语义、存档格式与 1.0.17 完全一致。配套客户端 0.5.9；纯原版 / 旧客户端零感知。
+> 这一版以**客户端协作**为主，不加规则、不加指令，另外修掉一条「合成页把原料侧也列成可兑换」的回归：给 [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search)（0.5.9）开了「按键打开虚空仓库」的服务端 C2S 通道，并把原版 `THROW` 的仓库格分支接上以便快速丢弃。仓库数据、规则语义、存档格式与 1.0.17 完全一致。配套客户端 0.5.9；纯原版 / 旧客户端零感知。
 > **This release is all about client cooperation** — a C2S channel to open the warehouse by keybind and the THROW branch on warehouse slots for quick dropping. No new rules, no new commands, no save-format change.
 
 ### ✨ Added & Improved / 新增与优化
@@ -30,22 +30,36 @@
 - 🔴 **掉落物手工造 `ItemEntity`**，不走 `ServerPlayer#drop`：26.1.x/26.2 是 `drop(Stack, boolean, boolean)`、26.3 是 `drop(Stack, boolean, Prediction)`，签名换过两次；而且客户端预测也会走同一条路，只有服务端生成一份才不会双掉。
 - 自检 `vw-drop` **12 条 × 5 版本 = 60 条**：1 个 / 一组 / 整格 4096 上限 / 导航行不扣 / 空格不扣 / 光标非空不扣 / 地面实体数量对得上。自检两阶段跑（下一 tick 才查实体，`addFreshEntity` 当 tick 查不到是 entity manager 的索引延迟，不是功能坏）。
 
+### 🐛 Fixed / 修复
+
+#### 合成页把「原料侧」也列成了可兑换：兔子皮 / 蜜脾 / 红砖 们凭空多出一格（`voidWarehouseExchange` + `voidWarehouseCraft`，2026-11-22）
+
+玩家 2026-11-22 报：合成页里有几行**原版根本没有反向配方**的东西，tooltip 还写着「可合成 8 个，用 兔子皮 8 个」—— 那等于把仓库页的内容原样抄到了合成页(The crafting page listed items that have no reverse recipe at all, because the offer list had degenerated into "list whatever the warehouse holds".)
+
+- **症状**：`4 合 1` 原料族（兔子皮 / 蜜脾 / 海晶碎片 / 海晶晶体 / 红砖 / 下界砖 / 岩浆膏 / 硫磺尖刺 / 雪球 / 沙 / 红沙 / 粘土球 / 荧石粉 / 石英 / 紫水晶碎片 / 树脂砖）的**原料侧**，以及只能拆不能合的**骨头**，只要仓库里有现货就占一格；旁边紧挨着正例（8 个海晶碎片 → 2 个海晶石），一眼就能看出不对。
+- **根因是「两张纸分页」那次删掉的一条早退**（`603de77`）：`amountOf(item) > 0 → continue` 本来是「同一件东西别占两格」的补丁，分页之后确实没有存在理由，删掉是对的 —— 但 9 合 1 的入选条件因此只剩「上界 > 0」，而上界由 `maxObtainable` 算、**自身库存也算进价值里**；于是「有 8 张兔子皮」推出「可兑 8 个兔子皮」，规划器给的计划就是 `兔子皮 −8`。
+- 🔴 **判据必须是「这一份计划」，不是「这张表能不能造」**：`suppliersOf(item).size() > 1` 看着更便宜，但它只证明**理论上**能造 —— 骨头会漏网（供货者只有骨粉，可骨头造不出来），而「仓库里一块兔子皮都没有时的皮革」会被误留（那份计划里同样只有皮革自己）。真判据是：**这笔账里至少扣了一样别的物品**(The criterion is per-plan: at least one *other* item must be debited. A table-level test passes bones and keeps a leather entry that has no rabbit hide behind it.)
+- **两段式，缺一不可**：① 账目只动自己 ⇒ 丢掉；② 但「现货先把这一格撑起来」不算 —— 海晶灯 8 个 + 碎片 8 + 晶体 8 时上界只算到 1（多原料配方的硬顶），取 1 个正好被现货满足，账目也只剩海晶灯。第 ② 步把**目标自己的库存当 0** 再问一次（`VoidWarehouseExchange#planMaxFromIngredients`）：问得出就是真能造，界面改画那份计划（「用 5 海晶碎片 + 4 海晶晶体」，而不是「用 海晶灯 1 个」）；问不出才丢(The second stage re-plans with the item's own stock zeroed, so an entry that is merely satisfied by stock is not mistaken for one that cannot be made.)
+- **顺手修好一条被顶掉的条目**：9 合 1 那条不再占用 `taken`，配方本里真有的那条（`4 兔子皮 → 1 皮革`）不会被它挤掉。
+- **影响面只有「可见性」**：`maxObtainable` / `planMax` / 取货与扣账路径一个字没动，9 合 1 的数量、上界、余数口径全部照旧；被隐藏的那些格子本来也拿不出东西 —— 老界面给出的「数量」就是它自己的库存(Only visibility changed: the amount, the upper bound and the deduction path are untouched, and the hidden entries never had anything to give.)
+- 自检 `vw-exchange` **333 → 336** 条（新增 F59~F61：混装时海晶灯必须还在、且账里只出现碎片与晶体；只有现货时必须不在），26.3 实跑 `checks=336 failures=0`；`SystemTest` 209 条、`InteractionCheck` 71 条回归全绿。
+
 **本版产物（2026-11-22 1.0.18 发布）**
 
 | 版本 | 文件 | 大小 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.18.jar` | 530,275 B | `71223b1853e267ce1bf3ce73d63c424d` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.18-sources.jar` | 587,384 B | `fb3adbfb0ab3244393f1eebc46ee5642` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.18.jar` | 530,458 B | `71b58d1eed706d01f4f7e0692e866ae8` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.18-sources.jar` | 587,844 B | `bb3c5ec18e50844c613e9140737a1788` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.18.jar` | 533,726 B | `12ea6811b33dc21489a0a70af78666ad` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.18-sources.jar` | 588,861 B | `7750f0965a280c5d22699379fdf8108a` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.18.jar` | 533,727 B | `1c874fc21eaec680665c0aa1e66b6db9` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.18-sources.jar` | 588,860 B | `3234aa41b3c1a63d3c625d7ea3cc0f5d` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18.jar` | 530,197 B | `12c53f2bbccbc6e8e49e99601a1d3a2e` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18-sources.jar` | 588,395 B | `c996604ef2e611dfc6af7f975cc7e861` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.18.jar` | 530,746 B | `bea6d0df494e11d6d2117304c46e7277` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.18-sources.jar` | 588,836 B | `8da710443f67a54cba5cc689260bead2` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.18.jar` | 530,944 B | `2db9f3a36cb491b0ed0dff210f245f5e` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.18-sources.jar` | 589,569 B | `618f2b279c9a5a1294df59842d0bc4c4` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.18.jar` | 534,212 B | `15139e1930e5bf537437e3f9a87c85b5` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.18-sources.jar` | 590,586 B | `23dfd364e420dec179501ee26358cdee` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.18.jar` | 534,213 B | `061ecbf6056d71246d6bec89085f462a` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.18-sources.jar` | 590,585 B | `e351c52f6dc392fd9ab9778612a2374d` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18.jar` | 530,693 B | `ad39c1058e5f955ae2980da3de9bfd47` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18-sources.jar` | 590,122 B | `f9ed65aeedc03cd815a70fd42e76c321` |
 
-> **本表已按 2026-11-22 16:25 CST 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.18 **首次发布**：规则集、配置键、规则名、存档格式一个字都没动，相对 1.0.17 只多了两条<b>客户端协作</b>特性 —— 按键打开仓库的 C2S 通道、以及仓库格的快速丢弃（THROW 分支）。主 jar 530,275 / 530,458 / 533,726 / 533,727 / 530,197 B，sources jar 587,384 / 587,844 / 588,861 / 588,860 / 588,395 B。请按上表核对 md5。🔴 **sources jar 只存在于本地 `dist/`，不随 Release 发布** —— GitHub Release 的 Assets <b>只放主 jar</b>（用户铁律）。(This table was refreshed against the local full build of 2026-11-22; v1.0.18 is the first release of this version and adds two client-cooperation features relative to 1.0.17: a C2S channel to open the warehouse by keybind, and the THROW branch on warehouse slots for quick dropping. The sources jars stay in the local dist/ and are never uploaded as release assets.)。
+> **本表已按 2026-11-22 20:55 CST 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。相对 16:25 那次，**只多了「合成页原料侧不再占格」这一条修复**：主 jar 530,746 / 530,944 / 534,212 / 534,213 / 530,693 B，sources jar 588,836 / 589,569 / 590,586 / 590,585 / 590,122 B（每个都涨了约 0.5 KB —— 两段式守卫的注释与 `planMaxFromIngredients`）。规则集、配置键、规则名、存档格式一个字都没动，**同版本号原地覆盖**（本文件开头的版本号约定：修 bug 不升号）。🔴 **sources jar 只存在于本地 `dist/`，不随 Release 发布** —— GitHub Release 的 Assets <b>只放主 jar</b>（用户铁律）。(The table was refreshed against a local full build at 2026-11-22 20:55 CST; the only delta since the 16:25 build is the crafting-page visibility fix. Only the main jars are ever uploaded to a GitHub Release; the sources jars stay in the local dist/.)
 
 ## Carpet Neko Addition 1.0.17
 

@@ -455,6 +455,32 @@ public final class VoidWarehouseExchange {
     }
 
     /**
+     * 这笔计划是不是<b>真的动了别的格子</b> —— 而不是只把目标物品自己从仓库里取出来。
+     *
+     * <p>合成页的「可兑」条目必须满足这一条。反例：仓库里有 8 张兔子皮时，
+     * {@code planMax("rabbit_hide", 8)} 会原样返回「取 8 张兔子皮」，账目就是
+     * {@code 兔子皮 −8} —— 界面于是写出「可合成 8 个，用 兔子皮 8 个」。可原版
+     * <b>没有</b>任何「1 个皮革 → 4 张兔子皮」的配方，兔子皮根本做不出来，
+     * 这一格只是把仓库页的内容复制到了合成页（玩家 2026-11-22 报的就是这条）。</p>
+     *
+     * <p>为什么不用 {@code suppliersOf(item).size() > 1}：那只证明「理论上能造」，
+     * 证明不了「现在真能造」。皮革的 suppliers 里有兔子皮（4 兔子皮 → 1 皮革），
+     * 可仓库里一块兔子皮都没有时，皮革的计划仍然只是把它自己取出来 ——
+     * 那同样不该算「可合成」。</p>
+     */
+    public static boolean isRealConversion(Plan plan, String itemId) {
+        if (plan == null || itemId == null) {
+            return false;
+        }
+        for (Delta delta : plan.deltas()) {
+            if (delta.change().signum() < 0 && !itemId.equals(delta.itemId())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * 规划「从仓库拿到 {@code want} 个 {@code itemId}」，不改任何状态。
      *
      * @param want 想要多少个（{@code <= 0} 返回空计划）
@@ -556,6 +582,35 @@ public final class VoidWarehouseExchange {
             }
         }
         return null;
+    }
+
+    /**
+     * 「<b>只花别的物品</b>」最多能造出多少个 {@code itemId} —— 目标自己的库存当 0 看。
+     *
+     * <h2>为什么需要它</h2>
+     * <p>{@link #plan}/{@link #planMax} 规划的是「<b>拿到</b> N 个」，最省的一条路永远是
+     * 「现货直接取」，于是<b>现货足够时账目里就只有目标自己</b>。合成页要判的是另一件事：
+     * 「<b>做得出来</b>吗」。两者在混装库存下会给出相反答案 ——</p>
+     * <ul>
+     *   <li>海晶灯 8 个 + 海晶碎片 8 + 海晶晶体 8：多原料配方的硬顶只算到 1
+     *       （{@code 8/5 = 1}、{@code 8/4 = 2}，取小），{@link #planMax} 问的 1 个
+     *       正好被现货满足 ⇒ 账目只剩 {@code 海晶灯 −1}，看着像「凭空拿」，
+     *       其实它<b>真的能造 1 个</b>（5 碎片 + 4 晶体）；</li>
+     *   <li>兔子皮 8 张：把目标自己当 0 之后<b>一个都造不出来</b> —— 原版没有
+     *       「1 个皮革 → 4 张兔子皮」这种反向配方。</li>
+     * </ul>
+     * <p>所以这两条路缺一不可：先问 {@link #planMax}（那是玩家真拿得到的量），
+     * 账目只动自己时再用这里问一次「撇开现货还能不能造」。返回的计划天然不含
+     * 目标自己的扣账（它的库存是 0，扣不动），因此可以直接拿去画 tooltip ——
+     * 「用 5 海晶碎片 + 4 海晶晶体」比「用 海晶灯 1 个」有意义得多。</p>
+     *
+     * @return 可行的计划；<b>撇开现货一个都造不出来时返回 {@code null}</b>
+     */
+    public static Plan planMaxFromIngredients(Table table, String itemId, BigInteger limit, Stock stock) {
+        if (table == null || itemId == null || stock == null) {
+            return null;
+        }
+        return planMax(table, itemId, limit, id -> itemId.equals(id) ? ZERO : stock.amountOf(id));
     }
 
     // ------------------------------------------------------------------ 可兑数量的上界

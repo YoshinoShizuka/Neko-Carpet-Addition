@@ -3007,6 +3007,30 @@ public final class VoidWarehouseData extends SavedData {
             if (plan == null || plan.amount().signum() <= 0) {
                 continue;
             }
+            // 🔴 2026-11-22：只有「账目里扣了别的物品」才算可兑 / 可合成。
+            //
+            // 这条挡的是「仓库里有什么就列什么」：4:1 原料族（兔子皮 / 蜜脾 / 海晶碎片 /
+            // 红砖 / 下界砖 …）的原料侧、以及只能拆不能合的骨头，原版都没有反向配方；
+            // 可它们的库存会被 maxObtainable 算成「可兑数量」，plan 也只是把目标自己
+            // 从仓库里取出来 —— 界面于是写出「可合成 8 个，用 兔子皮 8 个」。
+            // 玩家 2026-11-22 报的就是这条：「明明不支持逆向合成，却出现在合成页」。
+            //
+            // 判据必须是「这份计划」而不是「这张表能不能造」：后者只证明理论上能造，
+            // 证明不了现在真能造（仓库里一块兔子皮都没有时，皮革那格同样只是自己的库存）。
+            if (!VoidWarehouseExchange.isRealConversion(plan, itemId)) {
+                // 账目只动了它自己。两种可能，必须分开处理：
+                //   ① 原版根本没有反向配方（兔子皮 / 蜜脾 / 红砖 …）—— 这一格纯属把仓库页
+                //      抄到合成页，整条丢掉；
+                //   ② 有配方，只是「现货先把这一格撑起来了」—— 海晶灯 8 个 + 碎片 8 + 晶体 8
+                //      时上限只算到 1（多原料配方的硬顶），取 1 个正好被现货满足，账目就只剩
+                //      海晶灯自己。要救回来：把目标自己的库存当 0 再问一次，
+                //      问得出几个就是真能造几个（见 VoidWarehouseExchange#planMaxFromIngredients）。
+                plan = VoidWarehouseExchange.planMaxFromIngredients(table, itemId, cap, stock);
+                if (plan == null || plan.amount().signum() <= 0
+                        || !VoidWarehouseExchange.isRealConversion(plan, itemId)) {
+                    continue;
+                }
+            }
             // 「一次取货实际能拿到多少」一律交给规划器收敛，**不许自己算**：
             // min(堆叠上限, obtainable) 会给出 64，而真值是 63（按整块拆、不留零头，
             // 见 VoidWarehouseExchange#drain 第 ③ 条路）。这两个数写反就是「tooltip 说 64、

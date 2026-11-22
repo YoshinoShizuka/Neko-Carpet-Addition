@@ -45,7 +45,7 @@
 | 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18.jar` | 530,197 B | `12c53f2bbccbc6e8e49e99601a1d3a2e` |
 | 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18-sources.jar` | 588,395 B | `c996604ef2e611dfc6af7f975cc7e861` |
 
-> **本表已按 2026-11-22 16:25 CST 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.18 **首次发布**：规则集、配置键、规则名、存档格式一个字都没动，相对 1.0.17 只多了两条<b>客户端协作</b>特性 —— 按键打开仓库的 C2S 通道、以及仓库格的快速丢弃（THROW 分支）。主 jar 530,275 / 530,458 / 533,726 / 533,727 / 530,197 B，sources jar 587,384 / 587,844 / 588,861 / 588,860 / 588,395 B。请按上表核对 md5(This table was refreshed against the local full build of 2026-11-22; v1.0.18 is the first release of this version and adds two client-cooperation features relative to 1.0.17: a C2S channel to open the warehouse by keybind, and the THROW branch on warehouse slots for quick dropping.)。
+> **本表已按 2026-11-22 16:25 CST 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.18 **首次发布**：规则集、配置键、规则名、存档格式一个字都没动，相对 1.0.17 只多了两条<b>客户端协作</b>特性 —— 按键打开仓库的 C2S 通道、以及仓库格的快速丢弃（THROW 分支）。主 jar 530,275 / 530,458 / 533,726 / 533,727 / 530,197 B，sources jar 587,384 / 587,844 / 588,861 / 588,860 / 588,395 B。请按上表核对 md5。🔴 **sources jar 只存在于本地 `dist/`，不随 Release 发布** —— GitHub Release 的 Assets <b>只放主 jar</b>（用户铁律）。(This table was refreshed against the local full build of 2026-11-22; v1.0.18 is the first release of this version and adds two client-cooperation features relative to 1.0.17: a C2S channel to open the warehouse by keybind, and the THROW branch on warehouse slots for quick dropping. The sources jars stay in the local dist/ and are never uploaded as release assets.)。
 
 ## Carpet Neko Addition 1.0.17
 

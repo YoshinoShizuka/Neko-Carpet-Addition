@@ -3,8 +3,10 @@ package neko.voidwarehouse;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.Container;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.ChestMenu;
@@ -492,11 +494,17 @@ public class VoidWarehouseMenu extends ChestMenu {
                 this.syncAllViewers(player);
             }
             case THROW -> {
-                // 26.3 的 THROW 只处理光标上那一份，碰不到容器槽位（已核对字节码）。
-                // 光标为空时直接忽略，杜绝「把展示用堆叠丢出去」的可能。
+                // 光标上有东西：原版语义（丢光标那一份），与仓库无关。
                 if (!this.getCarried().isEmpty()) {
                     super.clicked(slotId, button, input, player);
+                    return;
                 }
+                // 光标为空 = 玩家对着仓库格按了丢弃键：把仓库里的物品丢到地上
+                // （neko-client 0.5.9 的「快速丢弃」走这条）。客户端对 THROW 的预测是
+                // 「槽位数量减少 + 生成掉落物」，所以服务端必须真的扣库存并发实体 ——
+                // 只要这里不做事，客户端就只会闪一帧，随后被 syncAllViewers 打回原样。
+                this.dropFromWarehouse(target, player, button);
+                this.syncAllViewers(player);
             }
             case CLONE -> {
                 // 拒绝：创造模式中键克隆是唯一能凭空造物的路径
@@ -829,6 +837,72 @@ public class VoidWarehouseMenu extends ChestMenu {
         if (player instanceof ServerPlayer serverPlayer) {
             serverPlayer.sendSystemMessage(this.msgInvFull());
         }
+    }
+
+    // ------------------------------------------------------------------ 快速丢弃
+
+    /** 一次「整格丢弃」最多交出去多少件（= 64 个掉落物实体）。再多就分批，玩家再按一次。 */
+    private static final int MAX_DROP_PER_ACTION = 4096;
+
+    /**
+     * 把仓库里这一格丢到玩家脚下（QuickCraft「快速丢弃」的仓库版）。
+     *
+     * <h2>为什么不复用 {@link #withdrawFrom}</h2>
+     * <p>那条路是「取到背包」，背包塞不下就退回仓库；丢弃<b>不占背包</b>，必须真的生成
+     * 掉落物。两者唯一的共同点是「都从仓库扣账」，所以这里同样走
+     * {@link VoidWarehouseData#withdraw}，只是拿到堆叠后交给 {@code drop} 而不是
+     * {@code moveItemStackTo}。</p>
+     *
+     * <h2>数量口径必须与客户端预测一致</h2>
+     * <p>{@code button == 0} 丢 1 个；其它值丢<b>整格</b> —— 26.3 原版
+     * {@code AbstractContainerMenu#doClick} 对 THROW 的 {@code button != 0} 就是
+     * 「取该槽全部数量」，客户端预测与服务端这里必须是同一个答案，否则会出现
+     * 「先少一整格、再被同步打回」的回弹。</p>
+     *
+     * <p>整格最多交出去 {@value #MAX_DROP_PER_ACTION} 件：一次生成上千个掉落物实体
+     * 会把客户端卡住，剩下的留在仓库，玩家再按一次即可。</p>
+     */
+    private void dropFromWarehouse(VoidWarehouseData.DisplaySlot target, Player player, int button) {
+        if (target == null || target.isEmpty() || player == null) {
+            return;
+        }
+        // 只有真实库存格能丢。合成页的「可兑 / 可合成」条目背后没有现货，
+        // 丢它等于凭空造物（与 CLONE 分支同一条拒绝理由）。
+        VoidWarehouseData.Entry entry = target.entry();
+        if (entry == null) {
+            return;
+        }
+        int maxStack = entry.maxStack();
+        int want = button == 0
+                ? 1
+                : entry.amount().min(BigInteger.valueOf(MAX_DROP_PER_ACTION)).intValue();
+        // 🔴 必须按「一组」循环扣：仓库的取货入口（withdraw / takeStack）单次最多给
+        //    一个 maxStackSize，一次要 5000 个只会给你 64 个。这里直接走 takeEntry
+        //    （只扣现货、不触发 9 合 1）—— 丢弃不该「先合成再丢掉」。
+        int remaining = want;
+        while (remaining > 0) {
+            int n = Math.min(maxStack, remaining);
+            int taken = this.data.takeEntry(entry, n);
+            if (taken <= 0) {
+                break;
+            }
+            dropOneStack(player, entry.template().copyWithCount(taken));
+            remaining -= taken;
+        }
+    }
+
+    /** 这一代 {@code ServerPlayer} 继承 {@code Player#drop(ItemStack, boolean)}，直接调即可。 */
+    private static void dropOneStack(Player player, ItemStack stack) {
+        if (stack.isEmpty() || !(player.level() instanceof ServerLevel level)) {
+            return;
+        }
+        // 不调 ServerPlayer#drop：26.3 的签名在版本之间换过（Prediction / 两个 boolean），
+        // 而且客户端预测也会走到同一条路 —— 手工造实体能保证「只有服务端生成一份」。
+        ItemEntity entity = new ItemEntity(level,
+                player.getX(), player.getY() + 0.3, player.getZ(), stack.copy());
+        entity.setDefaultPickUpDelay();
+        entity.setThrower(player);
+        level.addFreshEntity(entity);
     }
 
     /**

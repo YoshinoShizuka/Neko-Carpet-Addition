@@ -1,13 +1,12 @@
 # 更新日志 / Changelog
 
-> **版本号只代表「规则集变了」**：只有新增一条 carpet 规则才升号；修 bug、改算法、补自检、改文档一律**原地覆盖当前版本**。
+> **版本号代表一次对外发布**：新增规则、或一组成体系的新特性（例如 1.0.18 的两条客户端协作通道）才升号；修 bug、改算法、补自检、改文档一律**原地覆盖当前版本**。
 > 所以同一个版本号下的 jar 可能比首次发布更新，靠文件名旁的 md5 区分。
 
-## Carpet Neko Addition 1.0.17
+## Carpet Neko Addition 1.0.18
 
-> **这一版正式发布「虚空仓库直接放置」。规则来自 [Yur1Ca](https://github.com/Yur1Ca)（Hana）的 [PR #1](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/1)**，配套客户端是同一位维护的 [litematica-printer](https://github.com/Yur1Ca/litematica-printer)。
-> 1.0.16 的发布产物里**没有**这条规则 —— PR #1 在 1.0.16 发布之后才合入，所以这是唯一一次「因为新增一条 Carpet 规则」而升号，符合本文件的版本号约定。
-> **This release ships `voidWarehouseDirectPlace`**, contributed by [Yur1Ca](https://github.com/Yur1Ca) (Hana) in [PR #1](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/1), paired with their [litematica-printer](https://github.com/Yur1Ca/litematica-printer). The 1.0.16 artifacts predate that PR, hence the version bump.
+> 这一版只做**客户端协作**，不加规则、不加指令：给 [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search)（0.5.9）开了「按键打开虚空仓库」的服务端 C2S 通道，并把原版 `THROW` 的仓库格分支接上以便快速丢弃。仓库数据、规则语义、存档格式与 1.0.17 完全一致。配套客户端 0.5.9；纯原版 / 旧客户端零感知。
+> **This release is all about client cooperation** — a C2S channel to open the warehouse by keybind and the THROW branch on warehouse slots for quick dropping. No new rules, no new commands, no save-format change.
 
 ### ✨ Added & Improved / 新增与优化
 
@@ -31,6 +30,31 @@
 - 🔴 **掉落物手工造 `ItemEntity`**，不走 `ServerPlayer#drop`：26.1.x/26.2 是 `drop(Stack, boolean, boolean)`、26.3 是 `drop(Stack, boolean, Prediction)`，签名换过两次；而且客户端预测也会走同一条路，只有服务端生成一份才不会双掉。
 - 自检 `vw-drop` **12 条 × 5 版本 = 60 条**：1 个 / 一组 / 整格 4096 上限 / 导航行不扣 / 空格不扣 / 光标非空不扣 / 地面实体数量对得上。自检两阶段跑（下一 tick 才查实体，`addFreshEntity` 当 tick 查不到是 entity manager 的索引延迟，不是功能坏）。
 
+**本版产物（2026-11-22 1.0.18 发布）**
+
+| 版本 | 文件 | 大小 | md5 |
+| --- | --- | --- | --- |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.18.jar` | 530,275 B | `71223b1853e267ce1bf3ce73d63c424d` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.18-sources.jar` | 587,384 B | `fb3adbfb0ab3244393f1eebc46ee5642` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.18.jar` | 530,458 B | `71b58d1eed706d01f4f7e0692e866ae8` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.18-sources.jar` | 587,844 B | `bb3c5ec18e50844c613e9140737a1788` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.18.jar` | 533,726 B | `12ea6811b33dc21489a0a70af78666ad` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.18-sources.jar` | 588,861 B | `7750f0965a280c5d22699379fdf8108a` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.18.jar` | 533,727 B | `1c874fc21eaec680665c0aa1e66b6db9` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.18-sources.jar` | 588,860 B | `3234aa41b3c1a63d3c625d7ea3cc0f5d` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18.jar` | 530,197 B | `12c53f2bbccbc6e8e49e99601a1d3a2e` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18-sources.jar` | 588,395 B | `c996604ef2e611dfc6af7f975cc7e861` |
+
+> **本表已按 2026-11-22 16:25 CST 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.18 **首次发布**：规则集、配置键、规则名、存档格式一个字都没动，相对 1.0.17 只多了两条<b>客户端协作</b>特性 —— 按键打开仓库的 C2S 通道、以及仓库格的快速丢弃（THROW 分支）。主 jar 530,275 / 530,458 / 533,726 / 533,727 / 530,197 B，sources jar 587,384 / 587,844 / 588,861 / 588,860 / 588,395 B。请按上表核对 md5(This table was refreshed against the local full build of 2026-11-22; v1.0.18 is the first release of this version and adds two client-cooperation features relative to 1.0.17: a C2S channel to open the warehouse by keybind, and the THROW branch on warehouse slots for quick dropping.)。
+
+## Carpet Neko Addition 1.0.17
+
+> **这一版正式发布「虚空仓库直接放置」。规则来自 [Yur1Ca](https://github.com/Yur1Ca)（Hana）的 [PR #1](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/1)**，配套客户端是同一位维护的 [litematica-printer](https://github.com/Yur1Ca/litematica-printer)。
+> 1.0.16 的发布产物里**没有**这条规则 —— PR #1 在 1.0.16 发布之后才合入，所以这是唯一一次「因为新增一条 Carpet 规则」而升号，符合本文件的版本号约定。
+> **This release ships `voidWarehouseDirectPlace`**, contributed by [Yur1Ca](https://github.com/Yur1Ca) (Hana) in [PR #1](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/pull/1), paired with their [litematica-printer](https://github.com/Yur1Ca/litematica-printer). The 1.0.16 artifacts predate that PR, hence the version bump.
+
+### ✨ Added & Improved / 新增与优化
+
 #### 合成页与位置钉住
 
 仓库界面多了**第二张纸**：底栏第 `45` 格固定是「合成台 / 返回仓库」，点一下就在「我存了什么」与「我还能做多少」之间切换；同时**数量排序不再边取边重排** —— 连点同一个格子，拿到的一定还是那件东西(The warehouse GUI gained a second page behind the fixed slot-45 button, and the amount-sorted order is pinned while you are clicking.)。
@@ -47,23 +71,6 @@
 - **可兑表的两项「一次取货量」改成惰性算**：`bulk` / `boxed` 以前在**建表时**就各做一次规划，一张 84 条的表 = 168 次多余规划，实测占「重算一次可兑表」的 **70%（6.8 ms → 2.6 ms）** —— 而绝大多数重算根本不画合成页（仓库页一格可兑条目都没有，补货提示与取货路径也不读它们）。现在只有真正画出来的那 45 格与真正点的那一格才问规划器，数值逐位不变(Two per-offer planning calls moved from table build time to first use: measured 70% of a full offer-table rebuild, and most rebuilds never render the crafting page.)。20 人同 tick 的最坏峰值因此从 6.38 ms 降到 **1.93 ms**（改这个功能之前是 2.11 ms）。
 - 新增自检 `VoidWarehouseInteractionCheck`：**71 条 × 5 版本 = 355 条**，其中一条是**对照组** —— 连点 3 次之后后台数量序的第一名已经是铁锭，而界面第 0 格仍是圆石，证明这条判据真的在拦一件会发生的事；G7 那 5 条是后补的（界面标题不许回落到「手里那件东西」，见下方同名修复条目）。本轮又补了 4 条盯「左键数量」的：tooltip 必须写着「左键：兑换 1 个」、**不许**再出现「一组」、右键行必须写明「最多 N 个」、以及**合成页与仓库页抽出来的左键数字必须相等**。两次变异都验过：常量改成 64 ⇒ 前两条红；常量不动、只把仓库页文案写死成「取出 2 个」⇒ 对照那条红。后一次才是真正值钱的那条，它咬的是「只改了一页」。2026-11-21 再补 4 条盯两套手势：普通模式必须写「左键 / 右键：… 1 个」且**不许**出现「按数量取货」，盒模式必须写「左键：交出 1 盒」+「右键：按数量取货」且**不许**出现合并写法；把普通模式文案改回单键「左键：」做变异，G1 / G4 各红一条。2026-11-21 又补 7 条盯「右键 = 一组」：能兑多个时必须**分行**写「左键：… 1 个」+「右键：… N 个」（N 取自规划器，写死 64 就红）、只兑得出 1 个时才允许合并成一行、盒模式两行且不许合并；另在 `FillSelfCheck` 加 3 条**真点一下**的（合成页右键一次必须给满一组、扣的是原料）。两个变异都验过：文案改回恒写合并行 ⇒ G1×4 + G4 红；菜单右键改回 `LEFT_CLICK_AMOUNT` ⇒ 这套 71 条**全绿**、只有真点击的 E20/E21 红 —— 「文案断言管不住接线」是实测下来的(A 355-assertion self-check across five versions, including a control assertion proving the reorder really would have happened, a group proving the GUI title never falls back to whatever is in hand, and four assertions on the left-click amount — one of which compares the numbers taken from both pages, so editing only one side turns it red.)。
 - 自检：`VoidWarehouseCraftSelfCheck` 从 **224** 条加到 **276** 条（新增 **S 组 51 条**，M9 从 1 条拆成 2 条），四个 modern 版本各跑一遍 = **1,104 条**。S4 那 12 条盯「右键 / Ctrl+Alt 在合成页也扣原料」：现货 5 个、原料齐全时 `planTake(..., true)` 的账里**没有活塞这一项**、只留现货时整次拒绝，而同一时刻普通格口径仍然给得出（把 `planCraftedMax` 换回 `planExchangeMax` 做变异，红 3 条）；另 3 条盯「右键一组」的真账 —— 一次 `withdrawCrafted(一组)` 必须交出 16 个、圆石 64 → 0、活塞现货一个不动。S 组做了三次变异验证，每次都能红：把「强制合成」退回老口径红 **13** 条、把缺料行的物品名改成金色红 **2** 条、把缺料条目重新藏起来红 **3** 条。第二条第一次**没红** —— 判据按字面类型认「这一段有没有字」，而物品名是可翻译组件（`TranslatableContents`），整段被跳过；补成「不是空内容就得红」之后才咬得住(The craft self-check grew from 224 to 276 assertions, validated by four mutations.)。
-
-**本版产物（2026-11-22 第 29 次原地替换）**
-
-| 版本 | 文件 | 大小 | md5 |
-| --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 530,275 B | `0e5238a93ea8c5437c07d0b11dfabf94` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 587,384 B | `fb3adbfb0ab3244393f1eebc46ee5642` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 530,458 B | `806aa328800e9b76a615fa8517804b84` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 587,844 B | `bb3c5ec18e50844c613e9140737a1788` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 533,726 B | `2ac9e881d8449e9dc82b78af3e04cff5` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 588,861 B | `7750f0965a280c5d22699379fdf8108a` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 533,727 B | `2fd369c2da05e8ec673e0b2940f4fb85` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 588,860 B | `3234aa41b3c1a63d3c625d7ea3cc0f5d` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 530,197 B | `34448d42dafd00d22ce87b7f397443a1` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 588,395 B | `c996604ef2e611dfc6af7f975cc7e861` |
-
-> **本表已按 2026-11-22 12:26 CST 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第二十九次原地替换**：规则集、配置键、规则名、存档格式仍然一个字都没动。这一版做了两件事：① 新增 `open_warehouse` / `open_warehouse_result` 通道（客户端按键打开仓库）；② 放开 THROW 的仓库格分支（快速丢弃，button 0 = 1 个、其它 = 整格，单次上限 4096 件）。主 jar 530,275 / 530,458 / 533,726 / 533,727 / 530,197 B，sources jar 587,384 / 587,844 / 588,861 / 588,860 / 588,395 B。md5 与之前二十八次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-22; v1.0.17 was replaced in place a twenty-ninth time — adding the open_warehouse channel and enabling the THROW branch on warehouse slots so items can be dropped to the ground.)。
 
 #### 配方存入前的聊天确认（`voidWarehouseCraft`）
 

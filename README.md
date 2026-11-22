@@ -1,171 +1,69 @@
-# Carpet Neko Addition
+# Carpet Neko Addition [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Build](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/actions/workflows/build.yml/badge.svg)](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/actions/workflows/build.yml) ![Minecraft](https://img.shields.io/badge/Minecraft-26.3%20%7C%2026.2%20%7C%2026.1.2%20%7C%2026.1.1%20%7C%201.21.11-2ea043) ![Side](https://img.shields.io/badge/side-%E7%BA%AF%E6%9C%8D%E5%8A%A1%E7%AB%AF-informational)
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Build](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/actions/workflows/build.yml/badge.svg)](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/actions/workflows/build.yml)
-![Minecraft](https://img.shields.io/badge/Minecraft-26.3%20%7C%2026.2%20%7C%2026.1.2%20%7C%2026.1.1%20%7C%201.21.11-2ea043)
-![Side](https://img.shields.io/badge/side-%E7%BA%AF%E6%9C%8D%E5%8A%A1%E7%AB%AF-informational)
-
-纯服务端 Carpet 扩展，面向技术生存与生电场景。共八条规则：**自动经验修补**、**虚空仓库**（全服共享、跨维度的分页仓库，配漏斗双向自动化）、**虚空仓库补货**、**虚空仓库直接放置**、**虚空仓库 9 合 1 兑换**、**虚空仓库配方扣料**、**方块掉落物直接进虚空仓库**、**混凝土粉末烧制染色玻璃**。全部默认关闭，用 `/carpet` 逐条开启。客户端可以是原版。
-
-另有配套**纯客户端模组** [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search)：在虚空仓库界面上叠加搜索框，支持中文 / 拼音 / 注册名筛选物品，详见下文「[虚空仓库搜索框](#虚空仓库搜索框配套客户端-mod)」。
+纯服务端 Carpet 扩展，面向技术生存与生电。全部规则默认关闭，客户端可为原版。
 
 ## 规则
 
-| 规则 | 默认 | 一句话 |
+| 规则 | 默认 | 说明 |
 | --- | --- | --- |
-| `autoMending` | `false` | 每秒把一件带经验修补的物品修满，先花经验条、再动等级 |
+| `autoMending` | `false` | 每秒把一件带经验修补的物品修满 |
 | `voidWarehouse` | `false` | 铁砧改名的工作台成为全服共享仓库，一种物品一格、数量无上限 |
-| `voidWarehouseRestock` | `false` | 允许 litematica-printer 缺料时直接从仓库领一组（**依赖** `voidWarehouse`） |
-| `voidWarehouseDirectPlace` | `false` | 打印机缺料时从仓库预扣一件、直接放到目标位置，不经过背包（**依赖** `voidWarehouse` + `voidWarehouseRestock`） |
-| `voidWarehouseExchange` | `false` | 成品缺货时改用 N 合 1 配方的原料顶替，也可拆上级找零（**依赖** `voidWarehouse`） |
-| `voidWarehouseCraft` | `false` | 成品缺货时按玩家亲手合成过的配方扣原料，直接把成品取出来（**依赖** `voidWarehouse`） |
-| `voidWarehouseBlockDrops` | `false` | 玩家挖掉的方块，掉落物不进世界、直接进仓库（**依赖** `voidWarehouse`） |
-| `concretePowderToGlass` | `false` | 普通熔炉把 16 种混凝土粉末烧成对应颜色的染色玻璃 |
+| `voidWarehouseRestock` | `false` | 允许 litematica-printer 缺料时从仓库领一组（依赖 `voidWarehouse`） |
+| `voidWarehouseDirectPlace` | `false` | 打印机缺料时从仓库预扣一件并直接放置（依赖 `voidWarehouse` + `voidWarehouseRestock`） |
+| `voidWarehouseExchange` | `false` | 成品缺货时用 N 合 1 配方的原料顶替（依赖 `voidWarehouse`） |
+| `voidWarehouseCraft` | `false` | 成品缺货时按学过的配方扣原料（依赖 `voidWarehouse`） |
+| `voidWarehouseBlockDrops` | `false` | 玩家挖掉的方块掉落物直接进仓库（依赖 `voidWarehouse`） |
+| `concretePowderToGlass` | `false` | 普通熔炉把 16 种混凝土粉末烧成染色玻璃 |
 
-分类为 `neko` / `survival`，用法 `/carpet <规则> true`，`/carpet list` 查看全部规则。
+用法 `/carpet <规则> true`，`/carpet list` 查看全部；分类 `neko` / `survival`。
 
-### 虚空仓库
+### 虚空仓库速览
 
-- 铁砧把**工作台**重命名为 `虚空仓库`（精确匹配、区分大小写），**手持右键**任意目标即可开界面
-- 要把它当终端摆到世界里，**潜行 + 右键方块**；之后右键那个方块就能开仓库，不用再拿在手上
-- **按键打开**（2026-11-22 预留服务端通道）：客户端装 [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search) 后可按快捷键直接开仓库，不必手里拿着触发物。服务端开出 C2S 通道 `carpet_neko_addition:open_warehouse`（回执 `open_warehouse_result`），内部走的就是上面三条右键入口同一个 `open` 方法 —— 规则判定、标题、菜单完全一致。250 ms 限流；已经开着界面时不会重开（页码与钉住的位置不会被重置）。纯原版客户端不发这条包，零影响
-- **一种物品 = 一格，数量无上限**（内部 `BigInteger`，真任意精度）；页数随物品种类增长，也没有上限
-- 全服唯一一份、跨维度共享（存在主世界 `SavedData`），重启不丢；排列按创造模式物品栏顺序，与存取历史无关
-- 左键取 1 个 / 右键取一组，**都直接进背包**；格子里只画图标，真实数量看鼠标提示
-- **Ctrl + Alt + 左键取到装不下为止**：常规模式铺满背包（纯散货、不装盒），潜影盒模式下给满盒。装多少由服务端按你的真实背包现算，只取仓库里现有的（不走 9 合 1 兑换）。⚠️ **潜影壳 / 箱子也能装盒，但盒子材料要先预留**：库存刚好只够一盒容量时一盒都不给（付不出盒子钱），库存宽裕时照给满盒、壳和箱随货一起扣。这个手势要客户端装 [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search)（0.2.0 起），纯原版客户端点不出来
-- 导航行：`45` **合成台 / 返回仓库**、`47` 潜影盒模式（**图标关 = 红盒、开 = 绿盒**；取出给装满的盒、存入把盒拆开）、`48` / `50` 翻页、`49` 页码、`51` 数量排序
-- **合成是独立的一页**（第 `45` 格切换）：那一页列的是「**还能做多少**」，与仓库里有没有货无关 —— 存着 2 个铁锭也照样能看到「铁锭」这一条，不必先把库存清空。**普通模式左键取 1 个、右键取一组**（与仓库页同一口径，左键那个数字是 `LEFT_CLICK_AMOUNT`）、**Shift 取一组**；**盒模式左键给一盒、右键输入数量**。tooltip 会写清「仓库已有 N 个」，缺料的那几行标红
-- **数量排序下连点不会拿错**：顺序是**钉住**的 —— 只在打开界面、翻页、切开关时重建，**玩家动手期间一格都不挪**，停手满 2 秒才归位。取空的格子留一个空洞（不左移），点它是空操作，绝不会把顶上来的另一件东西交给你；格子上的数字仍实时刷新
-- **漏斗双向自动化**：朝终端摆放的漏斗 = 入库（无速率上限，玩家手动放过的物品成为白名单，分类物每格留 1 个）；**终端压在漏斗正上方** = 出料（按漏斗 5 格里的分类物发货，分类物永不外流）
-- **入库筛选**：只要非空就收。带数据组件的物品（受损工具、附魔、改名、药水、成书）**不拒收**，各占一格；要不要放行某个物品由玩家在漏斗里自己过滤（分类物白名单）
-- **不可堆叠物**（水桶 / 矿车 / 床 / 空潜影盒…）：**出料已支持** —— 标本留在格子里当分类物，货走「仓库 → 下游」直连；**入库还不能拿它当分类物**，因为格子只装得下 1 个、标本占住就腾不出位置（不带分类物的漏斗照常收这类物品）。三条候选方案见 `docs/入库漏斗支持不可堆叠物品-路线对照.md`
+铁砧把**工作台**改名为 `虚空仓库`，手持右键开界面；潜行右键方块可摆成终端。一种物品一格、数量无上限，全服共享、跨维度、重启不丢。左键取 1 个、右键取一组；第 45 格切「合成页」，按已学过的配方扣原料现做。漏斗朝终端=入库、终端压漏斗=出料，双向自动化。
 
-### 虚空仓库 9 合 1 兑换
+装 [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search) 可叠加搜索框、快捷键开仓、`Ctrl+Alt` 填满背包。
 
-- 只在**成品本身没货**时才兑换：仓库里有铁锭就老实扣铁锭，一个原料都不动
-- 扣减优先级：目标物品 → 族内更小的单位（下级合成）→ 族内更大的单位（拆整块，需要时多拆一块并找零退库）→ 单向边的上游
-- **绝不刷物**：每次成功兑换都满足 `Σ(数量 × 价值) == 需要数 × 目标价值`，自检逐笔校验（含随机 fuzz）
-- 比例是每条边自己的属性，引擎里没有写死 9：26.3 共 47 条边（含 4:1 的 2×2 配方与 3:1 的骨粉 ← 骨头）
-- 只走**原版真实存在的配方**：启动时用 `RecipeManager` 反查复核，两个物品缺一即丢边、单边缺失则降级；`/reload` 重算
+## 依赖
 
-### 虚空仓库配方扣料
+| 名称 | 类型 | 说明 |
+| --- | --- | --- |
+| [Fabric API](https://modrinth.com/mod/fabric-api) | 必需 | Fabric 运行所需 API |
+| [Carpet](https://modrinth.com/mod/carpet) | 必需 | 规则框架，版本需 ≥ 对应 MC 版本 |
+| [litematica-printer](https://github.com/Yur1Ca/litematica-printer) | 可选 | 虚空仓库补货 / 直接放置的客户端 |
+| [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search) | 可选 | 搜索框、快捷键开仓、填满背包手势 |
 
-- **先学会，才能用**：在合成台（含背包 2×2）里成功合成一次，这次用到的原料与产物才**能**被记进**配方本**
-- **记不记由你点**：合成之后聊天栏问一句，`[记住]` 记这一条、`[不要]` 本次登录内不再问这一条、`[总是记住]` 记下来并且本次登录内不再问任何配方。60 秒不点就不记；两个开关都只在内存里，重新登录恢复一条条询问。**不点就不会记住** —— 这是刻意的，别把没点当成坏了
-- 之后取这件物品时若**成品没货**，直接按记下的配方扣仓库里的原料，把成品给你 —— 等价于替你做掉这一步合成
-- **原料不够会往下钻**（最多 4 层）：取活塞要 3 块木板、木板没货但仓库里有原木，就扣原木做木板 —— 只在**已学过的配方**之间钻，不会凭空出现你没做过的东西
-- 配方本**全服共用一份**（和仓库一样），配方随存档持久化，重启不丢
-- 配方本上限 **2048 条**，存成**一条配方一个元素**（不是拼成一个大字符串）—— 不受 NBT 单字符串 65535 字节的硬上限约束；老档升级零操作，第一次写盘自动迁移
-- **配方本会说话了**：每记住一条新配方，聊天栏报一句「已记住配方：2 桦木木板 → 4 木棍，目前配方数量：1,845 / 2,048。」原料数量和产物数量都写 —— 同产物的不同配方产物数可能不一样，只写原料会让人误以为产物相同；用量跟在句尾，看一眼就知道还剩多少名额
-- **同产物还有别的走法时一并列出**：`2 橡木木板 → 木棍` 和 `2 桦木木板 → 木棍` 在仓库里是**两条独立配方**（记录的是玩家实际放的那一种，不做 tag 归一），所以新学桦木那条会接一行「└ 还能这样合：2 橡木木板 → 4 木棍；…」。最多列 5 条，其余折成「另有 N 条」；顺序按配方内容排，两次提示不会变
-- **快满提前打招呼**：用到上限的 90%（2048 条时是 1844 条）提醒一次；真的满了再报一次，之后**每 30 秒最多一次**（满本后玩家每合成一次都会撞上，不节流就是每合一次刷两行）。重复合成同一件东西时**每个玩家说一次**「这条配方之前已经记过了」—— 一句话都不说会让人分不清「已经记过」和「功能没生效」（这条是实机测试判出来的）；规则没开则彻底静默
-- 和 9 合 1 的分工：9 合 1 只会原版那几十条 9:1 / 4:1 的换算；本规则能覆盖**任意**配方（活塞、漏斗、侦测器……）
-- 优先级：真实库存 → 9 合 1 可兑 → 配方可合成。同一件物品**不会同时出现两格**
-- 界面里标「（可合成）」，鼠标提示写清「可合成 N 个，用 圆石 64 个 ＋ …」；一次动作能拿多少与真账同源，不会出现「说 64 实给 63」
-- **做不出来也占一格**：原料不够的产物照样列在合成页上，角标换成红色的「（缺料）」；鼠标提示首行写「缺少原料，暂时做不出」，然后把这条配方**要的全套原料**逐项列出 —— 仓库给不出的那几行**整行标红**并写出还差几个，够用的那几行保持正文灰。缺什么一眼能看到，不用自己对着账算
-- **合成页的「可合成」条目取货一律「真合成」**：哪怕仓库里已经有这件成品，点下去也是扣原料、给你**新做的**那一个（现货一个不少）。左键 / 右键 / 双击 / Shift / 盒模式「按数量」/ `Ctrl + Alt` 填满全走这条路；原料不够就整次拒绝，仓库零变化。合成页上的 9 合 1 条目照旧兑换，仓库页 / 补货 / 漏斗仍然是「有现货就直接给」—— 只有合成页的配方条目改了口径
-- 特殊配方（染色、烟火、地图缩放、成书复制等产物带数据组件的）**不记录** —— 学会了也只会给一件白板物品
+## 版本支持
 
-### 方块掉落物直接进虚空仓库
+| MC 版本 | 子工程 | 工具链 |
+| --- | --- | --- |
+| 26.3 / 26.2 / 26.1.2 / 26.1.1 | `modern/<版本>` | 不混淆，`fabric-loom`，Java 25 |
+| 1.21.11 | `versions/1.21.11` | 混淆，`fabric-loom-remap` + Mojang 映射，Java 21 |
 
-- 玩家**挖掉**的方块，掉落物不进世界，直接进仓库 —— 不占背包格子，也不受背包满不满影响
-- 掉落表、附魔、时运、精准采集**全部照原版算**，算出几个就收几个（拦的是掉落物的唯一出口 `ServerLevel#addFreshEntity`，不是某个方块）
-- 入库口径与漏斗完全一致：空潜影盒整盒占一格、带数据组件的按物品 + 组件归并
-- **聊天栏会说一声**：`[虚空仓库] 挖到 3 个 泥土（仓库共 128 个）、12 个 圆石（仓库共 64 个）` —— 与补货提示同一套配色（灰正文 + 亮绿数字）。除了挖到几个，还报**收完之后仓库里一共有多少**（现读，口径 = 物品 + 数据组件）；非空潜影盒只标「已拆开」不报库存、折成「N 种共 M 个」时也不报。同一种物品合并报数；一条最多列 4 种；同一玩家**每秒最多一条**，连挖不会刷屏
-- **只认玩家挖的**：TNT、苦力怕、活塞拆的、怪物掉落的、玩家丢的都照原样进世界；经验球不是物品，也不收
-- **绝不吞物品**：仓库没开、存档读不出、入库失败、任何异常 —— 一律照原样掉在地上
-- 关着的时候连上下文都不立，`addFreshEntity` 的额外代价只剩一次 `null` 读
+纯逻辑（设置、翻译、算法）在 `common/`，各版本以 `implementation project(':common')` 引用。
 
-### 虚空仓库补货
+## 安装
 
-给 [litematica-printer](https://github.com/Yur1Ca/litematica-printer) 用的通道（`carpet_neko_addition:printer_query`）：建造缺料时直接从共享仓库领一组。
+1. 服务端装 **Fabric Loader ≥ 0.16.0**，`mods/` 放 **Fabric API** + **Carpet** + 本模组（按 MC 版本选 `carpet-Neko-Addition-mc<版本>-<模组版本>.jar`）。
+2. 启动后用 `/carpet <规则> true` 逐条开启。
+3. 客户端可原版直连；要用补货 / 直放另装 `litematica-printer`，要搜索框另装 `neko-voidwarehouse-search`。
 
-**默认关是有意的** —— 开着就等于「任何装了对应打印机的玩家都能动用全服共享库存」，这个授权该由服主主动打开。
+从 [Releases](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/releases/latest) 下载产物。
 
-### 虚空仓库直接放置
+## 构建
 
-补货的下一步：打印机缺料时**不再把一整组塞进背包**，而是从仓库预扣**一件**、直接放到目标位置。手上不会出现物品，打印完背包里也不会剩一堆零头。
+需要 **JDK 25** 与 **Gradle 9.7.0**（wrapper 已固定）。**逐版本**构建，一次只跑一个子工程：
 
-- **零净变化的预扣**：流程是「从仓库预扣 1 件 → 临时塞进当前快捷栏格 → 走原版 `BlockItem#place` → 没放成的原样还回仓库」（`Withdrawal#returnUnplaced`）。结束之后快捷栏那一格与背包跟放置前完全一致
-- **走的是原版放置原语**，不是自己往世界里写方块 —— 朝向、半砖上下、楼梯拐角、栅栏连接、含水状态、红石灯亮灭、铁轨的 `shape` / `powered` / `waterlogged` 全部按原版算
-- **半砖合并**：对着底/顶台阶点缺失的那一面，一件预扣物直接给出双台阶（与手动放完全同理）
-- **结构化状态自己算，不依赖 Servux**：方块属性由本模组按语义属性表推出，装了 Servux 就借它的解码器交叉验证。**没装 Servux 也能用** —— 之前缺了它会整条回退成「补货到背包、手上放」，一条直放都发不出去
-- **不接的方块**：床 / 门 / 双格植物 / 潜影盒（一件预扣物放不出目标状态，或会额外消耗掉玩家自己的东西）；以及任何不是「裸 `BlockItem`」的物品（水桶、船、矿车……原版放置会改容器或产出多件）
-- **和手动放一样受规矩约束**：非生存模式、`mayBuild` 为假、界面没关、手臂够不着、目标位置已被别人改过（`expectedStateId` 不符）—— 任一条不满足就整笔撤回，**仓库零消耗**
-- **扣料会报一声**：`[虚空仓库] 放置消耗 64 个 石头（仓库剩余 998213 个）`，与取货提示同一套配色（灰正文 + 亮绿数字）。同一玩家**每秒最多一条**、同一种物品合并累加、一条最多列 4 种（再多折成「N 种共 M 个」）—— 直放实测峰值 **34 次/秒**，一次一条会把聊天栏刷穿
-- 默认 `false`，**依赖** `voidWarehouse` + `voidWarehouseRestock`。客户端要装 [litematica-printer](https://github.com/Yur1Ca/litematica-printer)，并在其配置里打开 `voidWarehouseDirectPlace`（与 `voidWarehouseRestock` 配套使用）
+```bat
+.\gradlew.bat :modern:26.3:build
+```
 
-### 混凝土粉末烧制染色玻璃
+产物在 `build/libs/`，`dist` 任务另复制一份到仓库根 `dist/`。不要一次性 `build`：五个版本挤进同一 JVM，TinyRemapper 在 JDK 25 上会崩（CI 用 matrix 逐版本跑）。
 
-16 种混凝土粉末在**普通熔炉**里烧成对应颜色的染色玻璃，数值与原版「沙子 → 玻璃」一致（0.1 经验 / 200 tick）。高炉与烟熏炉不在覆盖范围内。
-
-规则名**故意**与 Carpet DDS Addition 的 `smeltConcretePowderToGlass` 不同：Carpet 的 `SettingsManager#addCarpetRule` 遇重名会直接抛异常，沿用原名意味着「两个模组同装 = 服务端起不来」。
-
-### 虚空仓库搜索框（配套客户端 mod）
-
-[neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search) 是独立的**纯客户端** Fabric mod：在虚空仓库界面（一个 6 行原版大箱子）上方叠加一个搜索框，输入**中文名 / 拼音全拼 / 拼音首字母 / 注册名**都能筛选物品——`铁锭`、`tieding`、`td`、`iron_ingot` 均可命中，清空输入框即恢复完整列表。
-
-- **服务端界面零改动**：GUI 布局、导航行、点击语义与原版完全一致，只是「第 n 页装谁」按过滤结果变了；不装它时一切照旧，纯原版玩家零感知
-- **匹配在客户端做**（只有客户端有中文语言文件），服务端只按物品身份集合求交；过滤是会话级状态，关掉界面即消失，不写存档
-- 物品种类超过一页时最有用：不用翻页找，一个 `td` 直达全部铁质物品
-- 五个 MC 版本齐备（26.3 / 26.2 / 26.1.2 / 26.1.1 / 1.21.11），按客户端版本从其 [Releases](https://github.com/YoshinoShizuka/neko-voidwarehouse-search/releases/latest) 下载；旧服务端上搜索框自动隐藏，纯原版客户端零影响
+> 旧版 `carpet-automending`（包 `carpetaddition`）的仓库数据不兼容，升级等于换一个新仓库。
 
 ## 文档
 
 - [更新日志](CHANGELOG.md)
-
-细节与踩坑记录放在本地的 `docs/`，按项目铁律**只留在本地、不随仓库分发**（下面只列本地路径，GitHub 上点不开）：
-- `docs/多版本架构说明.md`
-- `docs/合成页与位置钉住.md`
-- `docs/虚空仓库 9 合 1 兑换.md`
-- `docs/虚空仓库配方扣料.md`
-- `docs/方块掉落物直接进虚空仓库.md`
-- `docs/混凝土粉末烧制染色玻璃规则移植.md`
-- `docs/投影材料列表显示虚空仓库库存.md`
-- `docs/功能审计与纯服务端可行性评估.md`
-- `docs/出料漏斗支持不可堆叠物品.md`
-- `docs/入库漏斗支持不可堆叠物品-路线对照.md`
-- `docs/仓库终端不能存进仓库.md`
-- `docs/中键取物被当成打印余料返还.md`
-
-## 安装
-
-1. 服务端装好 **Fabric Loader ≥ 0.16.0**（对应 MC 版本）
-2. 把下面三个 jar 放进 `mods/`：
-   - **Fabric API**（必需）
-   - **Carpet**（版本号需 ≥ 对应的 Minecraft 版本）
-   - **本模组**，按 MC 版本选 `carpet-Neko-Addition-mc<版本>-<模组版本>.jar`（从 [Releases](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/releases/latest) 下载）
-3. 启动后用 `/carpet <规则> true` 逐条开启
-4. 客户端可以原版直连；要用打印机补货 / 直接放置，客户端另装 `litematica-printer` 并在它的配置里打开 `voidWarehouseRestock` / `voidWarehouseDirectPlace`，服务端开对应的那几条规则
-5. 想要搜索框，客户端另装 [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search)（按客户端 MC 版本选 jar）；不装也不影响任何服务端功能
-
-> 旧版 `carpet-automending`（包 `carpetaddition`）的仓库数据不兼容，升级相当于换一个新仓库。
-
-## 支持版本
-
-当前构建与发布目标共 5 个：`26.3` · `26.2` · `26.1.2` · `26.1.1` · `1.21.11`
-
-| MC 版本 | 子工程 | 工具链 |
-| --- | --- | --- |
-| 26.3 / 26.2 / 26.1.2 / 26.1.1 | `modern/<版本>` | 不混淆，`net.fabricmc.fabric-loom`，Java 25 |
-| 1.21.11 | `versions/1.21.11` | 混淆，`fabric-loom-remap` + Mojang 官方映射，字节码目标 Java 21 |
-
-共享的纯逻辑（设置、翻译、算法）在 `common/`，各版本以 `implementation project(':common')` 引用。新增一个版本 = 复制一份目录 + 改它的 `gradle.properties` + 在 `settings.gradle` 里 `include` 一行。
-
-## 构建
-
-- **JDK 25**（Minecraft 26.3 的最低 Java SE 25）
-- **Gradle ≥ 9.7.0**（Loom 1.18.2 的硬要求；wrapper 已固定为 9.7.0，无需另装）
-
-**逐版本单独构建**，一次只跑一个子工程：
-
-```bat
-.\gradlew.bat :modern:26.3:build :modern:26.3:dist
-```
-
-产物在 `build/libs/`，`dist` 任务会另复制一份到仓库根的 `dist/`（`1.21.11` 没有 `dist` 任务，从 `build/libs/` 取即可）。开发时可 `.\gradlew.bat runServer` 起一个带 Carpet 的测试服务端。
-
-> 不要一次性 `.\gradlew.bat build`：五个版本会挤进同一个 JVM，TinyRemapper 在 JDK 25 上会崩。CI 用 matrix 逐版本跑，原因相同。
 
 ## 许可证
 

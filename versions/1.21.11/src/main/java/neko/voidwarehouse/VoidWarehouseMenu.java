@@ -873,9 +873,16 @@ public class VoidWarehouseMenu extends ChestMenu {
             return;
         }
         int maxStack = entry.maxStack();
-        int want = button == 0
-                ? 1
-                : entry.amount().min(BigInteger.valueOf(MAX_DROP_PER_ACTION)).intValue();
+        // 三种点击语义，必须与客户端（原版 + neko-client）逐个对齐：
+        //   button 0 → 1 个         （原版 Q）
+        //   button 1 → 一组         （原版 Ctrl+Q。仓库一格可能上万，按 maxStack 收口，
+        //                            而不是「整格」——那正是 0.5.9 首版被玩家报「丢大量」的原因）
+        //   button 2 → 整格         （neko-client 的 Shift+Q，单次上限 MAX_DROP_PER_ACTION）
+        int want = switch (button) {
+            case 0 -> 1;
+            case 1 -> maxStack;
+            default -> entry.amount().min(BigInteger.valueOf(MAX_DROP_PER_ACTION)).intValue();
+        };
         // 🔴 必须按「一组」循环扣：仓库的取货入口（withdraw / takeStack）单次最多给
         //    一个 maxStackSize，一次要 5000 个只会给你 64 个。这里直接走 takeEntry
         //    （只扣现货、不触发 9 合 1）—— 丢弃不该「先合成再丢掉」。

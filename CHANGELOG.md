@@ -25,11 +25,11 @@
 
 配套 neko-client 0.5.9：在仓库界面对着某一格按 **Ctrl+Q / Shift+Q**，物品从仓库掉到地上。服务端新增的不是一条通道，而是把原版 `THROW` 的仓库格分支接上 —— 客户端预测与服务端扣账因此天然一致。
 
-- **光标为空的 `THROW`**：`button == 0` 丢 1 个，其它值丢**整格**（与原版 `AbstractContainerMenu#doClick` 对 `button != 0` 的预测同口径，避免「先少一整格、再被同步打回」的回弹）。
+- **光标为空的 `THROW`**，三种 button 各管一件事：`0` = 1 个、`1` = **一组**（原版容器界面 Ctrl+Q 的语义）、`2` = 整格（neko-client 的 Shift+Q）。🔴 **`1` 绝不能解释成「整格」**：仓库一格可能上万，26.3 原版按 Ctrl+Q 发的就是 `1`，0.5.9 首版按「整格」处理，玩家一按就丢了几千件（正确的口径是 maxStackSize）。
 - **整格单次上限 4096 件**（64 个掉落物实体）：再多会一次生成上千个实体把客户端卡住；剩下的留在仓库，玩家再按一次即可。
 - **只认真实库存格**：合成页的「可兑 / 可合成」条目背后没有现货，丢它等于凭空造物（与 `CLONE` 同一条拒绝理由）；导航行、空格、光标非空一律走原样。
 - 🔴 **掉落物手工造 `ItemEntity`**，不走 `ServerPlayer#drop`：26.1.x/26.2 是 `drop(Stack, boolean, boolean)`、26.3 是 `drop(Stack, boolean, Prediction)`，签名换过两次；而且客户端预测也会走同一条路，只有服务端生成一份才不会双掉。
-- 自检 `vw-drop` **12 条 × 5 版本 = 60 条**：1 个 / 整格 / 4096 上限 / 导航行不扣 / 空格不扣 / 光标非空不扣 / 地面实体数量对得上。自检两阶段跑（下一 tick 才查实体，`addFreshEntity` 当 tick 查不到是 entity manager 的索引延迟，不是功能坏）。
+- 自检 `vw-drop` **12 条 × 5 版本 = 60 条**：1 个 / 一组 / 整格 4096 上限 / 导航行不扣 / 空格不扣 / 光标非空不扣 / 地面实体数量对得上。自检两阶段跑（下一 tick 才查实体，`addFreshEntity` 当 tick 查不到是 entity manager 的索引延迟，不是功能坏）。
 
 #### 合成页与位置钉住
 
@@ -52,18 +52,18 @@
 
 | 版本 | 文件 | 大小 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 530,243 B | `f70ca49f8ac7bf232cdc572c243e47b9` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 587,171 B | `c96c0cc2aced287903c49a245d593c9e` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 530,435 B | `0466565b68ce951c27ac0f2fe15184fe` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 587,655 B | `4562d963baa4808f054e94c8e98aa4d6` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 533,703 B | `816dd2083a3e91f7999e9211f449aab7` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 588,672 B | `4ed9ba45344fb5420bbf1aa7a6df753f` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 533,704 B | `e9f54951195c56c2beed6d23b4632153` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 588,671 B | `7508e5aaea9ee71e4ef1456aeb430e84` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 530,169 B | `39c5d7a2f36f1d10a31c113fe320ca8c` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 588,211 B | `deac7a6273b8c36b1fe71efbcacca405` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17.jar` | 530,275 B | `0e5238a93ea8c5437c07d0b11dfabf94` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.17-sources.jar` | 587,384 B | `fb3adbfb0ab3244393f1eebc46ee5642` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17.jar` | 530,458 B | `806aa328800e9b76a615fa8517804b84` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.17-sources.jar` | 587,844 B | `bb3c5ec18e50844c613e9140737a1788` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17.jar` | 533,726 B | `2ac9e881d8449e9dc82b78af3e04cff5` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.17-sources.jar` | 588,861 B | `7750f0965a280c5d22699379fdf8108a` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17.jar` | 533,727 B | `2fd369c2da05e8ec673e0b2940f4fb85` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.17-sources.jar` | 588,860 B | `3234aa41b3c1a63d3c625d7ea3cc0f5d` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17.jar` | 530,197 B | `34448d42dafd00d22ce87b7f397443a1` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.17-sources.jar` | 588,395 B | `c996604ef2e611dfc6af7f975cc7e861` |
 
-> **本表已按 2026-11-22 12:26 CST 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第二十九次原地替换**：规则集、配置键、规则名、存档格式仍然一个字都没动。这一版做了两件事：① 新增 `open_warehouse` / `open_warehouse_result` 通道（客户端按键打开仓库）；② 放开 THROW 的仓库格分支（快速丢弃，button 0 = 1 个、其它 = 整格，单次上限 4096 件）。主 jar 530,243 / 530,435 / 533,703 / 533,704 / 530,169 B，sources jar 587,171 / 587,655 / 588,672 / 588,671 / 588,211 B。md5 与之前二十八次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-22; v1.0.17 was replaced in place a twenty-ninth time — adding the open_warehouse channel and enabling the THROW branch on warehouse slots so items can be dropped to the ground.)。
+> **本表已按 2026-11-22 12:26 CST 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。v1.0.17 **第二十九次原地替换**：规则集、配置键、规则名、存档格式仍然一个字都没动。这一版做了两件事：① 新增 `open_warehouse` / `open_warehouse_result` 通道（客户端按键打开仓库）；② 放开 THROW 的仓库格分支（快速丢弃，button 0 = 1 个、其它 = 整格，单次上限 4096 件）。主 jar 530,275 / 530,458 / 533,726 / 533,727 / 530,197 B，sources jar 587,384 / 587,844 / 588,861 / 588,860 / 588,395 B。md5 与之前二十八次发布都不同，请按上表核对(This table was refreshed against the local full build of 2026-11-22; v1.0.17 was replaced in place a twenty-ninth time — adding the open_warehouse channel and enabling the THROW branch on warehouse slots so items can be dropped to the ground.)。
 
 #### 配方存入前的聊天确认（`voidWarehouseCraft`）
 

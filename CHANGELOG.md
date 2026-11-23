@@ -44,22 +44,49 @@
 - **影响面只有「可见性」**：`maxObtainable` / `planMax` / 取货与扣账路径一个字没动，9 合 1 的数量、上界、余数口径全部照旧；被隐藏的那些格子本来也拿不出东西 —— 老界面给出的「数量」就是它自己的库存(Only visibility changed: the amount, the upper bound and the deduction path are untouched, and the hidden entries never had anything to give.)
 - 自检 `vw-exchange` **333 → 336** 条（新增 F59~F61：混装时海晶灯必须还在、且账里只出现碎片与晶体；只有现货时必须不在），26.3 实跑 `checks=336 failures=0`；`SystemTest` 209 条、`InteractionCheck` 71 条回归全绿。
 
-**本版产物（2026-11-22 1.0.18 发布）**
+#### P0：盒装取货「盒子里的量」与「账上扣的量」不是一个数（`voidWarehouseExchange` + `voidWarehouseCraft`，2026-11-23）
+
+玩家 2026-11-23 报：仓库有**一盒橡木原木**（1728 根）+ **2 个箱子**，配方本里存了「木板 → 箱子」时，**用盒装模式在合成页取货，交出来的是只装着 2 个箱子的潜影盒，而原木被扣光**(A box-batch withdrawal delivered a shulker box holding 2 chests while debiting 1728 logs — the delivered amount and the ledger amount came from two different places.)
+
+- **实测复现**（`vw-boxp0` 的 S1，26.3 实跑）：交付 `1×潜影盒（内含 2 个箱子）`，扣账 `原木 1728 → 0`。按物理量算是 **864 个箱子**（1728 × 4 木板 ÷ 8），界面只给 2 个 —— 差的 862 个箱子的料被白吞。
+- **第二处同源洞**（S5）：合成页「按数量取货」要 1000 个箱子，交付 `1000×箱子` 而账上只扣得起 864 个的料 —— **凭空造出 136 个**。
+- **两条根因，都是「自己又算了一遍」**：① `VoidWarehouseMenu#withdrawShulkerBox` 里交付量取的是 `min(计划量, 容量)`，而真正扣账用的是那份 `Plan`；中途「盒子材料预留」还会把 `available` 再改一次，于是「盒里 2 个、账上扣 864 个的料」。② `VoidWarehouseWithdraw#executeCore` 在**规划之前**就用「请求量」算出满盒 / 散货 / 总盒数，规划收敛到 864 之后没有回头改这些数，于是照样按 1000 个打包(Two independent "recompute it myself" spots: the box packing used a locally re-derived amount, and the amount-withdrawal path derived the pack count from the *requested* number before the plan existed.)
+- **修法**：交付量一律**直接取计划量**（`exchange.amount()`），预留改动后**必须重规划**，并在最后加一条不变式「盒里装的量 == 账上扣的量，破了整次放弃」；按数量取货把满盒 / 散货的计算**全部后移到计划之后**，计划量不足时先收口 `requested`(Delivery amount is taken from the plan verbatim, the plan is re-derived when the reservation changes, and a final invariant refuses the whole action if the two ever disagree.)
+- ⚠️ **预留的重规划只对「货从计划里来」成立**：真实格（`target.entry() != null`）没有 `exchange` 这一份账，它按数量从库存拿，`amountExact` 收口后就是真值。第一版没加这个条件，`FillSelfCheck` 的 E13 当场变红（仓库 1728 壳 + 1 箱，点壳装盒给 0 盒，正确答案是 1 盒装 1726 个）—— 因为壳不在兑换表里，`planExchangeMax` 给 `null`，那条路被自己的收口掐死(The re-plan must only run for plan-backed goods; applying it to real stock entries kills the shell-packing path, which FillSelfCheck caught immediately.)
+- 自检 `vw-boxp0` **10 条 × 5 版本 = 50 条**：盒里 864 个 / 原木清空 / 现货 2 箱一个没动 / 外盒材料（壳 64→62、箱 2→1）/ 按数量 1000 要不到 1000 / 普通格整次拒绝且仓库零变化。**反证**：把两处修复回滚后 26.3 单报 `checks=10 failures=3`（P1/P5/P7），其余七条照绿 —— 判据确实咬在那三条上。
+
+#### 合成页「存了配方却搜不到」：搜索目录只认库存（2026-11-23）
+
+- **归属**：**服务端**，不是客户端。客户端只拿服务端下发的 `search_catalog` 目录去匹配，目录里没有的东西它**不会**回传成过滤集合。
+- **根因**：`SearchService#catalog` 走 `displaySlotAt`，而「两张纸分页」（2026-11-17）之后那条路**永远**只返回真实库存 —— 合成页的 9 合 1 / 配方条目一个都进不了目录。于是玩家只要搜到任何一件**在库存里**的东西，服务端就真的挂上过滤集合，**所有「不在库存、只在合成页」的格子当场消失**。玩家看到的就是「配方明明存了，搜一下就没了」(The search catalog was built from stock only, so any query that matched at least one stored item installed a filter that wiped every craft-page row whose output was not in stock.)
+- **修法**：目录 = 库存 + `exchangeOffers()` 的全部条目（9 合 1 可兑 + 已学配方可合成），去重后下发。仍在 hello 时建一次、100 ms 限流，两个来源都是缓存序列。
+- 自检 `vw-guard` 的 A 组 3 条：合成页独有的产物（箱子）必须在目录里 / 库存里的当然在 / 目录不是全物品表（信标不许出现）。回滚这一处 ⇒ A1 单红(Three assertions; reverting the fix turns exactly A1 red.)
+
+#### 占位图标被按键卡进背包（`voidWarehouse`，2026-11-23）
+
+玩家 2026-11-23 报：极端情况下虚空仓库的**占位物品**（空格子的屏障、导航行的红玻璃片）会被按键卡进背包，要求**绝对规避**(Placeholder icons could end up in the player's inventory via keybind clicks.)
+
+- **为什么服务端「什么都没做」反而是错的**：本界面在客户端眼里是**纯原版 6 行大箱子**，它不认识我们的 `PlaceholderSlot#mayPickup`（那个类只存在于服务端），看见格子里的屏障就照原版语义做**本地预测** —— Shift 一下就把屏障搬进背包。而服务端原来的「空格子直接 `return`，不做任何重发」让客户端**永远停在那次预测上**：`broadcastChanges` 只发「服务端以为变了」的槽位，服务端没变它就不发，那个幽灵就一直在(The client is a vanilla chest menu and knows nothing about our server-side `mayPickup`; the server's silent early-return left the client's local prediction uncorrected forever.)
+- **修法一：每一条「拒绝」都要收尾**。新增 `VoidWarehouseMenu#discardPrediction` = 清占位图标 + **54 格全量重发**，接在空内容格、导航行非开关输入、`CLONE`、未知输入、`PICKUP` 的非法 button、`THROW`（光标非空）这六条路径上；`removed(Player)` 关门时再清一次。
+- **修法二：认得出「自己画的假屏障」**。`VoidWarehousePageContainer#isPlaceholder` 按「屏障 + 我们那段自定义名与说明」精确识别 —— 玩家自己在创造模式拿的屏障、仓库里真的存着的屏障**一律不碰**（反证 C1/C2：3 个真屏障照常取得出 1 个、库存 3→2）。
+- 自检 `vw-guard` **24 条 × 5 版本 = 120 条**：A 组目录 3 条 + B 组「11 种输入逐个打占位格」（PICKUP ×3 button / PICKUP_ALL / QUICK_MOVE / SWAP ×2 / THROW ×2 / QUICK_CRAFT / CLONE）+ 导航行 + C 组真屏障反证 + D 组关门收尾 + E 组「预先塞一份假的，看这一下点击会不会清掉」。**反证**：回滚四处（目录 / 空格子 / 导航行 / 关门）后 26.3 单报 `checks=24 failures=4`（A1 / E1 / E2 / D1），其余照绿。
+
+**本版产物（2026-11-23 1.0.18 第二次原地覆盖）**
 
 | 版本 | 文件 | 大小 | md5 |
 | --- | --- | --- | --- |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.18.jar` | 530,746 B | `bea6d0df494e11d6d2117304c46e7277` |
-| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.18-sources.jar` | 588,836 B | `8da710443f67a54cba5cc689260bead2` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.18.jar` | 530,944 B | `2db9f3a36cb491b0ed0dff210f245f5e` |
-| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.18-sources.jar` | 589,569 B | `618f2b279c9a5a1294df59842d0bc4c4` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.18.jar` | 534,212 B | `15139e1930e5bf537437e3f9a87c85b5` |
-| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.18-sources.jar` | 590,586 B | `23dfd364e420dec179501ee26358cdee` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.18.jar` | 534,213 B | `061ecbf6056d71246d6bec89085f462a` |
-| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.18-sources.jar` | 590,585 B | `e351c52f6dc392fd9ab9778612a2374d` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18.jar` | 530,693 B | `ad39c1058e5f955ae2980da3de9bfd47` |
-| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18-sources.jar` | 590,122 B | `f9ed65aeedc03cd815a70fd42e76c321` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.18.jar` | 532,289 B | `06bba6d6d344a894e9ea031a1866cea9` |
+| 26.3 | `carpet-Neko-Addition-mc26.3-1.0.18-sources.jar` | 592,468 B | `7b9e5cf8174f37350e13927c1450c042` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.18.jar` | 532,514 B | `5494788c9e18390e22adbff130bf41d2` |
+| 26.2 | `carpet-Neko-Addition-mc26.2-1.0.18-sources.jar` | 593,224 B | `1c940da37e94f1fa044b141ee1078571` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.18.jar` | 535,782 B | `5ab6ec2f129fc3958275973d692b1c05` |
+| 26.1.2 | `carpet-Neko-Addition-mc26.1.2-1.0.18-sources.jar` | 594,241 B | `f3f4dbc2762ea6405837555da6110583` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.18.jar` | 535,783 B | `9523251bd8d2515d8b53ab680b6cbd1d` |
+| 26.1.1 | `carpet-Neko-Addition-mc26.1.1-1.0.18-sources.jar` | 594,240 B | `af3f856a856e556c475b9ef158bddb49` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18.jar` | 532,290 B | `d859d0bc6a9a7756bfc56f7a8cb6e8fa` |
+| 1.21.11 | `carpet-Neko-Addition-mc1.21.11-1.0.18-sources.jar` | 593,796 B | `da1e50050575d58072d45daa0b2e6b82` |
 
-> **本表已按 2026-11-22 20:55 CST 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。相对 16:25 那次，**只多了「合成页原料侧不再占格」这一条修复**：主 jar 530,746 / 530,944 / 534,212 / 534,213 / 530,693 B，sources jar 588,836 / 589,569 / 590,586 / 590,585 / 590,122 B（每个都涨了约 0.5 KB —— 两段式守卫的注释与 `planMaxFromIngredients`）。规则集、配置键、规则名、存档格式一个字都没动，**同版本号原地覆盖**（本文件开头的版本号约定：修 bug 不升号）。🔴 **sources jar 只存在于本地 `dist/`，不随 Release 发布** —— GitHub Release 的 Assets <b>只放主 jar</b>（用户铁律）。(The table was refreshed against a local full build at 2026-11-22 20:55 CST; the only delta since the 16:25 build is the crafting-page visibility fix. Only the main jars are ever uploaded to a GitHub Release; the sources jars stay in the local dist/.)
+> **本表已按 2026-11-23 21:5x CST 的本地全量构建整表刷新**（五版本逐个 `TARGET_MC_VERSIONS=<ver> ./gradlew :<proj>:build` + 手动 `cp` 到 `dist/`，非 CI 构建）。相对 11-22 22:55 那次，多了三件事：**P0 盒装取货的交付量与扣账同源**、**搜索目录覆盖合成页**、**占位图标不许被按键带出界面**；主 jar 532,289 / 532,514 / 535,782 / 535,783 / 532,290 B。规则集、配置键、规则名、存档格式一个字都没动，**同版本号原地覆盖**（本文件开头的版本号约定：修 bug 不升号）。🔴 **sources jar 只存在于本地 `dist/`，不随 Release 发布** —— GitHub Release 的 Assets <b>只放主 jar</b>（用户铁律）。(The table was refreshed against a local full build on 2026-11-23; the deltas since the previous build are the P0 box-batch fix, the search-catalog fix and the placeholder guard. Only the main jars are ever uploaded to a GitHub Release; the sources jars stay in the local dist/.)
 
 ## Carpet Neko Addition 1.0.17
 

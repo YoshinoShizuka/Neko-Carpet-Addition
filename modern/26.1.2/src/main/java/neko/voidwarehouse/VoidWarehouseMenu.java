@@ -110,6 +110,9 @@ import java.util.Set;
  * </ol>
  */
 public class VoidWarehouseMenu extends ChestMenu {
+    /** 只在「占位图标漏进背包」这种本该不可能发生的路径上说话（见 #purgePlaceholders） */
+    private static final org.slf4j.Logger LOGGER =
+            org.slf4j.LoggerFactory.getLogger("carpet_neko_addition/void_warehouse");
     // 聊天提示统一走 VoidWarehouseText.info()：亮金前缀 + 灰色正文，一眼能和普通聊天分开；
     // 正文里的关键数字用 VoidWarehouseText.key() 标亮绿。
     // 双语版（方案 B）：消息一律在发送时按玩家语言构造（msgXxx() 实例方法），
@@ -335,6 +338,9 @@ public class VoidWarehouseMenu extends ChestMenu {
      */
     @Override
     public void removed(Player player) {
+        // 关界面是最后一道闸：占位图标一旦漏进背包 / 光标，在这里清掉再走。
+        // 必须放在下面那个「光标是空的就直接 return」之前 —— 空光标是最常见的情形。
+        this.purgePlaceholders(player);
         ItemStack carried = this.getCarried();
         if (carried.isEmpty()) {
             return;
@@ -378,18 +384,29 @@ public class VoidWarehouseMenu extends ChestMenu {
         // ---- 第 6 行：导航行 ----
         if (slotId >= VoidWarehouseData.NAV_START) {
             int rowIndex = slotId - VoidWarehouseData.NAV_START;
+            boolean acted = false;
             if (input == ContainerInput.PICKUP && button == 0) {
                 if (VoidWarehouseNav.isScreenToggle(rowIndex)) {
                     this.switchScreen(player);
+                    acted = true;
                 } else if (VoidWarehouseNav.isShulkerToggle(rowIndex)) {
                     this.toggleShulkerMode(player);
+                    acted = true;
                 } else if (VoidWarehouseNav.isSortToggle(rowIndex)) {
                     this.toggleAmountSort(player);
+                    acted = true;
                 } else if (VoidWarehouseNav.isPageButton(rowIndex)) {
-                    this.flipPage(slotId);
+                    // 翻页 / 换页时页码没动就什么都没发（见 flipPage 的早退），
+                    // 这一下同样要把客户端的预测摁掉
+                    acted = this.flipPage(slotId);
                 }
             }
-            // 红色玻璃片占位格，以及其它任何输入：不做任何操作
+            // 红色玻璃片占位格，以及其它任何输入：不做任何操作。
+            // 但<b>客户端已经按原版语义预测过了</b>（它眼里这就是个能捡的玻璃片），
+            // 所以必须把 54 格全量发回去把那一帧预测摁掉，否则占位图标会留在客户端背包里。
+            if (!acted) {
+                this.discardPrediction(player);
+            }
             return;
         }
 
@@ -401,7 +418,12 @@ public class VoidWarehouseMenu extends ChestMenu {
         // 数量排序、以及条目会随库存出现 / 消失，都会让两次解析给出不同结果。
         VoidWarehouseData.DisplaySlot target = this.slotAt(slotId);
         if (target.isEmpty()) {
-            // 空格子（屏障占位符）：任何输入都无响应，纯占位，直接返回、不做任何重发
+            // 空格子（屏障占位符）：任何输入都无响应，纯占位。
+            // 🔴 但「无响应」不等于「什么都不用做」：客户端是纯原版大箱子，它不认识
+            //    PlaceholderSlot#mayPickup，看见格子里的屏障就照常做本地预测 ——
+            //    Shift 一下就把「屏障」搬进了客户端背包。这里必须全量重发，
+            //    用服务端的绝对真相把那一帧预测摁掉，并顺手清掉已经漏进背包的占位图标。
+            this.discardPrediction(player);
             return;
         }
         // 潜影盒模式下，所有「取出」动作都换成交出 1 个装满的潜影盒；
@@ -461,6 +483,7 @@ public class VoidWarehouseMenu extends ChestMenu {
                         this.withdrawOrStore(target, player);
                     }
                 } else {
+                    this.discardPrediction(player);
                     return;
                 }
                 this.syncAllViewers(player);
@@ -497,6 +520,8 @@ public class VoidWarehouseMenu extends ChestMenu {
                 // 光标上有东西：原版语义（丢光标那一份），与仓库无关。
                 if (!this.getCarried().isEmpty()) {
                     super.clicked(slotId, button, input, player);
+                    // 原版只丢光标那一份，但客户端对「丢弃一格」同样做过预测，收一下尾
+                    this.discardPrediction(player);
                     return;
                 }
                 // 光标为空 = 玩家对着仓库格按了丢弃键：把仓库里的物品丢到地上
@@ -507,11 +532,55 @@ public class VoidWarehouseMenu extends ChestMenu {
                 this.syncAllViewers(player);
             }
             case CLONE -> {
-                // 拒绝：创造模式中键克隆是唯一能凭空造物的路径
+                // 拒绝：创造模式中键克隆是唯一能凭空造物的路径。
+                // 拒绝之后同样要重发：客户端已经克隆了一份在光标上。
+                this.discardPrediction(player);
             }
             default -> {
                 // 未来的新输入类型：一律不处理，宁可无操作也不冒险
+                this.discardPrediction(player);
             }
+        }
+    }
+
+    /**
+     * 「服务端决定这一下什么都不做」的统一收尾。
+     *
+     * <h2>为什么不能只是 {@code return}</h2>
+     * <p>本界面在客户端眼里是<b>纯原版 6 行大箱子</b> —— 它用原版 {@code AbstractContainerMenu}
+     * 的预测算法先改自己的本地视图，再把点击包发上来。服务端如果什么都不回，客户端就<b>永远
+     * 停在那次预测上</b>：屏障占位图标被 Shift 进背包、或被光标带走，看起来就是「卡进背包了」。
+     * 所以每一条「拒绝」的路径都必须把 54 格全量发回去，用绝对真相覆盖客户端的本地预测。</p>
+     *
+     * <h2>为什么还要清一遍背包</h2>
+     * <p>重发只覆盖<b>菜单里的槽位</b>；真要有一份占位图标经别的路径（旧版本残留、别的模组的
+     * 预测）落进背包，光重发是抹不掉的。这里按「屏障 + 我们那段文案」精确识别
+     * （见 {@link VoidWarehousePageContainer#isPlaceholder}），玩家自己存的屏障不受影响。</p>
+     */
+    private void discardPrediction(Player player) {
+        this.purgePlaceholders(player);
+        this.syncAllViewers(player);
+    }
+
+    /** 把漏进玩家背包的<b>占位图标</b>清掉；真正的物品与玩家自己的屏障一律不碰 */
+    private void purgePlaceholders(Player player) {
+        if (player == null) {
+            return;
+        }
+        var inventory = player.getInventory();
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (VoidWarehousePageContainer.isPlaceholder(stack)) {
+                inventory.setItem(i, ItemStack.EMPTY);
+                LOGGER.warn("虚空仓库：清掉背包第 {} 格里的占位图标（{} × {}）—— 客户端预测漏出来的",
+                        i, stack.getCount(), stack.getItem());
+            }
+        }
+        ItemStack carried = this.getCarried();
+        if (VoidWarehousePageContainer.isPlaceholder(carried)) {
+            this.setCarried(ItemStack.EMPTY);
+            LOGGER.warn("虚空仓库：清掉光标上的占位图标（{} × {}）",
+                    carried.getCount(), carried.getItem());
         }
     }
 
@@ -556,8 +625,10 @@ public class VoidWarehouseMenu extends ChestMenu {
      * 于是光标上会闪一下箭头图标。这里用 {@link #syncAllViewers}（全量重发）而不是差异包，
      * 客户端拿到的就是 54 格的绝对真相，预测连同光标状态一起被摁回来 ——
      * 所以只是极短的一帧回弹，不会留下错误状态。</p>
+     *
+     * @return 真的换了页并发包了（{@code false} = 到头了，什么都没发，调用方要自己收尾）
      */
-    private void flipPage(int slotId) {
+    private boolean flipPage(int slotId) {
         int rowIndex = slotId - VoidWarehouseData.NAV_START;
         int pageCount = this.pageContainer.pageCount();
         int current = this.pageContainer.page();
@@ -570,11 +641,12 @@ public class VoidWarehouseMenu extends ChestMenu {
         };
         target = Math.max(0, Math.min(target, pageCount - 1));
         if (target == current) {
-            return;
+            return false;
         }
         this.pageContainer.setPage(target);
         // 只有本菜单的槽位内容变了（页码是本玩家私有的）
         this.sendAllDataToRemote();
+        return true;
     }
 
     /**
@@ -702,9 +774,11 @@ public class VoidWarehouseMenu extends ChestMenu {
             exchange = forceCraft
                     ? this.data.planCraftedMax(target.template(), BigInteger.valueOf(capacity))
                     : this.data.planExchangeMax(target.template(), BigInteger.valueOf(capacity));
-            available = exchange == null
-                    ? 0L
-                    : exchange.amount().min(BigInteger.valueOf(capacity)).longValue();
+            // 🔴 <b>交付量直接取计划量</b>，绝不自己再算一遍：盒子装几个、账上扣几份料
+            //    必须是<b>同一个数</b>。曾经这里写的是 `min(exchange.amount(), capacity)`，
+            //    看着等价，但下面 ② 的预留还会再改一次 available，而 applyExchange 用的是
+            //    这份 exchange —— 那就是「盒里 2 个、账上扣 864 个的料」（2026-11-23 P0）。
+            available = exchange == null ? 0L : exchange.amount().longValue();
         }
         if (available <= 0) {
             return;
@@ -719,18 +793,48 @@ public class VoidWarehouseMenu extends ChestMenu {
         //    仓库里那 2 壳 + 1 箱恰好归零，consumeBoxMaterials 只留一条 WARN，
         //    等于「1 个箱子换 1 个潜影盒」（见 VoidWarehouseShulker#isBoxPart）。
         //    例：仓库 1728 壳 + 1 箱 → 交出的那盒装 <b>1726</b> 个，另扣 2 壳 + 1 箱，账是平的。
-        if (VoidWarehouseShulker.isBoxPart(template)) {
+        //    ⚠️ 但这条预留<b>只对「货从现货里出」成立</b>：合成页的配方条目是<b>现做</b>的，
+        //    仓库里那几个箱子一个都不会少，拿现货量去收口只会把「能造 864 个」压成
+        //    「现货 2 个」（P0 的另一半，见 VoidWarehouseWithdraw 第 ② 段的同一口径）。
+        boolean leavingFromStock = !forceCraft;
+        if (VoidWarehouseShulker.isBoxPart(template) && leavingFromStock) {
             long reserve = (template.is(Items.SHULKER_SHELL) ? plan.shells() : 0)
                     + (template.is(Items.CHEST) ? plan.chests() : 0);
             long have = this.data.amountExact(template)
                     .min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
-            available = Math.min(available, Math.max(0L, have - reserve));
-            if (available <= 0) {
+            long capped = Math.min(available, Math.max(0L, have - reserve));
+            if (capped <= 0) {
                 this.message(player, this.msgNoBoxParts());
                 return;
             }
+            if (capped != available) {
+                available = capped;
+                // 🔴 数量一改，那份「凑够 available 个」的账就作废了 —— <b>必须重规划</b>。
+                //    不重规划就是「盒里 2 个、账上扣 864 个的料」，与上面 ① 同一条不变式。
+                //    ⚠️ 但只对「货是从计划里来的」成立。真实格（{@code target.entry() != null}）
+                //    根本没有 exchange 这一份账：它按数量从库存里拿，amountExact 收口之后
+                //    那个数就是真值。在这里无脑重规划会去问「潜影壳能不能兑换 1726 个」——
+                //    壳不在兑换表里，planExchangeMax 直接给 null，于是「点壳装盒」整条路
+                //    被自己的收口掐死（FillSelfCheck E13 实测：给 0 盒，正确答案是 1 盒装 1726 个）。
+                if (exchange != null) {
+                    exchange = this.data.planExchangeMax(template, BigInteger.valueOf(available));
+                    if (exchange == null || exchange.amount().signum() <= 0) {
+                        this.message(player, this.msgNoBoxParts());
+                        return;
+                    }
+                    available = Math.min(available, exchange.amount().longValue());
+                }
+            }
         }
-        if (!this.data.hasBoxMaterials(plan, template, BigInteger.valueOf(available))) {
+        // 🔴 最后一道闸：<b>盒里装的量 == 账上扣的量</b>。破了就整次放弃 ——
+        //    宁可什么也不给，也绝不允许「交付与扣账不同源」这种凭空造物 / 凭空吞货。
+        if (exchange != null && exchange.amount().longValue() != available) {
+            System.out.println("[虚空仓库] WARN 盒装取货的交付量与计划量不同源，整次放弃：available="
+                    + available + " plan=" + exchange.amount());
+            return;
+        }
+        if (!this.data.hasBoxMaterials(plan, leavingFromStock ? template : ItemStack.EMPTY,
+                BigInteger.valueOf(available))) {
             this.message(player, this.msgNoBoxParts());
             return;
         }

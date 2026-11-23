@@ -89,6 +89,30 @@ final class VoidWarehousePageContainer implements Container {
         return placeholder;
     }
 
+    /**
+     * 这个堆叠是不是本容器画出来的<b>占位图标</b>（屏障 + 我们那段名字与说明）。
+     *
+     * <p>为什么要有个「认得出自己」的办法：占位图标是<b>真的屏障物品</b>，只是永远不该
+     * 离开界面。客户端是纯原版大箱子，它<b>不认识</b> {@code PlaceholderSlot} 的
+     * {@code mayPickup}，看见格子里的屏障就会照原版语义做本地预测 —— 于是玩家
+     * 「用按键卡进背包」看到的那一份，只存在于客户端。服务端能把这一份抹掉的前提，
+     * 就是<b>分得清「我们画的假屏障」和「玩家真的存进去的屏障」</b>：判据用自定义名
+     * 与说明两段文案，玩家自己在创造模式里拿的屏障没有这两段，不会被误删。</p>
+     *
+     * <p>用法见 {@code VoidWarehouseMenu#discardPrediction} 与 {@code #removed}。</p>
+     */
+    static boolean isPlaceholder(ItemStack stack) {
+        if (stack == null || stack.isEmpty() || !stack.is(Items.BARRIER)) {
+            return false;
+        }
+        var name = stack.get(DataComponents.CUSTOM_NAME);
+        if (name == null) {
+            return false;
+        }
+        return name.equals(PLACEHOLDER_ZH.get(DataComponents.CUSTOM_NAME))
+                || name.equals(PLACEHOLDER_EN.get(DataComponents.CUSTOM_NAME));
+    }
+
     private final VoidWarehouseData data;
 
     /**

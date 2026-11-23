@@ -309,12 +309,13 @@ public final class VoidWarehouseWithdraw {
         //   「目标本身是盒子材料」（潜影壳 / 箱子）不走这条：那两样<b>仍然可以装盒</b>，
         //   只要材料账把那批货先刨掉 —— 见下面 ② 的预留。见 VoidWarehouseShulker#isBoxPart。
         boolean noPacking = !allowBox || !VoidWarehouseShulker.isBoxable(sample);
-        long fullBoxes = noPacking ? 0 : requested / capacity;
-        long loose = noPacking ? requested : requested % capacity;
-        // 散货超过 LOOSE_PACK_STACKS 组：它单独要占掉一大片背包格子，顺手装进一个盒子
-        // （这个盒子同样要算材料，所以盒子总数是 fullBoxes + 1）
-        boolean packLoose = !noPacking && loose > (long) LOOSE_PACK_STACKS * max;
-        long totalBoxes = packLoose ? fullBoxes + 1 : fullBoxes;
+        // 「几满盒 + 几散货」<b>要等账定下来之后再算</b>（见下面的 ①'）：账给不出 requested
+        // 个时，交付量必须跟着一起降 —— 先按 requested 算好再去扣账，就是「装 1000 个、
+        // 只扣 864 个的料」，凭空多出 136 个（2026-11-23 P0 复现）。
+        long fullBoxes;
+        long loose;
+        boolean packLoose;
+        long totalBoxes;
 
         // ① 校验物品库存（精确口径：同物品 + 同数据组件，与 takeExact 一致）。
         //    成品不够时，规则允许就用 9 合 1 兑换补齐 —— 规划是「先扣成品、再动别的」，
@@ -329,6 +330,28 @@ public final class VoidWarehouseWithdraw {
             return;
         }
         VoidWarehouseExchange.Plan exchange = take.plan();
+
+        // ①' 🔴 <b>交付量必须与账同源</b>：规划器给不出 requested 个时，只能按它给得出的量交付。
+        //     现货那条路不走规划（plan == null），requested 已经在 planTake 里与库存比过了。
+        if (exchange != null) {
+            long planned = exchange.amount().longValue();
+            if (planned <= 0) {
+                player.sendSystemMessage(forceCraft ? msgNoIngredients(en) : msgNoStock(en));
+                return;
+            }
+            if (planned < requested) {
+                requested = planned;
+                want = BigInteger.valueOf(requested);
+            }
+        }
+        // 数量定了，这才算「几满盒 + 几散货」
+        fullBoxes = noPacking ? 0 : requested / capacity;
+        loose = noPacking ? requested : requested % capacity;
+        packLoose = !noPacking && loose > (long) LOOSE_PACK_STACKS * max;
+        totalBoxes = packLoose ? fullBoxes + 1 : fullBoxes;
+        if (totalBoxes <= 0 && loose <= 0) {
+            return;
+        }
 
         // ② 校验盒子材料：优先空盒，不够的用壳 + 箱（按 totalBoxes 算，含散货装出来的那个）。
         //    与界面里「点击取一盒」共用同一份算法，两边行为必须一致。

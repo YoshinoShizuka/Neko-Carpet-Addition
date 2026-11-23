@@ -26,23 +26,39 @@ public final class SearchService {
     }
 
     /**
-     * 建一份「仓库现有全部物品」的目录：真实库存格 + 9 合 1 可兑虚拟条目，按展示序去重。
+     * 建一份「这个仓库现在能给我看的东西」的目录：<b>真实库存格 + 合成页的全部条目</b>
+     * （9 合 1 可兑 + 已学配方可合成），按物品去重。
      *
-     * <p>可兑条目也要进目录 —— 它们是界面上真实存在的格子，玩家搜「铁锭」时
-     * 「铁锭（可兑）」那一格同样应该被搜到。顺序跟展示序走（创造栏顺序），
-     * 客户端按什么顺序展示搜索结果都不受影响，这里去重只为包体最小。</p>
+     * <p>两边都要进目录 —— 它们是界面上真实存在的格子。玩家搜「铁锭」时，
+     * 「铁锭（可兑）」和「铁锭（可合成）」那两格同样应该被搜到。</p>
+     *
+     * <p>🔴 <b>2026-11-23 之前这里只有库存</b>（{@link VoidWarehouseData#displaySlotAt(int)}
+     * 在页面分离之后<b>永远</b>只返回真实条目，{@code offer} 那一支是死代码）。后果是
+     * 「合成页搜不到已学配方」：客户端只拿目录里的 id 去匹配，目录里没有的东西就<b>不会</b>
+     * 被回传成过滤集合 —— 而只要搜索命中了任何一件<b>在库存里</b>的东西，服务端就会
+     * 真的挂上过滤集合，于是所有「不在库存、只在合成页」的格子当场消失。玩家看到的是
+     * 「配方明明存了，搜一下就没了」。合成页专用的条目必须和库存一样进目录。</p>
      *
      * <p><b>不在热路径上</b>：只在客户端发 hello（打开界面 / 主动刷新）时调用一次，
-     * 且有 100ms 限流。走 {@link VoidWarehouseData#displaySlotAt(int)} 逐格解析，
-     * 内部全是缓存的数组与列表，全物品存档（1657 格）一次 ≈ 微秒级。</p>
+     * 且有 100ms 限流；两个来源都是缓存好的序列（{@code displaySlotAt} 走缓存数组，
+     * {@code exchangeOffers()} 按 tick 合并），全物品存档（1657 格 + 满本 746 条）
+     * 一次 ≈ 微秒级。</p>
      */
     public static List<String> catalog(VoidWarehouseData data) {
         int count = data.displayCount();
         Set<String> ids = new LinkedHashSet<>(count * 2);
         for (int i = 0; i < count; i++) {
             VoidWarehouseData.DisplaySlot slot = data.displaySlotAt(i);
-            var template = slot.entry() != null ? slot.entry().template()
-                    : slot.offer() != null ? slot.offer().template() : null;
+            var template = slot.entry() != null ? slot.entry().template() : null;
+            if (template == null || template.isEmpty()) {
+                continue;
+            }
+            ids.add(BuiltInRegistries.ITEM.getKey(template.getItem()).toString());
+        }
+        // 合成页（第二张）的条目：9 合 1「可兑」与配方「可合成」。
+        // 少了这一段，搜索就只认库存 —— 详见方法注释。
+        for (VoidWarehouseData.ExchangeOffer offer : data.exchangeOffers()) {
+            var template = offer.template();
             if (template == null || template.isEmpty()) {
                 continue;
             }

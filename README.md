@@ -21,7 +21,7 @@
 
 铁砧把**工作台**改名为 `虚空仓库`，手持右键开界面；潜行右键方块可摆成终端。一种物品一格、数量无上限，全服共享、跨维度、重启不丢。左键取 1 个、右键取一组；第 45 格切「合成页」，按已学过的配方扣原料现做。漏斗朝终端=入库、终端压漏斗=出料，双向自动化。
 
-装 [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search) 可叠加搜索框、快捷键开仓、`Ctrl+Alt` 填满背包。
+装 [neko-client](https://github.com/YoshinoShizuka/neko-client) 可叠加搜索框、快捷键开仓、`Ctrl+Alt` 填满背包。
 
 ## 依赖
 
@@ -30,7 +30,7 @@
 | [Fabric API](https://modrinth.com/mod/fabric-api) | 必需 | Fabric 运行所需 API |
 | [Carpet](https://modrinth.com/mod/carpet) | 必需 | 规则框架，版本需 ≥ 对应 MC 版本 |
 | [litematica-printer](https://github.com/Yur1Ca/litematica-printer) | 可选 | 虚空仓库补货 / 直接放置的客户端 |
-| [neko-voidwarehouse-search](https://github.com/YoshinoShizuka/neko-voidwarehouse-search) | 可选 | 搜索框、快捷键开仓、填满背包手势 |
+| [neko-client](https://github.com/YoshinoShizuka/neko-client) | 可选 | 搜索框、快捷键开仓、填满背包手势 |
 
 ## 版本支持
 
@@ -45,7 +45,7 @@
 
 1. 服务端装 **Fabric Loader ≥ 0.16.0**，`mods/` 放 **Fabric API** + **Carpet** + 本模组（按 MC 版本选 `carpet-Neko-Addition-mc<版本>-<模组版本>.jar`）。
 2. 启动后用 `/carpet <规则> true` 逐条开启。
-3. 客户端可原版直连；要用补货 / 直放另装 `litematica-printer`，要搜索框另装 `neko-voidwarehouse-search`。
+3. 客户端可原版直连；要用补货 / 直放另装 `litematica-printer`，要搜索框另装 `neko-client`。
 
 从 [Releases](https://github.com/YoshinoShizuka/Neko-Carpet-Addition/releases/latest) 下载产物。
 
